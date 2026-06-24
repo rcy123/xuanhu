@@ -1,0 +1,85 @@
+[project]
+name = "xuanhu"
+version = "0.1.0"
+description = "悬壶（Xuanhu）— 中医 AI 辅助诊疗 MVP"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "UNLICENSED" }
+
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "pydantic-settings>=2.14.2",
+    "uvicorn[standard]>=0.34,<1.0",
+    "httpx>=0.28,<1.0",
+    "sqlalchemy>=2.0.51",
+    "alembic>=1.18.4",
+    "asyncpg>=0.31.0",
+    "psycopg2-binary>=2.9.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.25,<1.0",
+    "ruff>=0.8,<1.0",
+    "mypy>=1.13,<2.0",
+    "respx>=0.22,<1.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "*.pyc",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "T20", # flake8-print
+]
+ignore = [
+    "E501", # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["T20"]  # scripts are CLI tools, print is expected
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+show_error_codes = true
+
+# 以下依赖尚未安装类型 stub，在此声明以避免 mypy 报错
+# 后续 P1-2 等任务可按需引入 types-* 包并移除对应条目
+[[tool.mypy.overrides]]
+module = [
+    "fastapi.*",
+    "uvicorn.*",
+    "httpx.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-v",
+    "--tb=short",
+]
