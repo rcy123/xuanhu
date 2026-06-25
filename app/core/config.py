@@ -118,6 +118,22 @@ class Settings(BaseSettings):
         default="default", description="网关路由 profile"
     )
 
+    # ---- Embedding 网关覆盖（可选，本地联调用） ----
+    # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 embedding 调用
+    # 未设置时回退到 MODEL_GATEWAY_* 生产口径
+    embedding_gateway_base_url: str = Field(
+        default="", description="Embedding 专用网关地址（可选，未设置时回退 MODEL_GATEWAY_BASE_URL）"
+    )
+    embedding_gateway_api_key: str = Field(
+        default="", description="Embedding 专用网关 API 密钥（可选，未设置时回退 MODEL_GATEWAY_API_KEY）"
+    )
+    embedding_gateway_timeout_seconds: int = Field(
+        default=0, ge=0, description="Embedding 网关超时（秒），0=回退 MODEL_GATEWAY_TIMEOUT_SECONDS"
+    )
+    embedding_gateway_max_retries: int = Field(
+        default=0, ge=0, description="Embedding 网关最大重试次数，0=回退 MODEL_GATEWAY_MAX_RETRIES"
+    )
+
     # ---- 模型名称 ----
     chat_model: str = Field(..., description="对话模型名称（必填）")
     embedding_model: str = Field(..., description="Embedding 模型名称（必填）")
