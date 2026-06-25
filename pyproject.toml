@@ -74,6 +74,7 @@ module = [
     "fastapi.*",
     "uvicorn.*",
     "httpx.*",
+    "pymilvus.*",
 ]
 ignore_missing_imports = true
 
