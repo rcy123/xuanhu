@@ -83,3 +83,6 @@ addopts = [
     "-v",
     "--tb=short",
 ]
+markers = [
+    "integration: marks tests that require a real PostgreSQL database (deselect with '-m \"not integration\"')",
+]
