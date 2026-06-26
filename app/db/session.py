@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+
+from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
@@ -69,3 +72,30 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
             expire_on_commit=False,
         )
     return _session_factory
+
+
+async def reset_session_factory() -> None:
+    """关闭并清空缓存的数据库引擎与会话工厂。
+
+    主要用于测试在修改配置后重建数据库连接；应用运行期通常不需要调用。
+    """
+    global _engine, _session_factory  # noqa: PLW0603
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _session_factory = None
+
+
+async def get_db(request: Request) -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI 依赖：为每个请求提供独立异步数据库会话。
+
+    事务在路由函数正常返回后提交；发生未捕获异常时自动回滚。
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

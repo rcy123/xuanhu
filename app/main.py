@@ -4,13 +4,17 @@
 """
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.health import router as health_router
+from app.api.sessions import router as sessions_router
+from app.api.sessions import session_exception_handlers
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient
 
@@ -34,6 +38,40 @@ app = FastAPI(
 )
 
 app.include_router(health_router)
+app.include_router(sessions_router)
+
+# 注册会话路由自定义异常处理器
+for exc_cls, handler in session_exception_handlers.items():
+    app.add_exception_handler(exc_cls, handler)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """将 FastAPI 请求校验失败转换为标准 envelope：VALIDATION_ERROR。"""
+    trace_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-trace-id")
+        or str(uuid.uuid4())
+    )
+    # 提取首条校验错误信息作为 detail
+    detail_parts = []
+    for err in exc.errors():
+        loc = ".".join(str(loc) for loc in err.get("loc", []))
+        msg = err.get("msg", "")
+        detail_parts.append(f"{loc}: {msg}" if loc else msg)
+    detail = "; ".join(detail_parts[:3]) if detail_parts else None
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "VALIDATION_ERROR",
+            "message": "请求参数校验失败",
+            "detail": detail,
+            "retryable": False,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
 
 
 @app.get("/health")
