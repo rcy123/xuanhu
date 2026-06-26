@@ -150,6 +150,11 @@ class Settings(BaseSettings):
     agent_max_retries: int = Field(default=2, ge=0, description="Agent 最大重试次数")
     safety_rollback_limit: int = Field(default=3, ge=1, description="安全审核回退次数上限")
     enable_streaming: bool = Field(default=False, description="是否启用 SSE 流式输出")
+    sse_heartbeat_interval_seconds: float = Field(
+        default=30.0,
+        ge=0.1,
+        description="SSE 空闲心跳间隔（秒）",
+    )
     prompt_manifest_path: str = Field(
         default="app/agents/prompts/manifest.yaml", description="Prompt 清单文件路径"
     )

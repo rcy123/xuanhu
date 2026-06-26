@@ -17,6 +17,7 @@ from app.api.messages import message_exception_handlers
 from app.api.messages import router as messages_router
 from app.api.sessions import router as sessions_router
 from app.api.sessions import session_exception_handlers
+from app.api.stream import router as stream_router
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient
 
@@ -42,6 +43,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(sessions_router)
 app.include_router(messages_router)
+app.include_router(stream_router)
 
 # 注册会话与消息路由自定义异常处理器
 for exc_cls, handler in {

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -35,7 +36,10 @@ from app.schemas.message import (
     MessageItem,
     MessageListResponse,
 )
+from app.services.events import EventService
 from app.services.session_lock import SessionLock
+
+logger = logging.getLogger("xuanhu.message")
 
 
 def _now() -> datetime:
@@ -196,6 +200,8 @@ class MessageService:
             await self._db.flush()
             await self._db.refresh(session)
 
+            await self._append_message_created_event(session_id, message)
+
             return MessageCreateResponse(
                 message_id=str(message.id),
                 session_id=session_id,
@@ -208,6 +214,35 @@ class MessageService:
             )
         finally:
             await lock.release()
+
+    async def _append_message_created_event(
+        self,
+        session_id: str,
+        message: ConsultMessage,
+    ) -> None:
+        """写入 message.created Redis Stream 事件；失败不影响权威 DB 事务。"""
+        try:
+            await EventService().append_session_event(
+                session_id,
+                "message.created",
+                {
+                    "message_id": str(message.id),
+                    "role": message.role,
+                    "agent_name": message.agent_name,
+                    "stage": message.stage,
+                    "content": message.content,
+                    "structured_delta": message.structured_delta,
+                    "agent_run_id": str(message.agent_run_id) if message.agent_run_id else None,
+                    "created_at": message.created_at.isoformat() if message.created_at else None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "message.created 事件写入 Redis Stream 失败 session=%s message=%s",
+                session_id,
+                message.id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # 查询消息历史
