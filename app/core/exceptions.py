@@ -74,6 +74,24 @@ class InvalidStageTransitionError(XuanhuError):
     retryable = False
 
 
+class SessionBusyError(XuanhuError):
+    """会话正在处理其他请求，获取锁失败。"""
+
+    code = "SESSION_BUSY"
+    message = "会话正在处理其他请求，请稍后重试"
+    status_code = 409
+    retryable = True
+
+
+class InvalidStateVersionError(XuanhuError):
+    """客户端 State 版本落后于服务端。"""
+
+    code = "INVALID_STATE_VERSION"
+    message = "客户端状态版本落后，请刷新后重试"
+    status_code = 409
+    retryable = True
+
+
 # ---------------------------------------------------------------------------
 # 模型网关异常（保留自 P1-4）
 # ---------------------------------------------------------------------------
