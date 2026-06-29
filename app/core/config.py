@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     milvus_host: str = Field(default="localhost", description="Milvus 服务地址")
     milvus_port: int = Field(default=19530, ge=1, le=65535, description="Milvus 端口")
     milvus_collection: str = Field(default="xuanhu_knowledge", description="Milvus collection 名称")
+    milvus_timeout_seconds: int = Field(default=30, ge=1, description="Milvus 连接超时（秒）")
 
     # ---- 模型网关（生产统一口径） ----
     model_gateway_base_url: str = Field(
@@ -110,6 +111,9 @@ class Settings(BaseSettings):
     )
     model_gateway_timeout_seconds: int = Field(
         default=60, ge=1, description="网关请求超时（秒）"
+    )
+    gateway_health_check_timeout_seconds: int = Field(
+        default=10, ge=1, description="网关健康检查超时（秒）"
     )
     model_gateway_max_retries: int = Field(
         default=2, ge=0, description="网关请求最大重试次数"

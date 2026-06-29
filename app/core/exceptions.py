@@ -174,3 +174,26 @@ class ChatStructuredParseError(ModelGatewayError):
         message: str = "结构化输出解析失败",
     ) -> None:
         super().__init__(message, retryable=False)
+
+
+# ---------------------------------------------------------------------------
+# P3-4 恢复与健康检查异常
+# ---------------------------------------------------------------------------
+
+
+class RecoveryNotNeededError(XuanhuError):
+    """会话状态正常，无需恢复。"""
+
+    code = "RECOVERY_NOT_NEEDED"
+    message = "会话状态正常，无需恢复"
+    status_code = 400
+    retryable = False
+
+
+class StateRecoveryRequiredError(XuanhuError):
+    """无法自动恢复，需人工处理。"""
+
+    code = "STATE_RECOVERY_REQUIRED"
+    message = "无法自动恢复，需人工处理"
+    status_code = 409
+    retryable = False

@@ -15,6 +15,8 @@ from fastapi.responses import JSONResponse
 from app.api.health import router as health_router
 from app.api.messages import message_exception_handlers
 from app.api.messages import router as messages_router
+from app.api.recovery import recovery_exception_handlers
+from app.api.recovery import router as recovery_router
 from app.api.sessions import router as sessions_router
 from app.api.sessions import session_exception_handlers
 from app.api.stream import router as stream_router
@@ -44,11 +46,13 @@ app.include_router(health_router)
 app.include_router(sessions_router)
 app.include_router(messages_router)
 app.include_router(stream_router)
+app.include_router(recovery_router)
 
-# 注册会话与消息路由自定义异常处理器
+# 注册会话、消息与恢复路由自定义异常处理器
 for exc_cls, handler in {
     **session_exception_handlers,
     **message_exception_handlers,
+    **recovery_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
 

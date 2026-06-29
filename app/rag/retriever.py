@@ -231,7 +231,7 @@ class RAGRetriever:
 
             self._milvus_client = MilvusClient(
                 uri=f"http://{self._settings.milvus_host}:{self._settings.milvus_port}",
-                timeout=30,
+                timeout=self._settings.milvus_timeout_seconds,
             )
         return self._milvus_client
 

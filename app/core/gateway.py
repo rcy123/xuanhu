@@ -465,11 +465,12 @@ class ModelGatewayClient:
             dict[str, str]: 各模型连通状态，如 {"chat": "ok", "embedding": "unavailable"}。
         """
         checks: dict[str, str] = {}
+        health_timeout = self._settings.gateway_health_check_timeout_seconds
 
         # 检查 chat 连通性
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0),
+                timeout=httpx.Timeout(float(health_timeout), connect=5.0),
             ) as client:
                 response = await client.post(
                     f"{self._base_url}/chat/completions",
@@ -490,7 +491,7 @@ class ModelGatewayClient:
         # 检查 embedding 连通性
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0),
+                timeout=httpx.Timeout(float(health_timeout), connect=5.0),
             ) as client:
                 response = await client.post(
                     f"{self._base_url}/embeddings",
