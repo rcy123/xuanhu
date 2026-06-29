@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.types import Gender, PregnancyStatus
 
 # ---------------------------------------------------------------------------
 # 枚举 / 子结构
@@ -18,15 +20,21 @@ class PatientInfo(BaseModel):
     与详细设计文档 §5.2 及接口设计文档 §4.1.1 保持一致。
     """
 
+    model_config = ConfigDict(use_enum_values=True)
+
     name: str | None = Field(default=None, description="患者姓名或脱敏标识")
     patient_ref: str | None = Field(default=None, description="患者门诊号/临时编号")
-    gender: Literal["male", "female", "unknown"] = Field(default="unknown")
+    gender: Gender = Field(default=Gender.UNKNOWN, validate_default=True)
     age: int | None = Field(default=None, ge=0, le=130)
+    visit_time: datetime | None = Field(default=None, description="就诊时间")
     allergies: list[str] = Field(default_factory=list)
-    pregnancy_status: Literal["unknown", "no", "pregnant", "possible", "lactating"] = Field(
-        default="unknown"
+    pregnancy_status: PregnancyStatus = Field(
+        default=PregnancyStatus.UNKNOWN,
+        validate_default=True,
+        description="possible 按妊娠同等严格处理",
     )
     menstruation_summary: str | None = Field(default=None)
+    special_conditions: list[str] = Field(default_factory=list)
 
 
 class SessionListItem(BaseModel):
