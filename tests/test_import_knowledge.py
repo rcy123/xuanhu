@@ -857,10 +857,14 @@ class TestIdempotency:
 
     @pytest.fixture(autouse=True)
     async def _setup_db(self):
-        """确保数据库可用；不可用时自动跳过集成测试。"""
+        """确保数据库可用；不可用时自动跳过集成测试。
+
+        每个测试方法独立获取全新 session factory，避免跨测试方法
+        复用全局引擎导致连接池中的连接被清理后仍被复用的竞态问题。
+        """
         from sqlalchemy import text
 
-        from app.db.session import get_session_factory
+        from app.db.session import get_session_factory, reset_session_factory
         from app.models import (  # noqa: F401
             Acupoint,
             DosageUnit,
@@ -870,11 +874,17 @@ class TestIdempotency:
             TheoryCase,
         )
 
+        # 重置全局引擎，确保每个测试方法获得独立连接池
+        await reset_session_factory()
         session_factory = get_session_factory()
         try:
             async with session_factory() as session:
                 await session.execute(text("SELECT 1"))
         except Exception as exc:  # noqa: BLE001
+            # 只跳过真正的连接拒绝异常（PostgreSQL 未启动/网络不通），
+            # 不吞掉 AttributeError、TypeError 等代码逻辑错误。
+            if isinstance(exc, (AttributeError, TypeError)):
+                raise
             pytest.skip(f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}")
 
         self._session_factory = session_factory

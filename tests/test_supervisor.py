@@ -1005,3 +1005,72 @@ async def test_supervisor_default_registry_includes_prescription() -> None:
     agent = registry.get(Stage.PRESCRIPTION)
     assert isinstance(agent, PrescriptionAgent)
 
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_modification_writes_result_and_routes_to_safety(db: AsyncSession) -> None:
+    """modification 阶段写入 state.modified_formula 并推进到 safety。
+
+    覆盖 P6-2 验收：Supervisor 在 Stage.MODIFICATION 能写入 state.modified_formula
+    并推进到 Stage.SAFETY，但不实现 Safety Agent。
+    """
+    session = await _create_session(db, stage=Stage.MODIFICATION)
+    registry = AgentRegistry()
+    registry.register(Stage.MODIFICATION, FakeModificationAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-modification")
+        assert result.to_stage == Stage.SAFETY
+        assert result.from_stage == Stage.MODIFICATION
+        assert result.agent_name == "modification"
+        assert result.state.modified_formula is not None
+        assert result.state.modified_formula.formula.name == "参苓白术散加减"
+        assert len(result.state.modified_formula.formula.composition) == 2
+        assert len(result.state.modified_formula.modifications) == 1
+        assert result.state.modified_formula.modifications[0].herb == "茯苓"
+
+        # PG snapshot 含 modified_formula
+        await db.refresh(session)
+        assert session.state_snapshot is not None
+        assert session.state_snapshot.get("current_stage") == "safety"
+        assert "modified_formula" in session.state_snapshot
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_modification_missing_agent_blocked(db: AsyncSession) -> None:
+    """modification 阶段未注册 Agent 时进入 blocked，不跳过到 safety。"""
+    session = await _create_session(db, stage=Stage.MODIFICATION)
+    registry = AgentRegistry()  # 不注册任何 modification agent
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-no-modification")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "missing_agent" in result.blocked_reason
+        assert "modification" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.status == "blocked"
+        assert session.current_stage == "blocked"
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_supervisor_default_registry_includes_modification() -> None:
+    """Supervisor 默认 registry 包含 ModificationAgent（不依赖 DB）。"""
+    from app.agents.modification import ModificationAgent
+    from app.agents.supervisor import _default_registry
+
+    registry = _default_registry()
+    agent = registry.get(Stage.MODIFICATION)
+    assert isinstance(agent, ModificationAgent)
+

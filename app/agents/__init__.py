@@ -3,6 +3,10 @@
 from app.agents.base import AgentResult, BaseAgent, BaseAgentImpl
 from app.agents.errors import AgentRunError
 from app.agents.inquiry import InquiryAgent, merge_inquiry_output_to_state
+from app.agents.modification import (
+    ModificationAgent,
+    merge_modified_formula_result_to_state,
+)
 from app.agents.prescription import PrescriptionAgent, merge_formula_result_to_state
 from app.agents.prompt_loader import PromptLoader, PromptTemplate
 from app.agents.registry import AgentRegistry
@@ -19,8 +23,10 @@ __all__ = [
     "InquiryAgent",
     "merge_formula_result_to_state",
     "merge_inquiry_output_to_state",
+    "merge_modified_formula_result_to_state",
     "merge_sufficiency_report_to_state",
     "merge_syndrome_result_to_state",
+    "ModificationAgent",
     "PrescriptionAgent",
     "PromptLoader",
     "PromptTemplate",
