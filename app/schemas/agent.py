@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from datetime import date
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.rag.schemas import Evidence
 from app.schemas.session import PatientInfo
@@ -172,6 +172,47 @@ class SafetyReview(BaseModel):
     summary: str = Field(min_length=1)
 
 
+class InquiryAgentOutput(BaseModel):
+    """问诊 Agent 结构化输出。
+
+    包含从本轮对话中抽取的结构化问诊增量以及下一条补问。
+    字段均为可选：仅当本轮对话确实提供了对应维度的新信息时才写入非空值。
+    """
+
+    chief_complaint: str | None = None
+    present_illness: str | None = None
+    past_history: str | None = None
+    personal_family_history: str | None = None
+    ten_questions_delta: TenQuestions | None = None
+    four_diagnosis_delta: FourDiagnosis | None = None
+
+    next_question: str = Field(min_length=1)
+    asked_dimension: str = Field(min_length=1)
+
+    safety_info_requested: list[str] = Field(default_factory=list)
+    safety_notes: str | None = None
+
+    @field_validator("next_question")
+    @classmethod
+    def validate_next_question(cls, v: str) -> str:
+        """校验 next_question 只包含一个核心问题。"""
+        question_count = v.count("？") + v.count("?")
+        if question_count > 1:
+            raise ValueError(
+                f"next_question 包含 {question_count} 个问句，"
+                "一次只能问一个核心问题"
+            )
+        parallel_markers = [
+            "另外", "此外", "还有", "同时请问", "另外请问",
+            "顺便问", "再问一下", "另外问", "还想问",
+        ]
+        if any(marker in v for marker in parallel_markers):
+            raise ValueError(
+                "next_question 包含并列追问标记，一次只能问一个核心问题"
+            )
+        return v
+
+
 class MedicalRecord(BaseModel):
     """病历生成结果。"""
 
@@ -246,6 +287,7 @@ __all__ = [
     "FourDiagnosis",
     "Gender",
     "HerbDose",
+    "InquiryAgentOutput",
     "InquiryState",
     "MedicalRecord",
     "MenopauseStatus",

@@ -36,6 +36,7 @@ from app.core.redis import get_redis
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
 from app.schemas.agent import (
+    InquiryAgentOutput,
     SafetyReview,
     SufficiencyReport,
     XuanhuState,
@@ -61,6 +62,15 @@ class SupervisorResult(BaseModel):
     blocked_reason: str | None = None
 
 
+def _default_registry() -> AgentRegistry:
+    """构造包含 P5-1 InquiryAgent 的默认 Agent 注册表。"""
+    from app.agents.inquiry import InquiryAgent
+
+    registry = AgentRegistry()
+    registry.register(Stage.INQUIRY, InquiryAgent())  # type: ignore[arg-type]  # output_schema 协变安全
+    return registry
+
+
 class Supervisor:
     """Supervisor 状态机。"""
 
@@ -73,7 +83,7 @@ class Supervisor:
         redis: Redis | None = None,
     ) -> None:
         self._db = db
-        self._registry = registry or AgentRegistry()
+        self._registry = registry or _default_registry()
         self._event_service = event_service
         self._redis = redis
 
@@ -418,8 +428,9 @@ class Supervisor:
         """将 Agent 输出写入 State 对应字段。"""
         updates: dict[str, Any] = {}
         if stage == Stage.INQUIRY:
-            # inquiry 输出目前不直接映射到 State 字段（由消息 service 处理）
-            pass
+            if isinstance(output, InquiryAgentOutput):
+                from app.agents.inquiry import merge_inquiry_output_to_state
+                updates = merge_inquiry_output_to_state(state, output)
         elif stage == Stage.SUFFICIENCY:
             if isinstance(output, SufficiencyReport):
                 updates["sufficiency_report"] = output
