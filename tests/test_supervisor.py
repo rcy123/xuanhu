@@ -933,3 +933,75 @@ async def test_no_real_model_called(db: AsyncSession) -> None:
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_prescription_writes_result_and_routes_to_modification(db: AsyncSession) -> None:
+    """prescription 阶段写入 state.base_formula 并推进到 modification。
+
+    覆盖 P6-1 验收：Supervisor 在 Stage.PRESCRIPTION 能写入 state.base_formula
+    并推进到 Stage.MODIFICATION，但不实现加减方 Agent。
+    """
+    session = await _create_session(db, stage=Stage.PRESCRIPTION)
+    registry = AgentRegistry()
+    registry.register(Stage.PRESCRIPTION, FakePrescriptionAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-prescription")
+        assert result.to_stage == Stage.MODIFICATION
+        assert result.from_stage == Stage.PRESCRIPTION
+        assert result.agent_name == "prescription"
+        assert result.state.base_formula is not None
+        assert result.state.base_formula.name == "参苓白术散"
+        assert len(result.state.base_formula.composition) == 2
+        assert result.state.base_formula.composition[0].herb == "党参"
+        assert result.state.base_formula.rationale == "健脾益气，渗湿止泻"
+
+        # PG snapshot 含 base_formula
+        await db.refresh(session)
+        assert session.state_snapshot is not None
+        assert session.state_snapshot.get("current_stage") == "modification"
+        assert "base_formula" in session.state_snapshot
+        # 不写入 modified_formula（P6-1 不实现加减方）
+        assert "modified_formula" not in session.state_snapshot
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_prescription_missing_agent_blocked(db: AsyncSession) -> None:
+    """prescription 阶段未注册 Agent 时进入 blocked，不跳过到 modification。"""
+    session = await _create_session(db, stage=Stage.PRESCRIPTION)
+    registry = AgentRegistry()  # 不注册任何 prescription agent
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-no-prescription")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "missing_agent" in result.blocked_reason
+        assert "prescription" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.status == "blocked"
+        assert session.current_stage == "blocked"
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_supervisor_default_registry_includes_prescription() -> None:
+    """Supervisor 默认 registry 包含 PrescriptionAgent（不依赖 DB）。"""
+    from app.agents.prescription import PrescriptionAgent
+    from app.agents.supervisor import _default_registry
+
+    registry = _default_registry()
+    agent = registry.get(Stage.PRESCRIPTION)
+    assert isinstance(agent, PrescriptionAgent)
+

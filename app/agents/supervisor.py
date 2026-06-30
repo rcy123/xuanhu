@@ -63,8 +63,10 @@ class SupervisorResult(BaseModel):
 
 
 def _default_registry() -> AgentRegistry:
-    """构造包含 P5-1/2/3 InquiryAgent/SufficiencyAgent/SyndromeAgent 的默认 Agent 注册表。"""
+    """构造包含 P5-1/2/3 InquiryAgent/SufficiencyAgent/SyndromeAgent 与
+    P6-1 PrescriptionAgent 的默认 Agent 注册表。"""
     from app.agents.inquiry import InquiryAgent
+    from app.agents.prescription import PrescriptionAgent
     from app.agents.sufficiency import SufficiencyAgent
     from app.agents.syndrome import SyndromeAgent
 
@@ -72,6 +74,7 @@ def _default_registry() -> AgentRegistry:
     registry.register(Stage.INQUIRY, InquiryAgent())  # type: ignore[arg-type]  # output_schema 协变安全
     registry.register(Stage.SUFFICIENCY, SufficiencyAgent())  # type: ignore[arg-type]
     registry.register(Stage.SYNDROME, SyndromeAgent())  # type: ignore[arg-type]
+    registry.register(Stage.PRESCRIPTION, PrescriptionAgent())  # type: ignore[arg-type]
     return registry
 
 
@@ -493,7 +496,11 @@ class Supervisor:
             from app.schemas.agent import FormulaResult
 
             if isinstance(output, FormulaResult):
-                updates["base_formula"] = output
+                from app.agents.prescription import merge_formula_result_to_state
+
+                updates = merge_formula_result_to_state(
+                    state, output, evidences=evidences
+                )
         elif stage == Stage.MODIFICATION:
             from app.schemas.agent import ModifiedFormulaResult
 
