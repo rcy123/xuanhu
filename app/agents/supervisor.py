@@ -63,11 +63,13 @@ class SupervisorResult(BaseModel):
 
 
 def _default_registry() -> AgentRegistry:
-    """构造包含 P5-1 InquiryAgent 的默认 Agent 注册表。"""
+    """构造包含 P5-1 InquiryAgent 与 P5-2 SufficiencyAgent 的默认 Agent 注册表。"""
     from app.agents.inquiry import InquiryAgent
+    from app.agents.sufficiency import SufficiencyAgent
 
     registry = AgentRegistry()
     registry.register(Stage.INQUIRY, InquiryAgent())  # type: ignore[arg-type]  # output_schema 协变安全
+    registry.register(Stage.SUFFICIENCY, SufficiencyAgent())  # type: ignore[arg-type]
     return registry
 
 
@@ -97,6 +99,7 @@ class Supervisor:
         trace_id: str,
         *,
         expected_state_version: int | None = None,
+        force: bool = False,
     ) -> SupervisorResult:
         """推进会话到下一个阶段。
 
@@ -115,7 +118,7 @@ class Supervisor:
         await lock.acquire()
         try:
             return await self._advance_locked(
-                session_id, trace_id, expected_state_version=expected_state_version
+                session_id, trace_id, expected_state_version=expected_state_version, force=force,
             )
         finally:
             await lock.release()
@@ -130,6 +133,7 @@ class Supervisor:
         trace_id: str,
         *,
         expected_state_version: int | None = None,
+        force: bool = False,
     ) -> SupervisorResult:
         # 1. 加载会话
         session = await self._load_session(session_id)
@@ -154,7 +158,7 @@ class Supervisor:
         # 4. 阶段路由
         try:
             to_stage, agent_name, blocked_reason, state = await self._route_and_run(
-                session, state, trace_id
+                session, state, trace_id, force=force
             )
         except AgentRunError as exc:
             # Agent 失败 → blocked
@@ -196,6 +200,33 @@ class Supervisor:
         # 6. 更新 PG snapshot
         session.state_snapshot = self._build_snapshot(state)
         session.last_checkpoint_at = datetime.now(UTC).replace(tzinfo=None)
+
+        # 6.1 医师 force 强制推进审计（仅作用于 sufficiency→syndrome，不绕过后续安全审核）
+        if (
+            force
+            and from_stage == Stage.SUFFICIENCY
+            and to_stage == Stage.SYNDROME
+            and state.sufficiency_report is not None
+            and not state.sufficiency_report.sufficient
+        ):
+            self._db.add(
+                self._audit_event(
+                    session_id=session.id,
+                    event_type="stage.force_advanced",
+                    actor_type="doctor",
+                    actor_id=None,
+                    payload={
+                        "from_stage": from_stage.value,
+                        "to_stage": to_stage.value,
+                        "stage": Stage.SUFFICIENCY.value,
+                        "sufficiency_sufficient": False,
+                        "missing": state.sufficiency_report.missing,
+                        "state_version": session.state_version,
+                        "trace_id": trace_id,
+                    },
+                    trace_id=trace_id,
+                )
+            )
 
         # 7. 写入 audit
         self._db.add(
@@ -317,6 +348,8 @@ class Supervisor:
         session: ConsultSession,
         state: XuanhuState,
         trace_id: str,
+        *,
+        force: bool = False,
     ) -> tuple[Stage, str | None, str | None, XuanhuState]:
         """根据当前阶段路由并执行 Agent。
 
@@ -342,7 +375,7 @@ class Supervisor:
         state = self._apply_agent_output(state, current, result.output)
 
         # 4. 根据阶段决定下一步
-        to_stage, blocked_reason = self._decide_next_stage(state, current)
+        to_stage, blocked_reason = self._decide_next_stage(state, current, force=force)
 
         # 5. 如果回退，更新 rollback_counts
         current_stage_val = current.value if isinstance(current, Stage) else current
@@ -356,7 +389,13 @@ class Supervisor:
     # 阶段决策
     # ------------------------------------------------------------------
 
-    def _decide_next_stage(self, state: XuanhuState, current: Stage) -> tuple[Stage, str | None]:
+    def _decide_next_stage(
+        self,
+        state: XuanhuState,
+        current: Stage,
+        *,
+        force: bool = False,
+    ) -> tuple[Stage, str | None]:
         """根据当前阶段和 State 内容决定下一阶段。"""
         settings = get_settings()
         limit = settings.safety_rollback_limit
@@ -370,6 +409,9 @@ class Supervisor:
                 # 无报告 → blocked（不应发生）
                 return Stage.BLOCKED, "sufficiency_report_missing"
             if report.sufficient:
+                return Stage.SYNDROME, None
+            # 不足且医师 force → 强制推进 syndrome（审计在 advance 层写入）
+            if force:
                 return Stage.SYNDROME, None
             # 不足 → 回退 inquiry（不计入 rollback_counts）
             return Stage.INQUIRY, None
@@ -433,7 +475,9 @@ class Supervisor:
                 updates = merge_inquiry_output_to_state(state, output)
         elif stage == Stage.SUFFICIENCY:
             if isinstance(output, SufficiencyReport):
-                updates["sufficiency_report"] = output
+                from app.agents.sufficiency import merge_sufficiency_report_to_state
+
+                updates = merge_sufficiency_report_to_state(state, output)
         elif stage == Stage.SYNDROME:
             from app.schemas.agent import SyndromeResult
 

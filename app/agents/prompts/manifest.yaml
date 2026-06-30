@@ -1,2 +1,3 @@
 test_agent: test_agent_v1.jinja2
 inquiry: inquiry_v1.jinja2
+sufficiency: sufficiency_v1.jinja2
