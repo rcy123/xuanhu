@@ -435,6 +435,66 @@ async def test_inquiry_to_sufficiency_to_syndrome(db: AsyncSession) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
+async def test_syndrome_writes_result_and_routes_to_prescription(db: AsyncSession) -> None:
+    """syndrome 阶段写入 state.syndrome_result 并推进到 prescription。
+
+    覆盖 P5-3 验收：Supervisor 在 Stage.SYNDROME 能写入 state.syndrome_result
+    并推进到 Stage.PRESCRIPTION，但不实现 Prescription Agent。
+    """
+    session = await _create_session(db, stage=Stage.SYNDROME)
+    registry = AgentRegistry()
+    registry.register(Stage.SYNDROME, FakeSyndromeAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-syndrome")
+        assert result.to_stage == Stage.PRESCRIPTION
+        assert result.from_stage == Stage.SYNDROME
+        assert result.agent_name == "syndrome"
+        assert result.state.syndrome_result is not None
+        assert result.state.syndrome_result.syndrome == "脾虚湿盛"
+        assert result.state.syndrome_result.treatment_principle == "健脾化湿"
+        assert result.state.syndrome_result.confidence == 0.85
+
+        # PG snapshot 含 syndrome_result
+        await db.refresh(session)
+        assert session.state_snapshot is not None
+        assert session.state_snapshot.get("current_stage") == "prescription"
+        assert "syndrome_result" in session.state_snapshot
+
+        # Evidence 已合并到 state.evidences
+        assert "evidences" in session.state_snapshot
+        assert len(session.state_snapshot["evidences"]) >= 0
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_syndrome_missing_agent_blocked(db: AsyncSession) -> None:
+    """syndrome 阶段未注册 Agent 时进入 blocked，不跳过到 prescription。"""
+    session = await _create_session(db, stage=Stage.SYNDROME)
+    registry = AgentRegistry()  # 不注册任何 syndrome agent
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-no-syndrome")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "missing_agent" in result.blocked_reason
+        assert "syndrome" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.status == "blocked"
+        assert session.current_stage == "blocked"
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
 async def test_sufficiency_insufficient_rollback_inquiry(db: AsyncSession) -> None:
     """sufficiency_report.sufficient=false 回退到 inquiry。"""
     session = await _create_session(db, stage=Stage.INQUIRY)

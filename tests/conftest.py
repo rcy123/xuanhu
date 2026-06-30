@@ -12,7 +12,7 @@ import os
 
 def _set_test_defaults() -> None:
     """设置测试用默认环境变量（不覆盖已存在的值）。"""
-    os.environ.setdefault("DB_URL", "postgresql://test:test@localhost:5432/xuanhu_test")
+    os.environ.setdefault("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
     os.environ.setdefault("REDIS_URL", "redis://:xuanhu_dev@localhost:6379/0")
     os.environ.setdefault("MODEL_GATEWAY_BASE_URL", "http://localhost:8080/v1")
     os.environ.setdefault("MODEL_GATEWAY_API_KEY", "sk-test-placeholder")

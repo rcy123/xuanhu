@@ -63,13 +63,15 @@ class SupervisorResult(BaseModel):
 
 
 def _default_registry() -> AgentRegistry:
-    """构造包含 P5-1 InquiryAgent 与 P5-2 SufficiencyAgent 的默认 Agent 注册表。"""
+    """构造包含 P5-1/2/3 InquiryAgent/SufficiencyAgent/SyndromeAgent 的默认 Agent 注册表。"""
     from app.agents.inquiry import InquiryAgent
     from app.agents.sufficiency import SufficiencyAgent
+    from app.agents.syndrome import SyndromeAgent
 
     registry = AgentRegistry()
     registry.register(Stage.INQUIRY, InquiryAgent())  # type: ignore[arg-type]  # output_schema 协变安全
     registry.register(Stage.SUFFICIENCY, SufficiencyAgent())  # type: ignore[arg-type]
+    registry.register(Stage.SYNDROME, SyndromeAgent())  # type: ignore[arg-type]
     return registry
 
 
@@ -372,7 +374,7 @@ class Supervisor:
         agent_name = agent.name
 
         # 3. 将 Agent 输出写入 State 对应字段
-        state = self._apply_agent_output(state, current, result.output)
+        state = self._apply_agent_output(state, current, result.output, evidences=result.evidences)
 
         # 4. 根据阶段决定下一步
         to_stage, blocked_reason = self._decide_next_stage(state, current, force=force)
@@ -466,6 +468,8 @@ class Supervisor:
         state: XuanhuState,
         stage: Stage,
         output: BaseModel,
+        *,
+        evidences: list[Any] | None = None,
     ) -> XuanhuState:
         """将 Agent 输出写入 State 对应字段。"""
         updates: dict[str, Any] = {}
@@ -482,7 +486,9 @@ class Supervisor:
             from app.schemas.agent import SyndromeResult
 
             if isinstance(output, SyndromeResult):
-                updates["syndrome_result"] = output
+                from app.agents.syndrome import merge_syndrome_result_to_state
+
+                updates = merge_syndrome_result_to_state(state, output, evidences=evidences)
         elif stage == Stage.PRESCRIPTION:
             from app.schemas.agent import FormulaResult
 

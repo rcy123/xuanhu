@@ -46,8 +46,8 @@ class SampleOutput(BaseModel):
 @pytest.fixture
 def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     """创建测试用 Settings 实例。"""
-    monkeypatch.setenv("DB_URL", "postgresql://test:test@localhost:5432/test")
-    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
+    monkeypatch.setenv("REDIS_URL", "redis://:xuanhu_dev@localhost:6379/0")
     monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "http://mock-gateway:8080/v1")
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "sk-test-key-12345")
     monkeypatch.setenv("MODEL_GATEWAY_TIMEOUT_SECONDS", "30")
