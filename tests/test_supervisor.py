@@ -358,6 +358,9 @@ async def _create_session(db: AsyncSession, stage: Stage = Stage.INQUIRY, status
 
 async def _cleanup_session(db: AsyncSession, session_id: uuid.UUID) -> None:
     """清理测试会话及相关数据。"""
+    from app.models.review import MedicalRecord
+
+    await db.execute(delete(MedicalRecord).where(MedicalRecord.session_id == session_id))
     await db.execute(delete(AuditEvent).where(AuditEvent.session_id == session_id))
     await db.execute(delete(ConsultSession).where(ConsultSession.id == session_id))
     await db.commit()
@@ -1521,5 +1524,652 @@ async def test_safety_agent_explanation_preserved_in_pg_snapshot(
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
         await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# P7-2: record→done 集成测试
+# ---------------------------------------------------------------------------
+
+async def _advance_to_record(
+    db: AsyncSession,
+    session: ConsultSession,
+    safety_passed: bool = True,
+) -> None:
+    """将测试会话从 review 推进到 record 阶段（模拟 P7-1 确认后状态）。
+
+    P7-1 confirm/modify 后 session.current_stage=record/status=active。
+    此处直接更新 PG 行，模拟 P7-1 已完成，准备 P7-2 病历生成。
+
+    同时写入一条 doctor_reviews 记录，使 medical_records.doctor_review_id
+    的外键约束可满足。
+    """
+    from datetime import UTC, datetime
+
+    from app.models.review import DoctorReview
+
+    review_id = uuid.uuid4()
+    # 写入 doctor_reviews，满足 medical_records 的外键约束
+    review = DoctorReview(
+        id=review_id,
+        session_id=session.id,
+        agent_run_id=None,
+        safety_rule_run_id=None,
+        action="confirm",
+        original_formula=None,
+        formula_override=None,
+        feedback=None,
+        reviewed_by="doctor-1",
+    )
+    db.add(review)
+
+    session.current_stage = "record"
+    session.status = "active"
+    session.pending_review = False
+    session.state_version += 1
+    session.state_snapshot = {
+        "session_id": str(session.id),
+        "current_stage": "record",
+        "pending_review": False,
+        "rollback_counts": {},
+        "state_version": session.state_version,
+        "patient_info": {"gender": "male", "age": 35},
+        "chief_complaint": "头痛3天",
+        "present_illness": "近3日头痛，伴发热",
+        "past_history": "无特殊",
+        "personal_family_history": "无特殊",
+        "syndrome_result": {
+            "syndrome": "风热头痛",
+            "treatment_principle": "疏风清热",
+            "syndrome_basis": ["头痛", "发热"],
+            "differential": [],
+            "confidence": 0.85,
+            "citations": [],
+        },
+        "modified_formula": {
+            "formula": {
+                "name": "川芎茶调散加减",
+                "composition": [{"herb": "川芎", "dose": 10, "unit": "g"}],
+                "rationale": "疏风清热",
+                "source": None,
+                "citations": [],
+            },
+            "modifications": [],
+        },
+        "safety_rule_result": {
+            "passed": safety_passed,
+            "issues": [],
+            "normalized_formula": {
+                "name": "川芎茶调散加减",
+                "composition": [{"herb": "川芎", "dose": 10, "unit": "g"}],
+                "rationale": "疏风清热",
+            },
+            "warnings": [],
+            "rule_version": "v1.0.0",
+            "execution_order": ["normalize"],
+        },
+        "safety_review": {
+            "passed": safety_passed,
+            "issues": [],
+            "rollback_target": "none",
+            "summary": "安全规则审核通过，无阻断性问题。",
+        },
+        "doctor_review": {
+            "action": "confirm",
+            "reviewed_by": "doctor-1",
+            "reviewed_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
+            "review_id": str(review_id),
+        },
+    }
+    await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_to_done_writes_medical_record(db: AsyncSession) -> None:
+    """P7-2: record→done 写入 medical_records version=1 并更新 session 状态。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 注册 RecordAgent 和必要的 fake agents
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-record-done")
+        assert result.to_stage == Stage.DONE
+        assert result.from_stage == Stage.RECORD
+        assert result.agent_name == "record"
+
+        # 校验 session 状态
+        await db.refresh(session)
+        assert session.current_stage == "done"
+        assert session.status == "done"
+        assert session.pending_review is False
+        assert session.state_version > 1
+
+        # 校验 PG state_snapshot 含 medical_record
+        assert session.state_snapshot is not None
+        assert "medical_record" in session.state_snapshot
+
+        # 校验 medical_records 表写入
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+
+        stmt = select(MedicalRecord).where(
+            MedicalRecord.session_id == session.id,
+            MedicalRecord.version == 1,
+        )
+        r = await db.execute(stmt)
+        record = r.scalar_one_or_none()
+        assert record is not None
+        assert record.record_text == "病历文本"
+        assert record.record_json == {"chief_complaint": "头痛"}
+        assert record.edited_by_doctor is False
+        assert record.version == 1
+
+        # 校验 audit_events(record.generated)
+        from app.models.audit import AuditEvent
+        audit_stmt = select(AuditEvent).where(
+            AuditEvent.session_id == session.id,
+            AuditEvent.event_type == "record.generated",
+        )
+        audit_result = await db.execute(audit_stmt)
+        audit_event = audit_result.scalar_one_or_none()
+        assert audit_event is not None
+        assert audit_event.payload.get("version") == 1
+        assert audit_event.payload.get("record_id") == str(record.id)
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        # 清理 medical_records
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_to_done_idempotent_no_duplicate(db: AsyncSession) -> None:
+    """P7-2: 重复执行不重复创建 version=1 病历。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        # 第一次推进
+        result1 = await supervisor.advance(str(session.id), "trace-record-1")
+        assert result1.to_stage == Stage.DONE
+
+        # 直接重置 session 为 record 以模拟"重复执行"
+        # 注意：这不会出现在实际场景中（done 不可再 advance），
+        # 但通过 _write_medical_record 幂等逻辑验证
+        session.current_stage = "record"
+        session.status = "active"
+        session.state_version += 1
+        session.state_snapshot = {
+            **session.state_snapshot,
+            "current_stage": "record",
+            "state_version": session.state_version,
+        }
+        await db.commit()
+
+        # 第二次推进
+        result2 = await supervisor.advance(str(session.id), "trace-record-2")
+        assert result2.to_stage == Stage.DONE
+
+        # 校验 medical_records 仍只有一条 version=1
+        from sqlalchemy import func as sqlfunc
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+
+        count_stmt = select(sqlfunc.count()).select_from(MedicalRecord).where(
+            MedicalRecord.session_id == session.id,
+            MedicalRecord.version == 1,
+        )
+        count_result = await db.execute(count_stmt)
+        count = count_result.scalar_one()
+        assert count == 1
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_to_done_emits_session_done_event(db: AsyncSession) -> None:
+    """P7-2: record→done 发射 session.done 事件，含 record_id。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        await supervisor.advance(str(session.id), "trace-record-event")
+
+        # 从 medical_records 获取 record_id
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(
+            MedicalRecord.session_id == session.id,
+            MedicalRecord.version == 1,
+        )
+        r = await db.execute(stmt)
+        record = r.scalar_one_or_none()
+        assert record is not None
+
+        # 校验 Redis Stream 事件
+        redis = await get_redis()
+        stream_key = f"xuanhu:events:{session.id}"
+        try:
+            events = await redis.xread({stream_key: "0"}, count=100)
+            found = False
+            for _stream_name, entries in events:
+                for _entry_id, fields in entries:
+                    event_type = None
+                    payload: dict[str, Any] = {}
+                    if isinstance(fields, dict):
+                        et_raw = fields.get(b"event_type") or fields.get("event_type")
+                        if isinstance(et_raw, bytes):
+                            et_raw = et_raw.decode("utf-8")
+                        event_type = et_raw
+                        p_raw = fields.get(b"payload") or fields.get("payload")
+                        if isinstance(p_raw, bytes):
+                            p_raw = p_raw.decode("utf-8")
+                        if isinstance(p_raw, str):
+                            import json
+                            payload = json.loads(p_raw)
+                    if event_type == "session.done":
+                        found = True
+                        assert "record_id" in payload
+                        assert payload["record_id"] == str(record.id)
+                        break
+                if found:
+                    break
+            assert found, "未找到 session.done 事件"
+        finally:
+            await redis.delete(stream_key)
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_without_doctor_review_blocked(db: AsyncSession) -> None:
+    """P7-2-fix B-014: 无 doctor_review 时 blocked，不写 medical_records。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 清除 doctor_review
+    snapshot = dict(session.state_snapshot or {})
+    snapshot.pop("doctor_review", None)
+    session.state_snapshot = snapshot
+    await db.commit()
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-no-review")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "doctor_review_required" in result.blocked_reason
+        assert "missing" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.current_stage == "blocked"
+        assert session.status == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_with_invalid_uuid_review_id_blocked(db: AsyncSession) -> None:
+    """P7-2-fix B-014: doctor_review.review_id 非合法 UUID 时 blocked。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 替换 review_id 为非法值
+    snapshot = dict(session.state_snapshot or {})
+    snapshot["doctor_review"] = {
+        "action": "confirm",
+        "reviewed_by": "doctor-1",
+        "reviewed_at": "2026-07-03T10:00:00",
+        "review_id": "not-a-valid-uuid",
+    }
+    session.state_snapshot = snapshot
+    await db.commit()
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-invalid-uuid")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "doctor_review_required" in result.blocked_reason
+        assert "invalid_uuid" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.current_stage == "blocked"
+        assert session.status == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_with_nonexistent_review_id_blocked(db: AsyncSession) -> None:
+    """P7-2-fix B-014: review_id 在 DB 中不存在时 blocked。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 替换为一个数据库中不存在的 UUID
+    nonexistent_id = uuid.uuid4()
+    snapshot = dict(session.state_snapshot or {})
+    snapshot["doctor_review"] = {
+        "action": "confirm",
+        "reviewed_by": "doctor-1",
+        "reviewed_at": "2026-07-03T10:00:00",
+        "review_id": str(nonexistent_id),
+    }
+    session.state_snapshot = snapshot
+    await db.commit()
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-nonexistent")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "doctor_review_required" in result.blocked_reason
+        assert "not_found" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.current_stage == "blocked"
+        assert session.status == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_with_cross_session_review_id_blocked(db: AsyncSession) -> None:
+    """P7-2-fix B-014: review_id 属于其他 session 时 blocked。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 创建另一个 session 和其 doctor_review
+    other_session = await _create_session(db, stage=Stage.INQUIRY)
+    from app.models.review import DoctorReview
+    other_review = DoctorReview(
+        id=uuid.uuid4(),
+        session_id=other_session.id,
+        action="confirm",
+        reviewed_by="doctor-1",
+    )
+    db.add(other_review)
+    await db.commit()
+
+    # 将 other_session 的 review_id 注入当前 session
+    snapshot = dict(session.state_snapshot or {})
+    snapshot["doctor_review"] = {
+        "action": "confirm",
+        "reviewed_by": "doctor-1",
+        "reviewed_at": "2026-07-03T10:00:00",
+        "review_id": str(other_review.id),
+    }
+    session.state_snapshot = snapshot
+    await db.commit()
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-cross-session")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "doctor_review_required" in result.blocked_reason
+        assert "not_found" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.current_stage == "blocked"
+        assert session.status == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_session(db, other_session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        await _cleanup_redis_checkpoint(str(other_session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_with_reject_action_blocked(db: AsyncSession) -> None:
+    """P7-2-fix B-014: doctor_review.action=reject 时 blocked。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 写入一条 action=reject 的 doctor_review，并更新 snapshot
+    from app.models.review import DoctorReview
+    reject_review = DoctorReview(
+        id=uuid.uuid4(),
+        session_id=session.id,
+        action="reject",
+        reviewed_by="doctor-1",
+    )
+    db.add(reject_review)
+
+    snapshot = dict(session.state_snapshot or {})
+    snapshot["doctor_review"] = {
+        "action": "reject",
+        "reviewed_by": "doctor-1",
+        "reviewed_at": "2026-07-03T10:00:00",
+        "review_id": str(reject_review.id),
+    }
+    session.state_snapshot = snapshot
+    await db.commit()
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-reject")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "doctor_review_required" in result.blocked_reason
+        assert "action_invalid" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.current_stage == "blocked"
+        assert session.status == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_writes_doctor_review_id(db: AsyncSession) -> None:
+    """P7-2: medical_records.doctor_review_id 正确关联 doctor_reviews。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    registry = AgentRegistry()
+    registry.register(Stage.RECORD, FakeRecordAgent())
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-review-id")
+        assert result.to_stage == Stage.DONE
+
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(
+            MedicalRecord.session_id == session.id,
+            MedicalRecord.version == 1,
+        )
+        r = await db.execute(stmt)
+        record = r.scalar_one_or_none()
+        assert record is not None
+
+        # doctor_review_id 来自 snapshot 中的 review_id
+        snapshot = session.state_snapshot or {}
+        expected_review_id = snapshot.get("doctor_review", {}).get("review_id")
+        if expected_review_id:
+            assert str(record.doctor_review_id) == expected_review_id
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_record_missing_agent_blocked(db: AsyncSession) -> None:
+    """P7-2: record 阶段未注册 Agent 时进入 blocked。"""
+    session = await _create_session(db, stage=Stage.RECORD)
+    await _advance_to_record(db, session)
+
+    # 不注册 RecordAgent
+    registry = AgentRegistry()
+    supervisor = Supervisor(db, registry=registry)
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-no-record-agent")
+        assert result.to_stage == Stage.BLOCKED
+        assert result.blocked_reason is not None
+        assert "missing_agent" in result.blocked_reason
+        assert "record" in result.blocked_reason
+
+        await db.refresh(session)
+        assert session.status == "blocked"
+        assert session.current_stage == "blocked"
+
+        # 无 medical_record 落库
+        from sqlalchemy import select
+
+        from app.models.review import MedicalRecord
+        stmt = select(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        r = await db.execute(stmt)
+        assert r.scalar_one_or_none() is None
+
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        from app.models.review import MedicalRecord
+        await db.execute(
+            delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
+        )
         await db.commit()
 

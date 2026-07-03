@@ -35,6 +35,7 @@ from app.core.exceptions import (
 from app.core.redis import get_redis
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
+from app.models.review import DoctorReview
 from app.safety.rule_version import SAFETY_RULE_VERSION
 from app.schemas.agent import (
     FormulaResult,
@@ -63,6 +64,20 @@ logger = logging.getLogger("xuanhu.supervisor")
 _CHECKPOINT_KEY_PREFIX = "xuanhu:checkpoint:"
 
 
+class DoctorReviewRequiredError(Exception):
+    """P7-2-fix B-014: 病历生成前 doctor_review 校验失败。
+
+    由 `_validate_doctor_review_for_record` 抛出，被 `_advance_locked`
+    捕获后进入 blocked(doctor_review_required/...)，不写 medical_records、
+    不置 done、不发 session.done。
+    """
+
+    def __init__(self, blocked_reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.blocked_reason = blocked_reason
+        self.detail = detail
+
+
 class SupervisorResult(BaseModel):
     """Supervisor 推进结果。"""
 
@@ -76,10 +91,12 @@ class SupervisorResult(BaseModel):
 
 def _default_registry() -> AgentRegistry:
     """构造包含 P5-1/2/3 InquiryAgent/SufficiencyAgent/SyndromeAgent 与
-    P6-1 PrescriptionAgent、P6-2 ModificationAgent 的默认 Agent 注册表。"""
+    P6-1 PrescriptionAgent、P6-2 ModificationAgent、P7-2 RecordAgent 的默认
+    Agent 注册表。"""
     from app.agents.inquiry import InquiryAgent
     from app.agents.modification import ModificationAgent
     from app.agents.prescription import PrescriptionAgent
+    from app.agents.record_agent import RecordAgent
     from app.agents.sufficiency import SufficiencyAgent
     from app.agents.syndrome import SyndromeAgent
 
@@ -89,6 +106,7 @@ def _default_registry() -> AgentRegistry:
     registry.register(Stage.SYNDROME, SyndromeAgent())  # type: ignore[arg-type]
     registry.register(Stage.PRESCRIPTION, PrescriptionAgent())  # type: ignore[arg-type]
     registry.register(Stage.MODIFICATION, ModificationAgent())  # type: ignore[arg-type]
+    registry.register(Stage.RECORD, RecordAgent())  # type: ignore[arg-type]
     return registry
 
 
@@ -189,6 +207,26 @@ class Supervisor:
                 trace_id=trace_id,
             )
 
+        # P7-2-fix B-014: record→done 前强制校验 doctor_review
+        # 只有经过 P7-1 confirm/modify 且存在合法 doctor_review 记录的会话
+        # 才能生成最终病历并进入 done；否则进入 blocked(doctor_review_required)，
+        # 不写 medical_records、不置 done、不发 session.done。
+        if (
+            from_stage == Stage.RECORD
+            and blocked_reason is None
+            and to_stage == Stage.DONE
+        ):
+            try:
+                await self._validate_doctor_review_for_record(session, state, trace_id)
+            except DoctorReviewRequiredError as exc:
+                return await self._enter_blocked(
+                    session,
+                    state,
+                    from_stage=from_stage,
+                    blocked_reason=exc.blocked_reason,
+                    trace_id=trace_id,
+                )
+
         # P6-4: SAFETY 阶段未通过时发射 safety.blocked 事件
         # 仅在 rollback 路径（非 blocked/非 review）时发射；
         # blocked 走 _enter_blocked 的 session.blocked，review 走 review.required
@@ -233,11 +271,21 @@ class Supervisor:
             session.pending_review = True
             session.status = "pending_review"
             state.pending_review = True
+        elif to_stage == Stage.DONE:
+            # P7-2: record→done 时更新 status=done
+            session.status = "done"
+            session.pending_review = False
+            state.pending_review = False
         else:
             # 非 review 阶段清除 pending_review（如果之前被挂起后恢复）
             if from_stage == Stage.REVIEW and to_stage == Stage.RECORD:
                 # P4-3 不自动从 review 进入 record，因此不会走到这里
                 pass
+
+        # P7-2: record→done 时写入 medical_records version=1
+        record_id: uuid.UUID | None = None
+        if from_stage == Stage.RECORD and to_stage == Stage.DONE:
+            record_id = await self._write_medical_record(session, state, trace_id)
 
         # 6. 更新 PG snapshot
         session.state_snapshot = self._build_snapshot(state)
@@ -289,6 +337,24 @@ class Supervisor:
             )
         )
 
+        # P7-2: record→done 时写入 audit_events(record.generated)
+        if from_stage == Stage.RECORD and to_stage == Stage.DONE and record_id is not None:
+            self._db.add(
+                self._audit_event(
+                    session_id=session.id,
+                    event_type="record.generated",
+                    actor_type="agent",
+                    actor_id="record",
+                    payload={
+                        "record_id": str(record_id),
+                        "version": 1,
+                        "state_version": session.state_version,
+                        "trace_id": trace_id,
+                    },
+                    trace_id=trace_id,
+                )
+            )
+
         # 8. 写入 Redis checkpoint（best-effort）
         checkpoint_ok = await self._write_redis_checkpoint(session_id, state, trace_id)
         if not checkpoint_ok:
@@ -330,6 +396,18 @@ class Supervisor:
                         if state.safety_review is not None
                         else {}
                     ),
+                },
+            )
+        elif to_stage == Stage.DONE:
+            await self._emit_stream_event(
+                session_id,
+                "session.done",
+                {
+                    "from_stage": from_stage.value,
+                    "to_stage": to_stage.value,
+                    "state_version": session.state_version,
+                    "trace_id": trace_id,
+                    "record_id": str(record_id) if record_id else None,
                 },
             )
         else:
@@ -1080,6 +1158,175 @@ class Supervisor:
             payload=payload,
             trace_id=trace_id,
         )
+
+    # ------------------------------------------------------------------
+    # P7-2: 病历落库
+    # ------------------------------------------------------------------
+
+    async def _validate_doctor_review_for_record(
+        self,
+        session: ConsultSession,
+        state: XuanhuState,
+        trace_id: str,
+    ) -> None:
+        """P7-2-fix B-014: 病历生成前强制校验 doctor_review。
+
+        校验项：
+        1. state.doctor_review 必须存在且为 dict。
+        2. doctor_review.review_id 必须存在且为合法 UUID。
+        3. 数据库中必须存在对应 session 的 doctor_reviews 记录。
+        4. doctor_review 的 action 必须是 confirm 或 modify（不允许 reject）。
+
+        任一校验失败 → DoctorReviewRequiredError，进入 blocked。
+        """
+        doctor_review = state.doctor_review
+        if not isinstance(doctor_review, dict):
+            raise DoctorReviewRequiredError(
+                blocked_reason="doctor_review_required/missing",
+                detail=(
+                    f"session_id={session.id} state.doctor_review 缺失或类型非法"
+                    f" trace_id={trace_id}"
+                ),
+            )
+
+        review_id_str = doctor_review.get("review_id")
+        if not review_id_str or not isinstance(review_id_str, str):
+            raise DoctorReviewRequiredError(
+                blocked_reason="doctor_review_required/review_id_missing",
+                detail=(
+                    f"session_id={session.id} doctor_review.review_id 缺失或非字符串"
+                    f" trace_id={trace_id}"
+                ),
+            )
+
+        try:
+            review_id = uuid.UUID(review_id_str)
+        except (ValueError, AttributeError) as exc:
+            raise DoctorReviewRequiredError(
+                blocked_reason="doctor_review_required/review_id_invalid_uuid",
+                detail=(
+                    f"session_id={session.id} doctor_review.review_id 非合法 UUID"
+                    f" review_id={review_id_str!r} trace_id={trace_id}"
+                ),
+            ) from exc
+
+        action = doctor_review.get("action", "")
+        if action not in ("confirm", "modify"):
+            raise DoctorReviewRequiredError(
+                blocked_reason="doctor_review_required/action_invalid",
+                detail=(
+                    f"session_id={session.id} doctor_review.action={action!r}"
+                    f" 仅允许 confirm/modify trace_id={trace_id}"
+                ),
+            )
+
+        # 数据库校验：review_id 必须对应本 session 的 doctor_reviews
+        existing = await self._db.execute(
+            select(DoctorReview).where(
+                DoctorReview.id == review_id,
+                DoctorReview.session_id == session.id,
+            )
+        )
+        review_record = existing.scalar_one_or_none()
+        if review_record is None:
+            raise DoctorReviewRequiredError(
+                blocked_reason="doctor_review_required/review_id_not_found",
+                detail=(
+                    f"session_id={session.id} review_id={review_id_str}"
+                    f" 在 doctor_reviews 表中不存在或不属于当前会话"
+                    f" trace_id={trace_id}"
+                ),
+            )
+
+        logger.info(
+            "doctor_review 校验通过 session_id=%s review_id=%s action=%s",
+            session.id,
+            review_id,
+            action,
+        )
+
+    async def _write_medical_record(
+        self,
+        session: ConsultSession,
+        state: XuanhuState,
+        trace_id: str,
+    ) -> uuid.UUID | None:
+        """写入 medical_records version=1 初版病历。
+
+        幂等：同一 session 已存在 version=1 病历时复用已有记录，
+        不重复落库，返回已有 record_id。
+
+        Args:
+            session: ConsultSession（已持锁）。
+            state: 已合并 RecordAgent 输出的 XuanhuState。
+            trace_id: 追踪 ID。
+
+        Returns:
+            新建或复用的 medical_record.id；无 RecordAgent 输出时返回 None。
+        """
+        from app.models.review import MedicalRecord
+
+        medical_record = state.medical_record
+        if medical_record is None:
+            logger.warning(
+                "RecordAgent 未生成 medical_record，跳过落库"
+                " session_id=%s trace_id=%s",
+                session.id,
+                trace_id,
+            )
+            return None
+
+        # 幂等：检查是否已存在 version=1 病历
+        existing = await self._db.execute(
+            select(MedicalRecord).where(
+                MedicalRecord.session_id == session.id,
+                MedicalRecord.version == 1,
+            )
+        )
+        existing_record = existing.scalar_one_or_none()
+        if existing_record is not None:
+            logger.info(
+                "medical_records version=1 已存在，复用已有记录"
+                " session_id=%s record_id=%s",
+                session.id,
+                existing_record.id,
+            )
+            return existing_record.id
+
+        # 解析 doctor_review_id（从 state.doctor_review.review_id 提取）
+        doctor_review_id = self._extract_doctor_review_id(state)
+
+        record = MedicalRecord(
+            session_id=session.id,
+            version=1,
+            record_text=medical_record.text,
+            record_json=medical_record.record_json or {},
+            diff_from_previous=None,
+            doctor_review_id=doctor_review_id,
+            disclaimer=medical_record.disclaimer,
+            edited_by_doctor=False,
+        )
+        self._db.add(record)
+        await self._db.flush()
+        return record.id
+
+    def _extract_doctor_review_id(self, state: XuanhuState) -> uuid.UUID | None:
+        """从 state.doctor_review 提取 review_id。
+
+        state.doctor_review 是 dict，由 ReviewService 在 confirm/modify 时
+        写入，包含 review_id 字段。
+        """
+        doctor_review = state.doctor_review
+        if not isinstance(doctor_review, dict):
+            return None
+        review_id = doctor_review.get("review_id")
+        if not review_id or not isinstance(review_id, str):
+            return None
+        try:
+            return uuid.UUID(review_id)
+        except (ValueError, AttributeError):
+            logger.warning("doctor_review.review_id 非合法 UUID: %s", review_id)
+            return None
 
 
 # 阶段可回退的目标映射（用于判断某阶段变化是否属于回退）

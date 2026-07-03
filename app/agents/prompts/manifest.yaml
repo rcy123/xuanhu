@@ -5,3 +5,4 @@ syndrome: syndrome_v1.jinja2
 prescription: prescription_v1.jinja2
 modification: modification_v1.jinja2
 safety: safety_v1.jinja2
+record: record_v1.jinja2
