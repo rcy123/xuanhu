@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class XuanhuError(Exception):
     """业务异常基类。
@@ -195,5 +197,64 @@ class StateRecoveryRequiredError(XuanhuError):
 
     code = "STATE_RECOVERY_REQUIRED"
     message = "无法自动恢复，需人工处理"
+    status_code = 409
+    retryable = False
+
+
+# ---------------------------------------------------------------------------
+# P7-1 医师确认异常
+# ---------------------------------------------------------------------------
+
+
+class InvalidReviewActionError(XuanhuError):
+    """无效的 review action。"""
+
+    code = "INVALID_REVIEW_ACTION"
+    message = "无效的医师确认动作"
+    status_code = 400
+    retryable = False
+
+
+class FormulaOverrideRequiredError(XuanhuError):
+    """修改处方时必须提供完整处方。"""
+
+    code = "FORMULA_OVERRIDE_REQUIRED"
+    message = "修改处方时必须提供完整处方"
+    status_code = 400
+    retryable = False
+
+
+class SafetyReviewBlockedError(XuanhuError):
+    """安全审核阻断。
+
+    医师修改处方后二次安全审核未通过，需医师再次修改。
+    """
+
+    code = "SAFETY_REVIEW_BLOCKED"
+    message = "安全审核阻断，处方未通过二次安全审核"
+    status_code = 409
+    retryable = False
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        detail: str | None = None,
+        retryable: bool | None = None,
+        issues: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message, detail=detail, retryable=retryable)
+        self.issues: list[dict[str, Any]] = issues or []
+
+    def to_payload(self) -> dict[str, Any]:
+        """返回包含安全问题的 payload，供 API 层附加到错误响应。"""
+        return {"issues": self.issues}
+
+
+class SafetyAcceptRiskUnsupportedError(XuanhuError):
+    """MVP 不支持接受风险继续。"""
+
+    code = "SAFETY_ACCEPT_RISK_UNSUPPORTED"
+    message = "MVP 不支持接受风险继续"
     status_code = 409
     retryable = False

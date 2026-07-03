@@ -18,6 +18,7 @@ SupportedEventType = Literal[
     "session.blocked",
     "session.done",
     "session.terminated",
+    "doctor.reviewed",
     "heartbeat",
     "resync",
 ]
@@ -33,6 +34,7 @@ SUPPORTED_EVENT_TYPES: tuple[str, ...] = (
     "session.blocked",
     "session.done",
     "session.terminated",
+    "doctor.reviewed",
     "heartbeat",
     "resync",
 )
