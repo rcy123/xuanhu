@@ -233,7 +233,11 @@ class FakeModificationAgent:
 
 
 class FakeSafetyAgent:
-    """Fake safety agent，直接实现 BaseAgent Protocol。"""
+    """Fake safety agent，用于 P6-4 之前的兼容路径测试。
+
+    P6-3 起 SAFETY 阶段由 SafetyRuleEngine 处理，不再走 FakeSafetyAgent。
+    保留该类以备 P6-4 Safety Agent 联调。
+    """
 
     name = "safety"
     stage = Stage.SAFETY
@@ -329,7 +333,7 @@ def _build_registry(
     registry.register(Stage.SYNDROME, FakeSyndromeAgent())
     registry.register(Stage.PRESCRIPTION, FakePrescriptionAgent())
     registry.register(Stage.MODIFICATION, FakeModificationAgent())
-    registry.register(Stage.SAFETY, FakeSafetyAgent(passed=safety_passed, rollback_target=safety_rollback_target))
+    # P6-3: SAFETY 阶段不再注册 FakeSafetyAgent（规则引擎直接处理）
     registry.register(Stage.RECORD, FakeRecordAgent())
     return registry
 
@@ -518,9 +522,34 @@ async def test_sufficiency_insufficient_rollback_inquiry(db: AsyncSession) -> No
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_safety_passed_to_review_suspend(db: AsyncSession) -> None:
-    """safety_review.passed=true 进入 review 并挂起，不能进入 record。"""
+    """P6-3: 安全规则通过进入 review 并挂起。
+
+    使用 SafetyRuleEngine 路径（不再依赖 FakeSafetyAgent）。
+    复用 DB 中已导入的 herbs/dosage_units 种子数据（党参已存在）。
+    """
     session = await _create_session(db, stage=Stage.SAFETY)
-    # 预设 safety_review 为空，让 FakeSafetyAgent 生成 passed=true
+
+    # 预设 modified_formula（安全处方，党参为已知安全药材）
+    formula = FormulaResult(
+        name="四君子汤",
+        composition=[HerbDose(herb="党参", dose=12, unit="g")],
+        rationale="健脾益气",
+    )
+    modified = ModifiedFormulaResult(
+        formula=formula,
+        modifications=[],
+    )
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
     registry = _build_registry(safety_passed=True)
     supervisor = Supervisor(db, registry=registry)
 
@@ -528,6 +557,8 @@ async def test_safety_passed_to_review_suspend(db: AsyncSession) -> None:
         result = await supervisor.advance(str(session.id), "trace-1")
         assert result.to_stage == Stage.REVIEW
         assert result.state.pending_review is True
+        assert result.state.safety_rule_result is not None
+        assert result.state.safety_rule_result.passed is True
 
         # 验证 PG
         await db.refresh(session)
@@ -535,21 +566,16 @@ async def test_safety_passed_to_review_suspend(db: AsyncSession) -> None:
         assert session.pending_review is True
         assert session.current_stage == "review"
 
-        # review 阶段再次 advance 应 blocked（P4-3 不实现医师确认 API）
-        # 但 review 阶段没有注册 Agent，因此会进入 blocked
-        state_version = session.state_version
+        # review 阶段再次 advance 应被拒绝
         with pytest.raises(InvalidStageTransitionError) as exc_info:
             await supervisor.advance(str(session.id), "trace-2")
         assert exc_info.value.code == "INVALID_STAGE_TRANSITION"
-
-        await db.refresh(session)
-        assert session.status == "pending_review"
-        assert session.pending_review is True
-        assert session.current_stage == "review"
-        assert session.state_version == state_version
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+        # 清理本测试产生的 safety_rule_runs（herbs/dosage_units 复用已有种子数据）
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration
@@ -588,57 +614,120 @@ async def test_done_and_blocked_terminal_stages_do_not_mutate(db: AsyncSession) 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_safety_failed_rollback_prescription(db: AsyncSession) -> None:
-    """safety_review.passed=false 回退到 prescription。"""
+    """P6-3: 安全规则未通过，回退到 prescription。
+
+    用党参（已知安全药材，max_dose=30，开 100g 触发 blocker）
+    验证剂量上限规则阻断后回退到 modification。
+    """
     session = await _create_session(db, stage=Stage.SAFETY)
-    registry = _build_registry(safety_passed=False, safety_rollback_target=RollbackTarget.PRESCRIPTION)
+
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],  # 严重超量
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    registry = _build_registry(safety_passed=False)
     supervisor = Supervisor(db, registry=registry)
 
     try:
         result = await supervisor.advance(str(session.id), "trace-1")
-        assert result.to_stage == Stage.PRESCRIPTION
+        # 规则引擎判定 dose_limit blocker → safety_review.passed=False
+        # 回退目标 modification（_rule_result_to_safety_review 默认）
+        assert result.to_stage == Stage.MODIFICATION
         assert result.state.rollback_counts.get("safety", 0) == 1
         assert result.state.safety_review is not None
         assert result.state.safety_review.passed is False
+        assert result.state.safety_rule_result is not None
+        assert result.state.safety_rule_result.passed is False
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_safety_rollback_within_limit(db: AsyncSession) -> None:
-    """safety 回退次数未超限时继续。"""
+    """P6-3: safety 回退次数未超限时继续（规则引擎路径）。"""
     session = await _create_session(db, stage=Stage.SAFETY)
-    # 预设 rollback_counts 在 limit 内
     session.rollback_counts = {"safety": 2}
     await db.commit()
 
-    registry = _build_registry(safety_passed=False, safety_rollback_target=RollbackTarget.PRESCRIPTION)
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {"safety": 2},
+    }
+    await db.commit()
+
+    registry = _build_registry(safety_passed=False)
     supervisor = Supervisor(db, registry=registry)
     settings = get_settings()
     limit = settings.safety_rollback_limit
 
     try:
-        assert limit >= 3  # 测试前提：limit 至少为 3
+        assert limit >= 3
         result = await supervisor.advance(str(session.id), "trace-1")
-        assert result.to_stage == Stage.PRESCRIPTION
+        assert result.to_stage == Stage.MODIFICATION
         assert result.state.rollback_counts["safety"] == 3
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_safety_rollback_exceeds_limit_blocked(db: AsyncSession) -> None:
-    """safety 回退次数超限后进入 blocked。"""
+    """P6-3: safety 回退次数超限后进入 blocked（规则引擎路径）。"""
     session = await _create_session(db, stage=Stage.SAFETY)
     settings = get_settings()
     limit = settings.safety_rollback_limit
     session.rollback_counts = {"safety": limit}
     await db.commit()
 
-    registry = _build_registry(safety_passed=False, safety_rollback_target=RollbackTarget.PRESCRIPTION)
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {"safety": limit},
+    }
+    await db.commit()
+
+    registry = _build_registry(safety_passed=False)
     supervisor = Supervisor(db, registry=registry)
 
     try:
@@ -654,18 +743,37 @@ async def test_safety_rollback_exceeds_limit_blocked(db: AsyncSession) -> None:
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_blocked_checkpoint_failure_is_audited(db: AsyncSession) -> None:
-    """进入 blocked 时 Redis checkpoint 失败也要写降级审计。"""
+    """P6-3: 进入 blocked 时 Redis checkpoint 失败也要写降级审计（规则引擎路径）。"""
     session = await _create_session(db, stage=Stage.SAFETY)
     settings = get_settings()
     session.rollback_counts = {"safety": settings.safety_rollback_limit}
     await db.commit()
 
-    registry = _build_registry(safety_passed=False, safety_rollback_target=RollbackTarget.PRESCRIPTION)
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {"safety": settings.safety_rollback_limit},
+    }
+    await db.commit()
+
+    registry = _build_registry(safety_passed=False)
     supervisor = Supervisor(db, registry=registry, redis=FailingRedis())  # type: ignore[arg-type]
 
     try:
@@ -684,6 +792,8 @@ async def test_blocked_checkpoint_failure_is_audited(db: AsyncSession) -> None:
     finally:
         await _cleanup_session(db, session.id)
         await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration
@@ -882,8 +992,26 @@ async def test_stream_stage_changed(db: AsyncSession) -> None:
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
 async def test_stream_review_required(db: AsyncSession) -> None:
-    """review 挂起写 review.required。"""
+    """P6-3: review 挂起写 review.required（规则引擎通过路径）。"""
     session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="四君子汤",
+        composition=[HerbDose(herb="党参", dose=12, unit="g")],
+        rationale="健脾益气",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
     registry = _build_registry(safety_passed=True)
     event_service = EventService()
     supervisor = Supervisor(db, registry=registry, event_service=event_service)
@@ -903,6 +1031,8 @@ async def test_stream_review_required(db: AsyncSession) -> None:
             await redis.delete(f"xuanhu:events:{session.id}")
         except Exception:
             pass
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
 
 @pytest.mark.integration

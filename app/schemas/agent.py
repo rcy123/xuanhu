@@ -153,12 +153,21 @@ class SafetyIssue(BaseModel):
 
 
 class SafetyRuleResult(BaseModel):
-    """确定性安全规则引擎输出。"""
+    """确定性安全规则引擎输出。
+
+    与 `docs/安全审核规则设计文档.md` §12.1 对齐：包含规则版本与执行顺序，
+    便于 ``safety_rule_runs`` 审计复盘与版本回滚。
+    """
 
     passed: bool
     issues: list[SafetyIssue] = Field(default_factory=list)
     normalized_formula: FormulaResult
     warnings: list[str] = Field(default_factory=list)
+    rule_version: str = Field(default="v1.0.0", min_length=1)
+    """本次审核使用的规则版本（写入 ``safety_rule_runs.rule_version``）。"""
+
+    execution_order: list[str] = Field(default_factory=list)
+    """规则执行顺序（便于复盘）。如 ["normalize", "convert_dose", ...]。"""
 
 
 class SafetyReview(BaseModel):

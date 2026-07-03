@@ -35,13 +35,24 @@ from app.core.exceptions import (
 from app.core.redis import get_redis
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
+from app.safety.rule_version import SAFETY_RULE_VERSION
 from app.schemas.agent import (
+    FormulaResult,
+    HerbDose,
     InquiryAgentOutput,
+    SafetyIssue,
     SafetyReview,
+    SafetyRuleResult,
     SufficiencyReport,
     XuanhuState,
 )
-from app.schemas.types import RecoveryStatus, RollbackTarget, Stage
+from app.schemas.types import (
+    RecoveryStatus,
+    RollbackTarget,
+    SafetyIssueType,
+    Severity,
+    Stage,
+)
 from app.services.events import EventService
 from app.services.session_lock import SessionLock
 
@@ -368,6 +379,10 @@ class Supervisor:
         if isinstance(current, str):
             current = Stage(current)
 
+        # P6-3: SAFETY 阶段由确定性规则引擎处理，不使用 AgentRegistry
+        if current == Stage.SAFETY:
+            return await self._run_safety_rule_engine(session, state, trace_id)
+
         # 1. 检查 Agent 是否注册
         agent = self._registry.get(current)
         if agent is None:
@@ -391,6 +406,159 @@ class Supervisor:
             state.rollback_counts[current_stage_val] = state.rollback_counts.get(current_stage_val, 0) + 1
 
         return to_stage, agent_name, blocked_reason, state
+
+    # ------------------------------------------------------------------
+    # SAFETY 阶段：确定性规则引擎（P6-3）
+    # ------------------------------------------------------------------
+
+    async def _run_safety_rule_engine(
+        self,
+        session: ConsultSession,
+        state: XuanhuState,
+        trace_id: str,
+    ) -> tuple[Stage, str | None, str | None, XuanhuState]:
+        """P6-3: 运行确定性安全规则引擎，不调用 Safety Agent。
+
+        1. 确定审核目标处方：优先 modified_formula，回退 base_formula（记 warning），
+           两者皆缺 → blocked。
+        2. 调用 SafetyRuleEngine.check() 得 SafetyRuleResult。
+        3. 写入 state.safety_rule_result。
+        4. 从规则结果自动生成 SafetyReview（兼容既有 _decide_next_stage 路由）。
+        5. 路由决策。
+        """
+        from app.safety.engine import SafetyRuleEngine
+
+        agent_name = "safety_rule_engine"
+        pre_warnings: list[str] = []
+
+        # 1. 确定审核目标处方
+        if state.modified_formula is not None:
+            formula = state.modified_formula.formula
+        elif state.base_formula is not None:
+            formula = state.base_formula
+            pre_warnings.append("加减方未生成，使用基础方进行安全审核。")
+        else:
+            # 两方皆缺 → blocked
+            placeholder = FormulaResult(
+                name="missing",
+                composition=[HerbDose(herb="missing", dose=None, unit="g")],
+                rationale="基础方与加减方均缺失，无法执行安全审核。",
+            )
+            blocked_result = SafetyRuleResult(
+                passed=False,
+                issues=[
+                    SafetyIssue(
+                        type=SafetyIssueType.CAUTION,
+                        severity=Severity.BLOCKER,
+                        herbs=[],
+                        rule_source="SafetyRuleEngine",
+                        suggestion="基础方与加减方均缺失，无法执行安全审核。",
+                    )
+                ],
+                normalized_formula=placeholder,
+                warnings=list(pre_warnings),
+                rule_version=SAFETY_RULE_VERSION,
+                execution_order=["formula_missing"],
+            )
+            state = state.model_copy(
+                update={
+                    "safety_rule_result": blocked_result,
+                    "safety_review": self._rule_result_to_safety_review(blocked_result),
+                    "blocked_reason": "safety_formula_missing",
+                }
+            )
+            # 仍尝试写入 safety_rule_runs（保留阻断留痕）
+            try:
+                engine = SafetyRuleEngine(self._db)
+                await engine.persist_result(
+                    session_id=str(session.id),
+                    trace_id=trace_id,
+                    result=blocked_result,
+                    formula=placeholder,
+                    patient_info=state.patient_info,
+                    formula_source="agent_output",
+                    agent_run_id=None,
+                )
+            except Exception:
+                logger.warning(
+                    "safety_rule_runs 写入失败（formula_missing 路径）"
+                    " session_id=%s trace_id=%s",
+                    session.id,
+                    trace_id,
+                    exc_info=True,
+                )
+            return Stage.BLOCKED, agent_name, "safety_formula_missing", state
+
+        # 2. 运行规则引擎
+        engine = SafetyRuleEngine(self._db)
+        rule_result = await engine.check(
+            formula=formula,
+            patient_info=state.patient_info,
+            session_id=str(session.id),
+            trace_id=trace_id,
+            formula_source="agent_output",
+        )
+
+        # 3. 合并 warnings
+        if pre_warnings:
+            rule_result = rule_result.model_copy(
+                update={"warnings": list(rule_result.warnings) + pre_warnings}
+            )
+
+        # 4. 写入 state
+        safety_review = self._rule_result_to_safety_review(rule_result)
+        state = state.model_copy(
+            update={
+                "safety_rule_result": rule_result,
+                "safety_review": safety_review,
+            }
+        )
+
+        # 5. 路由决策
+        to_stage, blocked_reason = self._decide_next_stage(state, Stage.SAFETY)
+
+        # 6. rollback 计数
+        to_stage_val = to_stage.value if isinstance(to_stage, Stage) else to_stage
+        if blocked_reason is None and to_stage_val in _ROLLBACK_TARGETS.get("safety", set()):
+            state.rollback_counts["safety"] = state.rollback_counts.get("safety", 0) + 1
+
+        return to_stage, agent_name, blocked_reason, state
+
+    def _rule_result_to_safety_review(
+        self,
+        result: SafetyRuleResult,
+    ) -> SafetyReview:
+        """从 SafetyRuleResult 生成 SafetyReview。
+
+        P6-3 不调用 Safety Agent，SafetyReview 直接由规则结果生成。
+        P6-4 将在此处插入 SafetyAgent（LLM 解释），但不得覆盖规则的
+        ``passed`` / ``issues``。
+        """
+        if result.passed:
+            return SafetyReview(
+                passed=True,
+                issues=[],
+                rollback_target=RollbackTarget.NONE,
+                summary="安全规则审核通过，无阻断性问题。",
+            )
+
+        # 未通过：存在 blocker/high。
+        # 默认回退到 modification；若 state 中无 modified_formula（即审核的是
+        # base_formula），则回退到 prescription。此判断在调用方更准确，
+        # 这里采用保守默认 modification。
+        blocker_high = [
+            i for i in result.issues if i.severity in (Severity.BLOCKER, Severity.HIGH)
+        ]
+        summary = (
+            f"安全规则审核未通过，发现 {len(blocker_high)} 个阻断性问题"
+            f"（blocker/high）。"
+        )
+        return SafetyReview(
+            passed=False,
+            issues=result.issues,
+            rollback_target=RollbackTarget.MODIFICATION,
+            summary=summary,
+        )
 
     # ------------------------------------------------------------------
     # 阶段决策
