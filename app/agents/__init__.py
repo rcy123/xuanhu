@@ -10,6 +10,7 @@ from app.agents.modification import (
 from app.agents.prescription import PrescriptionAgent, merge_formula_result_to_state
 from app.agents.prompt_loader import PromptLoader, PromptTemplate
 from app.agents.registry import AgentRegistry
+from app.agents.safety import SafetyAgent
 from app.agents.sufficiency import SufficiencyAgent, merge_sufficiency_report_to_state
 from app.agents.supervisor import Supervisor, SupervisorResult
 from app.agents.syndrome import SyndromeAgent, merge_syndrome_result_to_state
@@ -30,6 +31,7 @@ __all__ = [
     "PrescriptionAgent",
     "PromptLoader",
     "PromptTemplate",
+    "SafetyAgent",
     "SufficiencyAgent",
     "Supervisor",
     "SupervisorResult",

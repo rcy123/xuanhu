@@ -180,6 +180,41 @@ class SafetyReview(BaseModel):
     rollback_target: RollbackTarget = Field(default=RollbackTarget.NONE, validate_default=True)
     summary: str = Field(min_length=1)
 
+    # P6-4: SafetyAgent (LLM) 产物，仅用于医师可读解释，不影响路由。
+    explanation: str | None = None
+    """SafetyAgent 生成的面向医师的自然语言解释。"""
+
+    explanation_issues: list[str] | None = None
+    """每个 issue 的独立解释，与 issues 顺序一致。"""
+
+    safety_agent_run_id: str | None = None
+    """关联 agent_runs.id，便于审计回溯 SafetyAgent 的 LLM 调用。"""
+
+    safety_agent_model: str | None = None
+    """生成解释所用模型（审计用）。"""
+
+
+class SafetyExplanation(BaseModel):
+    """SafetyAgent（LLM）输出的医师可读解释。不含路由字段。
+
+    SafetyAgent 是 SafetyRuleEngine 的下游解释器，其输出不得修改
+    passed / issues / severity / rollback_target。这些字段由规则引擎
+    独占，SafetyAgent 仅输出解释文本。
+    """
+
+    summary: str = Field(min_length=1)
+    """中医师可读的所有安全发现摘要。"""
+
+    issue_explanations: list[str] = Field(default_factory=list)
+    """每个 issue 的独立解释，顺序与规则引擎输出的 issues 顺序一致。"""
+
+    recommendations: str | None = None
+    """面向医师的下一步操作建议（如"建议将党参剂量从 100g 调整至 30g 以内"）。"""
+
+    # 审计字段（由 Supervisor 填充，非 LLM 输出；exclude=True 不进入结构化输出 schema）
+    safety_agent_run_id: str | None = Field(default=None, exclude=True)
+    safety_agent_model: str | None = Field(default=None, exclude=True)
+
 
 class InquiryAgentOutput(BaseModel):
     """问诊 Agent 结构化输出。
@@ -309,6 +344,7 @@ __all__ = [
     "RecoveryStatus",
     "ReviewAction",
     "RollbackTarget",
+    "SafetyExplanation",
     "SafetyIssue",
     "SafetyIssueType",
     "SafetyReview",

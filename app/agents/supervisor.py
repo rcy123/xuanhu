@@ -40,6 +40,7 @@ from app.schemas.agent import (
     FormulaResult,
     HerbDose,
     InquiryAgentOutput,
+    SafetyExplanation,
     SafetyIssue,
     SafetyReview,
     SafetyRuleResult,
@@ -186,6 +187,29 @@ class Supervisor:
                 from_stage=from_stage,
                 blocked_reason=f"agent_failed/{exc.code}",
                 trace_id=trace_id,
+            )
+
+        # P6-4: SAFETY 阶段未通过时发射 safety.blocked 事件
+        # 仅在 rollback 路径（非 blocked/非 review）时发射；
+        # blocked 走 _enter_blocked 的 session.blocked，review 走 review.required
+        if (
+            from_stage == Stage.SAFETY
+            and blocked_reason is None
+            and to_stage not in (Stage.REVIEW, Stage.BLOCKED)
+            and state.safety_review is not None
+            and state.safety_review.passed is False
+        ):
+            await self._emit_stream_event(
+                str(session.id),
+                "safety.blocked",
+                {
+                    "from_stage": from_stage.value,
+                    "to_stage": to_stage.value,
+                    "state_version": state.state_version,
+                    "trace_id": trace_id,
+                    "safety_review": state.safety_review.model_dump(mode="json"),
+                    "rollback_counts": state.rollback_counts,
+                },
             )
 
         if blocked_reason is not None:
@@ -505,7 +529,8 @@ class Supervisor:
                 update={"warnings": list(rule_result.warnings) + pre_warnings}
             )
 
-        # 4. 写入 state
+        # 4. 写入 state（先写入 rule_result 和初始 safety_review，
+        #    使 SafetyAgent 能读取 state.safety_rule_result 生成解释）
         safety_review = self._rule_result_to_safety_review(rule_result)
         state = state.model_copy(
             update={
@@ -513,6 +538,28 @@ class Supervisor:
                 "safety_review": safety_review,
             }
         )
+
+        # P6-4: 调用 SafetyAgent 生成医师可读解释
+        # 必须在 state 写入 safety_rule_result 之后调用，否则 SafetyAgent
+        # 因 state.safety_rule_result is None 降级返回 None。
+        safety_explanation = await self._run_safety_agent(
+            state=state, trace_id=trace_id, session_id=str(session.id)
+        )
+        if safety_explanation is not None:
+            safety_review = safety_review.model_copy(
+                update={
+                    "explanation": safety_explanation.summary,
+                    "explanation_issues": safety_explanation.issue_explanations,
+                    "safety_agent_run_id": safety_explanation.safety_agent_run_id,
+                    "safety_agent_model": safety_explanation.safety_agent_model,
+                }
+            )
+            state = state.model_copy(
+                update={
+                    "safety_rule_result": rule_result,
+                    "safety_review": safety_review,
+                }
+            )
 
         # 5. 路由决策
         to_stage, blocked_reason = self._decide_next_stage(state, Stage.SAFETY)
@@ -558,6 +605,70 @@ class Supervisor:
             issues=result.issues,
             rollback_target=RollbackTarget.MODIFICATION,
             summary=summary,
+        )
+
+    async def _run_safety_agent(
+        self,
+        state: XuanhuState,
+        trace_id: str,
+        session_id: str,
+    ) -> SafetyExplanation | None:
+        """P6-4: 运行 SafetyAgent 生成解释文本。
+
+        SafetyAgent 运行在 SafetyRuleEngine 之后，其输出仅用于补充
+        解释文本，不修改 ``passed`` / ``issues`` / ``rollback_target``。
+        这些字段已由 ``_rule_result_to_safety_review`` 从规则引擎结果
+        确定性地写入 ``safety_review``，调用方合并时只追加 ``explanation*``
+        字段。
+
+        SafetyAgent 失败时 best-effort 降级：返回 None，不影响主流程的
+        ``safety_review`` 和路由决策——规则引擎结论仍然有效。
+        """
+        from app.agents.safety import SafetyAgent
+
+        # 前置检查：SafetyAgent 依赖 state.safety_rule_result 生成解释。
+        # 若缺失则直接降级，避免无谓的 Agent 启动/审计/模型调用。
+        if state.safety_rule_result is None:
+            logger.warning(
+                "SafetyAgent 跳过：state.safety_rule_result is None"
+                " session_id=%s trace_id=%s",
+                session_id,
+                trace_id,
+            )
+            return None
+
+        settings = get_settings()
+        try:
+            agent = SafetyAgent(
+                db=self._db,
+                max_retries=settings.agent_max_retries,
+                model_name=settings.chat_model,
+            )
+            result = await agent.run(state, trace_id)
+        except Exception:
+            logger.warning(
+                "SafetyAgent 执行失败，降级处理 session_id=%s trace_id=%s",
+                session_id,
+                trace_id,
+                exc_info=True,
+            )
+            return None
+
+        output = result.output
+        if not isinstance(output, SafetyExplanation):
+            logger.warning(
+                "SafetyAgent 返回非 SafetyExplanation 类型: %s",
+                type(output).__name__,
+            )
+            return None
+
+        # 附加审计元数据（safety_agent_run_id / safety_agent_model）
+        return SafetyExplanation(
+            summary=output.summary,
+            issue_explanations=output.issue_explanations,
+            recommendations=output.recommendations,
+            safety_agent_run_id=result.agent_run_id,
+            safety_agent_model=agent.model_name,
         )
 
     # ------------------------------------------------------------------

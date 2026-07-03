@@ -30,6 +30,7 @@ from app.schemas.agent import (
     MedicalRecord,
     ModificationItem,
     ModifiedFormulaResult,
+    SafetyExplanation,
     SafetyIssue,
     SafetyReview,
     SufficiencyReport,
@@ -1203,4 +1204,322 @@ async def test_supervisor_default_registry_includes_modification() -> None:
     registry = _default_registry()
     agent = registry.get(Stage.MODIFICATION)
     assert isinstance(agent, ModificationAgent)
+
+
+# ---------------------------------------------------------------------------
+# P6-4 SafetyAgent 解释层联调测试
+# ---------------------------------------------------------------------------
+
+
+def _patch_supervisor_safety_agent(
+    supervisor: Supervisor,
+    explanation: SafetyExplanation | None,
+) -> None:
+    """用 fake _run_safety_agent 替换 Supervisor 的 SafetyAgent 调用。
+
+    SafetyAgent 内部调用真实模型网关；集成测试只需验证"解释附加到
+    safety_review 但不修改路由"的契约，故直接注入预设解释。
+
+    注意：fake 仍校验 state.safety_rule_result 非空（与真实 _run_safety_agent
+    的前置检查一致），以覆盖 B-011 修复——调用方必须先写入 safety_rule_result。
+    """
+    import types
+
+    async def fake_run_safety_agent(
+        self: Supervisor,
+        state: XuanhuState,
+        trace_id: str,
+        session_id: str,
+    ) -> SafetyExplanation | None:
+        del self, trace_id, session_id
+        # 与真实 _run_safety_agent 一致的前置检查
+        if state.safety_rule_result is None:
+            return None
+        return explanation
+
+    supervisor._run_safety_agent = types.MethodType(  # type: ignore[method-assign]
+        fake_run_safety_agent, supervisor
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_safety_agent_explanation_attached_to_safety_review(
+    db: AsyncSession,
+) -> None:
+    """P6-4: SafetyAgent 解释文本附加到 safety_review 上。
+
+    使用 SafetyRuleEngine + fake _run_safety_agent 路径。验证 safety_review
+    包含 explanation 字段，且 passed/issues/rollback_target 仍由规则引擎决定。
+    """
+    session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="四君子汤",
+        composition=[HerbDose(herb="党参", dose=12, unit="g")],
+        rationale="健脾益气",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    supervisor = Supervisor(db, registry=_build_registry(safety_passed=True))
+    _patch_supervisor_safety_agent(
+        supervisor,
+        SafetyExplanation(
+            summary="经安全规则审核，该处方未发现安全问题，可进入医师复核。",
+            issue_explanations=[],
+            recommendations=None,
+            safety_agent_run_id="fake-run-id",
+            safety_agent_model="fake-model",
+        ),
+    )
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-safety-agent-explanation")
+        assert result.to_stage == Stage.REVIEW
+        assert result.state.safety_review is not None
+        assert result.state.safety_review.passed is True
+        # 规则引擎结论不变
+        assert result.state.safety_rule_result is not None
+        assert result.state.safety_rule_result.passed is True
+        # SafetyAgent 解释附加
+        assert result.state.safety_review.explanation is not None
+        assert "安全" in result.state.safety_review.explanation
+        assert result.state.safety_review.safety_agent_run_id == "fake-run-id"
+        assert result.state.safety_review.safety_agent_model == "fake-model"
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_safety_explanation_does_not_change_routing(db: AsyncSession) -> None:
+    """P6-4: SafetyAgent 失败（返回 None）时不影响路由决策。
+
+    规则引擎判定未通过 → 回退 modification，无论 SafetyAgent 是否产出解释。
+    """
+    session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    supervisor = Supervisor(db, registry=_build_registry(safety_passed=False))
+    _patch_supervisor_safety_agent(supervisor, None)  # SafetyAgent 失败降级
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-safety-agent-fail")
+        # 路由仍按规则引擎结果：passed=False → 回退 modification
+        assert result.to_stage == Stage.MODIFICATION
+        assert result.state.safety_review is not None
+        assert result.state.safety_review.passed is False
+        # explanation 为 None（SafetyAgent 失败）
+        assert result.state.safety_review.explanation is None
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_safety_blocked_event_emitted_on_safety_failure(db: AsyncSession) -> None:
+    """P6-4: SAFETY 未通过回退时发射 safety.blocked 事件。
+
+    规则引擎判定未通过，回退到 modification，应发射 safety.blocked。
+    """
+    session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="超量方",
+        composition=[HerbDose(herb="党参", dose=100, unit="g")],
+        rationale="测试",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    event_service = EventService()
+    supervisor = Supervisor(
+        db, registry=_build_registry(safety_passed=False), event_service=event_service
+    )
+    _patch_supervisor_safety_agent(
+        supervisor,
+        SafetyExplanation(
+            summary="党参超量，需调整",
+            issue_explanations=["党参剂量100g超限"],
+            recommendations="减量至30g",
+            safety_agent_run_id="fake-run-id",
+            safety_agent_model="fake-model",
+        ),
+    )
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-safety-blocked-event")
+        assert result.to_stage == Stage.MODIFICATION
+
+        # 读取 Redis Stream 验证 safety.blocked 事件
+        redis = await get_redis()
+        key = f"xuanhu:events:{session.id}"
+        entries = await redis.xrange(key, count=20)
+        types_list = [entry[1].get("event_type") for entry in entries]
+        assert "safety.blocked" in types_list
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        try:
+            redis = await get_redis()
+            await redis.delete(f"xuanhu:events:{session.id}")
+        except Exception:
+            pass
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_safety_passed_does_not_emit_safety_blocked(db: AsyncSession) -> None:
+    """P6-4: SAFETY 通过时不发射 safety.blocked，改发 review.required。"""
+    session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="四君子汤",
+        composition=[HerbDose(herb="党参", dose=12, unit="g")],
+        rationale="健脾益气",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    event_service = EventService()
+    supervisor = Supervisor(
+        db, registry=_build_registry(safety_passed=True), event_service=event_service
+    )
+    _patch_supervisor_safety_agent(
+        supervisor,
+        SafetyExplanation(
+            summary="审核通过",
+            issue_explanations=[],
+            recommendations=None,
+            safety_agent_run_id="fake-run-id",
+            safety_agent_model="fake-model",
+        ),
+    )
+
+    try:
+        result = await supervisor.advance(str(session.id), "trace-safety-passed-event")
+        assert result.to_stage == Stage.REVIEW
+
+        redis = await get_redis()
+        key = f"xuanhu:events:{session.id}"
+        entries = await redis.xrange(key, count=20)
+        types_list = [entry[1].get("event_type") for entry in entries]
+        assert "safety.blocked" not in types_list
+        assert "review.required" in types_list
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        try:
+            redis = await get_redis()
+            await redis.delete(f"xuanhu:events:{session.id}")
+        except Exception:
+            pass
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_safety_agent_explanation_preserved_in_pg_snapshot(
+    db: AsyncSession,
+) -> None:
+    """P6-4: SafetyAgent 解释文本写入 PG state_snapshot。"""
+    session = await _create_session(db, stage=Stage.SAFETY)
+
+    formula = FormulaResult(
+        name="四君子汤",
+        composition=[HerbDose(herb="党参", dose=12, unit="g")],
+        rationale="健脾益气",
+    )
+    modified = ModifiedFormulaResult(formula=formula, modifications=[])
+    session.state_snapshot = {
+        "current_stage": "safety",
+        "modified_formula": modified.model_dump(mode="python"),
+        "patient_info": {"allergies": [], "pregnancy_status": "no"},
+        "session_id": str(session.id),
+        "state_version": session.state_version,
+        "pending_review": False,
+        "rollback_counts": {},
+    }
+    await db.commit()
+
+    supervisor = Supervisor(db, registry=_build_registry(safety_passed=True))
+    _patch_supervisor_safety_agent(
+        supervisor,
+        SafetyExplanation(
+            summary="经安全规则审核，该处方未发现安全问题，可进入医师复核。",
+            issue_explanations=[],
+            recommendations=None,
+            safety_agent_run_id="fake-run-id",
+            safety_agent_model="fake-model",
+        ),
+    )
+
+    try:
+        await supervisor.advance(str(session.id), "trace-safety-pg-snapshot")
+        await db.refresh(session)
+        assert session.state_snapshot is not None
+        safety_review = session.state_snapshot.get("safety_review")
+        assert safety_review is not None
+        assert safety_review.get("explanation") is not None
+        assert safety_review.get("safety_agent_run_id") == "fake-run-id"
+        # 规则引擎字段仍在
+        assert safety_review.get("passed") is True
+    finally:
+        await _cleanup_session(db, session.id)
+        await _cleanup_redis_checkpoint(str(session.id))
+        await db.execute(text("DELETE FROM safety_rule_runs"))
+        await db.commit()
 
