@@ -23,6 +23,7 @@ Thumbs.db
 .env
 .env.local
 .env.*
+!frontend/.env.example
 
 # Coverage
 htmlcov/
