@@ -10,7 +10,7 @@
  * P8-3 只读；P8-4 添加确认/修改/否决按钮。
  */
 
-import { Card, Descriptions, Tag, Typography, Table, Empty } from 'antd'
+import { Card, Descriptions, Tag, Typography, Table } from 'antd'
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -23,6 +23,7 @@ import type {
   SafetyIssue,
   HerbItem,
   Severity,
+  SafetyReview,
 } from '@/types/api'
 
 const { Text, Title } = Typography
@@ -246,7 +247,7 @@ function SafetyReviewCard({
   blockedIssues,
   rollbackTarget,
 }: {
-  safetyReview?: Record<string, unknown> | null
+  safetyReview?: SafetyReview | null
   blockedIssues?: SafetyIssue[] | null
   rollbackTarget?: string | null
 }) {

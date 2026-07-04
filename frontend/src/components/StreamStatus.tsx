@@ -5,7 +5,7 @@
  * 运行中的 Agent 名称追加显示。
  */
 
-import { Badge, Button, Space, Typography } from 'antd'
+import { Button, Space, Typography } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import type { StreamConnectionState } from '@/hooks/useSessionStream'
 

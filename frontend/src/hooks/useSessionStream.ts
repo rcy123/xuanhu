@@ -52,19 +52,7 @@ const POLL_INTERVAL_MS = 3500
 const MAX_CONSECUTIVE_ERRORS = 3
 
 export function useSessionStream(options: UseSessionStreamOptions): UseSessionStreamResult {
-  const {
-    sessionId,
-    stateVersion: _sv,
-    onStageChanged,
-    onMessageCreated,
-    onResync,
-    onReviewRequired,
-    onSafetyBlocked,
-    onSessionDone,
-    onSessionBlocked,
-    onSessionTerminated,
-    onPollingRefresh,
-  } = options
+  const { sessionId, stateVersion: _sv } = options
   // stateVersion 当前 MVP 不直接使用，但保留在 options 接口中供 reconnect 参考。
   void _sv
 

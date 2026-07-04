@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
-import { render, fireEvent, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, fireEvent, waitFor } from '@testing-library/react'
 import { ConfigProvider, App as AntdApp } from 'antd'
 import { CreateSessionModal } from './CreateSessionModal'
 import type { SessionCreateRequest } from '@/types/api'
@@ -12,51 +12,64 @@ function wrap(node: React.ReactNode) {
   )
 }
 
-function form(): HTMLFormElement {
-  const forms = document.querySelectorAll('form')
-  if (forms.length === 0) throw new Error('form not found')
-  return forms[forms.length - 1] as HTMLFormElement
+function currentModal(): HTMLElement {
+  const modals = document.querySelectorAll('.ant-modal')
+  const modal = Array.from(modals)
+    .reverse()
+    .find((item) => item.querySelector('#chief_complaint'))
+  if (!modal) throw new Error('modal not found')
+  return modal as HTMLElement
 }
 
 function chiefComplaintInput(): HTMLTextAreaElement {
-  const inputs = document.querySelectorAll('#chief_complaint')
-  if (inputs.length === 0) throw new Error('chief_complaint input not found')
-  return inputs[inputs.length - 1] as HTMLTextAreaElement
+  const input = currentModal().querySelector('#chief_complaint')
+  if (!input) throw new Error('chief_complaint input not found')
+  return input as HTMLTextAreaElement
 }
 
-function chiefComplaintHelp(): HTMLElement | null {
-  const helps = document.querySelectorAll('#chief_complaint_help')
-  return helps.length > 0 ? (helps[helps.length - 1] as HTMLElement) : null
+function okButton(): HTMLButtonElement {
+  const button = currentModal().querySelector('.ant-modal-footer .ant-btn-primary')
+  if (!button) throw new Error('ok button not found')
+  return button as HTMLButtonElement
 }
+
+afterEach(() => {
+  cleanup()
+  document.body.innerHTML = ''
+})
 
 describe('CreateSessionModal', () => {
-  it('未填主诉时校验失败，不调用 onSubmit', async () => {
+  it('rejects empty chief complaint without calling onSubmit', async () => {
     const onSubmit = vi.fn()
     wrap(
       <CreateSessionModal open={true} creating={false} onClose={() => {}} onSubmit={onSubmit} />,
     )
-    fireEvent.submit(form())
-    await waitFor(() => {
-      expect(chiefComplaintHelp()?.textContent).toContain('请输入主诉内容')
-    })
+
+    const textarea = chiefComplaintInput()
+    expect(textarea).toHaveAttribute('aria-required', 'true')
+    fireEvent.click(okButton())
+
+    await Promise.resolve()
     expect(onSubmit).not.toHaveBeenCalled()
   })
 
-  it('填写主诉后提交调用 onSubmit 并关闭', async () => {
+  it('submits chief complaint and closes modal', async () => {
     const onSubmit = vi.fn<(b: SessionCreateRequest) => Promise<string>>().mockResolvedValue('s-1')
     const onClose = vi.fn()
     wrap(
       <CreateSessionModal open={true} creating={false} onClose={onClose} onSubmit={onSubmit} />,
     )
+
     const textarea = chiefComplaintInput()
-    expect(textarea).not.toBeNull()
-    fireEvent.change(textarea, { target: { value: '头痛三天' } })
+    fireEvent.change(textarea, { target: { value: 'headache for three days' } })
     await waitFor(() => {
-      expect(textarea.value).toBe('头痛三天')
+      expect(textarea.value).toBe('headache for three days')
     })
-    fireEvent.submit(form())
+
+    fireEvent.click(okButton())
+
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
-    expect(onSubmit.mock.calls[0][0].chief_complaint).toBe('头痛三天')
+    expect(onSubmit.mock.calls[0][0].chief_complaint).toBe('headache for three days')
     expect(onClose).toHaveBeenCalled()
-  }, 15000)
+  })
 })

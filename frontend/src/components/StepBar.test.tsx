@@ -17,7 +17,6 @@ describe('StepBar', () => {
   it('done 阶段全部完成', () => {
     render(<StepBar currentStage="done" />)
     // done 时 current=7, status=finish, 所有节点应显示完成
-    const items = screen.getAllByRole('img', { hidden: true })
     // 完成图标存在即可
     expect(screen.getByTestId('step-bar')).toBeInTheDocument()
   })

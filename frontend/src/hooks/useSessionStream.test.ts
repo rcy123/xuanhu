@@ -15,10 +15,10 @@ function makeConn(overrides: Partial<SseConnection> = {}): SseConnection {
 }
 
 type HandlerCapture = {
-  onEvent: SseHandlers['onEvent']
-  onOpen: SseHandlers['onOpen']
-  onError: SseHandlers['onError']
-  onResync: SseHandlers['onResync']
+  onEvent: (event: SessionEvent) => void
+  onOpen: () => void
+  onError: (err: Event) => void
+  onResync: (event: SessionEvent) => void
 }
 
 function setupConnectSpy() {
@@ -35,7 +35,11 @@ function setupConnectSpy() {
       return conn
     },
   )
-  return { spy, conn, getCaptured: () => captured! }
+  const getCaptured = (): HandlerCapture => {
+    if (!captured) throw new Error('connectSessionStream not called yet')
+    return captured
+  }
+  return { spy, conn, getCaptured }
 }
 
 function makeEvent(type: string, payload: Record<string, unknown> = {}): SessionEvent {
