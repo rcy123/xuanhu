@@ -1,0 +1,71 @@
+/**
+ * 悬壶 WebUI —— 设计令牌（CSS 变量）
+ *
+ * 与 UI 设计文档 §2 视觉系统对齐：传统中医暖色调，避免纯白纯黑。
+ * Ant Design 主题在 App.tsx 中通过 ConfigProvider.token 覆盖为同一套色板。
+ */
+
+:root {
+  /* 主色 */
+  --xh-primary: #c04040; /* 暗砂红 —— 主按钮、重要标记 */
+  --xh-primary-hover: #a83737;
+  --xh-secondary: #3d5a4b; /* 墨绿 —— 辅助色、链接 */
+
+  /* 中性色（暖调替代纯灰） */
+  --xh-bg-page: #fdf8f0; /* 宣纸白 —— 页面背景 */
+  --xh-bg-card: #f5eddf; /* 米白 —— 卡片/面板背景 */
+  --xh-border: #d4c8b5; /* 茶灰 —— 边框、分割线 */
+  --xh-text: #3c3228; /* 墨色 —— 主文字 */
+  --xh-text-secondary: #8b7d6b; /* 淡墨 —— 次要文字、提示 */
+
+  /* 语义色（克制） */
+  --xh-success: #5b8c5a;
+  --xh-warning: #c49b3c;
+  --xh-error: #a8443a;
+  --xh-info: #6b7d8a;
+
+  /* 间距（8px 基准） */
+  --xh-space-xs: 4px;
+  --xh-space-s: 8px;
+  --xh-space-m: 12px;
+  --xh-space-l: 16px;
+  --xh-space-xl: 24px;
+  --xh-space-xxl: 32px;
+
+  /* 圆角 */
+  --xh-radius-card: 8px;
+  --xh-radius-button: 6px;
+  --xh-radius-input: 4px;
+
+  /* 字体 */
+  --xh-font-serif: "Noto Serif SC", "Georgia", "Microsoft YaHei", serif;
+  --xh-font-sans: "Noto Sans SC", "Inter", system-ui, "Microsoft YaHei", sans-serif;
+
+  /* 卡片阴影（极轻） */
+  --xh-shadow-card: 0 1px 3px rgba(60, 50, 40, 0.06);
+
+  /* 侧边栏宽度 */
+  --xh-sider-width: 280px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--xh-bg-page);
+  color: var(--xh-text);
+  font-family: var(--xh-font-sans);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
