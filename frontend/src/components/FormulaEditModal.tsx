@@ -6,7 +6,8 @@
  */
 
 import { useState, useCallback, useEffect } from 'react'
-import { Modal, Input, InputNumber, Button, Space, Typography, Alert } from 'antd'
+import { Modal, Input, InputNumber, Button, Typography, Alert } from 'antd'
+import type { ButtonProps } from 'antd'
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons'
 import type { Formula, FormulaOverride, HerbItem } from '@/types/api'
 import type { ApiRequestError } from '@/api/errors'
@@ -113,7 +114,7 @@ export function FormulaEditModal({
       okText="保存修改"
       cancelText="取消"
       confirmLoading={submitting}
-      okButtonProps={{ disabled: submitting, 'data-testid': 'formula-edit-submit' } as Record<string, unknown>}
+      okButtonProps={{ disabled: submitting, 'data-testid': 'formula-edit-submit' } as ButtonProps}
       width={640}
       destroyOnClose
     >
@@ -188,7 +189,7 @@ export function FormulaEditModal({
             />
             <InputNumber
               placeholder="剂量"
-              value={herb.dose}
+              value={herb.dose ?? undefined}
               onChange={(v) => updateHerb(herb.key, 'dose', v)}
               style={{ flex: 1 }}
               min={0}
@@ -203,7 +204,7 @@ export function FormulaEditModal({
             />
             <Input
               placeholder="备注"
-              value={herb.note}
+              value={herb.note ?? ''}
               onChange={(e) => updateHerb(herb.key, 'note', e.target.value)}
               style={{ flex: 1 }}
             />

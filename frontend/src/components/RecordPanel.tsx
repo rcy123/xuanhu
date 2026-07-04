@@ -96,7 +96,7 @@ export function RecordPanel({
   }
 
   // ---------- done 阶段：展示病历 ----------
-  if (detail.current_stage === 'done' || detail.current_stage === 'record') {
+  if (detail.current_stage === 'done') {
     return (
       <Card
         size="small"

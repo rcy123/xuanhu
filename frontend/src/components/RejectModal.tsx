@@ -6,6 +6,7 @@
 
 import { useState, useEffect } from 'react'
 import { Modal, Input, Typography } from 'antd'
+import type { ButtonProps } from 'antd'
 
 const { Text } = Typography
 
@@ -36,7 +37,7 @@ export function RejectModal({ open, submitting, onCancel, onSubmit }: RejectModa
         danger: true,
         disabled: submitting,
         'data-testid': 'reject-submit-btn',
-      } as Record<string, unknown>}
+      } as ButtonProps}
       destroyOnClose
     >
       <div style={{ marginBottom: 'var(--xh-space-m)' }}>

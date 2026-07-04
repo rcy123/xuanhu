@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { ReviewActionsBar, isReviewBlocked } from './ReviewActionsBar'
 import { ApiRequestError } from '@/api/errors'
-import type { SessionDetail, Formula, SafetyReview, SafetyIssue } from '@/types/api'
+import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
 import { Modal } from 'antd'
 
 function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
@@ -209,8 +209,6 @@ describe('ReviewActionsBar', () => {
       />,
     )
     const confirmBtn = screen.getByTestId('review-confirm-btn') as HTMLButtonElement
-    const modifyBtn = screen.getByTestId('review-modify-btn') as HTMLButtonElement
-    const rejectBtn = screen.getByTestId('review-reject-btn') as HTMLButtonElement
     // AntD Button loading 态：disabled 属性
     expect(confirmBtn.disabled || confirmBtn.classList.contains('ant-btn-loading')).toBeTruthy()
   })
