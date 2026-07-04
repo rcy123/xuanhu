@@ -516,3 +516,38 @@ export interface ResyncPayload {
   reason: string
   timestamp: string
 }
+
+// ---------------------------------------------------------------------------
+// §4.5 病历
+// ---------------------------------------------------------------------------
+
+/** 病历 GET 响应 data。字段对齐后端 RecordResponse，snake_case。 */
+export interface RecordResponse {
+  id: string
+  session_id: string
+  version: number
+  record_text: string
+  record_json: Record<string, unknown>
+  disclaimer?: string | null
+  edited_by_doctor: boolean
+  doctor_review_id?: string | null
+  diff_from_previous?: Record<string, unknown> | null
+  created_at: string
+  updated_at: string
+}
+
+/** 病历编辑请求体。record_text 与 record_json 至少提供一个。 */
+export interface RecordUpdateRequest {
+  record_text?: string
+  record_json?: Record<string, unknown>
+}
+
+/** 病历编辑响应 data。 */
+export interface RecordUpdateResponse {
+  id: string
+  session_id: string
+  version: number
+  diff_from_previous?: Record<string, unknown> | null
+  edited_by_doctor: boolean
+  updated_at: string
+}

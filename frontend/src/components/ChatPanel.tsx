@@ -1,8 +1,9 @@
 /**
- * 悬壶 WebUI —— 问诊对话主区（P8-3 增强）
+ * 悬壶 WebUI —— 问诊对话主区（P8-4 增强）
  *
  * 组合 useSessionDetail + useMessages + useSessionStream + MessageList + MessageInput
- * + 患者信息条 + 步骤条（含 agent 运行状态）+ 阶段结果面板 + 流连接状态。
+ * + 患者信息条 + 步骤条（含 agent 运行状态）+ 阶段结果面板 + 流连接状态
+ * + 医师确认操作区 + 处方编辑/否决 Modal + 病历 Panel。
  *
  * 选中会话变化时：detail hook 自动拉取；本组件监听 sessionId 加载消息历史。
  * 提交消息：传当前 detail.state_version；版本冲突由 useMessages 刷新重提。
@@ -14,13 +15,20 @@ import { Empty, Spin, Typography, Layout, theme } from 'antd'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import { useSessionStream } from '@/hooks/useSessionStream'
-import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
+import type { SessionDetail, Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest } from '@/types/api'
 import { StepBar } from './StepBar'
 import { MessageList } from './MessageList'
 import { MessageInput } from './MessageInput'
 import { ErrorBanner } from './ErrorBanner'
 import { StreamStatus } from './StreamStatus'
 import { StageResultsPanel } from './StageResultsPanel'
+import { ReviewActionsBar } from './ReviewActionsBar'
+import { FormulaEditModal } from './FormulaEditModal'
+import { RejectModal } from './RejectModal'
+import { RecordPanel } from './RecordPanel'
+import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
+import { downloadFileResponse } from '@/api/download'
+import { ApiRequestError } from '@/api/errors'
 
 const { Content } = Layout
 const { Text, Title } = Typography
@@ -194,6 +202,188 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     return running ? running[0] : null
   }, [streamHook.agentRuns])
 
+  // ---------- P8-4 医师确认与病历状态 ----------
+  const [reviewSubmitting, setReviewSubmitting] = useState(false)
+  const [reviewError, setReviewError] = useState<ApiRequestError | null>(null)
+  const [modifyModalOpen, setModifyModalOpen] = useState(false)
+  const [rejectModalOpen, setRejectModalOpen] = useState(false)
+  const [modifyReviewError, setModifyReviewError] = useState<ApiRequestError | null>(null)
+
+  // 病历
+  const [record, setRecord] = useState<RecordResponse | null>(null)
+  const [recordLoading, setRecordLoading] = useState(false)
+  const [recordError, setRecordError] = useState<ApiRequestError | null>(null)
+  const [recordEditing, setRecordEditing] = useState(false)
+  const [recordSaving, setRecordSaving] = useState(false)
+  const [recordSaveError, setRecordSaveError] = useState<ApiRequestError | null>(null)
+
+  // 当 detail 变为 done 时拉取病历
+  useEffect(() => {
+    if (!sessionId) return
+    if (detail?.current_stage === 'done' && detail?.status === 'done') {
+      setRecordLoading(true)
+      setRecordError(null)
+      getRecord(sessionId, 'latest')
+        .then((data) => {
+          setRecord(data)
+          setRecordLoading(false)
+        })
+        .catch((err: unknown) => {
+          if (err instanceof ApiRequestError) setRecordError(err)
+          setRecordLoading(false)
+        })
+    } else {
+      setRecord(null)
+      setRecordError(null)
+      setRecordEditing(false)
+    }
+  }, [sessionId, detail?.current_stage, detail?.status])
+
+  // ---------- 医师确认操作 ----------
+
+  const handleConfirm = useCallback(() => {
+    if (!sessionId || !detail) return
+    setReviewSubmitting(true)
+    setReviewError(null)
+    reviewPrescription(
+      sessionId,
+      { action: 'confirm' },
+      { stateVersion: detail.state_version },
+    )
+      .then(() => {
+        setReviewSubmitting(false)
+        void refreshDetail()
+      })
+      .catch((err: unknown) => {
+        setReviewSubmitting(false)
+        if (err instanceof ApiRequestError) setReviewError(err)
+      })
+  }, [sessionId, detail, refreshDetail])
+
+  const handleModify = useCallback(() => {
+    setModifyModalOpen(true)
+    setModifyReviewError(null)
+  }, [])
+
+  const handleModifySubmit = useCallback(
+    (override: FormulaOverride, feedback?: string) => {
+      if (!sessionId || !detail) return
+      setReviewSubmitting(true)
+      setModifyReviewError(null)
+      reviewPrescription(
+        sessionId,
+        {
+          action: 'modify',
+          formula_override: override,
+          feedback: feedback || undefined,
+        },
+        { stateVersion: detail.state_version },
+      )
+        .then(() => {
+          setReviewSubmitting(false)
+          setModifyModalOpen(false)
+          void refreshDetail()
+        })
+        .catch((err: unknown) => {
+          setReviewSubmitting(false)
+          if (err instanceof ApiRequestError) {
+            // 二次安全审核失败：在 Modal 内展示 issues，不关闭弹窗
+            if (err.code === 'SAFETY_REVIEW_BLOCKED') {
+              setModifyReviewError(err)
+            } else {
+              setReviewError(err)
+              setModifyModalOpen(false)
+            }
+          }
+        })
+    },
+    [sessionId, detail, refreshDetail],
+  )
+
+  const handleReject = useCallback(() => {
+    setRejectModalOpen(true)
+  }, [])
+
+  const handleRejectSubmit = useCallback(
+    (feedback: string) => {
+      if (!sessionId || !detail) return
+      setReviewSubmitting(true)
+      setReviewError(null)
+      reviewPrescription(
+        sessionId,
+        { action: 'reject', feedback: feedback || undefined },
+        { stateVersion: detail.state_version },
+      )
+        .then(() => {
+          setReviewSubmitting(false)
+          setRejectModalOpen(false)
+          void refreshDetail()
+        })
+        .catch((err: unknown) => {
+          setReviewSubmitting(false)
+          if (err instanceof ApiRequestError) setReviewError(err)
+          setRejectModalOpen(false)
+        })
+    },
+    [sessionId, detail, refreshDetail],
+  )
+
+  const handleReviewRetry = useCallback(() => {
+    setReviewError(null)
+    void refreshDetail()
+  }, [refreshDetail])
+
+  // ---------- 病历操作 ----------
+
+  const handleRecordEdit = useCallback(() => {
+    setRecordEditing(true)
+    setRecordSaveError(null)
+  }, [])
+
+  const handleRecordCancelEdit = useCallback(() => {
+    setRecordEditing(false)
+    setRecordSaveError(null)
+  }, [])
+
+  const handleRecordSave = useCallback(
+    (body: RecordUpdateRequest) => {
+      if (!sessionId || !detail) return
+      setRecordSaving(true)
+      setRecordSaveError(null)
+      updateRecord(sessionId, body, { stateVersion: detail.state_version })
+        .then(() => {
+          setRecordSaving(false)
+          setRecordEditing(false)
+          // 刷新详情（拿新 state_version） + 重新拉病历
+          void refreshDetail().then(() => {
+            if (sessionId) {
+              getRecord(sessionId, 'latest')
+                .then((data) => setRecord(data))
+                .catch(() => { /* ignore */ })
+            }
+          })
+        })
+        .catch((err: unknown) => {
+          setRecordSaving(false)
+          if (err instanceof ApiRequestError) setRecordSaveError(err)
+        })
+    },
+    [sessionId, detail, refreshDetail],
+  )
+
+  const handleExport = useCallback(
+    (format: 'txt' | 'json' | 'md') => {
+      if (!sessionId) return
+      exportRecord(sessionId, format, 'latest')
+        .then((response) => downloadFileResponse(response, '病历', format))
+        .catch(() => { /* 导出失败静默，控制台已有错误 */ })
+    },
+    [sessionId],
+  )
+
+  // 待确认处方：优先 SSE payload，其次 detail.modified_formula
+  const effectivePendingFormula = pendingReviewFormula ?? detail?.modified_formula ?? null
+
   if (!sessionId) {
     return (
       <Content
@@ -273,6 +463,67 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           pendingReviewFormula={pendingReviewFormula}
           blockedIssues={blockedIssues}
           rollbackTarget={rollbackTarget}
+        />
+        {/* P8-4: 医师确认操作区 */}
+        {detail ? (
+          <ReviewActionsBar
+            detail={detail}
+            pendingReviewFormula={effectivePendingFormula}
+            blockedIssues={blockedIssues}
+            submitting={reviewSubmitting}
+            error={reviewError}
+            onConfirm={handleConfirm}
+            onModify={handleModify}
+            onReject={handleReject}
+            onRetry={handleReviewRetry}
+          />
+        ) : null}
+
+        {/* P8-4: 病历 Panel */}
+        {detail ? (
+          <RecordPanel
+            detail={detail}
+            record={record}
+            loading={recordLoading}
+            error={recordError}
+            editing={recordEditing}
+            saving={recordSaving}
+            saveError={recordSaveError}
+            onEdit={handleRecordEdit}
+            onCancelEdit={handleRecordCancelEdit}
+            onSave={handleRecordSave}
+            onExport={handleExport}
+            onRetry={() => {
+              setRecordError(null)
+              if (sessionId) {
+                setRecordLoading(true)
+                getRecord(sessionId, 'latest')
+                  .then((data) => { setRecord(data); setRecordLoading(false) })
+                  .catch((err: unknown) => {
+                    if (err instanceof ApiRequestError) setRecordError(err)
+                    setRecordLoading(false)
+                  })
+              }
+            }}
+          />
+        ) : null}
+
+        {/* P8-4: 处方编辑 Modal */}
+        <FormulaEditModal
+          open={modifyModalOpen}
+          initialFormula={effectivePendingFormula}
+          submitting={reviewSubmitting}
+          reviewError={modifyReviewError}
+          onCancel={() => { setModifyModalOpen(false); setModifyReviewError(null) }}
+          onSubmit={handleModifySubmit}
+        />
+
+        {/* P8-4: 否决 Modal */}
+        <RejectModal
+          open={rejectModalOpen}
+          submitting={reviewSubmitting}
+          onCancel={() => setRejectModalOpen(false)}
+          onSubmit={handleRejectSubmit}
         />
         {error ? (
           <div style={{ padding: 'var(--xh-space-l)' }}>
