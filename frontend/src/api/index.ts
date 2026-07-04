@@ -14,6 +14,9 @@ import type {
   MessageItem,
   MessageListParams,
   PageData,
+  RecordResponse,
+  RecordUpdateRequest,
+  RecordUpdateResponse,
   RecoveryData,
   RecoveryRequest,
   ReviewData,
@@ -193,6 +196,70 @@ export function getHealth(
   ctx?: RequestContext,
 ): Promise<{ status: string; version: string; timestamp: string }> {
   return request('/health', { method: 'GET', ctx })
+}
+
+// ---------------------------------------------------------------------------
+// 病历
+// ---------------------------------------------------------------------------
+
+/** GET /consult/sessions/{id}/record?version=latest|N —— 获取病历（envelope）。 */
+export function getRecord(
+  sessionId: string,
+  version: number | 'latest' = 'latest',
+  ctx?: RequestContext,
+): Promise<RecordResponse> {
+  return request<RecordResponse>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/record?version=${encodeURIComponent(String(version))}`,
+    {
+      method: 'GET',
+      ctx,
+    },
+  )
+}
+
+/**
+ * PUT /consult/sessions/{id}/record —— 医师编辑病历。
+ *
+ * body 至少包含 record_text 或 record_json 之一。
+ * ctx 应携带 X-State-Version。
+ */
+export function updateRecord(
+  sessionId: string,
+  body: RecordUpdateRequest,
+  ctx?: RequestContext,
+): Promise<RecordUpdateResponse> {
+  return request<RecordUpdateResponse>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/record`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(body),
+      ctx,
+    },
+  )
+}
+
+/**
+ * GET /consult/sessions/{id}/record/export?format=... —— 导出病历。
+ *
+ * 返回 raw Response（非 envelope 文件响应），调用方需自行处理下载。
+ */
+export function exportRecord(
+  sessionId: string,
+  format: 'txt' | 'json' | 'md',
+  version?: number | 'latest',
+  ctx?: RequestContext,
+): Promise<Response> {
+  const versionParam = version !== undefined
+    ? `&version=${encodeURIComponent(String(version))}`
+    : ''
+  return request<Response>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/record/export?format=${encodeURIComponent(format)}${versionParam}`,
+    {
+      method: 'GET',
+      raw: true,
+      ctx,
+    },
+  )
 }
 
 // ---------------------------------------------------------------------------

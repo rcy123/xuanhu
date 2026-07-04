@@ -19,6 +19,10 @@ export {
   listMessages,
   recoverSession,
   reviewPrescription,
+  getRecord,
+  updateRecord,
+  exportRecord,
   getHealth,
   toQuery,
 } from './index'
+export { downloadFileResponse } from './download'
