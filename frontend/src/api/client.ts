@@ -66,9 +66,19 @@ export async function request<T>(
     ctx?: RequestContext
     /** 若为 true 则返回原始 Response 不解析，用于 SSE 等非 JSON 接口。 */
     raw?: boolean
+    /**
+     * 仅与 `raw: true` 组合使用。当为 true 时，对非 2xx 响应识别后端 JSON
+     * 错误 envelope 并抛出 `ApiRequestError`；非 JSON 错误响应同样抛出
+     * `ApiRequestError`（BAD_RESPONSE）。2xx 成功响应仍原样返回 Response，
+     * 不按 envelope 解析，避免影响文件下载路径。
+     *
+     * 专用于 raw 文件接口（如病历导出）的错误处理，不改变全局 raw 语义，
+     * 不影响 SSE 或未来其他 raw 接口。
+     */
+    rawErrorEnvelope?: boolean
   } = {},
 ): Promise<T> {
-  const { ctx, raw, ...fetchOptions } = options
+  const { ctx, raw, rawErrorEnvelope, ...fetchOptions } = options
   const url = buildUrl(path)
 
   const headers: Record<string, string> = {
@@ -104,6 +114,11 @@ export async function request<T>(
   }
 
   if (raw) {
+    // raw 文件接口（如病历导出）：非 2xx 时识别后端 JSON 错误 envelope
+    // 并抛出 ApiRequestError，避免把错误响应当作文件下载。
+    if (rawErrorEnvelope && !response.ok) {
+      await throwRawResponseError(response)
+    }
     return response as unknown as T
   }
 
@@ -200,4 +215,40 @@ function buildUrl(path: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 对 raw 文件接口的非 2xx 响应做错误识别：
+ * - 若响应体为 JSON 且包含 `code` 字段（后端错误 envelope），复用
+ *   `ApiRequestError.fromEnvelope` 抛出，保留 code/message/retryable/trace_id 等。
+ * - 否则抛出 BAD_RESPONSE 占位码，message 含状态码，retryable 仅 5xx 为 true。
+ *
+ * 读取响应体后会消耗 response（不可再被下游当作文件下载使用）。
+ */
+async function throwRawResponseError(response: Response): Promise<never> {
+  const contentType = response.headers.get('content-type') ?? ''
+  const isJson = contentType.includes('application/json')
+  const text = await response.text().catch(() => '')
+
+  if (isJson && text) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const body: unknown = JSON.parse(text)
+      if (body && typeof body === 'object' && 'code' in body) {
+        throw ApiRequestError.fromEnvelope(response.status, body as ApiError)
+      }
+    } catch (err) {
+      // fromEnvelope 抛出的 ApiRequestError 直接向上传播
+      if (err instanceof ApiRequestError) throw err
+      // JSON 解析失败 → fall through 到 BAD_RESPONSE
+    }
+  }
+
+  throw new ApiRequestError({
+    code: TransportErrorCode.BAD_RESPONSE,
+    userMessage: `病历导出失败（HTTP ${response.status}）`,
+    status: response.status,
+    detail: text.slice(0, 512),
+    retryable: response.status >= 500,
+  })
 }

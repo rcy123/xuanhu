@@ -28,11 +28,15 @@ export interface RecordPanelProps {
   editing: boolean
   saving: boolean
   saveError: ApiRequestError | null
+  /** 导出失败错误，由 ChatPanel 管理。 */
+  exportError: ApiRequestError | null
   onEdit: () => void
   onCancelEdit: () => void
   onSave: (body: RecordUpdateRequest) => void
   onExport: (format: 'txt' | 'json' | 'md') => void
   onRetry: () => void
+  /** 关闭导出错误提示。 */
+  onExportErrorDismiss: () => void
 }
 
 export function RecordPanel({
@@ -43,11 +47,13 @@ export function RecordPanel({
   editing,
   saving,
   saveError,
+  exportError,
   onEdit,
   onCancelEdit,
   onSave,
   onExport,
   onRetry,
+  onExportErrorDismiss,
 }: RecordPanelProps) {
   const [editText, setEditText] = useState('')
   const [editJson, setEditJson] = useState('')
@@ -209,6 +215,34 @@ export function RecordPanel({
           ) : (
             /* ---------- 展示态 ---------- */
             <div>
+              {exportError ? (
+                <div style={{ marginBottom: 'var(--xh-space-m)' }} data-testid="record-export-error">
+                  <ErrorBanner
+                    error={exportError}
+                    onRetry={onExportErrorDismiss}
+                    showRetry={false}
+                  />
+                  <Space style={{ marginTop: 'var(--xh-space-s)' }}>
+                    <Button
+                      size="small"
+                      type="primary"
+                      icon={<ExportOutlined />}
+                      onClick={() => onExport('txt')}
+                      data-testid="record-export-retry-txt"
+                    >
+                      重新导出 TXT
+                    </Button>
+                    <Button
+                      size="small"
+                      icon={<CloseOutlined />}
+                      onClick={onExportErrorDismiss}
+                      data-testid="record-export-dismiss"
+                    >
+                      关闭
+                    </Button>
+                  </Space>
+                </div>
+              ) : null}
               {record.edited_by_doctor ? (
                 <Descriptions size="small" style={{ marginBottom: 'var(--xh-space-m)' }}>
                   <Descriptions.Item label="版本">

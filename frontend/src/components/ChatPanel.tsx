@@ -28,7 +28,7 @@ import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
-import { ApiRequestError } from '@/api/errors'
+import { ApiRequestError, TransportErrorCode } from '@/api/errors'
 
 const { Content } = Layout
 const { Text, Title } = Typography
@@ -216,6 +216,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const [recordEditing, setRecordEditing] = useState(false)
   const [recordSaving, setRecordSaving] = useState(false)
   const [recordSaveError, setRecordSaveError] = useState<ApiRequestError | null>(null)
+  const [recordExportError, setRecordExportError] = useState<ApiRequestError | null>(null)
 
   // 当 detail 变为 done 时拉取病历
   useEffect(() => {
@@ -236,6 +237,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
       setRecord(null)
       setRecordError(null)
       setRecordEditing(false)
+      setRecordExportError(null)
     }
   }, [sessionId, detail?.current_stage, detail?.status])
 
@@ -374,9 +376,23 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const handleExport = useCallback(
     (format: 'txt' | 'json' | 'md') => {
       if (!sessionId) return
+      setRecordExportError(null)
       exportRecord(sessionId, format, 'latest')
         .then((response) => downloadFileResponse(response, '病历', format))
-        .catch(() => { /* 导出失败静默，控制台已有错误 */ })
+        .catch((err: unknown) => {
+          if (err instanceof ApiRequestError) {
+            setRecordExportError(err)
+          } else {
+            setRecordExportError(
+              new ApiRequestError({
+                code: TransportErrorCode.NETWORK_ERROR,
+                userMessage: '导出失败，请重试',
+                status: 0,
+                retryable: true,
+              }),
+            )
+          }
+        })
     },
     [sessionId],
   )
@@ -489,10 +505,12 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
             editing={recordEditing}
             saving={recordSaving}
             saveError={recordSaveError}
+            exportError={recordExportError}
+            onExport={handleExport}
+            onExportErrorDismiss={() => setRecordExportError(null)}
             onEdit={handleRecordEdit}
             onCancelEdit={handleRecordCancelEdit}
             onSave={handleRecordSave}
-            onExport={handleExport}
             onRetry={() => {
               setRecordError(null)
               if (sessionId) {

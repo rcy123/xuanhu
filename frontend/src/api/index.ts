@@ -242,6 +242,7 @@ export function updateRecord(
  * GET /consult/sessions/{id}/record/export?format=... —— 导出病历。
  *
  * 返回 raw Response（非 envelope 文件响应），调用方需自行处理下载。
+ * 非 2xx 响应会识别后端 JSON 错误 envelope 并抛出 ApiRequestError。
  */
 export function exportRecord(
   sessionId: string,
@@ -257,6 +258,7 @@ export function exportRecord(
     {
       method: 'GET',
       raw: true,
+      rawErrorEnvelope: true,
       ctx,
     },
   )

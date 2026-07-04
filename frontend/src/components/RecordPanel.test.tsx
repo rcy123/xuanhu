@@ -55,10 +55,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -76,10 +78,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -104,10 +108,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={onEdit}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -125,10 +131,12 @@ describe('RecordPanel', () => {
         editing={true}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -147,10 +155,12 @@ describe('RecordPanel', () => {
         editing={true}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -172,10 +182,12 @@ describe('RecordPanel', () => {
         editing={true}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={onSave}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -197,10 +209,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={onExport}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -210,6 +224,97 @@ describe('RecordPanel', () => {
     expect(onExport).toHaveBeenCalledWith('json')
     fireEvent.click(screen.getByTestId('record-export-md'))
     expect(onExport).toHaveBeenCalledWith('md')
+  })
+
+  it('exportError 显示导出错误提示', () => {
+    const error = new ApiRequestError({
+      code: 'EXPORT_FORMAT_UNSUPPORTED',
+      userMessage: '不支持的导出格式',
+      status: 400,
+      retryable: false,
+    })
+    render(
+      <RecordPanel
+        detail={makeDetail()}
+        record={makeRecord()}
+        loading={false}
+        error={null}
+        editing={false}
+        saving={false}
+        saveError={null}
+        exportError={error}
+        onEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onSave={vi.fn()}
+        onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    )
+    expect(screen.getByTestId('record-export-error')).toBeInTheDocument()
+    expect(screen.getByText(/不支持的导出格式/)).toBeInTheDocument()
+    expect(screen.getByTestId('record-export-retry-txt')).toBeInTheDocument()
+  })
+
+  it('点击关闭按钮触发 onExportErrorDismiss', () => {
+    const onExportErrorDismiss = vi.fn()
+    const error = new ApiRequestError({
+      code: 'RECORD_NOT_FOUND',
+      userMessage: '病历不存在',
+      status: 404,
+      retryable: false,
+    })
+    render(
+      <RecordPanel
+        detail={makeDetail()}
+        record={makeRecord()}
+        loading={false}
+        error={null}
+        editing={false}
+        saving={false}
+        saveError={null}
+        exportError={error}
+        onEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onSave={vi.fn()}
+        onExport={vi.fn()}
+        onExportErrorDismiss={onExportErrorDismiss}
+        onRetry={vi.fn()}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('record-export-dismiss'))
+    expect(onExportErrorDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('exportError 状态下点击重新导出触发 onExport 并清空旧错误', () => {
+    const onExport = vi.fn()
+    const onExportErrorDismiss = vi.fn()
+    const error = new ApiRequestError({
+      code: 'EXPORT_FORMAT_UNSUPPORTED',
+      userMessage: '不支持的导出格式',
+      status: 400,
+      retryable: false,
+    })
+    render(
+      <RecordPanel
+        detail={makeDetail()}
+        record={makeRecord()}
+        loading={false}
+        error={null}
+        editing={false}
+        saving={false}
+        saveError={null}
+        exportError={error}
+        onEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onSave={vi.fn()}
+        onExport={onExport}
+        onExportErrorDismiss={onExportErrorDismiss}
+        onRetry={vi.fn()}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('record-export-retry-txt'))
+    expect(onExport).toHaveBeenCalledWith('txt')
   })
 
   it('edited_by_doctor=true 显示版本与编辑状态', () => {
@@ -222,10 +327,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -242,10 +349,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )
@@ -269,10 +378,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={onRetry}
       />,
     )
@@ -290,10 +401,12 @@ describe('RecordPanel', () => {
         editing={false}
         saving={false}
         saveError={null}
+        exportError={null}
         onEdit={vi.fn()}
         onCancelEdit={vi.fn()}
         onSave={vi.fn()}
         onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
         onRetry={vi.fn()}
       />,
     )

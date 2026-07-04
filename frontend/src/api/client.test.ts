@@ -705,6 +705,88 @@ describe('exportRecord', () => {
     expect(url).toContain('format=md')
     expect(url).not.toContain('version=')
   })
+
+  it('exportRecord 400 EXPORT_FORMAT_UNSUPPORTED 抛出 ApiRequestError，不下载', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 400,
+        body: {
+          code: 'EXPORT_FORMAT_UNSUPPORTED',
+          message: '不支持的导出格式',
+          detail: 'format=pdf',
+          retryable: false,
+          trace_id: 't-400',
+        },
+      }),
+    )
+
+    await expect(exportRecord('s1', 'txt')).rejects.toMatchObject({
+      name: 'ApiRequestError',
+      code: 'EXPORT_FORMAT_UNSUPPORTED',
+      userMessage: '不支持的导出格式',
+      status: 400,
+      retryable: false,
+      traceId: 't-400',
+    })
+  })
+
+  it('exportRecord 404 RECORD_NOT_FOUND 抛出 ApiRequestError，不下载', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 404,
+        body: {
+          code: 'RECORD_NOT_FOUND',
+          message: '病历不存在',
+          retryable: false,
+          trace_id: 't-404',
+        },
+      }),
+    )
+
+    await expect(exportRecord('s1', 'json')).rejects.toMatchObject({
+      name: 'ApiRequestError',
+      code: 'RECORD_NOT_FOUND',
+      status: 404,
+    })
+  })
+
+  it('exportRecord 500 非 JSON 错误抛出 BAD_RESPONSE，用户可见', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 500,
+        text: '<html>Internal Server Error</html>',
+        headers: { 'content-type': 'text/html' },
+      }),
+    )
+
+    await expect(exportRecord('s1', 'md')).rejects.toMatchObject({
+      name: 'ApiRequestError',
+      code: TransportErrorCode.BAD_RESPONSE,
+      status: 500,
+      retryable: true,
+    })
+  })
+
+  it('exportRecord 500 JSON envelope 错误抛出对应业务错误码', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 500,
+        body: {
+          code: 'MODEL_GATEWAY_UNAVAILABLE',
+          message: 'AI 模型服务暂不可用',
+          retryable: true,
+          trace_id: 't-500',
+        },
+      }),
+    )
+
+    await expect(exportRecord('s1', 'txt')).rejects.toMatchObject({
+      name: 'ApiRequestError',
+      code: 'MODEL_GATEWAY_UNAVAILABLE',
+      status: 500,
+      retryable: true,
+    })
+  })
 })
 
 describe('downloadFileResponse', () => {
