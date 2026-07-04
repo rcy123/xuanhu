@@ -10,9 +10,7 @@ import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import * as api from '@/api/index'
-import * as sse from '@/api/sse'
-import type { SessionDetail, Formula, SafetyReview } from '@/types/api'
-import { ApiRequestError } from '@/api/errors'
+import type { SessionDetail } from '@/types/api'
 
 // Mock SSE
 vi.mock('@/api/sse', () => ({
