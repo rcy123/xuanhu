@@ -714,11 +714,13 @@ describe('downloadFileResponse', () => {
     const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
     const revokeObjectURLSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
 
+    let downloadAnchor: HTMLAnchorElement | null = null
     const clickSpy = vi.fn()
     const origCreateElement = document.createElement.bind(document)
     vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
       const el = origCreateElement(tag)
       if (tag === 'a') {
+        downloadAnchor = el as HTMLAnchorElement
         Object.defineProperty(el, 'click', { value: clickSpy })
       }
       return el
@@ -737,6 +739,8 @@ describe('downloadFileResponse', () => {
 
     expect(clickSpy).toHaveBeenCalled()
     expect(createObjectURLSpy).toHaveBeenCalled()
+    expect(downloadAnchor).not.toBeNull()
+    expect(downloadAnchor!.download).toBe('病历_test.txt')
 
     createObjectURLSpy.mockRestore()
     revokeObjectURLSpy.mockRestore()
@@ -748,17 +752,20 @@ describe('downloadFileResponse', () => {
     const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test2')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
 
+    let downloadAnchor: HTMLAnchorElement | null = null
     const clickSpy = vi.fn()
     const origCreateElement = document.createElement.bind(document)
     vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
       const el = origCreateElement(tag)
       if (tag === 'a') {
+        downloadAnchor = el as HTMLAnchorElement
         Object.defineProperty(el, 'click', { value: clickSpy })
       }
       return el
     })
 
     const encodedFilename = encodeURIComponent('病历_李明_2026-06-22.txt')
+    const expectedFilename = decodeURIComponent(encodedFilename)
     const blob = new Blob(['test'])
     const response = {
       headers: new Headers({
@@ -770,6 +777,8 @@ describe('downloadFileResponse', () => {
     await downloadFileResponse(response, '病历', 'txt')
 
     expect(clickSpy).toHaveBeenCalled()
+    expect(downloadAnchor).not.toBeNull()
+    expect(downloadAnchor!.download).toBe(expectedFilename)
 
     createObjectURLSpy.mockRestore()
   })
@@ -780,11 +789,13 @@ describe('downloadFileResponse', () => {
     const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test3')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
 
+    let downloadAnchor: HTMLAnchorElement | null = null
     const clickSpy = vi.fn()
     const origCreateElement = document.createElement.bind(document)
     vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
       const el = origCreateElement(tag)
       if (tag === 'a') {
+        downloadAnchor = el as HTMLAnchorElement
         Object.defineProperty(el, 'click', { value: clickSpy })
       }
       return el
@@ -799,6 +810,8 @@ describe('downloadFileResponse', () => {
     await downloadFileResponse(response, '病历', 'json')
 
     expect(clickSpy).toHaveBeenCalled()
+    expect(downloadAnchor).not.toBeNull()
+    expect(downloadAnchor!.download).toBe('病历.json')
 
     createObjectURLSpy.mockRestore()
   })
