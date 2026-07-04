@@ -16,6 +16,7 @@ import {
   ApiRequestError,
   createSession,
   getHealth,
+  getRecord,
   listMessages,
   listSessions,
   request,
@@ -23,6 +24,8 @@ import {
   submitMessage,
   submitMessageWithRetry,
   terminateSession,
+  updateRecord,
+  exportRecord,
   TransportErrorCode,
 } from '@/api/mod'
 import { __setBaseUrlResolver } from '@/api/mod'
@@ -503,5 +506,300 @@ describe('业务方法签名', () => {
     const url = fn.mock.calls[0][0] as string
     expect(url).toContain('/terminate')
     expect(JSON.parse(fn.mock.calls[0][1].body as string)).toEqual({ reason: 'done' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 病历 API
+// ---------------------------------------------------------------------------
+
+describe('getRecord', () => {
+  it('getRecord 返回 envelope data', async () => {
+    const recordData = {
+      id: 'rec-1',
+      session_id: 's1',
+      version: 1,
+      record_text: '中医病历内容...',
+      record_json: { chief_complaint: '头痛' },
+      disclaimer: '本记录由AI辅助生成',
+      edited_by_doctor: false,
+      doctor_review_id: 'dr-1',
+      diff_from_previous: null,
+      created_at: '2026-07-04T10:00:00+08:00',
+      updated_at: '2026-07-04T10:00:00+08:00',
+    }
+
+    mockFetch(() =>
+      mockResponse({
+        body: { code: 'SUCCESS', message: 'ok', data: recordData, trace_id: 't' },
+      }),
+    )
+
+    const result = await getRecord('s1')
+    expect(result).toMatchObject({ id: 'rec-1', version: 1, record_text: '中医病历内容...' })
+    expect(result.edited_by_doctor).toBe(false)
+  })
+
+  it('getRecord 传入 version 参数', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: { code: 'SUCCESS', message: 'ok', data: { id: 'rec-1', version: 2, record_text: 'v2', record_json: {}, edited_by_doctor: true, created_at: '', updated_at: '' }, trace_id: 't' },
+      }),
+    )
+
+    await getRecord('s1', 2)
+    const url = fn.mock.calls[0][0] as string
+    expect(url).toContain('version=2')
+  })
+
+  it('getRecord 默认 version=latest', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: { code: 'SUCCESS', message: 'ok', data: { id: 'rec-1', version: 1, record_text: 'v1', record_json: {}, edited_by_doctor: false, created_at: '', updated_at: '' }, trace_id: 't' },
+      }),
+    )
+
+    await getRecord('s1')
+    const url = fn.mock.calls[0][0] as string
+    expect(url).toContain('version=latest')
+  })
+
+  it('getRecord RECORD_NOT_FOUND 抛出错误', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 404,
+        body: {
+          code: 'RECORD_NOT_FOUND',
+          message: '病历不存在',
+          retryable: false,
+          trace_id: 't',
+        },
+      }),
+    )
+
+    await expect(getRecord('s1')).rejects.toMatchObject({
+      code: 'RECORD_NOT_FOUND',
+      status: 404,
+    })
+  })
+})
+
+describe('updateRecord', () => {
+  it('updateRecord 发送 PUT 并携带 X-State-Version', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: {
+          code: 'SUCCESS',
+          message: 'ok',
+          data: {
+            id: 'rec-1',
+            session_id: 's1',
+            version: 2,
+            diff_from_previous: { changed_fields: ['record_text'] },
+            edited_by_doctor: true,
+            updated_at: '2026-07-04T11:00:00+08:00',
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+
+    const result = await updateRecord('s1', { record_text: '更新的病历' }, { stateVersion: 1 })
+    expect(result.version).toBe(2)
+    expect(result.edited_by_doctor).toBe(true)
+
+    const init = fn.mock.calls[0][1]
+    const headers = init.headers as Record<string, string>
+    expect(headers['X-State-Version']).toBe('1')
+    expect(init.method).toBe('PUT')
+  })
+
+  it('updateRecord 发送 record_json 编辑', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: {
+          code: 'SUCCESS',
+          message: 'ok',
+          data: {
+            id: 'rec-1',
+            session_id: 's1',
+            version: 3,
+            edited_by_doctor: true,
+            updated_at: '2026-07-04T12:00:00+08:00',
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+
+    await updateRecord('s1', { record_json: { chief_complaint: '腹痛' } }, { stateVersion: 2 })
+    const init = fn.mock.calls[0][1]
+    expect(init.body).toContain('chief_complaint')
+  })
+
+  it('updateRecord INVALID_STATE_VERSION 抛出错误', async () => {
+    mockFetch(() =>
+      mockResponse({
+        status: 409,
+        body: {
+          code: 'INVALID_STATE_VERSION',
+          message: '状态版本冲突',
+          retryable: true,
+          trace_id: 't',
+        },
+      }),
+    )
+
+    await expect(updateRecord('s1', { record_text: 'x' }, { stateVersion: 1 })).rejects.toMatchObject({
+      code: 'INVALID_STATE_VERSION',
+      retryable: true,
+    })
+  })
+})
+
+describe('exportRecord', () => {
+  it('exportRecord 返回 raw Response，不解析 envelope', async () => {
+    const responseText = '中医病历纯文本内容'
+    const encodedFilename = encodeURIComponent('病历_test.txt')
+    mockFetch(() =>
+      mockResponse({
+        text: responseText,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-disposition': `attachment; filename*=UTF-8''${encodedFilename}`,
+        },
+      }),
+    )
+
+    const response = await exportRecord('s1', 'txt')
+    expect(response).toBeDefined()
+    expect(typeof response.text).toBe('function')
+    const text = await response.text()
+    expect(text).toBe(responseText)
+  })
+
+  it('exportRecord 传入 version 参数', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        text: 'v2 content',
+        headers: { 'content-type': 'text/plain' },
+      }),
+    )
+
+    await exportRecord('s1', 'json', 2)
+    const url = fn.mock.calls[0][0] as string
+    expect(url).toContain('version=2')
+    expect(url).toContain('format=json')
+  })
+
+  it('exportRecord 默认不传 version 参数', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        text: 'md content',
+        headers: { 'content-type': 'text/markdown' },
+      }),
+    )
+
+    await exportRecord('s1', 'md')
+    const url = fn.mock.calls[0][0] as string
+    expect(url).toContain('format=md')
+    expect(url).not.toContain('version=')
+  })
+})
+
+describe('downloadFileResponse', () => {
+  it('downloadFileResponse 解析 Content-Disposition filename 并触发下载', async () => {
+    const { downloadFileResponse } = await import('@/api/download')
+
+    const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
+    const revokeObjectURLSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+
+    const clickSpy = vi.fn()
+    const origCreateElement = document.createElement.bind(document)
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = origCreateElement(tag)
+      if (tag === 'a') {
+        Object.defineProperty(el, 'click', { value: clickSpy })
+      }
+      return el
+    })
+
+    const blob = new Blob(['test content'])
+    const encodedFilename = encodeURIComponent('病历_test.txt')
+    const response = {
+      headers: new Headers({
+        'content-disposition': `attachment; filename*=UTF-8''${encodedFilename}`,
+      }),
+      blob: () => Promise.resolve(blob),
+    } as Response
+
+    await downloadFileResponse(response, '病历', 'txt')
+
+    expect(clickSpy).toHaveBeenCalled()
+    expect(createObjectURLSpy).toHaveBeenCalled()
+
+    createObjectURLSpy.mockRestore()
+    revokeObjectURLSpy.mockRestore()
+  })
+
+  it('downloadFileResponse 解析 RFC 5987 filename* 中文文件名', async () => {
+    const { downloadFileResponse } = await import('@/api/download')
+
+    const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test2')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+
+    const clickSpy = vi.fn()
+    const origCreateElement = document.createElement.bind(document)
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = origCreateElement(tag)
+      if (tag === 'a') {
+        Object.defineProperty(el, 'click', { value: clickSpy })
+      }
+      return el
+    })
+
+    const encodedFilename = encodeURIComponent('病历_李明_2026-06-22.txt')
+    const blob = new Blob(['test'])
+    const response = {
+      headers: new Headers({
+        'content-disposition': `attachment; filename="fallback.txt"; filename*=UTF-8''${encodedFilename}`,
+      }),
+      blob: () => Promise.resolve(blob),
+    } as Response
+
+    await downloadFileResponse(response, '病历', 'txt')
+
+    expect(clickSpy).toHaveBeenCalled()
+
+    createObjectURLSpy.mockRestore()
+  })
+
+  it('downloadFileResponse 无 Content-Disposition 时使用 fallbackName', async () => {
+    const { downloadFileResponse } = await import('@/api/download')
+
+    const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test3')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+
+    const clickSpy = vi.fn()
+    const origCreateElement = document.createElement.bind(document)
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = origCreateElement(tag)
+      if (tag === 'a') {
+        Object.defineProperty(el, 'click', { value: clickSpy })
+      }
+      return el
+    })
+
+    const blob = new Blob(['test'])
+    const response = {
+      headers: new Headers({}),
+      blob: () => Promise.resolve(blob),
+    } as Response
+
+    await downloadFileResponse(response, '病历', 'json')
+
+    expect(clickSpy).toHaveBeenCalled()
+
+    createObjectURLSpy.mockRestore()
   })
 })
