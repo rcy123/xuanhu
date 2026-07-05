@@ -25,6 +25,7 @@ from app.core.exceptions import (
     ModelGatewayUnavailableError,
 )
 from app.core.gateway import ModelGatewayClient
+from app.schemas.agent import InquiryAgentOutput
 
 # ---------------------------------------------------------------------------
 # 测试用 Schema
@@ -228,6 +229,117 @@ async def test_chat_structured_parse_from_content(mock_settings: Settings) -> No
 
     assert result.name == "from-content"
     assert result.value == 50
+
+
+@pytest.mark.asyncio
+async def test_chat_structured_json_mode_fallback(mock_settings: Settings) -> None:
+    """tool-call arguments malformed 时自动退回 JSON mode。"""
+    client = ModelGatewayClient(mock_settings)
+    call_payloads: list[dict[str, Any]] = []
+
+    def side_effect(request: httpx.Request) -> Response:
+        call_payloads.append(json.loads(request.content.decode()))
+        if len(call_payloads) == 1:
+            return Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"function": {"arguments": "not valid json"}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        return Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"name": "fallback", "value": 64})}}
+                ]
+            },
+        )
+
+    with respx.mock:
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            side_effect=side_effect
+        )
+
+        result = await client.chat_structured(
+            messages=[{"role": "user", "content": "Generate JSON"}],
+            output_schema=SampleOutput,
+            trace_id="test-trace-json-fallback",
+        )
+
+    assert result.name == "fallback"
+    assert result.value == 64
+    assert call_payloads[1]["response_format"] == {"type": "json_object"}
+    assert "tools" not in call_payloads[1]
+
+
+@pytest.mark.asyncio
+async def test_chat_structured_json_fallback_repairs_inquiry_output(mock_settings: Settings) -> None:
+    """InquiryAgent fallback 对多问句和 dotted dimension 做窄修复。"""
+    client = ModelGatewayClient(mock_settings)
+
+    with respx.mock:
+        responses = [
+            Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"function": {"arguments": "not valid json"}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            ),
+            Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "chief_complaint": None,
+                                        "present_illness": "头痛三天",
+                                        "past_history": None,
+                                        "personal_family_history": None,
+                                        "ten_questions_delta": None,
+                                        "four_diagnosis_delta": None,
+                                        "next_question": "请问头痛是持续性的吗？有没有恶心呕吐？",
+                                        "asked_dimension": "ten_questions_delta.head_body",
+                                        "safety_info_requested": [],
+                                        "safety_notes": None,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            ),
+        ]
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            side_effect=responses
+        )
+
+        result = await client.chat_structured(
+            messages=[{"role": "user", "content": "Generate JSON"}],
+            output_schema=InquiryAgentOutput,
+            trace_id="test-trace-inquiry-repair",
+        )
+
+    assert result.next_question == "请问头痛是持续性的吗？"
+    assert result.asked_dimension == "ten_questions"
 
 
 @pytest.mark.asyncio

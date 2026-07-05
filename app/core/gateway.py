@@ -372,10 +372,176 @@ class ModelGatewayClient:
                     type(exc).__name__,
                 )
 
+
+            fallback_result = await self._chat_structured_json_fallback(
+                messages=messages,
+                output_schema=output_schema,
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=trace_id,
+                session_id=session_id,
+                agent_name=agent_name,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+            )
+            if fallback_result is not None:
+                return fallback_result
         # 所有重试耗尽
         raise ChatStructuredParseError(
             last_parse_error or "结构化输出解析失败（重试耗尽）",
         )
+
+    def _loads_json_object(self, raw: str) -> dict[str, Any]:
+        """Load a JSON object, allowing markdown fences and surrounding text."""
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            parsed = json.loads(text[start : end + 1])
+
+        if not isinstance(parsed, dict):
+            raise TypeError("structured output is not a JSON object")
+        return parsed
+
+    async def _chat_structured_json_fallback(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        model_name: str,
+        temperature: float,
+        max_tokens: int,
+        trace_id: str,
+        session_id: str | None,
+        agent_name: str | None,
+        attempt: int,
+        max_attempts: int,
+    ) -> BaseModel | None:
+        """Fallback to JSON mode when tool-call structured output is malformed."""
+        schema_json = json.dumps(output_schema.model_json_schema(), ensure_ascii=False)
+        fallback_messages = [
+            *messages,
+            {
+                "role": "system",
+                "content": (
+                    "请重新输出。必须只返回一个合法 JSON object，不要 Markdown，不要解释文字。"
+                    f"JSON 必须符合这个 schema: {schema_json}"
+                ),
+            },
+        ]
+        payload: dict[str, Any] = {
+            "model": model_name,
+            "messages": fallback_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            **self._build_payload_overrides(trace_id, session_id, agent_name),
+        }
+
+        logger.info(
+            "chat_structured JSON fallback request: model=%s, schema=%s, trace_id=%s, attempt=%d/%d",
+            model_name,
+            output_schema.__name__,
+            trace_id,
+            attempt,
+            max_attempts,
+        )
+
+        try:
+            response = await self._request_with_retry(
+                method="POST",
+                path="/chat/completions",
+                payload=payload,
+            )
+            data = response.json()
+            message = data["choices"][0]["message"]
+            content = message.get("content") or ""
+            result = self._validate_or_repair_structured_payload(
+                self._loads_json_object(content),
+                output_schema,
+            )
+            logger.info(
+                "chat_structured JSON fallback completed: model=%s, schema=%s, trace_id=%s",
+                model_name,
+                output_schema.__name__,
+                trace_id,
+            )
+            return result
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValidationError):
+            logger.warning(
+                "chat_structured JSON fallback parse failed: schema=%s, trace_id=%s, attempt=%d/%d",
+                output_schema.__name__,
+                trace_id,
+                attempt,
+                max_attempts,
+            )
+            return None
+
+    def _validate_or_repair_structured_payload(
+        self,
+        payload: dict[str, Any],
+        output_schema: type[BaseModel],
+    ) -> BaseModel:
+        """Validate payload, with narrow repair for known model formatting drift."""
+        try:
+            return output_schema.model_validate(payload)
+        except ValidationError:
+            if output_schema.__name__ != "InquiryAgentOutput":
+                raise
+            repaired = dict(payload)
+            next_question = repaired.get("next_question")
+            if isinstance(next_question, str):
+                repaired["next_question"] = self._first_question(next_question)
+
+            asked_dimension = repaired.get("asked_dimension")
+            if isinstance(asked_dimension, str):
+                repaired["asked_dimension"] = self._normalize_inquiry_dimension(asked_dimension)
+
+            return output_schema.model_validate(repaired)
+
+    def _first_question(self, text: str) -> str:
+        """Keep the first question sentence to satisfy InquiryAgent's one-question contract."""
+        markers = ["另外", "此外", "还有", "同时请问", "另外请问", "顺便问", "再问一个", "另外问", "还想问"]
+        candidate = text.strip()
+        for marker in markers:
+            idx = candidate.find(marker)
+            if idx > 0:
+                candidate = candidate[:idx].strip()
+        question_positions = [pos for pos in (candidate.find("？"), candidate.find("?")) if pos >= 0]
+        if question_positions:
+            candidate = candidate[: min(question_positions) + 1].strip()
+        return candidate or text.strip()
+
+    def _normalize_inquiry_dimension(self, value: str) -> str:
+        """Map model-specific dimension strings back to the InquiryAgent enum-like values."""
+        allowed = {
+            "chief_complaint",
+            "present_illness",
+            "past_history",
+            "personal_family_history",
+            "ten_questions",
+            "four_diagnosis",
+            "safety",
+        }
+        if value in allowed:
+            return value
+        for dimension in allowed:
+            if value.startswith(dimension) or dimension in value:
+                return dimension
+        return "present_illness"
 
     async def embed(
         self,
