@@ -90,6 +90,7 @@ export const ErrorCode = {
   EXPORT_FORMAT_UNSUPPORTED: 'EXPORT_FORMAT_UNSUPPORTED',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   AGENT_SCHEMA_INVALID: 'AGENT_SCHEMA_INVALID',
+  AGENT_TRIGGER_FAILED: 'AGENT_TRIGGER_FAILED',
 } as const
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
@@ -106,6 +107,7 @@ export const RETRYABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   ErrorCode.REDIS_UNAVAILABLE,
   ErrorCode.INTERNAL_ERROR,
   ErrorCode.AGENT_SCHEMA_INVALID,
+  ErrorCode.AGENT_TRIGGER_FAILED,
 ])
 
 // ---------------------------------------------------------------------------
@@ -312,7 +314,7 @@ export interface MessageCreateRequest {
   role: 'doctor' | 'patient_proxy'
 }
 
-/** 提交消息响应 data。 */
+/** 提交消息响应 data。P8-6: 新增 agent_message / sufficiency_report。 */
 export interface MessageCreateData {
   message_id: string
   session_id: string
@@ -322,6 +324,29 @@ export interface MessageCreateData {
   current_stage: Stage
   state_version: number
   created_at: string
+  /** P8-6: Agent 回复消息（inquiry 阶段提交后由后端 Agent 生成）。 */
+  agent_message?: AgentMessageItem | null
+  /** P8-6: 完备性报告。 */
+  sufficiency_report?: SufficiencyReport | null
+}
+
+/** Agent 回复消息（嵌入 MessageCreateData）。 */
+export interface AgentMessageItem {
+  message_id: string
+  role: string
+  agent_name?: string | null
+  stage: Stage
+  content: string
+  agent_run_id?: string | null
+  created_at?: string | null
+}
+
+/** 完备性报告。 */
+export interface SufficiencyReport {
+  sufficient: boolean
+  covered: string[]
+  missing: string[]
+  suggestions: string[]
 }
 
 /** 消息历史列表项。 */
@@ -345,8 +370,25 @@ export interface MessageListParams {
 }
 
 // ---------------------------------------------------------------------------
-// §4.3 恢复
+// §4.3 阶段推进与恢复
 // ---------------------------------------------------------------------------
+
+/** 阶段推进请求体。 */
+export interface AdvanceRequest {
+  target_stage?: string | null
+  force?: boolean
+}
+
+/** 阶段推进响应 data。 */
+export interface AdvanceData {
+  session_id: string
+  current_stage: string
+  from_stage: string
+  state_version: number
+  blocked_reason?: string | null
+  agent_name?: string | null
+  trace_id?: string | null
+}
 
 /** 恢复中断会话请求体。 */
 export interface RecoveryRequest {

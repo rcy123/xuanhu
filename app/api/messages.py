@@ -4,6 +4,9 @@
 - POST /api/v1/consult/sessions/{session_id}/messages
 - GET  /api/v1/consult/sessions/{session_id}/messages
 
+P8-6: POST /messages 在 inquiry 阶段保存医生消息后触发 InquiryAgent
++ SufficiencyAgent，返回 Agent 回复与完备性报告。
+
 本模块不实现 Agent 调度、SSE、RAG 调用或病历生成。
 """
 
@@ -17,8 +20,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
+    AgentTriggerFailedError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
+    ModelGatewayUnavailableError,
     SessionBusyError,
     SessionNotFoundError,
     SessionTerminatedError,
@@ -77,7 +82,7 @@ async def create_message(
     doctor_id: str | None = Depends(_doctor_id),
     state_version: int | None = Depends(_state_version),
 ) -> JSONResponse:
-    """提交问诊消息。"""
+    """提交问诊消息（P8-6: 触发 Agent 回复）。"""
     trace_id = _get_trace_id(request)
     service = MessageService(db)
     data = await service.submit_message(
@@ -89,7 +94,10 @@ async def create_message(
     )
     return JSONResponse(
         status_code=200,
-        content=success_response(data=data.model_dump(mode="json"), trace_id=trace_id),
+        content=success_response(
+            data=data.model_dump(mode="json", exclude_none=True),
+            trace_id=trace_id,
+        ),
     )
 
 
@@ -213,6 +221,48 @@ async def message_invalid_stage_handler(
     )
 
 
+async def agent_trigger_failed_handler(
+    request: Request, exc: AgentTriggerFailedError
+) -> JSONResponse:
+    """AGENT_TRIGGER_FAILED 异常处理（P8-6）。
+
+    医生消息已落库，Agent 回复失败。返回 503，携带 agent_error_code。
+    """
+    trace_id = _get_trace_id(request)
+    payload: dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+        "detail": exc.detail,
+        "retryable": exc.retryable,
+        "stage": None,
+        "trace_id": trace_id,
+    }
+    if exc.agent_error_code:
+        payload["agent_error_code"] = exc.agent_error_code
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=payload,
+    )
+
+
+async def model_gateway_unavailable_handler(
+    request: Request, exc: ModelGatewayUnavailableError
+) -> JSONResponse:
+    """MODEL_GATEWAY_UNAVAILABLE 异常处理（P8-6）。"""
+    trace_id = _get_trace_id(request)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "MODEL_GATEWAY_UNAVAILABLE",
+            "message": "模型网关不可用，Agent 回复暂不可用",
+            "detail": str(exc),
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
+
+
 # 导出路由级异常处理映射
 message_exception_handlers: dict[Any, Any] = {
     SessionBusyError: session_busy_handler,
@@ -220,4 +270,6 @@ message_exception_handlers: dict[Any, Any] = {
     SessionTerminatedError: session_terminated_handler,
     SessionNotFoundError: message_not_found_handler,
     InvalidStageTransitionError: message_invalid_stage_handler,
+    AgentTriggerFailedError: agent_trigger_failed_handler,
+    ModelGatewayUnavailableError: model_gateway_unavailable_handler,
 }

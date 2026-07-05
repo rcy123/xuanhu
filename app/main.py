@@ -12,6 +12,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.api.advance import advance_exception_handlers
+from app.api.advance import router as advance_router
 from app.api.health import router as health_router
 from app.api.messages import message_exception_handlers
 from app.api.messages import router as messages_router
@@ -53,6 +55,7 @@ app.include_router(stream_router)
 app.include_router(recovery_router)
 app.include_router(review_router)
 app.include_router(record_router)
+app.include_router(advance_router)
 
 # 注册会话、消息、恢复、review 与 record 路由自定义异常处理器
 for exc_cls, handler in {
@@ -61,6 +64,7 @@ for exc_cls, handler in {
     **recovery_exception_handlers,
     **review_exception_handlers,
     **record_exception_handlers,
+    **advance_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
 

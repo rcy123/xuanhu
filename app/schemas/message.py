@@ -3,6 +3,8 @@
 覆盖 P3-2 两个接口：
 - POST /api/v1/consult/sessions/{session_id}/messages
 - GET  /api/v1/consult/sessions/{session_id}/messages
+
+P8-6 扩展 MessageCreateResponse 以支持 Agent 回复 + 完备性报告。
 """
 
 from __future__ import annotations
@@ -25,10 +27,32 @@ class MessageCreateRequest(BaseModel):
     role: Literal["doctor", "patient_proxy"] = Field(..., description="消息来源角色")
 
 
+class AgentMessageItem(BaseModel):
+    """Agent 回复消息（嵌入 MessageCreateResponse）。"""
+
+    message_id: str
+    role: str = "agent"
+    agent_name: str | None = None
+    stage: str
+    content: str
+    agent_run_id: str | None = None
+    created_at: datetime | None = None
+
+
+class SufficiencyReportData(BaseModel):
+    """完备性报告（嵌入 MessageCreateResponse）。"""
+
+    sufficient: bool
+    covered: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+
+
 class MessageCreateResponse(BaseModel):
     """提交消息响应 data。
 
     字段对齐接口设计文档 §4.2.1 成功响应。
+    P8-6: 新增 agent_message / sufficiency_report 可选字段。
     """
 
     message_id: str
@@ -39,6 +63,9 @@ class MessageCreateResponse(BaseModel):
     current_stage: str
     state_version: int
     created_at: datetime
+    # P8-6: Agent 回复与完备性报告
+    agent_message: AgentMessageItem | None = None
+    sufficiency_report: SufficiencyReportData | None = None
 
 
 class MessageItem(BaseModel):

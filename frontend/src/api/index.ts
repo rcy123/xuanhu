@@ -8,6 +8,8 @@
 import { request, requestWithRetry } from './client'
 import type { RequestContext } from './client'
 import type {
+  AdvanceData,
+  AdvanceRequest,
   CursorData,
   MessageCreateData,
   MessageCreateRequest,
@@ -259,6 +261,32 @@ export function exportRecord(
       method: 'GET',
       raw: true,
       rawErrorEnvelope: true,
+      ctx,
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 阶段推进（P8-6 §4.3.1）
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /consult/sessions/{id}/advance —— 阶段推进。
+ *
+ * 问诊完备性充分后调用，依次执行辨证→开方→加减→安全审核。
+ * 安全审核通过后挂起等待医师确认（不进病历生成）。
+ * review 阶段不可调用，需先提交医师确认。
+ */
+export function advanceSession(
+  sessionId: string,
+  body: AdvanceRequest = {},
+  ctx?: RequestContext,
+): Promise<AdvanceData> {
+  return request<AdvanceData>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/advance`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
       ctx,
     },
   )

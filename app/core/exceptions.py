@@ -258,3 +258,55 @@ class SafetyAcceptRiskUnsupportedError(XuanhuError):
     message = "MVP 不支持接受风险继续"
     status_code = 409
     retryable = False
+
+
+# ---------------------------------------------------------------------------
+# P8-6 阶段推进异常
+# ---------------------------------------------------------------------------
+
+
+class InsufficientInquiryError(XuanhuError):
+    """问诊信息不充分，不能推进。
+
+    接口设计文档 §4.3.1 定义：完备性不足时调用 advance 返回此错误。
+    """
+
+    code = "INSUFFICIENT_INQUIRY"
+    message = "问诊信息不充分，不能推进"
+    status_code = 400
+    retryable = False
+
+
+class PendingDoctorReviewError(XuanhuError):
+    """有待确认处方，请先处理。
+
+    接口设计文档 §4.3.1 定义：有 pending review 时调用 advance 返回此错误。
+    """
+
+    code = "PENDING_DOCTOR_REVIEW"
+    message = "有待确认处方，请先处理"
+    status_code = 409
+    retryable = False
+
+
+class AgentTriggerFailedError(XuanhuError):
+    """Agent 触发失败（模型网关不可用 / Agent 执行异常）。
+
+    用于 POST /messages 的段 B 失败时返回，医生消息已落库。
+    """
+
+    code = "AGENT_TRIGGER_FAILED"
+    message = "Agent 触发失败，医生消息已保存"
+    status_code = 503
+    retryable = True
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        detail: str | None = None,
+        retryable: bool | None = None,
+        agent_error_code: str | None = None,
+    ) -> None:
+        super().__init__(message, detail=detail, retryable=retryable)
+        self.agent_error_code = agent_error_code

@@ -81,10 +81,60 @@ async def db() -> AsyncSession:
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def client() -> AsyncClient:
-    """FastAPI 异步测试客户端。"""
+    """FastAPI 异步测试客户端（注入 fake inquiry/sufficiency agent 绕过真实模型网关）。"""
+    from app.agents.base import AgentResult
+    from app.agents.registry import AgentRegistry
+    from app.schemas.agent import InquiryAgentOutput, SufficiencyReport
+    from app.schemas.types import Stage
+
+    class _FakeInquiry:
+        name = "inquiry"
+        stage = "inquiry"
+        primary_sources = ()
+        allow_cross_source = True
+        output_schema = InquiryAgentOutput
+
+        async def run(self, state: Any, trace_id: str) -> AgentResult:
+            return AgentResult(
+                output=InquiryAgentOutput(
+                    next_question="请补充现病史细节",
+                    asked_dimension="chief_complaint",
+                ),
+                prompt_version="fake",
+            )
+
+    class _FakeSufficiency:
+        name = "sufficiency"
+        stage = "sufficiency"
+        primary_sources = ()
+        allow_cross_source = True
+        output_schema = SufficiencyReport
+
+        async def run(self, state: Any, trace_id: str) -> AgentResult:
+            return AgentResult(
+                output=SufficiencyReport(
+                    covered=["chief_complaint"],
+                    missing=["present_illness"],
+                    sufficient=False,
+                    suggestions=["请补充现病史"],
+                ),
+                prompt_version="fake",
+            )
+
+    reg = AgentRegistry()
+    reg.register(Stage.INQUIRY, _FakeInquiry())  # type: ignore[arg-type]
+    reg.register(Stage.SUFFICIENCY, _FakeSufficiency())  # type: ignore[arg-type]
+
+    import app.services.message as msg_module
+
+    _orig_registry = msg_module._default_inquiry_registry
+    msg_module._default_inquiry_registry = lambda: reg  # type: ignore[assignment]
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+    msg_module._default_inquiry_registry = _orig_registry  # type: ignore[assignment]
 
 
 @pytest_asyncio.fixture(loop_scope="module", autouse=True)
@@ -194,7 +244,7 @@ async def test_stream_endpoint_session_not_found(client: AsyncClient) -> None:
 async def test_message_submit_writes_message_created_stream_event(
     client: AsyncClient,
 ) -> None:
-    """P3-2 消息提交成功后写入 message.created Redis Stream 事件。"""
+    """P3-2 消息提交成功后写入 message.created Redis Stream 事件。P8-6: 医生消息 + Agent 消息各一条。"""
     session = await _create_session(client)
     session_id = session["session_id"]
 
@@ -204,15 +254,19 @@ async def test_message_submit_writes_message_created_stream_event(
         headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
     )
     assert response.status_code == 200, response.text
-    message_id = response.json()["data"]["message_id"]
+    doctor_message_id = response.json()["data"]["message_id"]
 
     events, needs_resync = await EventService().read_events_after(session_id, "0-0")
 
     assert needs_resync is False
     message_events = [event for event in events if event.event_type == "message.created"]
-    assert message_events
-    payload = message_events[-1].payload
-    assert payload["session_id"] == session_id
-    assert payload["message_id"] == message_id
-    assert payload["role"] == "doctor"
-    assert payload["content"] == "SSE message event"
+    assert len(message_events) >= 1
+    # 至少有一条 doctor 消息事件
+    doctor_events = [
+        e for e in message_events
+        if e.payload.get("message_id") == doctor_message_id
+        and e.payload.get("role") == "doctor"
+    ]
+    assert len(doctor_events) >= 1, f"应有 doctor 消息事件: {[e.payload for e in message_events]}"
+    assert doctor_events[0].payload["session_id"] == session_id
+    assert doctor_events[0].payload["content"] == "SSE message event"
