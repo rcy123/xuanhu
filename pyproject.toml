@@ -90,3 +90,8 @@ addopts = [
 markers = [
     "integration: marks tests that require a real PostgreSQL database (deselect with '-m \"not integration\"')",
 ]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.61.0",
+]
