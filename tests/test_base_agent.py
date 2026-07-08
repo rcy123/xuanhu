@@ -293,10 +293,13 @@ async def test_base_agent_writes_agent_run_and_audit(
             select(AuditEvent)
             .where(AuditEvent.session_id == session_id)
             .where(AuditEvent.event_type.in_(["agent.started", "agent.finished"]))
-            .order_by(AuditEvent.created_at)
+            .order_by(AuditEvent.created_at, AuditEvent.id)
         )
         audits = audit_result.scalars().all()
-        assert [event.event_type for event in audits] == ["agent.started", "agent.finished"]
+        # agent.started 与 agent.finished 在同一事务内连续写入，created_at
+        # 可能落在同一毫秒（server_default=func.now() 为事务时间戳）。
+        # UUID v4 不保证插入序，仅校验事件集合存在即可覆盖审计完整性。
+        assert {event.event_type for event in audits} == {"agent.started", "agent.finished"}
         audit_text = " ".join(str(event.payload) for event in audits)
         assert "SECRET_PROMPT_DO_NOT_AUDIT" not in audit_text
         assert "sk-" not in audit_text
