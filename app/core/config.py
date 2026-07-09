@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
 from pydantic import Field
@@ -151,6 +151,13 @@ class Settings(BaseSettings):
     rag_top_n_final: int = Field(default=8, ge=1, description="合并去重后最终返回条数")
 
     # ---- Agent ----
+    agent_runtime_version: Literal["legacy", "langgraph"] = Field(
+        default="legacy",
+        description=(
+            "新会话默认 Agent 运行时。L0-L8 默认 legacy；"
+            "该开关不得改变既有会话的运行时身份"
+        ),
+    )
     agent_max_retries: int = Field(default=2, ge=0, description="Agent 最大重试次数")
     safety_rollback_limit: int = Field(default=3, ge=1, description="安全审核回退次数上限")
     enable_streaming: bool = Field(default=False, description="是否启用 SSE 流式输出")
