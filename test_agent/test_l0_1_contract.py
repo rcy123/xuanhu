@@ -433,6 +433,8 @@ class TestL0Scope:
             "routing.py",
             "graph.py",
             "checkpoint.py",
+            "runner.py",
+            "events.py",
         }
     )
 

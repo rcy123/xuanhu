@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L1 进行中 |
-| 当前任务 | L1-4 已发布，待验收 |
-| LangGraph 新链路 | L1-4 GraphRunner、超时取消与事件转换已发布，等待交付验收 |
+| 当前阶段 | L2 进行中 |
+| 当前任务 | L2-1 已发布，待交付验收 |
+| LangGraph 新链路 | L1 Runtime 骨架阶段已关闭；进入 L2 Harness 核心与领域 State，当前建设 Observation/Safety/Artifact Schema 与数据库迁移 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -44,8 +44,8 @@
 | 阶段 | 名称 | 状态 | 完成度 | 进入条件 | 关闭条件 |
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
-| L1 | LangGraph Runtime 骨架 | 进行中 | 75% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
-| L2 | Harness 核心与领域 State | 未开始 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
+| L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
+| L2 | Harness 核心与领域 State | 进行中 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
@@ -71,13 +71,13 @@
 | L1-1 | LangGraph 与 PG Checkpointer 兼容性 Spike | L0 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-1.md` |
 | L1-2 | GraphState、MainGraph 与命令路由 | L1-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-2.md` |
 | L1-3 | AsyncPostgresSaver 与跨进程恢复 | L1-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-3.md` |
-| L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l1-4.md` |
+| L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-4.md` |
 
 ### L2：Harness 核心与领域 State
 
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
-| L2-1 | Observation/Safety/Artifact Schema 与数据库迁移 | L1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-1.md` |
+| L2-1 | Observation/Safety/Artifact Schema 与数据库迁移 | L1 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l2-1.md` |
 | L2-2 | AgentSpec、RunSpec 与 AgentRuntime | L2-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-2.md` |
 | L2-3 | ContextBuilder、Prompt 分层与隐私投影 | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-3.md` |
 | L2-4 | Verifier Chain 与 Domain Reducer | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-4.md` |
@@ -158,6 +158,7 @@
 | AR-B-005 | P1 | L1-3 的 `validate_checkpoint_config` 未接入 MainGraph/checkpoint 执行路径，错配 state 可写入错误 namespace；`close_postgres_checkpointer` 对真实 saver 调用不存在的 `__aexit__` 并吞掉异常，实际不关闭资源；跨进程 helper 通过命令行传递含密码 DB_URL 且原样输出底层异常，可能泄露凭据 | L1-3 | 已关闭 | 校验已置于 checkpointer 实际写入边界；以拥有生命周期的 context manager 管理关闭；DB_URL 由子进程环境读取并统一脱敏错误输出 |
 | AR-B-006 | P1 | L1-3 第 1 轮返工不完整：新增 `validated_ainvoke` 仍是调用方可绕过的自由函数，直接 `graph.ainvoke` 继续把错配 state 写入 checkpoint；子进程虽不再通过 argv 传 DB_URL，但仍输出截断的原始 `str(exc)`，真实连接失败暴露目标 IP、端口和底层 psycopg 文本 | L1-3 | 已关闭 | 在 checkpointer 写入边界强制校验；公开 graph API 的错配 state 已有回归测试；子进程失败只返回固定错误码和异常类型 |
 | AR-B-007 | P1 | L1-3 第二轮行为和全量测试通过，但 Ruff 门禁失败：`app/agent_runtime/checkpoint.py:26` 导入未使用的 `collections.abc.Sequence` | L1-3 | 已关闭 | 删除未使用导入，Ruff 复验通过 |
+| AR-B-008 | P1 | L1-4 的 `_sanitize_runner_error` 仅截断消息并处理 `postgresql://`，仍会把任意异常内的 API key、Bearer token、prompt 片段或患者身份文本带入 `GraphRunnerError`；专项测试只覆盖 DB URL，未覆盖该隐私边界 | L1-4 | 已关闭 | 对外 Runner 错误改为固定文本和错误码，底层异常链不再保留；ainvoke/stream 已覆盖 API key、token、prompt、身份文本和 DB URL 的异常、事件与异常链脱敏回归 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -179,11 +180,17 @@
 | 2026-07-10 | L1-3 | 1 | 验收未通过 | L1-3 专项 `33 passed`、L1-2/L1-1/L0 回归 `187 passed`，ruff、Python 3.11 mypy、lock、diff check 通过；未跑全量门禁。资源生命周期和 DB_URL argv 已修复，但诊断再次证明直接 `graph.ainvoke` 可绕过 `validated_ainvoke` 并写入错配 state；使用伪造 DB_URL 触发真实子进程连接失败时，stdout 暴露目标 IP、端口和底层连接文本。登记 AR-B-006，AR-B-005 未关闭 |
 | 2026-07-10 | L1-3 | 2 | 验收未通过 | 独立诊断确认公开 `graph.ainvoke` 错配拒绝、子进程固定错误码输出；L1-3 专项 `33 passed`；L1-2/L1-1/L0 回归 `187 passed`；定向可写临时目录全量 `1043 passed, 1 xfailed, 2 warnings`；mypy（含 Python 3.11）、lock、diff check 通过，但 Ruff 因 `checkpoint.py:26` 未使用 `Sequence` 失败，登记 AR-B-007 |
 | 2026-07-10 | L1-3 | 3 | 验收通过 | 删除未使用 `Sequence` 后 Ruff 通过；L1-3 专项 `33 passed`；L1-2/L1-1/L0 合并回归 `220 passed`；全量后端 `1043 passed, 1 xfailed, 2 warnings`；mypy 默认与显式 Python 3.11、uv lock、diff check 均通过；AR-B-005/006/007 关闭 |
+| 2026-07-10 | L1-4 | 0 | 验收未通过 | L1-4 专项 `32 passed`，但独立诊断输入 `api_key=demo-secret-value`、`prompt=patient name demo-user`、`authorization: Bearer demo-token` 均可经 `_sanitize_runner_error` 原样进入 `GraphRunnerError`。违反错误、事件和日志不得泄露密钥、prompt 或患者身份的隐私门禁；登记 AR-B-008，未继续执行全量门禁 |
+| 2026-07-10 | L1-4 | 1 | 验收通过 | AR-B-008 已关闭：Runner 对外错误仅保留固定文本和错误码，异常链不保留底层文本；L1-4 专项 `34 passed`；L1-3/L1-2/L1-1/L0 合并回归 `254 passed`；隔离临时目录全量后端 `1077 passed, 1 xfailed, 2 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、diff check 通过 |
+| 2026-07-10 | L1 | 阶段门禁 | 验收通过 | L1-1～L1-4 全部完成且 AR-B-003～008 均关闭；复核 L1-4 专项 `34 passed`；隔离临时目录全量后端 `1077 passed, 1 xfailed, 3 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、git diff check 通过；保持 `AGENT_RUNTIME_VERSION=legacy` |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-10 | Codex | L1 阶段关口通过并发布 L2-1：L1 四项任务全部完成、无开放 P0/P1/AR-B，专项、全量后端与静态门禁通过；L2-1 限定为 Observation/Safety/Artifact Schema、对应数据库迁移与测试，不实现 AgentRuntime、Reducer、Repository/outbox、业务 Agent、API 或切流 |
+| 2026-07-10 | Codex | L1-4 第 1 轮复验通过：固定 Runner 对外错误并断开底层异常链，新增 API key、Bearer token、prompt、身份文本和 DB URL 的 ainvoke/stream 隐私回归；专项、合并回归、全量后端及静态门禁通过，关闭 AR-B-008，L1-4 完成 |
+| 2026-07-10 | Codex | L1-4 第 0 轮验收未通过：专项 `32 passed`，但 Runner 错误归一化将任意 `str(exc)` 前缀带入对外错误，API key、Bearer token、prompt 和身份类文本均可泄露；登记 AR-B-008，限定返工为固定错误输出与隐私回归测试，不扩大到 API、业务 Agent 或 L2 |
 | 2026-07-10 | Codex | 提交 L1-3 并发布 L1-4：实现 GraphRunner 的 `ainvoke/astream` 包装、总超时与取消语义、错误归一化、state 版本校验，以及 LangGraph 事件到版本化业务事件的转换；不得接入 API/SSE 路由、业务 Agent、领域 Schema、RAG 或 Legacy 改造 |
 | 2026-07-10 | Codex | L1-3 第 3 轮复验通过：删除未使用 `Sequence` 导入，Ruff、L1-3 专项、合并回归、全量后端和静态门禁均通过；AR-B-005/006/007 关闭，L1-3 完成，下一任务 L1-4 |
 | 2026-07-10 | Codex | L1-3 第 2 轮复验：不可绕过 checkpointer 校验、资源关闭和子进程错误脱敏均通过，定向全量 `1043 passed, 1 xfailed, 2 warnings`；仅 Ruff 报 `Sequence` 未使用，登记 AR-B-007，限定删除导入并复跑 Ruff |
@@ -207,8 +214,8 @@
 
 ## 8. 下一步
 
-1. 等待 L1-4 交付并验收：GraphRunner、超时取消与事件转换。
-2. L1-4 不接入业务 Agent 或生产 API 路由，不改造 Legacy 恢复链路。
+1. 等待并验收 L2-1：Observation/Safety/Artifact Schema 与数据库迁移。
+2. L2-1 验收通过后发布 L2-2：AgentSpec、RunSpec 与 AgentRuntime。
 3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求

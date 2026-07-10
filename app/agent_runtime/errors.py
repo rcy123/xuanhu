@@ -1,7 +1,8 @@
 """Agent Runtime 错误类型。
 
-L1-2/L1-3 只定义图执行和 checkpoint 相关的最小错误类型，不引入业务异常。
-错误消息不得包含 prompt 原文、API key、完整模型输出、DB URL、密码或患者数据。
+L1-2/L1-3/L1-4 只定义图执行、checkpoint 和 runner 相关的最小错误类型，
+不引入业务异常。错误消息不得包含 prompt 原文、API key、完整模型输出、
+DB URL、密码或患者数据。
 """
 
 from __future__ import annotations
@@ -74,3 +75,30 @@ class CheckpointHealthCheckError(CheckpointError):
             code="CHECKPOINT_HEALTH_CHECK_FAILED",
         )
         self.detail = detail
+
+
+class GraphRunnerError(GraphStateError):
+    """GraphRunner 执行失败的基类。
+
+    所有 runner 相关错误（超时、取消、执行异常）均继承此类。
+    消息不得包含完整 state、prompt、模型原始输出、密钥或患者身份。
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message, code=code)
+
+
+class GraphRunnerTimeoutError(GraphRunnerError):
+    """GraphRunner 总超时。
+
+    在可配置的总超时时间内图未完成时抛出。
+    ``asyncio.CancelledError`` 不被吞掉；超时通过 ``asyncio.timeout`` 实现，
+    超时后内部任务被取消，此异常在 ``asyncio.TimeoutError`` 捕获后包装抛出。
+    """
+
+    def __init__(self, *, timeout_seconds: float) -> None:
+        super().__init__(
+            f"Graph runner timed out after {timeout_seconds}s",
+            code="RUNNER_TIMEOUT",
+        )
+        self.timeout_seconds = timeout_seconds
