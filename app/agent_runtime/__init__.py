@@ -17,4 +17,45 @@ L1-2 范围：
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from app.agent_runtime.context import (
+    ContextBuilder,
+    ContextBuilderError,
+    ContextPacket,
+    PromptLayer,
+    PromptMessage,
+    PseudonymKeyProvider,
+    PseudonymKeyUnavailable,
+    TemplateValidationError,
+    TokenBudget,
+    TokenBudgetExceeded,
+    pseudonym,
+    render_template,
+)
+from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase, RuntimeRunRecorder
+from app.agent_runtime.specs import (
+    AgentSpec,
+    Capability,
+    FailurePolicy,
+    ModelPolicy,
+    RunArtifact,
+    RunSpec,
+    RuntimeErrorCode,
+    TokenUsage,
+)
+
+__all__ = [
+    "AgentRuntime",
+    "RuntimeErrorBase",
+    "RuntimeRunRecorder",
+    "AgentSpec",
+    "Capability",
+    "FailurePolicy",
+    "ModelPolicy",
+    "RunArtifact",
+    "RunSpec",
+    "RuntimeErrorCode",
+    "TokenUsage",
+    "ContextBuilder", "ContextBuilderError", "ContextPacket", "PromptLayer", "PromptMessage",
+    "PseudonymKeyProvider", "PseudonymKeyUnavailable",
+    "TemplateValidationError", "TokenBudget", "TokenBudgetExceeded", "pseudonym", "render_template",
+]

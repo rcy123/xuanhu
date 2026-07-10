@@ -45,14 +45,16 @@ class ModelGatewayClient:
     所有模型调用配置均来自 ``get_settings()``，使用 ``MODEL_GATEWAY_*`` 口径。
     """
 
-    def __init__(self, settings: Any = None) -> None:
+    def __init__(self, settings: Any = None, *, max_retries: int | None = None) -> None:
         if settings is None:
             settings = get_settings()
         self._settings = settings
         self._base_url = settings.model_gateway_base_url.rstrip("/")
         self._api_key = settings.model_gateway_api_key
         self._timeout = settings.model_gateway_timeout_seconds
-        self._max_retries = settings.model_gateway_max_retries
+        # Explicit callers (the L2 runtime) can use a separate retry budget;
+        # all legacy callers preserve the configured behavior by default.
+        self._max_retries = settings.model_gateway_max_retries if max_retries is None else max_retries
         self._route_profile = settings.model_gateway_route_profile
         self._chat_model = settings.chat_model
         self._embedding_model = settings.embedding_model
@@ -87,6 +89,7 @@ class ModelGatewayClient:
         path: str,
         payload: dict[str, Any],
         retryable_on_parse: bool = False,
+        max_requests: int | None = None,
     ) -> httpx.Response:
         """带重试的 HTTP 请求，处理超时、连接失败和非 2xx 响应。
 
@@ -106,7 +109,8 @@ class ModelGatewayClient:
         url = f"{self._base_url}{path}"
         headers = self._build_headers()
         last_exception: Exception | None = None
-        max_attempts = 1 + self._max_retries
+        configured_attempts = 1 + self._max_retries
+        max_attempts = configured_attempts if max_requests is None else min(configured_attempts, max_requests)
 
         for attempt in range(max_attempts):
             try:
@@ -263,6 +267,7 @@ class ModelGatewayClient:
         trace_id: str,
         session_id: str | None = None,
         agent_name: str | None = None,
+        max_requests: int | None = None,
     ) -> BaseModel:
         """结构化输出，通过 tools/function calling 强制 schema。
 
@@ -287,9 +292,12 @@ class ModelGatewayClient:
             ModelGatewayUnavailableError: 网关不可用。
             ModelGatewayTimeoutError: 请求超时。
         """
+        if max_requests is not None and max_requests < 1:
+            raise ValueError("max_requests must be at least 1")
         model_name = model or self._chat_model
         schema_dict = output_schema.model_json_schema()
-        max_attempts = 1 + self._max_retries
+        configured_attempts = 1 + self._max_retries
+        max_attempts = configured_attempts if max_requests is None else min(configured_attempts, max_requests)
         last_parse_error: str | None = None
 
         for attempt in range(max_attempts):
@@ -326,6 +334,7 @@ class ModelGatewayClient:
                     method="POST",
                     path="/chat/completions",
                     payload=payload,
+                    max_requests=max_requests,
                 )
             except (ModelGatewayUnavailableError, ModelGatewayTimeoutError):
                 raise  # 网关错误直接上抛，不重试解析
@@ -372,6 +381,11 @@ class ModelGatewayClient:
                     type(exc).__name__,
                 )
 
+
+            # A bounded caller owns a request budget.  Its one request must
+            # not be expanded by the optional JSON fallback.
+            if max_requests is not None:
+                break
 
             fallback_result = await self._chat_structured_json_fallback(
                 messages=messages,
