@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L2 进行中 |
-| 当前任务 | L2-1 已发布，待交付验收 |
-| LangGraph 新链路 | L1 Runtime 骨架阶段已关闭；进入 L2 Harness 核心与领域 State，当前建设 Observation/Safety/Artifact Schema 与数据库迁移 |
+| 当前任务 | L2-2 已发布，待交付验收 |
+| LangGraph 新链路 | L2-1 领域 Schema 与迁移验收通过；当前建设 AgentSpec、RunSpec 与 AgentRuntime |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -45,7 +45,7 @@
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
-| L2 | Harness 核心与领域 State | 进行中 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
+| L2 | Harness 核心与领域 State | 进行中 | 20% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
@@ -77,8 +77,8 @@
 
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
-| L2-1 | Observation/Safety/Artifact Schema 与数据库迁移 | L1 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l2-1.md` |
-| L2-2 | AgentSpec、RunSpec 与 AgentRuntime | L2-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-2.md` |
+| L2-1 | Observation/Safety/Artifact Schema 与数据库迁移 | L1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-1.md` |
+| L2-2 | AgentSpec、RunSpec 与 AgentRuntime | L2-1 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l2-2.md` |
 | L2-3 | ContextBuilder、Prompt 分层与隐私投影 | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-3.md` |
 | L2-4 | Verifier Chain 与 Domain Reducer | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-4.md` |
 | L2-5 | Repository、幂等事务与 Outbox | L2-1/L2-4 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-5.md` |
@@ -159,6 +159,7 @@
 | AR-B-006 | P1 | L1-3 第 1 轮返工不完整：新增 `validated_ainvoke` 仍是调用方可绕过的自由函数，直接 `graph.ainvoke` 继续把错配 state 写入 checkpoint；子进程虽不再通过 argv 传 DB_URL，但仍输出截断的原始 `str(exc)`，真实连接失败暴露目标 IP、端口和底层 psycopg 文本 | L1-3 | 已关闭 | 在 checkpointer 写入边界强制校验；公开 graph API 的错配 state 已有回归测试；子进程失败只返回固定错误码和异常类型 |
 | AR-B-007 | P1 | L1-3 第二轮行为和全量测试通过，但 Ruff 门禁失败：`app/agent_runtime/checkpoint.py:26` 导入未使用的 `collections.abc.Sequence` | L1-3 | 已关闭 | 删除未使用导入，Ruff 复验通过 |
 | AR-B-008 | P1 | L1-4 的 `_sanitize_runner_error` 仅截断消息并处理 `postgresql://`，仍会把任意异常内的 API key、Bearer token、prompt 片段或患者身份文本带入 `GraphRunnerError`；专项测试只覆盖 DB URL，未覆盖该隐私边界 | L1-4 | 已关闭 | 对外 Runner 错误改为固定文本和错误码，底层异常链不再保留；ainvoke/stream 已覆盖 API key、token、prompt、身份文本和 DB URL 的异常、事件与异常链脱敏回归 |
+| AR-B-009 | P1 | L2-1 ORM 与迁移外键删除语义不一致：ORM 声明 CASCADE/RESTRICT/SET NULL，migration `_uuid_column` 却未传 `ondelete`；Safety Pydantic Schema 接受数据库约束拒绝的 pregnancy/lactation 任意字符串；Artifact revision 允许同一 artifact 多个 `current`，且父 revision 可跨 artifact/session，无法保证有效 revision 链 | L2-1 | 已关闭 | Schema/ORM/migration 外键 action 与安全值域已统一；partial unique index 保证单 current，复合自引用 FK 与前序 revision CHECK 保证同 artifact/session 父链；真实 PostgreSQL 约束测试通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -183,11 +184,16 @@
 | 2026-07-10 | L1-4 | 0 | 验收未通过 | L1-4 专项 `32 passed`，但独立诊断输入 `api_key=demo-secret-value`、`prompt=patient name demo-user`、`authorization: Bearer demo-token` 均可经 `_sanitize_runner_error` 原样进入 `GraphRunnerError`。违反错误、事件和日志不得泄露密钥、prompt 或患者身份的隐私门禁；登记 AR-B-008，未继续执行全量门禁 |
 | 2026-07-10 | L1-4 | 1 | 验收通过 | AR-B-008 已关闭：Runner 对外错误仅保留固定文本和错误码，异常链不保留底层文本；L1-4 专项 `34 passed`；L1-3/L1-2/L1-1/L0 合并回归 `254 passed`；隔离临时目录全量后端 `1077 passed, 1 xfailed, 2 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、diff check 通过 |
 | 2026-07-10 | L1 | 阶段门禁 | 验收通过 | L1-1～L1-4 全部完成且 AR-B-003～008 均关闭；复核 L1-4 专项 `34 passed`；隔离临时目录全量后端 `1077 passed, 1 xfailed, 3 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、git diff check 通过；保持 `AGENT_RUNTIME_VERSION=legacy` |
+| 2026-07-10 | L2-1 | 0 | 验收未通过 | 专项 `5 passed`、models/migrations 回归 `59 passed`、Ruff、Python 3.11 mypy、uv lock、diff check 通过；独立真实 PostgreSQL `0001 → 0002 → 0001 → 0002` 迁移循环通过。静态契约审查发现迁移未实现 ORM 的 FK ondelete、Safety Schema/DB 值域不一致、artifact revision 缺少单 current 与同 artifact 父链约束，登记 AR-B-009；未继续全量门禁 |
+| 2026-07-10 | L2-1 | 1 | 验收通过 | AR-B-009 关闭：真实 PostgreSQL 专项 `8 passed`，覆盖 `0001 → 0002 → 0001 → 0002`、FK action、安全值域、单 current、同 artifact/session 前序父链；额外 session 级联删除诊断通过；models/migrations `59 passed`；全量后端 `1085 passed, 1 xfailed, 6 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、diff check 通过 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-10 | Codex | 提交 L2-1 并发布 L2-2：定义版本化 AgentSpec/RunSpec/RunArtifact 等 Harness 协议，基于现有 ModelGatewayClient 实现受预算约束的 AgentRuntime，透传每 Agent 的 model/token/timeout/temperature 并注入最小 run/audit 记录；不得实现 ContextBuilder、Verifier/Reducer、Repository/outbox、业务 Agent、API 或切流 |
+| 2026-07-10 | Codex | L2-1 第 1 轮复验通过：统一 Schema/ORM/migration 外键与安全值域，以 partial unique index 和复合父链 FK/CHECK 固化 artifact revision 约束；真实 PG 专项、额外级联诊断、全量后端及静态门禁通过，关闭 AR-B-009，下一可发布 L2-2 |
+| 2026-07-10 | Codex | L2-1 第 0 轮验收未通过：专项、既有迁移回归、静态门禁及真实 PostgreSQL upgrade/downgrade 循环通过，但 ORM/migration 外键删除语义、Safety Schema/DB 值域和 artifact revision 链约束不一致；登记 AR-B-009，限定返工不扩展到 L2-2～L2-5 |
 | 2026-07-10 | Codex | L1 阶段关口通过并发布 L2-1：L1 四项任务全部完成、无开放 P0/P1/AR-B，专项、全量后端与静态门禁通过；L2-1 限定为 Observation/Safety/Artifact Schema、对应数据库迁移与测试，不实现 AgentRuntime、Reducer、Repository/outbox、业务 Agent、API 或切流 |
 | 2026-07-10 | Codex | L1-4 第 1 轮复验通过：固定 Runner 对外错误并断开底层异常链，新增 API key、Bearer token、prompt、身份文本和 DB URL 的 ainvoke/stream 隐私回归；专项、合并回归、全量后端及静态门禁通过，关闭 AR-B-008，L1-4 完成 |
 | 2026-07-10 | Codex | L1-4 第 0 轮验收未通过：专项 `32 passed`，但 Runner 错误归一化将任意 `str(exc)` 前缀带入对外错误，API key、Bearer token、prompt 和身份类文本均可泄露；登记 AR-B-008，限定返工为固定错误输出与隐私回归测试，不扩大到 API、业务 Agent 或 L2 |
@@ -214,8 +220,9 @@
 
 ## 8. 下一步
 
-1. 等待并验收 L2-1：Observation/Safety/Artifact Schema 与数据库迁移。
-2. L2-1 验收通过后发布 L2-2：AgentSpec、RunSpec 与 AgentRuntime。
+1. 等待并验收 L2-2：AgentSpec、RunSpec 与 AgentRuntime。
+2. L2-2 验收通过后发布 L2-3：ContextBuilder、Prompt 分层与隐私投影。
+3. L2-2 不实现 ContextBuilder、Verifier/Reducer、Repository/outbox 或业务 Agent。
 3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求

@@ -7,6 +7,7 @@ Alembic 在 ``env.py`` 中依赖此行为。
 from app.models.agent import AgentEvidence, AgentRun
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
+from app.models.domain import ArtifactRevision, GateResult, GraphRun, GraphRunStep, Observation, SafetyProfile
 from app.models.knowledge import (
     Acupoint,
     DosageUnit,
@@ -26,6 +27,12 @@ __all__ = [
     "AuditEvent",
     "ConsultMessage",
     "ConsultSession",
+    "Observation",
+    "SafetyProfile",
+    "ArtifactRevision",
+    "GateResult",
+    "GraphRun",
+    "GraphRunStep",
     "DoctorReview",
     "DosageUnit",
     "Formula",
