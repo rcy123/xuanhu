@@ -1,4 +1,4 @@
-"""悬壶 LangGraph Agent Runtime 骨架（L1）。
+"""悬壶 Harness 与 LangGraph Agent Runtime 公共契约。
 
 本包是 LangGraph v2 执行体系的最小运行底座，不包含临床逻辑。
 
@@ -31,6 +31,15 @@ from app.agent_runtime.context import (
     pseudonym,
     render_template,
 )
+from app.agent_runtime.reducer import (
+    DomainDelta,
+    DomainReducerError,
+    DomainState,
+    ReducerErrorCode,
+    domain_delta_digest,
+    reduce_domain_state,
+    validate_domain_delta,
+)
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase, RuntimeRunRecorder
 from app.agent_runtime.specs import (
     AgentSpec,
@@ -41,6 +50,23 @@ from app.agent_runtime.specs import (
     RunSpec,
     RuntimeErrorCode,
     TokenUsage,
+)
+from app.agent_runtime.verifiers import (
+    DEFAULT_VERIFIER_CHAIN,
+    CheckResult,
+    CheckStatus,
+    DeltaLegalityVerifier,
+    OutputTypeVerifier,
+    PrerequisiteVerifier,
+    ProvenanceVersionVerifier,
+    SchemaVerifier,
+    VerificationContext,
+    VerificationFailureClass,
+    VerificationFailureCode,
+    VerificationReport,
+    Verifier,
+    VerifierChain,
+    VerifierName,
 )
 
 __all__ = [
@@ -55,7 +81,38 @@ __all__ = [
     "RunSpec",
     "RuntimeErrorCode",
     "TokenUsage",
-    "ContextBuilder", "ContextBuilderError", "ContextPacket", "PromptLayer", "PromptMessage",
-    "PseudonymKeyProvider", "PseudonymKeyUnavailable",
-    "TemplateValidationError", "TokenBudget", "TokenBudgetExceeded", "pseudonym", "render_template",
+    "ContextBuilder",
+    "ContextBuilderError",
+    "ContextPacket",
+    "PromptLayer",
+    "PromptMessage",
+    "PseudonymKeyProvider",
+    "PseudonymKeyUnavailable",
+    "TemplateValidationError",
+    "TokenBudget",
+    "TokenBudgetExceeded",
+    "pseudonym",
+    "render_template",
+    "DomainDelta",
+    "DomainReducerError",
+    "DomainState",
+    "ReducerErrorCode",
+    "domain_delta_digest",
+    "reduce_domain_state",
+    "validate_domain_delta",
+    "DEFAULT_VERIFIER_CHAIN",
+    "CheckResult",
+    "CheckStatus",
+    "DeltaLegalityVerifier",
+    "OutputTypeVerifier",
+    "PrerequisiteVerifier",
+    "ProvenanceVersionVerifier",
+    "SchemaVerifier",
+    "VerificationContext",
+    "VerificationFailureClass",
+    "VerificationFailureCode",
+    "VerificationReport",
+    "Verifier",
+    "VerifierChain",
+    "VerifierName",
 ]
