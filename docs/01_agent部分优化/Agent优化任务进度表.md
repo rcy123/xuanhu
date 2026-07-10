@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L0 已关闭；L1 进入条件已满足 |
-| 当前任务 | 无；下一可发布任务为 L1-1 |
-| LangGraph 新链路 | 未开始 |
+| 当前阶段 | L1 进行中 |
+| 当前任务 | L1-1 已完成；下一可发布任务为 L1-2 |
+| LangGraph 新链路 | L1-1 兼容性 Spike 验收通过 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -44,7 +44,7 @@
 | 阶段 | 名称 | 状态 | 完成度 | 进入条件 | 关闭条件 |
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
-| L1 | LangGraph Runtime 骨架 | 未开始 | 0% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
+| L1 | LangGraph Runtime 骨架 | 进行中 | 25% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 未开始 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
@@ -68,7 +68,7 @@
 
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
-| L1-1 | LangGraph 与 PG Checkpointer 兼容性 Spike | L0 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-1.md` |
+| L1-1 | LangGraph 与 PG Checkpointer 兼容性 Spike | L0 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-1.md` |
 | L1-2 | GraphState、MainGraph 与命令路由 | L1-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-2.md` |
 | L1-3 | AsyncPostgresSaver 与跨进程恢复 | L1-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-3.md` |
 | L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-4.md` |
@@ -153,6 +153,7 @@
 |---|---|---|---|---|---|
 | AR-B-001 | P1 | L0-1 文档契约互相冲突：允许 LangGraph 会话阶段级回退到 Legacy、允许 LLM Sufficiency 回归、Graph State 可保存结构化模型结果且沿用 `pending_review`、下一问职责仍归 InquiryAgent；契约测试未能捕获这些冲突 | L0-1 | 已关闭 | ADR、兼容矩阵、迁移边界和精确负向契约测试已统一 |
 | AR-B-002 | P1 | L0-1 第 1 轮返修不完整：下一问职责、`force=true`、Graph State 字段和弱测试仍有冲突 | L0-1 | 已关闭 | 统一 §6.2 字段、禁止 Gate 绕过与跨运行时重建，最终专项 131 passed |
+| AR-B-003 | P1 | L1-1 交付不完整：缺少指定交接文件 `docs/dev-handoff/agent-refactor-l1-1.md`；删除了 L0-1 契约测试 `test_agent/test_l0_1_contract.py`，超出 L1-1 范围；PG Checkpointer Spike 失败，`aget_state(config)` 将 `checkpoint_ns` 误解析为 subgraph，7 项集成测试中 5 项失败 | L1-1 | 已关闭 | 已恢复 L0-1 契约测试，补交 L1-1 交接文件；PG Spike 改用版本化 root `thread_id` 验证隔离，专项、全量后端、ruff、mypy、lock、diff check 均通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -166,11 +167,16 @@
 | 2026-07-09 | L0-2 | 0 | 验收通过 | Golden `9 passed, 1 xfailed`；覆盖 8 类场景；strict xfail 记录 Legacy 红旗缺口且禁止迁移复制 |
 | 2026-07-09 | L0-3 | 0 | 验收通过 | Feature Flag `8 passed`；性能 `1 passed`；20 回合 P50 54.48 ms、P95 91.67 ms、失败率 0%，默认 runtime=legacy |
 | 2026-07-09 | L0 | 阶段门禁 | 验收通过 | L0 专项 `149 passed, 1 xfailed`；全量后端 `954 passed, 1 xfailed, 2 warnings`；ruff、mypy、uv lock、git diff check 通过；前端 22 files/161 tests、typecheck、lint、build 通过 |
+| 2026-07-10 | L1-1 | 0 | 验收未通过 | `uv run pytest tests/test_langgraph_compatibility_spike.py -q -rs`：`5 passed`；`$env:DB_URL='postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu'; uv run pytest tests/test_langgraph_postgres_checkpoint_spike.py -q -rs`：`5 failed, 2 passed`，失败为 `ValueError: Subgraph l1-1-spike not found` / `ValueError: Subgraph v1 not found`；指定交接文件缺失；`test_agent/test_l0_1_contract.py` 被删除，超出 L1-1 范围 |
+| 2026-07-10 | L1-1 | 1 | 验收通过 | L1-1 非 PG Spike `5 passed`；PG Checkpointer Spike `7 passed`；L0-1 契约 `131 passed`；全量后端 `966 passed, 1 xfailed, 2 warnings`；`uv run ruff check .`、`uv run mypy app`、`uv lock --check`、`git diff --check` 均通过；AR-B-003 关闭 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-10 | Codex | 完成并验收 L1-1：引入 LangGraph/PG checkpointer 依赖和隔离 Spike 测试，验证 async graph、FastAPI async、InMemorySaver、AsyncPostgresSaver、PG 持久化、重建实例读取、版本化 thread 隔离和 interrupt/resume；关闭 AR-B-003，下一任务 L1-2 |
+| 2026-07-10 | Codex | L1-1 第 0 轮验收未通过：缺少交接文件，删除 L0-1 契约测试超出范围，PG Checkpointer Spike 集成测试 5/7 失败；登记 AR-B-003 并改为返工中 |
+| 2026-07-09 | Codex | 发布 L1-1：验证 LangGraph 与异步 PostgreSQL checkpointer 在当前 Python、Pydantic、FastAPI async、PostgreSQL/连接池和 Windows 开发环境中的兼容性；仅允许依赖、锁文件和隔离 Spike 测试，不接入业务 Agent、MainGraph 或生产路由 |
 | 2026-07-09 | Codex | L0 阶段关闭：L0-1/L0-2/L0-3 全部完成并验收通过，无打开 AR-B/P0/P1；L1 进入条件满足，下一可发布任务 L1-1 |
 | 2026-07-09 | Codex | 完成 L0-3：Runtime Feature Flag 默认 legacy；建立 fake-model 性能基线和 Token 可观测缺口记录 |
 | 2026-07-09 | Codex | 完成 L0-2：建立 Golden E2E 与 Legacy 行为/测试分类基线；红旗缺口以 strict xfail 固定并明确禁止迁移复制 |
@@ -182,8 +188,8 @@
 
 ## 8. 下一步
 
-1. 发布 L1-1：LangGraph 与 PostgreSQL Checkpointer 兼容性 Spike。
-2. L1-1 仅验证依赖兼容、async checkpointer、Windows/FastAPI/Pydantic 组合，不接入业务 Agent。
+1. 发布 L1-2：GraphState、MainGraph 与命令路由。
+2. L1-2 只允许最小 MainGraph、命令路由和 InMemorySaver 骨架，不接入业务 Agent 或生产 API 路由。
 3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求
