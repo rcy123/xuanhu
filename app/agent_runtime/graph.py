@@ -31,10 +31,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from app.agent_runtime.checkpoint import ConfigValidatingCheckpointer
 from app.agent_runtime.commands import (
     NODE_BLOCKED_TERMINAL,
     NODE_COMMAND_ROUTER,
@@ -86,7 +87,7 @@ def _make_placeholder_node(
 
 
 def build_main_graph(
-    checkpointer: InMemorySaver | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> CompiledStateGraph[XuanhuGraphState, None, XuanhuGraphState, XuanhuGraphState]:
     """构造最小 MainGraph。
 
@@ -94,9 +95,9 @@ def build_main_graph(
         START -> command_router -> [conditional] -> placeholder -> END
 
     参数:
-        checkpointer: LangGraph checkpointer 实例。L1-2 测试使用 ``InMemorySaver``。
-            生产 ``AsyncPostgresSaver`` 接入留给 L1-3。传入 ``None`` 表示不使用
-            checkpointer（适用于无状态单次 invoke 测试）。
+        checkpointer: LangGraph checkpointer 实例。支持 ``InMemorySaver``（单测）
+            或 ``AsyncPostgresSaver``（L1-3 生产 checkpointer）。传入 ``None``
+            表示不使用 checkpointer（适用于无状态单次 invoke 测试）。
 
     返回:
         编译后的 ``CompiledStateGraph``。
@@ -132,5 +133,8 @@ def build_main_graph(
     # 所有占位节点 -> END
     for node_name in _PLACEHOLDER_NODES:
         graph.add_edge(node_name, END)
+
+    if checkpointer is not None and not isinstance(checkpointer, ConfigValidatingCheckpointer):
+        checkpointer = ConfigValidatingCheckpointer(checkpointer)
 
     return graph.compile(checkpointer=checkpointer)

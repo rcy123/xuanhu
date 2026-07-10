@@ -1,6 +1,6 @@
 """Agent Runtime 配置常量与 thread_id 构造工具。
 
-L1-2 只定义图版本和 checkpoint config 构造函数，不读取生产 ``Settings``
+L1-2/L1-3 只定义图版本和 checkpoint config 构造/校验函数，不读取生产 ``Settings``
 或环境变量，不改变 ``AGENT_RUNTIME_VERSION`` 默认值。
 
 对齐 ADR-002 / 迁移边界 §2：
@@ -11,6 +11,8 @@ L1-2 只定义图版本和 checkpoint config 构造函数，不读取生产 ``Se
 from __future__ import annotations
 
 from typing import Any
+
+from app.agent_runtime.errors import CheckpointConfigMismatchError
 
 # 当前 MainGraph 主版本。图结构发生不兼容变更时递增。
 # 对齐实施计划 §6.2 ``graph_version`` 字段。
@@ -55,3 +57,67 @@ def make_run_config(
         ``{"configurable": {"thread_id": "v1:session-abc"}}`` 格式的 config dict。
     """
     return {"configurable": {"thread_id": make_thread_id(session_id, graph_version)}}
+
+
+def parse_thread_id(thread_id: str) -> tuple[str, str]:
+    """解析版本化 ``thread_id``：``{graph_version}:{session_id}``。
+
+    参数:
+        thread_id: 形如 ``v1:session-abc`` 的版本化 thread_id。
+
+    返回:
+        ``(graph_version, session_id)`` 元组。
+
+    Raises:
+        ValueError: 如果 thread_id 格式无效（不含 ``:`` 分隔符）。
+    """
+    if ":" not in thread_id:
+        raise ValueError("Invalid thread_id format: expected '{graph_version}:{session_id}'")
+    parts = thread_id.split(":", 1)
+    return parts[0], parts[1]
+
+
+def validate_checkpoint_config(
+    config: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    """校验 checkpoint config 的 thread_id 与 Graph State 的 session_id/graph_version 一致。
+
+    对齐验收标准 7：config/state session_id 或 graph_version 错配被确定性拒绝。
+    错误消息脱敏，不含 DB URL 或密码。
+
+    参数:
+        config: LangGraph runnable config，包含 ``configurable.thread_id``。
+        state: Graph State（或包含 ``session_id`` 和 ``graph_version`` 字段的 dict）。
+
+    Raises:
+        CheckpointConfigMismatchError: 如果 session_id 或 graph_version 不一致。
+    """
+    configurable = config.get("configurable", {})
+    thread_id = configurable.get("thread_id", "")
+
+    if not thread_id or ":" not in thread_id:
+        raise CheckpointConfigMismatchError(
+            field="thread_id",
+            config_value=thread_id,
+            state_value="(missing or invalid)",
+        )
+
+    config_graph_version, config_session_id = parse_thread_id(thread_id)
+
+    state_session_id = state.get("session_id", "")
+    state_graph_version = state.get("graph_version", "")
+
+    if state_session_id and config_session_id != state_session_id:
+        raise CheckpointConfigMismatchError(
+            field="session_id",
+            config_value=config_session_id,
+            state_value=state_session_id,
+        )
+
+    if state_graph_version and config_graph_version != state_graph_version:
+        raise CheckpointConfigMismatchError(
+            field="graph_version",
+            config_value=config_graph_version,
+            state_value=state_graph_version,
+        )

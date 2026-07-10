@@ -1,7 +1,7 @@
 """Agent Runtime 错误类型。
 
-L1-2 只定义图执行相关的最小错误类型，不引入业务异常。
-错误消息不得包含 prompt 原文、API key、完整模型输出或患者数据。
+L1-2/L1-3 只定义图执行和 checkpoint 相关的最小错误类型，不引入业务异常。
+错误消息不得包含 prompt 原文、API key、完整模型输出、DB URL、密码或患者数据。
 """
 
 from __future__ import annotations
@@ -32,3 +32,45 @@ class CommandRoutingError(GraphStateError):
             code="COMMAND_ROUTING_UNKNOWN",
         )
         self.command = command
+
+
+class CheckpointError(GraphStateError):
+    """Checkpoint 操作失败的基类。
+
+    所有 checkpoint 相关错误（创建、健康检查、关闭、config 校验）均继承此类。
+    消息不得包含 DB URL、密码、连接字符串或底层异常堆栈。
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message, code=code)
+
+
+class CheckpointConfigMismatchError(CheckpointError):
+    """checkpoint config 与 Graph State 的 session_id 或 graph_version 不一致。
+
+    对齐验收标准 7：config/state session_id 或 graph_version 错配被确定性拒绝。
+    """
+
+    def __init__(self, *, field: str, config_value: str, state_value: str) -> None:
+        super().__init__(
+            f"Checkpoint config mismatch: field={field!r}, "
+            f"config_value={config_value!r}, state_value={state_value!r}",
+            code="CHECKPOINT_CONFIG_MISMATCH",
+        )
+        self.field = field
+        self.config_value = config_value
+        self.state_value = state_value
+
+
+class CheckpointHealthCheckError(CheckpointError):
+    """checkpoint 健康检查失败。
+
+    错误消息已脱敏，不含 DB URL、密码或底层连接细节。
+    """
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(
+            f"Checkpoint health check failed: {detail}",
+            code="CHECKPOINT_HEALTH_CHECK_FAILED",
+        )
+        self.detail = detail

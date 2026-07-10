@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L1 进行中 |
-| 当前任务 | L1-2 已完成，L1-3 待发布 |
-| LangGraph 新链路 | L1-2 GraphState / MainGraph 骨架验收通过 |
+| 当前任务 | L1-4 已发布，待验收 |
+| LangGraph 新链路 | L1-4 GraphRunner、超时取消与事件转换已发布，等待交付验收 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -44,7 +44,7 @@
 | 阶段 | 名称 | 状态 | 完成度 | 进入条件 | 关闭条件 |
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
-| L1 | LangGraph Runtime 骨架 | 进行中 | 50% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
+| L1 | LangGraph Runtime 骨架 | 进行中 | 75% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 未开始 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
@@ -70,8 +70,8 @@
 |---|---|---|---|---|---|
 | L1-1 | LangGraph 与 PG Checkpointer 兼容性 Spike | L0 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-1.md` |
 | L1-2 | GraphState、MainGraph 与命令路由 | L1-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-2.md` |
-| L1-3 | AsyncPostgresSaver 与跨进程恢复 | L1-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-3.md` |
-| L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-4.md` |
+| L1-3 | AsyncPostgresSaver 与跨进程恢复 | L1-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-3.md` |
+| L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l1-4.md` |
 
 ### L2：Harness 核心与领域 State
 
@@ -155,6 +155,9 @@
 | AR-B-002 | P1 | L0-1 第 1 轮返修不完整：下一问职责、`force=true`、Graph State 字段和弱测试仍有冲突 | L0-1 | 已关闭 | 统一 §6.2 字段、禁止 Gate 绕过与跨运行时重建，最终专项 131 passed |
 | AR-B-003 | P1 | L1-1 交付不完整：缺少指定交接文件 `docs/dev-handoff/agent-refactor-l1-1.md`；删除了 L0-1 契约测试 `test_agent/test_l0_1_contract.py`，超出 L1-1 范围；PG Checkpointer Spike 失败，`aget_state(config)` 将 `checkpoint_ns` 误解析为 subgraph，7 项集成测试中 5 项失败 | L1-1 | 已关闭 | 已恢复 L0-1 契约测试，补交 L1-1 交接文件；PG Spike 改用版本化 root `thread_id` 验证隔离，专项、全量后端、ruff、mypy、lock、diff check 均通过 |
 | AR-B-004 | P1 | L1-2 将 mypy `python_version` 从 `3.11` 改为 `3.12`，但项目仍声明 `requires-python = ">=3.11"` 且 Ruff 目标为 `py311`，导致静态检查不再覆盖仍受支持的 Python 3.11；强制 3.11 检查暴露 NumPy stub 语法失败 | L1-2 | 已关闭 | mypy 恢复 `python_version = "3.11"`，约束 NumPy `>=2.4,<2.5` 并锁定 2.4.6；默认和显式 Python 3.11 无增量 mypy 均通过，未使用全局 import skip |
+| AR-B-005 | P1 | L1-3 的 `validate_checkpoint_config` 未接入 MainGraph/checkpoint 执行路径，错配 state 可写入错误 namespace；`close_postgres_checkpointer` 对真实 saver 调用不存在的 `__aexit__` 并吞掉异常，实际不关闭资源；跨进程 helper 通过命令行传递含密码 DB_URL 且原样输出底层异常，可能泄露凭据 | L1-3 | 已关闭 | 校验已置于 checkpointer 实际写入边界；以拥有生命周期的 context manager 管理关闭；DB_URL 由子进程环境读取并统一脱敏错误输出 |
+| AR-B-006 | P1 | L1-3 第 1 轮返工不完整：新增 `validated_ainvoke` 仍是调用方可绕过的自由函数，直接 `graph.ainvoke` 继续把错配 state 写入 checkpoint；子进程虽不再通过 argv 传 DB_URL，但仍输出截断的原始 `str(exc)`，真实连接失败暴露目标 IP、端口和底层 psycopg 文本 | L1-3 | 已关闭 | 在 checkpointer 写入边界强制校验；公开 graph API 的错配 state 已有回归测试；子进程失败只返回固定错误码和异常类型 |
+| AR-B-007 | P1 | L1-3 第二轮行为和全量测试通过，但 Ruff 门禁失败：`app/agent_runtime/checkpoint.py:26` 导入未使用的 `collections.abc.Sequence` | L1-3 | 已关闭 | 删除未使用导入，Ruff 复验通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -172,11 +175,21 @@
 | 2026-07-10 | L1-1 | 1 | 验收通过 | L1-1 非 PG Spike `5 passed`；PG Checkpointer Spike `7 passed`；L0-1 契约 `131 passed`；全量后端 `966 passed, 1 xfailed, 2 warnings`；`uv run ruff check .`、`uv run mypy app`、`uv lock --check`、`git diff --check` 均通过；AR-B-003 关闭 |
 | 2026-07-10 | L1-2 | 0 | 验收未通过 | 功能与回归门禁通过：L1-2 专项 `44 passed`、L1-1 Spike `12 passed`、L0-1 契约 `131 passed`、全量后端 `1010 passed, 1 xfailed, 2 warnings`，ruff、配置为 3.12 的 mypy、lock、diff check 通过；静态配置审查发现 AR-B-004：项目仍支持 Python 3.11，但 mypy 目标被改为 3.12，`uv run mypy app --no-incremental --python-version 3.11` 失败于 NumPy stub 的 PEP 695 `type` 语句 |
 | 2026-07-10 | L1-2 | 1 | 验收通过 | AR-B-004 关闭：`uv run mypy app --no-incremental` 与显式 `--python-version 3.11` 均为 `Success: no issues found in 79 source files`；L1-2 专项 `44 passed`、L1-1/PG Spike `12 passed`、L0-1 契约 `131 passed`、全量后端 `1010 passed, 1 xfailed, 2 warnings`；ruff、lock、diff check 通过；`.gitignore` 的 `.workbuddy/` 改动未申报且不属于 L1-2，验收与后续提交均应排除 |
+| 2026-07-10 | L1-3 | 0 | 验收未通过 | L1-3 PG 专项 `30 passed`，L1-2/L1-1/L0 回归 `187 passed`，ruff、Python 3.11 mypy、lock、diff check 通过；未继续跑全量门禁。诊断证明错配 config/state 被 MainGraph 成功写入 checkpoint（thread `v1:config-session` 内保存 state `session_id=state-session, graph_version=v2`），且 `close_postgres_checkpointer` 调用后 saver 仍可 `setup()`；静态审查发现子进程 argv/错误输出凭据泄漏风险，登记 AR-B-005 |
+| 2026-07-10 | L1-3 | 1 | 验收未通过 | L1-3 专项 `33 passed`、L1-2/L1-1/L0 回归 `187 passed`，ruff、Python 3.11 mypy、lock、diff check 通过；未跑全量门禁。资源生命周期和 DB_URL argv 已修复，但诊断再次证明直接 `graph.ainvoke` 可绕过 `validated_ainvoke` 并写入错配 state；使用伪造 DB_URL 触发真实子进程连接失败时，stdout 暴露目标 IP、端口和底层连接文本。登记 AR-B-006，AR-B-005 未关闭 |
+| 2026-07-10 | L1-3 | 2 | 验收未通过 | 独立诊断确认公开 `graph.ainvoke` 错配拒绝、子进程固定错误码输出；L1-3 专项 `33 passed`；L1-2/L1-1/L0 回归 `187 passed`；定向可写临时目录全量 `1043 passed, 1 xfailed, 2 warnings`；mypy（含 Python 3.11）、lock、diff check 通过，但 Ruff 因 `checkpoint.py:26` 未使用 `Sequence` 失败，登记 AR-B-007 |
+| 2026-07-10 | L1-3 | 3 | 验收通过 | 删除未使用 `Sequence` 后 Ruff 通过；L1-3 专项 `33 passed`；L1-2/L1-1/L0 合并回归 `220 passed`；全量后端 `1043 passed, 1 xfailed, 2 warnings`；mypy 默认与显式 Python 3.11、uv lock、diff check 均通过；AR-B-005/006/007 关闭 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-10 | Codex | 提交 L1-3 并发布 L1-4：实现 GraphRunner 的 `ainvoke/astream` 包装、总超时与取消语义、错误归一化、state 版本校验，以及 LangGraph 事件到版本化业务事件的转换；不得接入 API/SSE 路由、业务 Agent、领域 Schema、RAG 或 Legacy 改造 |
+| 2026-07-10 | Codex | L1-3 第 3 轮复验通过：删除未使用 `Sequence` 导入，Ruff、L1-3 专项、合并回归、全量后端和静态门禁均通过；AR-B-005/006/007 关闭，L1-3 完成，下一任务 L1-4 |
+| 2026-07-10 | Codex | L1-3 第 2 轮复验：不可绕过 checkpointer 校验、资源关闭和子进程错误脱敏均通过，定向全量 `1043 passed, 1 xfailed, 2 warnings`；仅 Ruff 报 `Sequence` 未使用，登记 AR-B-007，限定删除导入并复跑 Ruff |
+| 2026-07-10 | Codex | L1-3 第 1 轮复验未通过：关闭语义和 DB_URL argv 已修复，但 `validated_ainvoke` 仍可被公开 `graph.ainvoke` 绕过，子进程仍返回原始连接异常详情；新增 AR-B-006，限定第二轮返工只收口不可绕过校验和失败输出脱敏 |
+| 2026-07-10 | Codex | L1-3 第 0 轮验收未通过：PG setup、持久化、重建实例读取和真实跨进程 interrupt/resume 测试通过，但 config/state 校验未接入执行路径、公开关闭 helper 实际不关闭 saver、子进程通过 argv 传递 DB URL且错误未脱敏；登记 AR-B-005，限定返工不得扩展至 L1-4 |
+| 2026-07-10 | Codex | 提交 L1-2（`d5f0c64`）并发布 L1-3：接入 AsyncPostgresSaver 初始化/健康检查，基于版本化 root `thread_id` 验证 PG 持久化、重建 graph/checkpointer 实例读取、进程边界恢复、thread/graph-version 隔离和错误归一化边界；不得实现 Runner/stream、业务 Agent、生产 API 或 Legacy 恢复改造 |
 | 2026-07-10 | Codex | L1-2 第 1 轮复验通过：恢复 Python 3.11 mypy 契约并以 NumPy 2.4.6 兼容约束解决 PEP 695 stub 问题，专项、PG 回归、L0 契约、全量后端和静态门禁通过；关闭 AR-B-004，L1 完成度更新为 50%，下一可发布任务 L1-3 |
 | 2026-07-10 | Codex | L1-2 第 0 轮验收未通过：图骨架、InMemorySaver、全量回归和常规静态门禁均通过，但交付通过把 mypy 目标从 3.11 改为 3.12 绕开 NumPy stub 失败，与项目 `requires-python >=3.11` 契约不一致；登记 AR-B-004，限定返工仅修复 Python 3.11 静态检查兼容性 |
 | 2026-07-10 | Codex | 发布 L1-2：定义最小 `XuanhuGraphState`、MainGraph 和 command router，使用 InMemorySaver 验证命令路由、状态序列化、thread/graph version 隔离和边界占位；不得接入业务 Agent、生产 API 路由或 PG checkpointer |
@@ -194,10 +207,9 @@
 
 ## 8. 下一步
 
-1. 下一可发布任务为 L1-3：接入 `AsyncPostgresSaver` 并验证跨进程恢复。
-2. L1-3 必须确认 root graph 的生产 namespace 策略；L1-4 Runner 必须校验 state `graph_version` 与 checkpoint config 一致。
-3. L1-3 通过前不发布 L1-4，不接入业务 Agent 或生产 API 路由。
-4. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
+1. 等待 L1-4 交付并验收：GraphRunner、超时取消与事件转换。
+2. L1-4 不接入业务 Agent 或生产 API 路由，不改造 Legacy 恢复链路。
+3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求
 

@@ -422,7 +422,7 @@ class TestL0Scope:
     而是验证该目录只包含 L1 运行时骨架（不含业务 Agent 实现）。
     """
 
-    # L1-2 允许的 agent_runtime 骨架文件（不含业务 Agent）。
+    # L1 允许的 agent_runtime 骨架文件（不含业务 Agent）。
     _ALLOWED_RUNTIME_FILES: frozenset[str] = frozenset(
         {
             "__init__.py",
@@ -432,6 +432,7 @@ class TestL0Scope:
             "state.py",
             "routing.py",
             "graph.py",
+            "checkpoint.py",
         }
     )
 
