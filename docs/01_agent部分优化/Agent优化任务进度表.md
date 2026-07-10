@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L1 进行中 |
-| 当前任务 | L1-1 已完成；下一可发布任务为 L1-2 |
-| LangGraph 新链路 | L1-1 兼容性 Spike 验收通过 |
+| 当前任务 | L1-2 已完成，L1-3 待发布 |
+| LangGraph 新链路 | L1-2 GraphState / MainGraph 骨架验收通过 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -44,7 +44,7 @@
 | 阶段 | 名称 | 状态 | 完成度 | 进入条件 | 关闭条件 |
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
-| L1 | LangGraph Runtime 骨架 | 进行中 | 25% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
+| L1 | LangGraph Runtime 骨架 | 进行中 | 50% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 未开始 | 0% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
@@ -69,7 +69,7 @@
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
 | L1-1 | LangGraph 与 PG Checkpointer 兼容性 Spike | L0 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-1.md` |
-| L1-2 | GraphState、MainGraph 与命令路由 | L1-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-2.md` |
+| L1-2 | GraphState、MainGraph 与命令路由 | L1-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l1-2.md` |
 | L1-3 | AsyncPostgresSaver 与跨进程恢复 | L1-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-3.md` |
 | L1-4 | GraphRunner、超时取消与事件转换 | L1-2/L1-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l1-4.md` |
 
@@ -154,6 +154,7 @@
 | AR-B-001 | P1 | L0-1 文档契约互相冲突：允许 LangGraph 会话阶段级回退到 Legacy、允许 LLM Sufficiency 回归、Graph State 可保存结构化模型结果且沿用 `pending_review`、下一问职责仍归 InquiryAgent；契约测试未能捕获这些冲突 | L0-1 | 已关闭 | ADR、兼容矩阵、迁移边界和精确负向契约测试已统一 |
 | AR-B-002 | P1 | L0-1 第 1 轮返修不完整：下一问职责、`force=true`、Graph State 字段和弱测试仍有冲突 | L0-1 | 已关闭 | 统一 §6.2 字段、禁止 Gate 绕过与跨运行时重建，最终专项 131 passed |
 | AR-B-003 | P1 | L1-1 交付不完整：缺少指定交接文件 `docs/dev-handoff/agent-refactor-l1-1.md`；删除了 L0-1 契约测试 `test_agent/test_l0_1_contract.py`，超出 L1-1 范围；PG Checkpointer Spike 失败，`aget_state(config)` 将 `checkpoint_ns` 误解析为 subgraph，7 项集成测试中 5 项失败 | L1-1 | 已关闭 | 已恢复 L0-1 契约测试，补交 L1-1 交接文件；PG Spike 改用版本化 root `thread_id` 验证隔离，专项、全量后端、ruff、mypy、lock、diff check 均通过 |
+| AR-B-004 | P1 | L1-2 将 mypy `python_version` 从 `3.11` 改为 `3.12`，但项目仍声明 `requires-python = ">=3.11"` 且 Ruff 目标为 `py311`，导致静态检查不再覆盖仍受支持的 Python 3.11；强制 3.11 检查暴露 NumPy stub 语法失败 | L1-2 | 已关闭 | mypy 恢复 `python_version = "3.11"`，约束 NumPy `>=2.4,<2.5` 并锁定 2.4.6；默认和显式 Python 3.11 无增量 mypy 均通过，未使用全局 import skip |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -169,11 +170,16 @@
 | 2026-07-09 | L0 | 阶段门禁 | 验收通过 | L0 专项 `149 passed, 1 xfailed`；全量后端 `954 passed, 1 xfailed, 2 warnings`；ruff、mypy、uv lock、git diff check 通过；前端 22 files/161 tests、typecheck、lint、build 通过 |
 | 2026-07-10 | L1-1 | 0 | 验收未通过 | `uv run pytest tests/test_langgraph_compatibility_spike.py -q -rs`：`5 passed`；`$env:DB_URL='postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu'; uv run pytest tests/test_langgraph_postgres_checkpoint_spike.py -q -rs`：`5 failed, 2 passed`，失败为 `ValueError: Subgraph l1-1-spike not found` / `ValueError: Subgraph v1 not found`；指定交接文件缺失；`test_agent/test_l0_1_contract.py` 被删除，超出 L1-1 范围 |
 | 2026-07-10 | L1-1 | 1 | 验收通过 | L1-1 非 PG Spike `5 passed`；PG Checkpointer Spike `7 passed`；L0-1 契约 `131 passed`；全量后端 `966 passed, 1 xfailed, 2 warnings`；`uv run ruff check .`、`uv run mypy app`、`uv lock --check`、`git diff --check` 均通过；AR-B-003 关闭 |
+| 2026-07-10 | L1-2 | 0 | 验收未通过 | 功能与回归门禁通过：L1-2 专项 `44 passed`、L1-1 Spike `12 passed`、L0-1 契约 `131 passed`、全量后端 `1010 passed, 1 xfailed, 2 warnings`，ruff、配置为 3.12 的 mypy、lock、diff check 通过；静态配置审查发现 AR-B-004：项目仍支持 Python 3.11，但 mypy 目标被改为 3.12，`uv run mypy app --no-incremental --python-version 3.11` 失败于 NumPy stub 的 PEP 695 `type` 语句 |
+| 2026-07-10 | L1-2 | 1 | 验收通过 | AR-B-004 关闭：`uv run mypy app --no-incremental` 与显式 `--python-version 3.11` 均为 `Success: no issues found in 79 source files`；L1-2 专项 `44 passed`、L1-1/PG Spike `12 passed`、L0-1 契约 `131 passed`、全量后端 `1010 passed, 1 xfailed, 2 warnings`；ruff、lock、diff check 通过；`.gitignore` 的 `.workbuddy/` 改动未申报且不属于 L1-2，验收与后续提交均应排除 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-10 | Codex | L1-2 第 1 轮复验通过：恢复 Python 3.11 mypy 契约并以 NumPy 2.4.6 兼容约束解决 PEP 695 stub 问题，专项、PG 回归、L0 契约、全量后端和静态门禁通过；关闭 AR-B-004，L1 完成度更新为 50%，下一可发布任务 L1-3 |
+| 2026-07-10 | Codex | L1-2 第 0 轮验收未通过：图骨架、InMemorySaver、全量回归和常规静态门禁均通过，但交付通过把 mypy 目标从 3.11 改为 3.12 绕开 NumPy stub 失败，与项目 `requires-python >=3.11` 契约不一致；登记 AR-B-004，限定返工仅修复 Python 3.11 静态检查兼容性 |
+| 2026-07-10 | Codex | 发布 L1-2：定义最小 `XuanhuGraphState`、MainGraph 和 command router，使用 InMemorySaver 验证命令路由、状态序列化、thread/graph version 隔离和边界占位；不得接入业务 Agent、生产 API 路由或 PG checkpointer |
 | 2026-07-10 | Codex | 完成并验收 L1-1：引入 LangGraph/PG checkpointer 依赖和隔离 Spike 测试，验证 async graph、FastAPI async、InMemorySaver、AsyncPostgresSaver、PG 持久化、重建实例读取、版本化 thread 隔离和 interrupt/resume；关闭 AR-B-003，下一任务 L1-2 |
 | 2026-07-10 | Codex | L1-1 第 0 轮验收未通过：缺少交接文件，删除 L0-1 契约测试超出范围，PG Checkpointer Spike 集成测试 5/7 失败；登记 AR-B-003 并改为返工中 |
 | 2026-07-09 | Codex | 发布 L1-1：验证 LangGraph 与异步 PostgreSQL checkpointer 在当前 Python、Pydantic、FastAPI async、PostgreSQL/连接池和 Windows 开发环境中的兼容性；仅允许依赖、锁文件和隔离 Spike 测试，不接入业务 Agent、MainGraph 或生产路由 |
@@ -188,9 +194,10 @@
 
 ## 8. 下一步
 
-1. 发布 L1-2：GraphState、MainGraph 与命令路由。
-2. L1-2 只允许最小 MainGraph、命令路由和 InMemorySaver 骨架，不接入业务 Agent 或生产 API 路由。
-3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
+1. 下一可发布任务为 L1-3：接入 `AsyncPostgresSaver` 并验证跨进程恢复。
+2. L1-3 必须确认 root graph 的生产 namespace 策略；L1-4 Runner 必须校验 state `graph_version` 与 checkpoint config 一致。
+3. L1-3 通过前不发布 L1-4，不接入业务 Agent 或生产 API 路由。
+4. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求
 

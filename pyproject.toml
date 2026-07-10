@@ -21,6 +21,10 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.0,<4.0",
     "psycopg>=3.3.4,<4.0",
     "psycopg-pool>=3.3.1,<4.0",
+    # 约束 numpy 版本：numpy >=2.5 的 stub 文件使用 PEP 695 type 语句
+    #（Python 3.12+），与 mypy python_version="3.11" 不兼容。
+    # 本项目不直接依赖 numpy，此约束仅锁定传递依赖版本以保证 mypy 可运行。
+    "numpy>=2.4,<2.5",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +34,7 @@ dev = [
     "ruff>=0.8,<1.0",
     "mypy>=1.13,<2.0",
     "respx>=0.22,<1.0",
+    "psycopg-binary>=3.3.4,<4.0",
 ]
 
 [tool.ruff]
@@ -78,7 +83,6 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 module = [
     "fastapi.*",
-    "uvicorn.*",
     "httpx.*",
     "pymilvus.*",
 ]

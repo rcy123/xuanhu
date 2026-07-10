@@ -416,10 +416,35 @@ class TestDocumentConsistency:
 
 
 class TestL0Scope:
-    """验证累计完成 L0 后仍未提前实现 L1/L2。"""
+    """验证 L0 基线约束在 L1+ 阶段仍被遵守。
 
-    def test_no_langgraph_runtime_implementation(self) -> None:
-        assert not (REPO_ROOT / "app" / "agent_runtime").exists()
+    L1-2 已合法创建 ``app/agent_runtime`` 骨架，因此本类不再断言该目录不存在，
+    而是验证该目录只包含 L1 运行时骨架（不含业务 Agent 实现）。
+    """
+
+    # L1-2 允许的 agent_runtime 骨架文件（不含业务 Agent）。
+    _ALLOWED_RUNTIME_FILES: frozenset[str] = frozenset(
+        {
+            "__init__.py",
+            "config.py",
+            "errors.py",
+            "commands.py",
+            "state.py",
+            "routing.py",
+            "graph.py",
+        }
+    )
+
+    def test_agent_runtime_is_skeleton_only(self) -> None:
+        """``app/agent_runtime`` 若存在，只包含 L1 骨架文件，不含业务 Agent。"""
+        runtime_dir = REPO_ROOT / "app" / "agent_runtime"
+        if not runtime_dir.exists():
+            return  # L1 尚未创建，无需检查
+        py_files = {p.name for p in runtime_dir.glob("*.py")}
+        unexpected = py_files - self._ALLOWED_RUNTIME_FILES
+        assert not unexpected, (
+            f"app/agent_runtime 包含非 L1-2 骨架文件: {unexpected}"
+        )
 
     def test_no_harness_implementation(self) -> None:
         assert not (REPO_ROOT / "app" / "harness").exists()
@@ -526,25 +551,41 @@ class TestProhibitions:
             assert ph not in content, f"迁移边界包含占位符: {ph}"
 
     def test_no_langgraph_implementation(self) -> None:
-        """不得实现 LangGraph、checkpointer 或 Feature Flag。"""
-        # L0-1 不得创建 harper 目录（L2 负责）
+        """不得提前实现 Harness（L2）或业务 Agent。
+
+        L1-2 已合法创建 ``app/agent_runtime`` 骨架，因此只检查 ``app/harness``
+        不存在（L2 负责），并验证 ``app/agent_runtime`` 不包含业务 Agent 文件。
+        """
+        # L0-1 不得创建 harness 目录（L2 负责）
         harper_dir = REPO_ROOT / "app" / "harness"
         assert not harper_dir.exists(), (
             f"L0-1 不得创建 app/harness 目录（L2 负责），但检测到: {harper_dir}"
         )
-        # L0-1 不得创建 agent_runtime 目录（L1 负责）
+        # L1-2 允许 agent_runtime 骨架，但不得包含业务 Agent
         agent_runtime_dir = REPO_ROOT / "app" / "agent_runtime"
-        assert not agent_runtime_dir.exists(), (
-            f"L0-1 不得创建 app/agent_runtime 目录（L1 负责），但检测到: {agent_runtime_dir}"
-        )
+        if agent_runtime_dir.exists():
+            forbidden_patterns = [
+                "intake_extraction",
+                "syndrome_draft",
+                "formula_draft",
+                "safety_explanation",
+                "record_narration",
+                "question_composer",
+            ]
+            for py_file in agent_runtime_dir.glob("*.py"):
+                content = py_file.read_text(encoding="utf-8")
+                for pattern in forbidden_patterns:
+                    assert pattern not in content.lower(), (
+                        f"app/agent_runtime/{py_file.name} 包含业务 Agent "
+                        f"模式 {pattern!r}，超出 L1 骨架范围"
+                    )
 
-    def test_agent_runtime_version_is_l0_3_only(self) -> None:
-        """L0-3 只增加受校验配置，不得提前增加 LangGraph 路由。"""
+    def test_agent_runtime_version_defaults_legacy(self) -> None:
+        """``agent_runtime_version`` 必须默认 ``legacy``（L0-3 约束，L1 不得改变）。"""
         config_py = REPO_ROOT / "app" / "core" / "config.py"
         content = _read(config_py)
         assert "agent_runtime_version" in content
         assert 'default="legacy"' in content
-        assert not (REPO_ROOT / "app" / "agent_runtime").exists()
 
 
 # ===================================================================
