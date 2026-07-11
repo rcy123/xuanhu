@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L3 进行中 |
-| 当前任务 | L3-1 已验收通过；下一可发布 L3-2 TriagePolicy 与人工转介 |
-| LangGraph 新链路 | L2-1～L2-5 已验收并提交；L3-1 IntakeExtractionAgent、canonical 输入/输出边界、抽取验证与身份信息拒绝已验收通过 |
+| 当前任务 | L3-2 已验收通过；下一可发布 L3-3 CompletenessPolicy 与停滞策略 |
+| LangGraph 新链路 | L2-1～L2-5 已验收并提交；L3-1 已验收并提交（`b3b182b`）；L3-2 TriagePolicy、深度冻结结果与不可变规则注册表已验收通过 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -46,7 +46,7 @@
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
-| L3 | Intake 问诊子图 | 进行中 | 20% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
+| L3 | Intake 问诊子图 | 进行中 | 40% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
@@ -88,7 +88,7 @@
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
 | L3-1 | IntakeExtractionAgent 与抽取验证 | L2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-1.md` |
-| L3-2 | TriagePolicy 与人工转介 | L3-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-2.md` |
+| L3-2 | TriagePolicy 与人工转介 | L3-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-2.md` |
 | L3-3 | CompletenessPolicy 与停滞策略 | L3-1/L3-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-3.md` |
 | L3-4 | GapSelector 与 Question Composer | L3-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-4.md` |
 | L3-5 | IntakeSubgraph、Messages API 与问诊 E2E | L3-1～L3-4 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-5.md` |
@@ -171,6 +171,8 @@
 | AR-B-018 | P1 | L3-1 身份信息 verifier 只按 dot 分段匹配少量 fact key，且正文只识别连续手机号/身份证号；普通合法 DTO 中的 `patient.full_name='Alice'`、`{'patient_name':'Alice'}` 嵌套值和 `contact.mobile_number='138-0013-8000'` 均通过验证 | L3-1 | 已关闭 | 统一 canonical 身份语义集，递归检查 fact key/嵌套 JSON key，支持命名空间、下划线/紧凑别名与常见分隔格式号码；所有已证实样例均固定拒绝 |
 | AR-B-019 | P1 | L3-1 第 2 轮身份边界返工不完整：`_is_identity_key()` 将 key 全量规范化后只和 `id_card`/`identity_card`/`national_id`/`outpatient_no`/`medical_record_no` 等做整体相等，但对加了命名空间的 `patient.id_card`、`patient.identity_card`、`patient.national_id`、`patient.outpatient_no`、`patient.medical_record_no` 及嵌套 `{'patient.id_card': ...}` 均返回 succeeded | L3-1 | 已关闭 | `_is_identity_key()` 新增完整别名或 `_<identity_alias>` 后缀匹配，指定五个 fact key 与嵌套 key 均固定返回 `INTAKE_IDENTITY_FACT_FORBIDDEN` |
 | AR-B-020 | P1 | L3-1 第 3 轮身份边界返工仍不完整：别名集显式支持 `fullname`/`phonenumber`/`mobilenumber` 无下划线形式，但遗漏同类 `idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno`；`patient.<alias>` 五个合法 fact key 在公开入口均返回 succeeded | L3-1 | 已关闭 | 别名只维护一份 canonical 语义集，比较时统一紧凑化连续 token 后缀；五个紧凑 fact key、嵌套 key 及全部历史回归均通过 |
+| AR-B-021 | P1 | L3-2 声明 Triage 结果严格冻结且规则版本化，但 `TriagePolicyResult` 内嵌的 `GateResultSchema` 及 `details` dict 可原地修改：呼吸困难结果可从 `BLOCKED` 改为 `PASSED`、details 可改为 `continue`；导出的 `TRIAGE_RED_FLAG_RULES` 也是普通 dict，可将呼吸困难从 emergency referral 降级为 manual review | L3-2 | 已关闭 | 权威结果改为 frozen Triage DTO，嵌套 details/rules/source refs 使用 tuple/frozen 子 DTO；公开规则注册表结构不可变，适配副本不反向影响权威结果 |
+| AR-B-022 | P1 | L3-2 第 1 轮不可变返工不完整：公开 `TRIAGE_RED_FLAG_RULES` 虽改为 `MappingProxyType`，模块仍保留同一底层 `_TRIAGE_RED_FLAG_RULES` 普通 dict；修改该引用后，呼吸困难的权威处置由 `emergency_referral` 降级为 `manual_review` | L3-2 | 已关闭 | 删除普通 dict backing store，改为 tuple 支撑的 `FrozenTriageRuleRegistry`；独立扫描无可变规则表，高危规则篡改回归及二次 evaluate 均通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -208,11 +210,18 @@
 | 2026-07-11 | L3-1 | 2 | 验收未通过 | 专项 `35 passed`；Ruff、mypy（96 files）、lock、diff check 通过。原 constructed decision、隐藏 `route`、`patient.full_name`、嵌套 `patient_name`和格式化手机号诊断已固定拒绝，AR-B-017 关闭；但独立诊断证明 `patient.id_card`、`patient.identity_card`、`patient.national_id`、`patient.outpatient_no`、`patient.medical_record_no` 和嵌套 `patient.id_card` 均 succeeded，AR-B-018 未关闭，登记 AR-B-019，未继续跑全量门禁 |
 | 2026-07-11 | L3-1 | 3 | 验收未通过 | 专项 `41 passed`；Ruff、mypy（96 files）、lock、diff check 通过。AR-B-019 指定的五个命名空间复合键与嵌套 key 均已拒绝，AR-B-019 关闭；但独立诊断证明 `patient.idcard`、`patient.identitycard`、`patient.nationalid`、`patient.outpatientno`、`patient.medicalrecordno` 均 succeeded，AR-B-018 未关闭，登记 AR-B-020，未继续跑全量门禁 |
 | 2026-07-11 | L3-1 | 4 | 验收通过 | 专项 `47 passed`；独立诊断确认 `idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno` 紧凑别名及合法分隔变体均固定拒绝；L2 合并回归 `68 passed, 8 warnings`，Legacy 兼容回归 `78 passed`，全量后端 `1192 passed, 1 xfailed, 10 warnings`；Ruff、mypy（96 files）、lock、diff check 全部通过；关闭 AR-B-018/020，L3-1 完成 |
+| 2026-07-11 | L3-2 | 0 | 验收未通过 | 专项 `19 passed`；Ruff、mypy（98 files）、lock、diff check 通过。独立诊断证明 emergency referral 结果的 `gate_result.decision` 可原地改为 `PASSED`、`details.disposition` 可改为 `continue`，且导出规则 dict 可将呼吸困难降级为 manual review；登记 AR-B-021，未继续跑全量门禁 |
+| 2026-07-11 | L3-2 | 1 | 验收未通过 | 专项 `22 passed`，定向 Ruff 与 mypy 通过；权威结果 DTO、嵌套 details/rules/source refs 及公开规则映射的直接篡改已被拒绝。但独立子进程诊断通过模块保留的 `_TRIAGE_RED_FLAG_RULES` backing dict 替换呼吸困难规则后，evaluate 结果由 `emergency_referral` 降级为 `manual_review`；AR-B-021 未关闭，登记 AR-B-022，未继续跑全量门禁 |
+| 2026-07-11 | L3-2 | 2 | 验收通过 | L3-1/L3-2 合并回归 `70 passed`；独立子进程确认模块内无包含 `TriageRule` 的可变 dict，低置信度呼吸困难仍为 `emergency_referral/BLOCKED`；全量后端 `1215 passed, 1 xfailed, 10 warnings`；Ruff、mypy（98 files）、lock、diff check 全部通过；关闭 AR-B-021/022，L3-2 完成 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-11 | Codex | L3-2 第 2 轮复验通过：规则注册表改为 tuple 支撑的冻结 Mapping，模块内不再保留可变 backing dict；深度冻结、篡改对抗、L3-1/L3-2 回归、全量后端及全部静态门禁通过，关闭 AR-B-021/022，L3-2 完成，下一可发布 L3-3 |
+| 2026-07-11 | Codex | L3-2 第 1 轮复验仍未通过：22 个专项用例及定向 Ruff/mypy 通过，权威结果的深度冻结已生效；但 `MappingProxyType` 仍共享模块内可变 backing dict，可从模块属性替换高危规则并改变权威决策，登记 AR-B-022，限定第 2 轮返工于彻底移除可变权威引用及对应对抗回归 |
+| 2026-07-11 | Codex | L3-2 第 0 轮验收未通过：确定性映射、红旗阻断、去重/顺序无关和隐私专项均通过，但权威 GateResult/details 与导出规则表均可在返回/导入后篡改，可把 BLOCKED 改为 PASSED 或降级 emergency 规则；登记 AR-B-021，限定返工于深度不可变契约和回归 |
+| 2026-07-11 | Codex | 提交 L3-1（`b3b182b`）并发布 L3-2：实现纯确定性、版本化 TriagePolicy，仅消费已验证的 red-flag candidates，生成权威 GateResult 与 continue/emergency referral/manual review 处置；任何红旗候选都不得自动放行，高危类别不得被模型 severity/confidence 降级；不实现 Graph/interrupt、阶段迁移、API、Repository 或 L3-3～L3-5 |
 | 2026-07-11 | Codex | L3-1 第 4 轮复验通过：复合身份别名改为单一 canonical 语义集与紧凑连续 token 后缀匹配，紧凑/下划线/命名空间/嵌套样例与 AR-B-016～020 回归全部通过；专项、L2/Legacy 回归、全量后端和静态门禁均通过，关闭 AR-B-018/020，L3-1 完成，下一可发布 L3-2 |
 | 2026-07-11 | Codex | L3-1 第 3 轮复验仍未通过：指定的命名空间复合身份键后缀已修复，关闭 AR-B-019；但无下划线复合别名策略不一致，`idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno` 仍可作为合法 fact key 输出，登记 AR-B-020，限定第 4 轮返工于别名规范化与回归 |
 | 2026-07-11 | Codex | L3-1 第 2 轮复验仍未通过：输出 canonical 重建、原隐藏越权与原三类身份样例已修复，关闭 AR-B-017；但身份键匹配对命名空间后的 `id_card`/`identity_card`/`national_id`/`outpatient_no`/`medical_record_no` 复合后缀失效，登记 AR-B-019，限定第 3 轮返工于该确定性匹配与回归 |
@@ -251,8 +260,8 @@
 
 ## 8. 下一步
 
-1. L3-1 已完成，保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，未经明确发布不得开始 L3-2 实现。
-2. 下一可发布任务为 L3-2：TriagePolicy 与人工转介；仅消费已验证 red-flag candidates，以确定性规则生成权威 GateResult，不允许模型决定转急诊、人工复核或阶段迁移。
+1. L3-2 已完成，保持 `AGENT_RUNTIME_VERSION=legacy`；未经明确发布不得开始 L3-3 实现。
+2. 下一可发布任务为 L3-3：CompletenessPolicy 与停滞策略；必须保持确定性策略权威，不允许模型自行判定信息充分或修改阶段。
 
 ## 9. 维护要求
 
