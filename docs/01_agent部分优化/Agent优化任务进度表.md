@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L2 已完成，L3 待启动 |
-| 当前任务 | L2-5 已验收通过，待提交；L3-1 待发布 |
-| LangGraph 新链路 | L2-1～L2-5 已验收通过；L2 阶段关口通过，L2-5 尚未提交 |
+| 当前阶段 | L3 进行中 |
+| 当前任务 | L3-1 已验收通过；下一可发布 L3-2 TriagePolicy 与人工转介 |
+| LangGraph 新链路 | L2-1～L2-5 已验收并提交；L3-1 IntakeExtractionAgent、canonical 输入/输出边界、抽取验证与身份信息拒绝已验收通过 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -46,7 +46,7 @@
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
-| L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
+| L3 | Intake 问诊子图 | 进行中 | 20% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
@@ -87,7 +87,7 @@
 
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
-| L3-1 | IntakeExtractionAgent 与抽取验证 | L2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-1.md` |
+| L3-1 | IntakeExtractionAgent 与抽取验证 | L2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-1.md` |
 | L3-2 | TriagePolicy 与人工转介 | L3-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-2.md` |
 | L3-3 | CompletenessPolicy 与停滞策略 | L3-1/L3-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-3.md` |
 | L3-4 | GapSelector 与 Question Composer | L3-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-4.md` |
@@ -166,6 +166,11 @@
 | AR-B-013 | P1 | L2-3 裸字符串 context 绕过脱敏，伪名 HMAC 使用源码公开固定 key | L2-3 | 已关闭 | 所有 context 统一递归脱敏；伪名密钥仅运行时注入/密钥提供者，缺失即拒绝 |
 | AR-B-014 | P1 | L2-4 Reducer 接受可手工伪造的 passed report，绕过 source/stage/prerequisite | L2-4 | 已关闭 | Reducer 仅接受完整 VerificationContext，并在提交边界重跑 canonical VerifierChain |
 | AR-B-015 | P1 | L2-4 安全返工后残留旧 report API 测试和旧交接说明 | L2-4 | 已关闭 | 所有正向调用迁移到 VerificationContext，专项与交接文件同步完成 |
+| AR-B-016 | P1 | L3-1 公开执行入口与 L2 Runtime 对已是 `IntakeExtractionInput` 的实例仅做 `isinstance` 判断而不重验；免校验构造的 assistant-only 当前消息会先进入模型请求，然后才被 Intake verifier 拒绝，使“严格输入校验 / assistant 不得作为当前 patient 来源”可被绕过 | L3-1 | 已关闭 | 公开入口对所有输入使用基类 serializer + `model_validate_json()` canonical 重建；assistant-only、重复 ID 和 DTO 子类负向回归均在 gateway 前拒绝且请求数为 0 |
+| AR-B-017 | P1 | L3-1 输出边界仍信任已是 `IntakeExtractionOutput` 的实例；Intake verifier 只重验 `model_dump()` 副本，后续检查和成功返回仍使用原对象。`model_construct(decision='abstained', observations=...)` 可跳过 Enum identity/决策一致性并以 `succeeded` 返回；`model_copy(update={'route':'reasoning'})` 的隐藏越权字段被 dump 丢弃却仍存在于成功输出 | L3-1 | 已关闭 | 新增 `canonicalize_intake_output()`，递归拒绝原对象隐藏字段，以 canonical 基类 DTO 替换 artifact 后执行 verifier 并返回；字符串 decision 矛盾固定拒绝，隐藏 `route` 固定拒绝 |
+| AR-B-018 | P1 | L3-1 身份信息 verifier 只按 dot 分段匹配少量 fact key，且正文只识别连续手机号/身份证号；普通合法 DTO 中的 `patient.full_name='Alice'`、`{'patient_name':'Alice'}` 嵌套值和 `contact.mobile_number='138-0013-8000'` 均通过验证 | L3-1 | 已关闭 | 统一 canonical 身份语义集，递归检查 fact key/嵌套 JSON key，支持命名空间、下划线/紧凑别名与常见分隔格式号码；所有已证实样例均固定拒绝 |
+| AR-B-019 | P1 | L3-1 第 2 轮身份边界返工不完整：`_is_identity_key()` 将 key 全量规范化后只和 `id_card`/`identity_card`/`national_id`/`outpatient_no`/`medical_record_no` 等做整体相等，但对加了命名空间的 `patient.id_card`、`patient.identity_card`、`patient.national_id`、`patient.outpatient_no`、`patient.medical_record_no` 及嵌套 `{'patient.id_card': ...}` 均返回 succeeded | L3-1 | 已关闭 | `_is_identity_key()` 新增完整别名或 `_<identity_alias>` 后缀匹配，指定五个 fact key 与嵌套 key 均固定返回 `INTAKE_IDENTITY_FACT_FORBIDDEN` |
+| AR-B-020 | P1 | L3-1 第 3 轮身份边界返工仍不完整：别名集显式支持 `fullname`/`phonenumber`/`mobilenumber` 无下划线形式，但遗漏同类 `idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno`；`patient.<alias>` 五个合法 fact key 在公开入口均返回 succeeded | L3-1 | 已关闭 | 别名只维护一份 canonical 语义集，比较时统一紧凑化连续 token 后缀；五个紧凑 fact key、嵌套 key 及全部历史回归均通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -198,11 +203,22 @@
 | 2026-07-11 | L2-4 | 2 | 验收通过 | 专项 `16 passed`；L2-1～L2-3 回归 `40 passed, 4 warnings`；全量 `1133 passed, 1 xfailed, 6 warnings`；Ruff、mypy（91 files）、lock、diff check 通过；AR-B-014/015 关闭 |
 | 2026-07-11 | L2-5 | 0 | 验收通过 | 真实 PostgreSQL 专项 `12 passed, 4 warnings`；L2-1～L2-5 合并回归 `68 passed, 8 warnings`；全量 `1145 passed, 1 xfailed, 10 warnings`；Ruff、mypy（93 files）、lock、diff check 通过；确认原子事务、数据库级幂等、并发版本冲突、Outbox claim/lease/ack/retry、故障回滚与隐私边界，无新增阻塞 |
 | 2026-07-11 | L2 | 阶段门禁 | 验收通过 | L2-1～L2-5 全部完成且无打开 P0/P1 阻塞；真实 PostgreSQL L2 合并回归 `68 passed, 8 warnings`；全量 `1145 passed, 1 xfailed, 10 warnings`；Ruff、mypy（93 files）、uv lock、git diff check 通过；保持 `AGENT_RUNTIME_VERSION=legacy` |
+| 2026-07-11 | L3-1 | 0 | 验收未通过 | 专项 `25 passed`；`ruff check .`、`mypy app`（96 files）、`uv lock --check`、`git diff --check` 通过。独立诊断以 `model_construct` 构造 assistant-only `IntakeExtractionInput`，公开入口实际调用 gateway 1 次并发送 assistant 文本，随后才返回 `INTAKE_SOURCE_NOT_ALLOWED`；登记 AR-B-016，未继续跑全量门禁 |
+| 2026-07-11 | L3-1 | 1 | 验收未通过 | AR-B-016 修复确认：专项 `28 passed`，原 assistant-only 诊断返回 `INTAKE_INPUT_SCHEMA_INVALID` 且 gateway `0` 次；L2 合并回归 `68 passed, 8 warnings`，Legacy 兼容回归 `78 passed`，全量后端 `1173 passed, 1 xfailed, 10 warnings`；Ruff、mypy（96 files）、lock、diff check 通过。独立诊断仍证明已构造输出可以字符串 decision/隐藏 `.route` 通过并成功返回，三类身份候选也均 `passed=True`；关闭 AR-B-016，登记 AR-B-017/018 |
+| 2026-07-11 | L3-1 | 2 | 验收未通过 | 专项 `35 passed`；Ruff、mypy（96 files）、lock、diff check 通过。原 constructed decision、隐藏 `route`、`patient.full_name`、嵌套 `patient_name`和格式化手机号诊断已固定拒绝，AR-B-017 关闭；但独立诊断证明 `patient.id_card`、`patient.identity_card`、`patient.national_id`、`patient.outpatient_no`、`patient.medical_record_no` 和嵌套 `patient.id_card` 均 succeeded，AR-B-018 未关闭，登记 AR-B-019，未继续跑全量门禁 |
+| 2026-07-11 | L3-1 | 3 | 验收未通过 | 专项 `41 passed`；Ruff、mypy（96 files）、lock、diff check 通过。AR-B-019 指定的五个命名空间复合键与嵌套 key 均已拒绝，AR-B-019 关闭；但独立诊断证明 `patient.idcard`、`patient.identitycard`、`patient.nationalid`、`patient.outpatientno`、`patient.medicalrecordno` 均 succeeded，AR-B-018 未关闭，登记 AR-B-020，未继续跑全量门禁 |
+| 2026-07-11 | L3-1 | 4 | 验收通过 | 专项 `47 passed`；独立诊断确认 `idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno` 紧凑别名及合法分隔变体均固定拒绝；L2 合并回归 `68 passed, 8 warnings`，Legacy 兼容回归 `78 passed`，全量后端 `1192 passed, 1 xfailed, 10 warnings`；Ruff、mypy（96 files）、lock、diff check 全部通过；关闭 AR-B-018/020，L3-1 完成 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-11 | Codex | L3-1 第 4 轮复验通过：复合身份别名改为单一 canonical 语义集与紧凑连续 token 后缀匹配，紧凑/下划线/命名空间/嵌套样例与 AR-B-016～020 回归全部通过；专项、L2/Legacy 回归、全量后端和静态门禁均通过，关闭 AR-B-018/020，L3-1 完成，下一可发布 L3-2 |
+| 2026-07-11 | Codex | L3-1 第 3 轮复验仍未通过：指定的命名空间复合身份键后缀已修复，关闭 AR-B-019；但无下划线复合别名策略不一致，`idcard`/`identitycard`/`nationalid`/`outpatientno`/`medicalrecordno` 仍可作为合法 fact key 输出，登记 AR-B-020，限定第 4 轮返工于别名规范化与回归 |
+| 2026-07-11 | Codex | L3-1 第 2 轮复验仍未通过：输出 canonical 重建、原隐藏越权与原三类身份样例已修复，关闭 AR-B-017；但身份键匹配对命名空间后的 `id_card`/`identity_card`/`national_id`/`outpatient_no`/`medical_record_no` 复合后缀失效，登记 AR-B-019，限定第 3 轮返工于该确定性匹配与回归 |
+| 2026-07-11 | Codex | L3-1 第 1 轮复验仍未通过：AR-B-016 的 canonical 输入重验已修复并关闭，专项、L2/Legacy 回归、全量后端和静态门禁均通过；但已构造输出可绕过 Schema/decision/authority 并返回原对象，fact-key 别名、嵌套 key 和格式化手机号也可绕过身份 verifier；登记 AR-B-017/018，限定第 2 轮返工于 L3-1 输出验证边界 |
+| 2026-07-11 | Codex | L3-1 第 0 轮验收未通过：专项和静态门禁通过，但公开入口对已构造 Intake DTO 跳过重验，assistant-only 消息会先发送给模型再被 verifier 拒绝；登记 AR-B-016，限定返工为输入边界不可绕过重验与负向回归，不扩展到 L3-2～L3-5 |
+| 2026-07-11 | Codex | 提交 L2-5（`3d525b5`）并发布 L3-1：实现版本化严格 IntakeExtraction 输出契约、IntakeExtractionAgent/AgentSpec/Prompt 与抽取验证，输出仅限 observations、safety delta、red-flag candidates、ambiguities、extraction decision；必须复用 L2 Runtime/Context/Verifier 边界并使用 fake model 测试；不得实现 TriagePolicy、CompletenessPolicy、下一问、Subgraph/API、Repository 编排、Legacy 切换或 L3-2～L3-5 |
 | 2026-07-11 | Codex | L2-5 验收通过并关闭 L2 阶段：真实 PostgreSQL migration 往返、事务原子性、幂等重放、并发冲突、Outbox 多 worker/lease/retry/recovery 和隐私专项通过；L2 合并回归、全量后端及静态门禁全部通过，无新增阻塞；L2-5 待提交，下一可发布 L3-1 |
 | 2026-07-11 | Codex | L2-5 已交付待验收：新增真实 PostgreSQL Domain Repository、session 行锁与复合唯一键幂等、同事务 run/step/gate/outbox、SKIP LOCKED claim/lease/ack/retry，并覆盖并发、故障触发器回滚、重复请求、父 revision、进程恢复和隐私负向测试；未接入 Redis/SSE publisher、API 或业务 Agent |
 | 2026-07-11 | Codex | 根据本地提交 `c2b3f9a`、`fd492b5`、交接文件和验收门禁恢复曾回退的 L2-2～L2-4 看板事实；发布 L2-5，限定为真实 PostgreSQL Domain Repository、乐观版本事务、命令幂等和同事务 Outbox，不接入 Redis/SSE 发布、API、业务 Agent 或 L3 |
@@ -235,9 +251,8 @@
 
 ## 8. 下一步
 
-1. 提交已验收的 L2-5，提交范围排除 `docs/dev-handoff/*`。
-2. 发布 L3-1：IntakeExtractionAgent 与抽取验证；不得提前接入 L3-2～L3-5、生产 API 或切流。
-3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
+1. L3-1 已完成，保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，未经明确发布不得开始 L3-2 实现。
+2. 下一可发布任务为 L3-2：TriagePolicy 与人工转介；仅消费已验证 red-flag candidates，以确定性规则生成权威 GateResult，不允许模型决定转急诊、人工复核或阶段迁移。
 
 ## 9. 维护要求
 

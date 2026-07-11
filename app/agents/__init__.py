@@ -3,6 +3,14 @@
 from app.agents.base import AgentResult, BaseAgent, BaseAgentImpl
 from app.agents.errors import AgentRunError
 from app.agents.inquiry import InquiryAgent, merge_inquiry_output_to_state
+from app.agents.intake_extraction import (
+    IntakeBoundaryFailureCode,
+    IntakeExecutionResult,
+    IntakeExecutionStatus,
+    build_intake_agent_spec,
+    build_intake_context,
+    execute_intake_extraction,
+)
 from app.agents.modification import (
     ModificationAgent,
     merge_modified_formula_result_to_state,
@@ -22,6 +30,12 @@ __all__ = [
     "BaseAgent",
     "BaseAgentImpl",
     "InquiryAgent",
+    "IntakeBoundaryFailureCode",
+    "IntakeExecutionResult",
+    "IntakeExecutionStatus",
+    "build_intake_agent_spec",
+    "build_intake_context",
+    "execute_intake_extraction",
     "merge_formula_result_to_state",
     "merge_inquiry_output_to_state",
     "merge_modified_formula_result_to_state",
