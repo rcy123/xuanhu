@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.exceptions import InvalidStageTransitionError, SessionNotFoundError
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
@@ -74,6 +75,7 @@ class SessionService:
         """创建新问诊会话并写入 session.created 审计事件。"""
         patient_info_dict = request.patient_info.model_dump()
         patient_ref = request.patient_info.patient_ref
+        agent_runtime = request.agent_runtime or get_settings().agent_runtime_version
 
         session = ConsultSession(
             patient_ref=patient_ref,
@@ -81,6 +83,7 @@ class SessionService:
             chief_complaint=request.chief_complaint,
             current_stage="inquiry",
             status="active",
+            agent_runtime=agent_runtime,
             recovery_status="normal",
             state_version=1,
             rollback_counts={},
@@ -101,6 +104,7 @@ class SessionService:
                 "chief_complaint": request.chief_complaint,
                 "initial_stage": "inquiry",
                 "initial_status": "active",
+                "agent_runtime": agent_runtime,
                 "created_by": doctor_id,
             },
             trace_id=trace_id,

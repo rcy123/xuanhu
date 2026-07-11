@@ -30,6 +30,7 @@ class ConsultSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     chief_complaint: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="inquiry")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    agent_runtime: Mapped[str] = mapped_column(String(16), nullable=False, default="legacy")
     pending_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     rollback_counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     state_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -79,10 +80,15 @@ class ConsultSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             name="chk_consult_sessions_status",
         ),
         CheckConstraint(
+            "agent_runtime IN ('legacy','langgraph')",
+            name="chk_consult_sessions_agent_runtime",
+        ),
+        CheckConstraint(
             "recovery_status IN ('normal','recovering','manual_required')",
             name="chk_consult_sessions_recovery_status",
         ),
         Index("idx_consult_sessions_status_updated_at", "status", sa.text("updated_at DESC")),
+        Index("idx_consult_sessions_agent_runtime", "agent_runtime"),
         Index("idx_consult_sessions_patient_ref", "patient_ref"),
         Index("idx_consult_sessions_current_stage", "current_stage"),
         Index("idx_consult_sessions_recovery_status", "recovery_status"),

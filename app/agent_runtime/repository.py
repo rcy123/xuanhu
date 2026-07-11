@@ -23,7 +23,7 @@ from app.agent_runtime.reducer import (
     reduce_domain_state,
 )
 from app.agent_runtime.verifiers import VerificationContext
-from app.models.consult import ConsultSession
+from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
     DomainCommandCommit,
@@ -34,7 +34,7 @@ from app.models.domain import (
     OutboxEvent,
     SafetyProfile,
 )
-from app.schemas.domain import ArtifactRevisionSchema, ObservationSchema, SafetyProfileSchema
+from app.schemas.domain import ArtifactRevisionSchema, GateResultSchema, ObservationSchema, SafetyProfileSchema
 
 DOMAIN_STATE_COMMITTED = "domain.state_committed.v1"
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -74,6 +74,26 @@ class CommitResult(BaseModel):
     input_state_version: int = Field(ge=1)
     output_state_version: int = Field(ge=1)
     changed: bool
+
+
+class GraphStepSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    step_name: str = Field(min_length=1, max_length=64)
+    status: str = Field(pattern=r"^(started|completed|failed|skipped)$")
+    metadata: dict[str, object] | None = None
+
+
+class ConsultMessageSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    message_id: UUID
+    role: str = Field(pattern=r"^(doctor|patient_proxy|agent|system)$")
+    stage: str = Field(min_length=1, max_length=32)
+    content: str = Field(min_length=1, max_length=5000)
+    agent_name: str | None = Field(default=None, max_length=32)
+    structured_delta: dict[str, object] | None = None
+    trace_id: str | None = Field(default=None, max_length=64)
 
 
 class OutboxMessage(BaseModel):
@@ -137,6 +157,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         context: VerificationContext,
         *,
         graph_version: str,
+        gate_results: Sequence[GateResultSchema] = (),
+        graph_steps: Sequence[GraphStepSpec] = (),
+        consult_messages: Sequence[ConsultMessageSpec] = (),
+        session_updates: dict[str, object] | None = None,
+        outbox_event_type: str = DOMAIN_STATE_COMMITTED,
+        outbox_payload: dict[str, object] | None = None,
     ) -> CommitResult:
         self._validate_metadata(context, graph_version)
         digest = domain_delta_digest(delta)
@@ -170,17 +196,23 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 await self._persist_state(session, state, next_state, delta)
                 locked.state_version = next_state.state_version
 
-                graph_run = GraphRun(
-                    id=delta.run_id,
-                    session_id=delta.session_id,
-                    graph_version=graph_version,
-                    command_id=idempotency_ref,
-                    input_state_version=delta.expected_state_version,
-                    status="completed",
-                    completed_at=func.now(),
-                )
-                session.add(graph_run)
-                await session.flush([graph_run])
+                with session.no_autoflush:
+                    graph_run = await session.get(GraphRun, delta.run_id)
+                if graph_run is None:
+                    graph_run = GraphRun(
+                        id=delta.run_id,
+                        session_id=delta.session_id,
+                        graph_version=graph_version,
+                        command_id=idempotency_ref,
+                        input_state_version=delta.expected_state_version,
+                        status="completed",
+                        completed_at=func.now(),
+                    )
+                    session.add(graph_run)
+                    await session.flush([graph_run])
+                else:
+                    graph_run.status = "completed"
+                    graph_run.completed_at = func.now()
                 session.add(
                     GraphRunStep(
                         id=uuid4(),
@@ -191,6 +223,17 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         step_metadata={"state_version": next_state.state_version},
                     )
                 )
+                for index, step in enumerate(graph_steps, start=1):
+                    session.add(
+                        GraphRunStep(
+                            id=uuid4(),
+                            graph_run_id=delta.run_id,
+                            step_index=index,
+                            step_name=step.step_name,
+                            status=step.status,
+                            step_metadata=step.metadata,
+                        )
+                    )
                 session.add(
                     GateResult(
                         id=uuid4(),
@@ -203,6 +246,34 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         details={"subject_digest": digest},
                     )
                 )
+                for gate in gate_results:
+                    session.add(
+                        GateResult(
+                            id=uuid4(),
+                            session_id=delta.session_id,
+                            graph_run_id=delta.run_id,
+                            gate_name=gate.gate_name,
+                            policy_version=gate.policy_version,
+                            input_state_version=gate.input_state_version,
+                            decision=gate.decision.value,
+                            details=gate.details,
+                        )
+                    )
+                for message in consult_messages:
+                    session.add(
+                        ConsultMessage(
+                            id=message.message_id,
+                            session_id=delta.session_id,
+                            role=message.role,
+                            stage=message.stage,
+                            agent_name=message.agent_name,
+                            content=message.content,
+                            structured_delta=message.structured_delta,
+                            trace_id=message.trace_id,
+                        )
+                    )
+                if session_updates:
+                    self._apply_session_updates(locked, session_updates)
                 # Explicit flush phases make FK ordering unambiguous without
                 # introducing ORM relationships into the persistence contract.
                 # All phases remain inside this one transaction.
@@ -212,12 +283,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 session.add(
                     OutboxEvent(
                         id=outbox_id,
-                        event_type=DOMAIN_STATE_COMMITTED,
+                        event_type=outbox_event_type,
                         session_id=delta.session_id,
                         graph_run_id=delta.run_id,
                         state_version=next_state.state_version,
                         trace_id=self._stable_ref("trace", context.run_spec.trace_id),
-                        payload=self._event_payload(delta, next_state),
+                        payload=outbox_payload or self._event_payload(delta, next_state),
                         status="pending",
                         attempt_count=0,
                     )
@@ -508,6 +579,21 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             "observation_ids": [str(item.observation_id) for item in delta.observations],
             "artifact_ids": sorted({str(item.artifact_id) for item in delta.artifact_revisions}),
         }
+
+    @staticmethod
+    def _apply_session_updates(session_row: ConsultSession, updates: dict[str, object]) -> None:
+        allowed = {
+            "current_stage",
+            "status",
+            "recovery_status",
+            "blocked_reason",
+            "blocked_at",
+            "state_snapshot",
+        }
+        if set(updates) - allowed:
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+        for name, value in updates.items():
+            setattr(session_row, name, value)
 
     @staticmethod
     def _commit_result(row: DomainCommandCommit) -> CommitResult:

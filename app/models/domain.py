@@ -345,3 +345,52 @@ class DomainCommandCommit(Base, UUIDPrimaryKeyMixin):
         ),
         Index("idx_domain_command_commits_session_created", "session_id", "created_at"),
     )
+
+
+class IntakeCommandClaim(Base, UUIDPrimaryKeyMixin):
+    """Durable L3-5 command claim and replayable response."""
+
+    __tablename__ = "intake_command_claims"
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    patient_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    question_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    output_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    intermediate_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), server_onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "idempotency_key", name="uq_intake_command_claims_idempotency"),
+        CheckConstraint("input_state_version >= 1", name="chk_intake_command_claims_input_version"),
+        CheckConstraint(
+            "output_state_version IS NULL OR output_state_version >= input_state_version",
+            name="chk_intake_command_claims_output_version",
+        ),
+        CheckConstraint("payload_digest ~ '^[0-9a-f]{64}$'", name="chk_intake_command_claims_digest"),
+        CheckConstraint("status IN ('running','completed','failed')", name="chk_intake_command_claims_status"),
+        CheckConstraint(
+            "intermediate_payload IS NULL OR jsonb_typeof(intermediate_payload) = 'object'",
+            name="chk_intake_command_claims_intermediate_object",
+        ),
+        CheckConstraint(
+            "response_payload IS NULL OR jsonb_typeof(response_payload) = 'object'",
+            name="chk_intake_command_claims_response_object",
+        ),
+        Index("idx_intake_command_claims_session_status", "session_id", "status", "created_at"),
+        Index("idx_intake_command_claims_run", "run_id"),
+    )

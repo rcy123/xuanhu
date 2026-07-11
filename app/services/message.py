@@ -61,6 +61,7 @@ from app.schemas.message import (
 )
 from app.schemas.types import Stage
 from app.services.events import EventService
+from app.services.langgraph_intake import LangGraphIntakeMessageRunner
 from app.services.session_lock import SessionLock
 
 logger = logging.getLogger("xuanhu.message")
@@ -177,6 +178,19 @@ class MessageService:
           10. 递增 state_version，写 audit + message.created 事件
           11. commit + 释放锁
         """
+        session = await self._load_session(session_id)
+        if getattr(session, "agent_runtime", "legacy") == "langgraph":
+            return await LangGraphIntakeMessageRunner(
+                self._db,
+                event_service=self._event_service,
+            ).submit_message(
+                session_id,
+                body,
+                doctor_id=doctor_id,
+                trace_id=trace_id,
+                x_state_version=x_state_version,
+            )
+
         # 段 A：保存医生消息
         doctor_message, session = await self._save_doctor_message_locked(
             session_id,

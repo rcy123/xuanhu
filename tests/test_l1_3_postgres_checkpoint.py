@@ -175,11 +175,11 @@ class TestWriteAndRead:
         async with postgres_checkpointer(_pg_url()) as saver:
             graph = build_main_graph(checkpointer=saver)
             result = await graph.ainvoke(state, config=config)
-            assert result["route"] == "intake_placeholder"
+            assert result["route"] == "intake_subgraph_v1"
 
             snapshot: StateSnapshot = await graph.aget_state(config)
             assert snapshot is not None
-            assert snapshot.values.get("route") == "intake_placeholder"
+            assert snapshot.values.get("route") == "intake_subgraph_v1"
             assert snapshot.values.get("command") == XuanhuCommand.MESSAGE.value
             assert snapshot.values.get("session_id") == session_id
 
@@ -424,7 +424,7 @@ class TestThreadIsolation:
             snap_a = await graph.aget_state(config_a)
             snap_b = await graph.aget_state(config_b)
 
-            assert snap_a.values.get("route") == "intake_placeholder"
+            assert snap_a.values.get("route") == "intake_subgraph_v1"
             assert snap_b.values.get("route") == "reasoning_placeholder"
             assert snap_a.values.get("session_id") == session_a
             assert snap_b.values.get("session_id") == session_b
@@ -465,7 +465,7 @@ class TestGraphVersionIsolation:
             snap_v1 = await graph.aget_state(config_v1)
             snap_v2 = await graph.aget_state(config_v2)
 
-            assert snap_v1.values.get("route") == "intake_placeholder"
+            assert snap_v1.values.get("route") == "intake_subgraph_v1"
             assert snap_v2.values.get("route") == "reasoning_placeholder"
             assert snap_v1.values.get("graph_version") == "v1"
             assert snap_v2.values.get("graph_version") == "v2"
@@ -622,7 +622,7 @@ class TestConfigStateMismatch:
             # 第一次：正常写入
             await graph.ainvoke(state, config=config)
             snap1 = await graph.aget_state(config)
-            assert snap1.values.get("route") == "intake_placeholder"
+            assert snap1.values.get("route") == "intake_subgraph_v1"
 
             # 第二次：错配请求被拒绝
             mismatch_state = _make_initial_state(
@@ -635,7 +635,7 @@ class TestConfigStateMismatch:
 
             # 原有 checkpoint 未被破坏
             snap2 = await graph.aget_state(config)
-            assert snap2.values.get("route") == "intake_placeholder"
+            assert snap2.values.get("route") == "intake_subgraph_v1"
             assert snap2.values.get("session_id") == session_id
 
 
@@ -757,10 +757,10 @@ class TestInMemorySaverCompatibility:
         state = _make_initial_state(command=XuanhuCommand.MESSAGE.value, session_id=session_id)
 
         result = await graph.ainvoke(state, config=config)
-        assert result["route"] == "intake_placeholder"
+        assert result["route"] == "intake_subgraph_v1"
 
         snapshot = await graph.aget_state(config)
-        assert snapshot.values.get("route") == "intake_placeholder"
+        assert snapshot.values.get("route") == "intake_subgraph_v1"
 
     @pytest.mark.asyncio
     async def test_main_graph_works_without_checkpointer(self) -> None:

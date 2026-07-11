@@ -39,18 +39,18 @@ from app.agent_runtime.checkpoint import ConfigValidatingCheckpointer
 from app.agent_runtime.commands import (
     NODE_BLOCKED_TERMINAL,
     NODE_COMMAND_ROUTER,
-    NODE_INTAKE_PLACEHOLDER,
+    NODE_INTAKE_SUBGRAPH_V1,
     NODE_MANUAL_TERMINAL,
     NODE_REASONING_PLACEHOLDER,
     NODE_RECOVERY_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
 )
+from app.agent_runtime.intake_subgraph import IntakeExecutor, build_intake_subgraph
 from app.agent_runtime.routing import command_router, route_after_router
 from app.agent_runtime.state import XuanhuGraphState
 
 # 占位节点列表（不含 command_router 和终端节点）。
 _PLACEHOLDER_NODES: tuple[str, ...] = (
-    NODE_INTAKE_PLACEHOLDER,
     NODE_REASONING_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
     NODE_RECOVERY_PLACEHOLDER,
@@ -88,6 +88,8 @@ def _make_placeholder_node(
 
 def build_main_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
+    *,
+    intake_executor: IntakeExecutor | None = None,
 ) -> CompiledStateGraph[XuanhuGraphState, None, XuanhuGraphState, XuanhuGraphState]:
     """构造最小 MainGraph。
 
@@ -106,6 +108,8 @@ def build_main_graph(
 
     # 注册 command_router 节点
     graph.add_node(NODE_COMMAND_ROUTER, command_router)
+    intake_node: Any = build_intake_subgraph(intake_executor=intake_executor)
+    graph.add_node(NODE_INTAKE_SUBGRAPH_V1, intake_node)
 
     # 注册占位节点（每个占位节点有独立的闭包函数）
     # LangGraph add_node 的类型签名使用 Never 作为输入类型参数，
@@ -121,7 +125,7 @@ def build_main_graph(
         NODE_COMMAND_ROUTER,
         route_after_router,
         {
-            NODE_INTAKE_PLACEHOLDER: NODE_INTAKE_PLACEHOLDER,
+            NODE_INTAKE_SUBGRAPH_V1: NODE_INTAKE_SUBGRAPH_V1,
             NODE_REASONING_PLACEHOLDER: NODE_REASONING_PLACEHOLDER,
             NODE_REVIEW_PLACEHOLDER: NODE_REVIEW_PLACEHOLDER,
             NODE_RECOVERY_PLACEHOLDER: NODE_RECOVERY_PLACEHOLDER,
@@ -131,6 +135,7 @@ def build_main_graph(
     )
 
     # 所有占位节点 -> END
+    graph.add_edge(NODE_INTAKE_SUBGRAPH_V1, END)
     for node_name in _PLACEHOLDER_NODES:
         graph.add_edge(node_name, END)
 

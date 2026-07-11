@@ -54,9 +54,9 @@ def migrated_database() -> str:
         pytest.skip("DB_URL is required for L2-5 PostgreSQL verification")
     config = Config("alembic.ini")
     command.downgrade(config, "20260710_0002")
-    command.upgrade(config, "20260711_0003")
+    command.upgrade(config, "20260711_0005")
     command.downgrade(config, "20260710_0002")
-    command.upgrade(config, "20260711_0003")
+    command.upgrade(config, "20260711_0005")
     return db_url
 
 

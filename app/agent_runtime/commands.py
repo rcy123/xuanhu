@@ -36,7 +36,8 @@ class XuanhuCommand(StrEnum):
 # ---------------------------------------------------------------------------
 
 NODE_COMMAND_ROUTER: str = "command_router"
-NODE_INTAKE_PLACEHOLDER: str = "intake_placeholder"
+NODE_INTAKE_SUBGRAPH_V1: str = "intake_subgraph_v1"
+NODE_INTAKE_PLACEHOLDER: str = NODE_INTAKE_SUBGRAPH_V1
 NODE_REASONING_PLACEHOLDER: str = "reasoning_placeholder"
 NODE_REVIEW_PLACEHOLDER: str = "review_placeholder"
 NODE_RECOVERY_PLACEHOLDER: str = "recovery_placeholder"
@@ -46,7 +47,7 @@ NODE_MANUAL_TERMINAL: str = "manual_terminal"
 # 终端节点集合：这些节点执行后直接进入 END。
 TERMINAL_NODES: frozenset[str] = frozenset(
     {
-        NODE_INTAKE_PLACEHOLDER,
+        NODE_INTAKE_SUBGRAPH_V1,
         NODE_REASONING_PLACEHOLDER,
         NODE_REVIEW_PLACEHOLDER,
         NODE_RECOVERY_PLACEHOLDER,
@@ -57,7 +58,7 @@ TERMINAL_NODES: frozenset[str] = frozenset(
 
 # 路由目标 -> 占位节点映射（正向路由）。
 COMMAND_ROUTE_MAP: dict[str, str] = {
-    XuanhuCommand.MESSAGE.value: NODE_INTAKE_PLACEHOLDER,
+    XuanhuCommand.MESSAGE.value: NODE_INTAKE_SUBGRAPH_V1,
     XuanhuCommand.ADVANCE.value: NODE_REASONING_PLACEHOLDER,
     XuanhuCommand.REVIEW.value: NODE_REVIEW_PLACEHOLDER,
     XuanhuCommand.RECOVER.value: NODE_RECOVERY_PLACEHOLDER,

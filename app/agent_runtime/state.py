@@ -116,6 +116,7 @@ class XuanhuGraphState(TypedDict, total=False):
     graph_version: str
     run_id: str
     route: str
+    intake_route: str
     gate_results: list[GateResultRef]
     artifact_refs: list[ArtifactRef]
     pending_interrupt: PendingInterrupt | None
@@ -165,6 +166,7 @@ def default_state(
         graph_version=graph_version,
         run_id=run_id,
         route="",
+        intake_route="",
         gate_results=[],
         artifact_refs=[],
         pending_interrupt=None,

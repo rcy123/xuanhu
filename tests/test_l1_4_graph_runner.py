@@ -85,7 +85,7 @@ class TestNormalInvoke:
         state = _make_state(command=XuanhuCommand.MESSAGE.value, session_id=session_id)
 
         result = await runner.ainvoke(state, config)
-        assert result["route"] == "intake_placeholder"
+        assert result["route"] == "intake_subgraph_v1"
 
     @pytest.mark.asyncio
     async def test_ainvoke_preserves_session_id(self) -> None:
@@ -769,12 +769,12 @@ class TestEventConversion:
 
     def test_convert_updates_chunk_valid(self) -> None:
         """convert_updates_chunk 正确转换有效 chunk。"""
-        chunk = {"command_router": {"route": "intake_placeholder"}}
+        chunk = {"command_router": {"route": "intake_subgraph_v1"}}
         event = convert_updates_chunk(chunk)
         assert event is not None
         assert event["event_type"] == "node_completed"
         assert event["node_name"] == "command_router"
-        assert event["route"] == "intake_placeholder"
+        assert event["route"] == "intake_subgraph_v1"
         assert event["event_version"] == EVENT_SCHEMA_VERSION
 
     def test_convert_updates_chunk_empty(self) -> None:
