@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L3 进行中 |
-| 当前任务 | L3-3 已验收通过，待提交；下一可发布 L3-4 GapSelector 与 Question Composer |
-| LangGraph 新链路 | L2-1～L2-5 已验收并提交；L3-1（`b3b182b`）与 L3-2（`d0c25aa`）已验收并提交；L3-3 CompletenessPolicy 与停滞策略已验收通过 |
+| 当前任务 | L3-4 已验收通过，待提交；下一可发布 L3-5 IntakeSubgraph、Messages API 与问诊 E2E |
+| LangGraph 新链路 | L2-1～L2-5 已验收并提交；L3-1（`b3b182b`）、L3-2（`d0c25aa`）与 L3-3（`4c00ea7`）已验收并提交；L3-4 GapSelector 与 Question Composer 已验收通过 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -46,7 +46,7 @@
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
-| L3 | Intake 问诊子图 | 进行中 | 60% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
+| L3 | Intake 问诊子图 | 进行中 | 80% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
@@ -90,7 +90,7 @@
 | L3-1 | IntakeExtractionAgent 与抽取验证 | L2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-1.md` |
 | L3-2 | TriagePolicy 与人工转介 | L3-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-2.md` |
 | L3-3 | CompletenessPolicy 与停滞策略 | L3-1/L3-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-3.md` |
-| L3-4 | GapSelector 与 Question Composer | L3-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-4.md` |
+| L3-4 | GapSelector 与 Question Composer | L3-3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l3-4.md` |
 | L3-5 | IntakeSubgraph、Messages API 与问诊 E2E | L3-1～L3-4 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l3-5.md` |
 
 ### L4：临床推理与方药子图
@@ -174,6 +174,7 @@
 | AR-B-021 | P1 | L3-2 声明 Triage 结果严格冻结且规则版本化，但 `TriagePolicyResult` 内嵌的 `GateResultSchema` 及 `details` dict 可原地修改：呼吸困难结果可从 `BLOCKED` 改为 `PASSED`、details 可改为 `continue`；导出的 `TRIAGE_RED_FLAG_RULES` 也是普通 dict，可将呼吸困难从 emergency referral 降级为 manual review | L3-2 | 已关闭 | 权威结果改为 frozen Triage DTO，嵌套 details/rules/source refs 使用 tuple/frozen 子 DTO；公开规则注册表结构不可变，适配副本不反向影响权威结果 |
 | AR-B-022 | P1 | L3-2 第 1 轮不可变返工不完整：公开 `TRIAGE_RED_FLAG_RULES` 虽改为 `MappingProxyType`，模块仍保留同一底层 `_TRIAGE_RED_FLAG_RULES` 普通 dict；修改该引用后，呼吸困难的权威处置由 `emergency_referral` 降级为 `manual_review` | L3-2 | 已关闭 | 删除普通 dict backing store，改为 tuple 支撑的 `FrozenTriageRuleRegistry`；独立扫描无可变规则表，高危规则篡改回归及二次 evaluate 均通过 |
 | AR-B-023 | P1 | L3-3 完备性权威语义不成立：`chief_complaint.category` 被当作主诉症状，只有类别没有症状即可 `ready/PASSED`；同一维度的不同合法子字段按 value fingerprint 互判冲突，补充真实 `chief_complaint.symptom` 后反而 `conflict`；女性年龄 30 但缺少绝经状态仍直接判妊娠/哺乳 `applicable`，与“必要事实缺失应 unknown”契约冲突；内部携带 candidate 的伪造 `continue/PASSED` Triage Gate 仍可被接受并进入 `ready`；第 1 轮返工后两个不同的当前 `chief_complaint.category` 因不属于覆盖维度而逃逸同 canonical fact key 冲突检测，动态十问类别由排序结果静默决定并可返回 `ready` | L3-3 | 已关闭 | 分类辅助事实与症状覆盖分离；冲突检测消费完整当前事实集并以独立辅助维度审计 category，同值重复幂等、异值乱序稳定 `conflict/FAILED`；缺绝经状态保持 unknown；Triage Gate 内部一致性固定重验；两轮对抗回归及全门禁通过 |
+| AR-B-024 | P1 | L3-4 权威边界可绕过：`compose_question()` 只重验裸 `GapSelectionResult` 形状，伪造 `source_completeness_disposition=ready` 的 selected 结果仍生成问题；公开 `select_gap(..., priority_registry=...)` 允许调用方替换权威优先级并把首选从过敏改为主诉；公开模板注入可返回与 selected dimension 不一致的问题；模型 fallback 接受与 selection 不同 `state_version` 的 RunSpec 并成功调用；单问验证遗漏英文 name/phone/ID 等身份索取；第 1 轮返工后 supplied selection 的隐藏 `route/force` 仍被 canonical 序列化静默丢弃并成功生成问题，且 fallback 接受 temperature=2、max_tokens=200000、timeout=86400、空 verifier chain 的宽松 AgentSpec 并请求模型 | L3-4 | 已关闭 | Composer 内部重算 Completeness→Gap 权威选择；生产优先级/模板固定为私有冻结权威引用；模板与 RunSpec/AgentSpec 完整绑定；supplied selection 递归拒绝未声明/授权字段；中英文身份语义拒绝；两轮对抗回归、L3 合并回归及全门禁通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -217,11 +218,18 @@
 | 2026-07-11 | L3-3 | 0 | 验收未通过 | 专项 `27 passed`、L3-1～L3-3 合并回归 `97 passed`，定向 Ruff/mypy、lock、diff check 通过；独立诊断确认无症状仅类别即可 `ready`、类别与真实症状并存反而 `conflict`、缺绝经状态的 30 岁女性提前判 applicable、携带 candidate_count 的伪造 continue/PASSED Triage Gate 仍进入 `ready`；登记 AR-B-023，未继续跑全量门禁 |
 | 2026-07-11 | L3-3 | 1 | 验收未通过 | 专项 `38 passed`、L3-1～L3-3 合并回归 `108 passed`，定向 Ruff/mypy、lock、diff check 通过；原四项诊断均已修复，但独立诊断构造两个不同的当前 `chief_complaint.category` 后仍得到 `ready` 且无 conflict，证明辅助分类 fact 逃逸同 canonical key 冲突规则；AR-B-023 保持打开，未继续跑全量门禁 |
 | 2026-07-11 | L3-3 | 2 | 验收通过 | 专项 `43 passed`、L3-1～L3-3 合并回归 `113 passed`；独立诊断确认 category 异值为稳定 `conflict/FAILED`、乱序一致、同值重复不冲突且输出不含 category/value fingerprint，原症状/互补字段/menopause/Triage 四项修复保持；全量后端 `1258 passed, 1 xfailed, 10 warnings`；Ruff、mypy（100 files）、lock、diff check 全部通过；关闭 AR-B-023，L3-3 完成 |
+| 2026-07-11 | L3-4 | 0 | 验收未通过 | 专项 `23 passed`、L3-1～L3-4 合并回归 `136 passed`，定向 Ruff/mypy、lock、diff check 通过；独立诊断确认伪造 ready-selected 仍成功生成问题、注入替代优先级可改变唯一缺口、错配模板可为症状缺口生成睡眠问题、state version 7 的 selection 可用 version 106 的 RunSpec 成功调用模型，英文 phone/full name/ID 问句均通过验证；登记 AR-B-024，未继续跑全量门禁 |
+| 2026-07-11 | L3-4 | 1 | 验收未通过 | 专项 `45 passed`、L3-1～L3-4 合并回归 `158 passed`，定向 Ruff/mypy、lock、diff check 通过；原五项诊断均已修复，但独立诊断确认权威 selection 的 `model_copy(update={'route':'ready','force':true})` 被静默接受并成功生成问题，且高温度、20 万 token、24 小时 timeout、空 verifier chain 的 AgentSpec 仍通过 fallback 前置检查并发起 1 次模型请求；AR-B-024 保持打开，未继续跑全量门禁 |
+| 2026-07-11 | L3-4 | 2 | 验收通过 | 专项 `55 passed`、L3-1～L3-4 合并回归 `168 passed`；独立诊断确认 supplied selection 隐藏 `route/force` 固定拒绝、宽松 AgentSpec 在 gateway 前拒绝且请求数 0、ready 路径无问题、生产注册表不可公开替换及英文身份请求保持拒绝；全量后端 `1313 passed, 1 xfailed, 10 warnings`；Ruff、mypy（103 files）、lock、diff check 全部通过；关闭 AR-B-024，L3-4 完成 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-11 | Codex | L3-4 第 2 轮复验通过：supplied selection 增加递归未声明/授权字段拒绝，Question Composer 的 model policy、verifier chain、failure policy 与只读权限锁定为单一固定契约；原五项返工、独立诊断、L3 合并回归、全量后端和静态门禁全部通过，关闭 AR-B-024，L3-4 完成，下一可发布 L3-5 |
+| 2026-07-11 | Codex | L3-4 第 1 轮复验仍未通过：Completeness→Gap 重算、生产注册表收口、模板绑定、RunSpec state/version 和中英文身份语义五项原问题已修复；但 supplied selection 隐藏 authority 字段仍被 serializer 丢弃后接受，AgentSpec 也未固定低温/短输出/短超时及 verifier chain。AR-B-024 保持打开，第二轮仅收口这两项及 gateway 前对抗回归 |
+| 2026-07-11 | Codex | L3-4 第 0 轮验收未通过：专项、L3 合并回归与静态门禁通过，但 GapSelection 可伪造、生产优先级可注入替换、模板与 selected dimension 未绑定、fallback RunSpec state version 未绑定，且英文身份索取绕过单问验证；登记 AR-B-024，限定返工于权威绑定、注册表收口、RunSpec 一致性和中英文身份隐私回归，不得扩展到 L3-5 |
+| 2026-07-11 | Codex | 提交 L3-3（`4c00ea7`）并发布 L3-4：实现纯确定性、版本化 GapSelector，只消费经过 canonical 重验且内部一致的 Completeness 权威结果，在 incomplete/conflict 路径按不可变优先级选择唯一缺口；Question Composer 对已选缺口模板优先，模板缺失时才允许通过 L2 AgentRuntime 使用受限只读模型兜底，输出必须是单一、无身份信息索取且不可携带路由/充分性权威的问题。不得让模型自选缺口、追加第二问或改变 Triage/Completeness，不接入 Graph、阶段迁移、API、Repository/DB/Outbox，也不实现 L3-5 |
 | 2026-07-11 | Codex | L3-3 第 2 轮复验通过：辅助策略事实纳入完整当前事实集冲突检测，`chief_complaint.category` 使用独立辅助维度审计，异值乱序稳定 conflict、同值重复幂等且不泄露原值；原 AR-B-023 四项修复、L3 合并回归、全量后端和静态门禁全部通过，关闭 AR-B-023，L3-3 完成，下一可发布 L3-4 |
 | 2026-07-11 | Codex | L3-3 第 1 轮复验仍未通过：主诉覆盖/互补字段、menopause unknown 与 Triage 内部一致性四项原问题已修复；但两个冲突的当前 `chief_complaint.category` 不进入任何维度分组，动态十问类别仍由排序结果静默决定并可 `ready`。AR-B-023 保持打开，第二轮返工仅补齐策略辅助 fact 的同 key 冲突检测与回归 |
 | 2026-07-11 | Codex | L3-3 第 0 轮验收未通过：专项与静态门禁通过，但主诉覆盖、聚合维度冲突、妊娠/哺乳适用性和 Triage 前置权威存在四项确定性绕过/误判；登记 AR-B-023，限定返工于语义分离、冲突键收口、unknown 适用性和 Triage continue 内部一致性重验及其对抗回归，不得扩展到 L3-4/L3-5 |
@@ -268,8 +276,8 @@
 
 ## 8. 下一步
 
-1. L3-3 已完成，保持 `AGENT_RUNTIME_VERSION=legacy`；提交前只纳入已验收的 L3-3 代码、Schema、测试和进度表，不提交 `docs/dev-handoff/*`，除非用户明确要求。
-2. 下一可发布任务为 L3-4：GapSelector 与 Question Composer；必须只选择一个最高优先级缺口，模板优先，模型不得自选缺口、追加第二问或改变 Completeness/Triage 结果。
+1. L3-4 已完成，保持 `AGENT_RUNTIME_VERSION=legacy`；提交前只纳入已验收的 L3-4 代码、Schema、Prompt、测试、导出和进度表，不提交 `docs/dev-handoff/*`，除非用户明确要求。
+2. 下一可发布任务为 L3-5：IntakeSubgraph、Messages API 与问诊 E2E；需集成 L3-1～L3-4、同事务 Domain State/Gate/Question/Outbox、幂等 command、并发 state version、红旗/停滞/manual/ready/incomplete/conflict 路由及 Legacy/LangGraph 会话隔离。
 
 ## 9. 维护要求
 

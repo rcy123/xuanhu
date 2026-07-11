@@ -43,6 +43,14 @@ from app.agent_runtime.context import (
     pseudonym,
     render_template,
 )
+from app.agent_runtime.gap_selector import (
+    GAP_PRIORITY_RULES,
+    FrozenGapPriorityRegistry,
+    GapSelectionFailureCode,
+    GapSelectionInputError,
+    canonicalize_gap_selection_input,
+    select_gap,
+)
 from app.agent_runtime.intake_verifier import (
     INTAKE_AGENT_NAME,
     INTAKE_AGENT_VERSION,
@@ -140,6 +148,12 @@ __all__ = [
     "completeness_gate_result",
     "completeness_to_gate_result_schema",
     "evaluate_completeness_policy",
+    "GAP_PRIORITY_RULES",
+    "FrozenGapPriorityRegistry",
+    "GapSelectionFailureCode",
+    "GapSelectionInputError",
+    "canonicalize_gap_selection_input",
+    "select_gap",
     "TRIAGE_RED_FLAG_RULES",
     "TriagePolicyFailureCode",
     "TriagePolicyInputError",
