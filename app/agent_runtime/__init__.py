@@ -17,6 +17,18 @@ L1-2 范围：
 
 from __future__ import annotations
 
+from app.agent_runtime.completeness_policy import (
+    COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES,
+    COMPLETENESS_DIMENSION_RULES,
+    COMPLETENESS_POLICY_CONFIG,
+    CompletenessPolicyFailureCode,
+    CompletenessPolicyInputError,
+    FrozenCompletenessRuleRegistry,
+    canonicalize_completeness_input,
+    completeness_gate_result,
+    completeness_to_gate_result_schema,
+    evaluate_completeness_policy,
+)
 from app.agent_runtime.context import (
     ContextBuilder,
     ContextBuilderError,
@@ -118,6 +130,16 @@ __all__ = [
     "RunSpec",
     "RuntimeErrorCode",
     "TokenUsage",
+    "COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES",
+    "COMPLETENESS_DIMENSION_RULES",
+    "COMPLETENESS_POLICY_CONFIG",
+    "CompletenessPolicyFailureCode",
+    "CompletenessPolicyInputError",
+    "FrozenCompletenessRuleRegistry",
+    "canonicalize_completeness_input",
+    "completeness_gate_result",
+    "completeness_to_gate_result_schema",
+    "evaluate_completeness_policy",
     "TRIAGE_RED_FLAG_RULES",
     "TriagePolicyFailureCode",
     "TriagePolicyInputError",
