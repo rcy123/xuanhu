@@ -40,6 +40,17 @@ from app.agent_runtime.reducer import (
     reduce_domain_state,
     validate_domain_delta,
 )
+from app.agent_runtime.repository import (
+    DOMAIN_STATE_COMMITTED,
+    CommitResult,
+    DomainRepository,
+    OutboxErrorCode,
+    OutboxMessage,
+    OutboxRepository,
+    PostgresDomainRepository,
+    RepositoryError,
+    RepositoryErrorCode,
+)
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase, RuntimeRunRecorder
 from app.agent_runtime.specs import (
     AgentSpec,
@@ -100,6 +111,15 @@ __all__ = [
     "domain_delta_digest",
     "reduce_domain_state",
     "validate_domain_delta",
+    "DOMAIN_STATE_COMMITTED",
+    "CommitResult",
+    "DomainRepository",
+    "OutboxErrorCode",
+    "OutboxMessage",
+    "OutboxRepository",
+    "PostgresDomainRepository",
+    "RepositoryError",
+    "RepositoryErrorCode",
     "DEFAULT_VERIFIER_CHAIN",
     "CheckResult",
     "CheckStatus",

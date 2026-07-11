@@ -10,7 +10,17 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, ForeignKeyConstraint, Index, Integer, String, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,8 +39,8 @@ class Observation(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
     )
     fact_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
-    normalized_value: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    value: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    normalized_value: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     source_message_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("consult_messages.id", ondelete="RESTRICT"), nullable=False
     )
@@ -39,7 +49,7 @@ class Observation(Base, UUIDPrimaryKeyMixin):
     supersedes_observation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("observations.id", ondelete="RESTRICT"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     source_message: Mapped[ConsultMessage] = relationship("ConsultMessage")
     supersedes: Mapped[Observation | None] = relationship("Observation", remote_side="Observation.id")
@@ -71,19 +81,21 @@ class SafetyProfile(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False, unique=True
     )
     allergy_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    allergens: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    allergens: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     pregnancy_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
     pregnancy_value: Mapped[str | None] = mapped_column(String(16), nullable=True)
     lactation_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
     lactation_value: Mapped[str | None] = mapped_column(String(16), nullable=True)
     medications_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    medications: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    medications: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     major_conditions_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    major_conditions: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    major_conditions: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     contraindications_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    contraindications: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), server_onupdate=func.now(), nullable=False)
+    contraindications: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), server_onupdate=func.now(), nullable=False
+    )
 
     __table_args__ = (
         *(
@@ -141,8 +153,8 @@ class GraphRun(Base, UUIDPrimaryKeyMixin):
     command_id: Mapped[str] = mapped_column(String(128), nullable=False)
     input_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (
         CheckConstraint("input_state_version >= 1", name="chk_graph_runs_input_state_version"),
         CheckConstraint("status IN ('running','completed','failed','cancelled')", name="chk_graph_runs_status"),
@@ -160,7 +172,7 @@ class GraphRunStep(Base, UUIDPrimaryKeyMixin):
     step_name: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     step_metadata: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     __table_args__ = (
         CheckConstraint("step_index >= 0", name="chk_graph_run_steps_index"),
         CheckConstraint("status IN ('started','completed','failed','skipped')", name="chk_graph_run_steps_status"),
@@ -186,7 +198,7 @@ class ArtifactRevision(Base, UUIDPrimaryKeyMixin):
     )
     parent_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     parent_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     __table_args__ = (
         CheckConstraint("revision >= 1", name="chk_artifact_revisions_revision"),
         CheckConstraint("input_state_version >= 1", name="chk_artifact_revisions_input_state_version"),
@@ -240,7 +252,7 @@ class GateResult(Base, UUIDPrimaryKeyMixin):
     input_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
     decision: Mapped[str] = mapped_column(String(16), nullable=False)
     details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     __table_args__ = (
         CheckConstraint("input_state_version >= 1", name="chk_gate_results_input_state_version"),
         CheckConstraint("decision IN ('passed','failed','blocked')", name="chk_gate_results_decision"),
@@ -248,4 +260,88 @@ class GateResult(Base, UUIDPrimaryKeyMixin):
         CheckConstraint("details IS NULL OR jsonb_typeof(details) = 'object'", name="chk_gate_results_details_object"),
         Index("idx_gate_results_session_created", "session_id", "created_at"),
         Index("idx_gate_results_run", "graph_run_id"),
+    )
+
+
+class OutboxEvent(Base, UUIDPrimaryKeyMixin):
+    """A durable, privacy-minimal event awaiting an external publisher."""
+
+    __tablename__ = "outbox_events"
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    graph_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    leased_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint("char_length(event_type) > 0", name="chk_outbox_events_type_nonempty"),
+        CheckConstraint("state_version >= 1", name="chk_outbox_events_state_version"),
+        CheckConstraint("attempt_count >= 0", name="chk_outbox_events_attempt_count"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="chk_outbox_events_payload_object"),
+        CheckConstraint("status IN ('pending','leased','published')", name="chk_outbox_events_status"),
+        CheckConstraint(
+            "(status = 'leased' AND leased_by IS NOT NULL AND leased_until IS NOT NULL) OR "
+            "(status <> 'leased' AND leased_by IS NULL AND leased_until IS NULL)",
+            name="chk_outbox_events_lease_relation",
+        ),
+        CheckConstraint(
+            "(status = 'published' AND published_at IS NOT NULL) OR (status <> 'published' AND published_at IS NULL)",
+            name="chk_outbox_events_published_relation",
+        ),
+        CheckConstraint(
+            "last_error_code IS NULL OR last_error_code ~ '^[A-Z][A-Z0-9_]{0,63}$'",
+            name="chk_outbox_events_error_code",
+        ),
+        Index("idx_outbox_events_claim", "status", "available_at", "leased_until", "created_at"),
+        Index("idx_outbox_events_session_version", "session_id", "state_version"),
+    )
+
+
+class DomainCommandCommit(Base, UUIDPrimaryKeyMixin):
+    """Database-level idempotency record and stable commit result."""
+
+    __tablename__ = "domain_command_commits"
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    input_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_spec_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    delta_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    changed: Mapped[bool] = mapped_column(nullable=False)
+    graph_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    outbox_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("outbox_events.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (
+        CheckConstraint("input_state_version >= 1", name="chk_domain_command_commits_input_version"),
+        CheckConstraint(
+            "output_state_version IN (input_state_version, input_state_version + 1)",
+            name="chk_domain_command_commits_output_version",
+        ),
+        CheckConstraint("delta_digest ~ '^[0-9a-f]{64}$'", name="chk_domain_command_commits_digest"),
+        UniqueConstraint(
+            "session_id",
+            "idempotency_key",
+            "input_state_version",
+            "agent_spec_version",
+            name="uq_domain_command_commits_idempotency",
+        ),
+        Index("idx_domain_command_commits_session_created", "session_id", "created_at"),
     )

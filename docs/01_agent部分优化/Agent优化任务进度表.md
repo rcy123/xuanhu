@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L2 进行中 |
-| 当前任务 | L2-2 已发布，待交付验收 |
-| LangGraph 新链路 | L2-1 领域 Schema 与迁移验收通过；当前建设 AgentSpec、RunSpec 与 AgentRuntime |
+| 当前阶段 | L2 已完成，L3 待启动 |
+| 当前任务 | L2-5 已验收通过，待提交；L3-1 待发布 |
+| LangGraph 新链路 | L2-1～L2-5 已验收通过；L2 阶段关口通过，L2-5 尚未提交 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 未完成，目标 L3 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -45,7 +45,7 @@
 |---|---|---|---:|---|---|
 | L0 | 大修基线与迁移护栏 | 已完成 | 100% | 架构和计划已确认 | ADR、Golden tests、Feature Flag、基线完成 |
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
-| L2 | Harness 核心与领域 State | 进行中 | 20% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
+| L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 未开始 | 0% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
 | L4 | 临床推理与方药子图 | 未开始 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
@@ -78,10 +78,10 @@
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
 | L2-1 | Observation/Safety/Artifact Schema 与数据库迁移 | L1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-1.md` |
-| L2-2 | AgentSpec、RunSpec 与 AgentRuntime | L2-1 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l2-2.md` |
-| L2-3 | ContextBuilder、Prompt 分层与隐私投影 | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-3.md` |
-| L2-4 | Verifier Chain 与 Domain Reducer | L2-1/L2-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-4.md` |
-| L2-5 | Repository、幂等事务与 Outbox | L2-1/L2-4 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l2-5.md` |
+| L2-2 | AgentSpec、RunSpec 与 AgentRuntime | L2-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-2.md` |
+| L2-3 | ContextBuilder、Prompt 分层与隐私投影 | L2-1/L2-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-3.md` |
+| L2-4 | Verifier Chain 与 Domain Reducer | L2-1/L2-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-4.md` |
+| L2-5 | Repository、幂等事务与 Outbox | L2-1/L2-4 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l2-5.md` |
 
 ### L3：Intake 问诊子图
 
@@ -160,6 +160,12 @@
 | AR-B-007 | P1 | L1-3 第二轮行为和全量测试通过，但 Ruff 门禁失败：`app/agent_runtime/checkpoint.py:26` 导入未使用的 `collections.abc.Sequence` | L1-3 | 已关闭 | 删除未使用导入，Ruff 复验通过 |
 | AR-B-008 | P1 | L1-4 的 `_sanitize_runner_error` 仅截断消息并处理 `postgresql://`，仍会把任意异常内的 API key、Bearer token、prompt 片段或患者身份文本带入 `GraphRunnerError`；专项测试只覆盖 DB URL，未覆盖该隐私边界 | L1-4 | 已关闭 | 对外 Runner 错误改为固定文本和错误码，底层异常链不再保留；ainvoke/stream 已覆盖 API key、token、prompt、身份文本和 DB URL 的异常、事件与异常链脱敏回归 |
 | AR-B-009 | P1 | L2-1 ORM 与迁移外键删除语义不一致：ORM 声明 CASCADE/RESTRICT/SET NULL，migration `_uuid_column` 却未传 `ondelete`；Safety Pydantic Schema 接受数据库约束拒绝的 pregnancy/lactation 任意字符串；Artifact revision 允许同一 artifact 多个 `current`，且父 revision 可跨 artifact/session，无法保证有效 revision 链 | L2-1 | 已关闭 | Schema/ORM/migration 外键 action 与安全值域已统一；partial unique index 保证单 current，复合自引用 FK 与前序 revision CHECK 保证同 artifact/session 父链；真实 PostgreSQL 约束测试通过 |
+| AR-B-010 | P1 | L2-2 缺少专项测试，Runtime attempt 未限制 gateway 内部实际请求，FailurePolicy 未接入执行分支 | L2-2 | 已关闭 | 新增 fake-gateway 专项；每 attempt 限制一个实际请求并接入固定错误码、预算和 deadline 重试策略 |
+| AR-B-011 | P1 | L2-2 recorder 可位于完整 run deadline 之外无限阻塞 | L2-2 | 已关闭 | recorder 操作受剩余 deadline/短收尾上限约束，阻塞异步任务可取消并消费 |
+| AR-B-012 | P1 | L2-2 同步 recorder 的 `to_thread` 工作可逃逸 run 生命周期 | L2-2 | 已关闭 | recorder 收紧为 async-only；同步实现构造阶段固定拒绝，不创建后台线程 |
+| AR-B-013 | P1 | L2-3 裸字符串 context 绕过脱敏，伪名 HMAC 使用源码公开固定 key | L2-3 | 已关闭 | 所有 context 统一递归脱敏；伪名密钥仅运行时注入/密钥提供者，缺失即拒绝 |
+| AR-B-014 | P1 | L2-4 Reducer 接受可手工伪造的 passed report，绕过 source/stage/prerequisite | L2-4 | 已关闭 | Reducer 仅接受完整 VerificationContext，并在提交边界重跑 canonical VerifierChain |
+| AR-B-015 | P1 | L2-4 安全返工后残留旧 report API 测试和旧交接说明 | L2-4 | 已关闭 | 所有正向调用迁移到 VerificationContext，专项与交接文件同步完成 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -187,10 +193,19 @@
 | 2026-07-10 | L2-1 | 0 | 验收未通过 | 专项 `5 passed`、models/migrations 回归 `59 passed`、Ruff、Python 3.11 mypy、uv lock、diff check 通过；独立真实 PostgreSQL `0001 → 0002 → 0001 → 0002` 迁移循环通过。静态契约审查发现迁移未实现 ORM 的 FK ondelete、Safety Schema/DB 值域不一致、artifact revision 缺少单 current 与同 artifact 父链约束，登记 AR-B-009；未继续全量门禁 |
 | 2026-07-10 | L2-1 | 1 | 验收通过 | AR-B-009 关闭：真实 PostgreSQL 专项 `8 passed`，覆盖 `0001 → 0002 → 0001 → 0002`、FK action、安全值域、单 current、同 artifact/session 前序父链；额外 session 级联删除诊断通过；models/migrations `59 passed`；全量后端 `1085 passed, 1 xfailed, 6 warnings`；Ruff、mypy（默认及 Python 3.11）、uv lock、diff check 通过 |
 
+| 2026-07-10 | L2-2 | 3 | 验收通过 | 专项 `23 passed`；Gateway/BaseAgent 回归 `36 passed`；全量 `1108 passed, 1 xfailed, 6 warnings`；Ruff、mypy、lock、diff check 通过；AR-B-010～012 关闭 |
+| 2026-07-10 | L2-3 | 1 | 验收通过 | 专项 `9 passed`；L2-2 回归 `23 passed`；全量 `1117 passed, 1 xfailed, 6 warnings`；Ruff、mypy、lock、diff check 通过；AR-B-013 关闭 |
+| 2026-07-11 | L2-4 | 2 | 验收通过 | 专项 `16 passed`；L2-1～L2-3 回归 `40 passed, 4 warnings`；全量 `1133 passed, 1 xfailed, 6 warnings`；Ruff、mypy（91 files）、lock、diff check 通过；AR-B-014/015 关闭 |
+| 2026-07-11 | L2-5 | 0 | 验收通过 | 真实 PostgreSQL 专项 `12 passed, 4 warnings`；L2-1～L2-5 合并回归 `68 passed, 8 warnings`；全量 `1145 passed, 1 xfailed, 10 warnings`；Ruff、mypy（93 files）、lock、diff check 通过；确认原子事务、数据库级幂等、并发版本冲突、Outbox claim/lease/ack/retry、故障回滚与隐私边界，无新增阻塞 |
+| 2026-07-11 | L2 | 阶段门禁 | 验收通过 | L2-1～L2-5 全部完成且无打开 P0/P1 阻塞；真实 PostgreSQL L2 合并回归 `68 passed, 8 warnings`；全量 `1145 passed, 1 xfailed, 10 warnings`；Ruff、mypy（93 files）、uv lock、git diff check 通过；保持 `AGENT_RUNTIME_VERSION=legacy` |
+
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-11 | Codex | L2-5 验收通过并关闭 L2 阶段：真实 PostgreSQL migration 往返、事务原子性、幂等重放、并发冲突、Outbox 多 worker/lease/retry/recovery 和隐私专项通过；L2 合并回归、全量后端及静态门禁全部通过，无新增阻塞；L2-5 待提交，下一可发布 L3-1 |
+| 2026-07-11 | Codex | L2-5 已交付待验收：新增真实 PostgreSQL Domain Repository、session 行锁与复合唯一键幂等、同事务 run/step/gate/outbox、SKIP LOCKED claim/lease/ack/retry，并覆盖并发、故障触发器回滚、重复请求、父 revision、进程恢复和隐私负向测试；未接入 Redis/SSE publisher、API 或业务 Agent |
+| 2026-07-11 | Codex | 根据本地提交 `c2b3f9a`、`fd492b5`、交接文件和验收门禁恢复曾回退的 L2-2～L2-4 看板事实；发布 L2-5，限定为真实 PostgreSQL Domain Repository、乐观版本事务、命令幂等和同事务 Outbox，不接入 Redis/SSE 发布、API、业务 Agent 或 L3 |
 | 2026-07-10 | Codex | 提交 L2-1 并发布 L2-2：定义版本化 AgentSpec/RunSpec/RunArtifact 等 Harness 协议，基于现有 ModelGatewayClient 实现受预算约束的 AgentRuntime，透传每 Agent 的 model/token/timeout/temperature 并注入最小 run/audit 记录；不得实现 ContextBuilder、Verifier/Reducer、Repository/outbox、业务 Agent、API 或切流 |
 | 2026-07-10 | Codex | L2-1 第 1 轮复验通过：统一 Schema/ORM/migration 外键与安全值域，以 partial unique index 和复合父链 FK/CHECK 固化 artifact revision 约束；真实 PG 专项、额外级联诊断、全量后端及静态门禁通过，关闭 AR-B-009，下一可发布 L2-2 |
 | 2026-07-10 | Codex | L2-1 第 0 轮验收未通过：专项、既有迁移回归、静态门禁及真实 PostgreSQL upgrade/downgrade 循环通过，但 ORM/migration 外键删除语义、Safety Schema/DB 值域和 artifact revision 链约束不一致；登记 AR-B-009，限定返工不扩展到 L2-2～L2-5 |
@@ -220,9 +235,8 @@
 
 ## 8. 下一步
 
-1. 等待并验收 L2-2：AgentSpec、RunSpec 与 AgentRuntime。
-2. L2-2 验收通过后发布 L2-3：ContextBuilder、Prompt 分层与隐私投影。
-3. L2-2 不实现 ContextBuilder、Verifier/Reducer、Repository/outbox 或业务 Agent。
+1. 提交已验收的 L2-5，提交范围排除 `docs/dev-handoff/*`。
+2. 发布 L3-1：IntakeExtractionAgent 与抽取验证；不得提前接入 L3-2～L3-5、生产 API 或切流。
 3. 保持 `AGENT_RUNTIME_VERSION` 默认 `legacy`，直到后续切流任务通过独立验收。
 
 ## 9. 维护要求
