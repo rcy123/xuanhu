@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L4 进行中 |
-| 当前任务 | L4-1 SyndromeDraftAgent 与 SyndromeVerifier 已验收通过，待提交；下一可发布 L4-2 |
-| LangGraph 新链路 | L2-1～L2-5 与 L3-1～L3-5 已验收并提交；L4-1 已验收通过，AR-B-026 已关闭 |
+| 当前任务 | L4-2 FormulaDraftAgent 合并基础方与加减已验收通过，待提交；下一可发布 L4-3 |
+| LangGraph 新链路 | L2-1～L2-5、L3-1～L3-5 与 L4-1 已验收并提交；L4-2 已验收通过，AR-B-027 已关闭 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 已完成，L3 关闭 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -47,7 +47,7 @@
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 已完成 | 100% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
-| L4 | 临床推理与方药子图 | 进行中 | 25% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
+| L4 | 临床推理与方药子图 | 进行中 | 50% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
 | L7 | Evidence/RAG 增强 | 未开始 | 0% | L6 关闭 | Evidence policy、claim links、trace 和 RAG 评估通过 |
@@ -98,7 +98,7 @@
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
 | L4-1 | SyndromeDraftAgent 与 SyndromeVerifier | L3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-1.md` |
-| L4-2 | FormulaDraftAgent 合并基础方与加减 | L4-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-2.md` |
+| L4-2 | FormulaDraftAgent 合并基础方与加减 | L4-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-2.md` |
 | L4-3 | FormulaConsistencyVerifier 与无 RAG 模式 | L4-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-3.md` |
 | L4-4 | ReasoningSubgraph、Revision 与回问闭环 | L4-1～L4-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-4.md` |
 
@@ -177,6 +177,7 @@
 | AR-B-024 | P1 | L3-4 权威边界可绕过：`compose_question()` 只重验裸 `GapSelectionResult` 形状，伪造 `source_completeness_disposition=ready` 的 selected 结果仍生成问题；公开 `select_gap(..., priority_registry=...)` 允许调用方替换权威优先级并把首选从过敏改为主诉；公开模板注入可返回与 selected dimension 不一致的问题；模型 fallback 接受与 selection 不同 `state_version` 的 RunSpec 并成功调用；单问验证遗漏英文 name/phone/ID 等身份索取；第 1 轮返工后 supplied selection 的隐藏 `route/force` 仍被 canonical 序列化静默丢弃并成功生成问题，且 fallback 接受 temperature=2、max_tokens=200000、timeout=86400、空 verifier chain 的宽松 AgentSpec 并请求模型 | L3-4 | 已关闭 | Composer 内部重算 Completeness→Gap 权威选择；生产优先级/模板固定为私有冻结权威引用；模板与 RunSpec/AgentSpec 完整绑定；supplied selection 递归拒绝未声明/授权字段；中英文身份语义拒绝；两轮对抗回归、L3 合并回归及全门禁通过 |
 | AR-B-025 | P1 | L3-5 集成未满足 Harness/LangGraph 权威边界：LangGraph 消息路径绕过 `PostgresDomainRepository`，未写 `DomainCommandCommit`/`OutboxEvent`，患者消息与领域结果分两次 commit；模型调用位于持锁数据库事务内；同 command 无数据库级幂等；ready 在 `/messages` 内直接改为 `syndrome`，而 `/advance` 不读取持久化 Completeness Gate、只运行 reasoning 占位并原样返回；所谓 IntakeSubgraph 只是依赖请求级 `ContextVar` executor 的单节点，进程恢复时未绑定即失败；L3-5 仅 2 个适配器单测，未覆盖 E2E、路由、并发、幂等、Outbox、调用次数和恢复；`mypy app` 另有 6 errors | L3-5 | 已关闭 | IntakeSubgraph 已拆为真实节点图并使用条件边路由；领域提交复用 Repository/Outbox 与数据库 claim 幂等，模型调用移出持锁事务；`/advance` 消费当前版本持久化 Gate；恢复元数据不保存临床事实，真实 PostgreSQL/Fake Gateway E2E 覆盖并发单调用、重放、commit 后恢复、路由和隐私，全部门禁通过 |
 | AR-B-026 | P1 | L4-1 模型前权威边界可绕过：`validate_syndrome_preflight()` 只检查调用方传入的裸 `GateResultSchema` 名称、版本、state version、decision 和少量 details，不从当前 Domain snapshot 重算或验证持久化来源；仅有主诉和一项十问事实的明显不完整快照配自造 `ready/PASSED` Gate 仍调用模型并成功。`_verify_context()` 只比较 observation ID 集合及 session/status，不比较 fact key、value、normalized value；同一 ID 下篡改症状内容后，篡改文本被直接发送给模型并成功 | L4-1 | 已关闭 | 新增 Repository `ReasoningAuthoritySnapshot`：在同一持锁读取事务中验证 `syndrome/active/langgraph` 当前会话、当前 Domain State `V+1` 与 `/advance` 精确绑定的来源 Gate `V`；source Gate ID/version、同一 completed Intake GraphRun、Triage continue/零候选和 Completeness ready 全部固定重验。模型 Context 仅从权威 Domain State 投影，调用方 State/Context/Gate/stage 不再成为临床真源；缺 authority 固定失败，真实 PG 阶段/版本/跨 run/重复 Gate 与对抗回归全部通过 |
+| AR-B-027 | P1 | L4-2 未真正绑定上游已验证 Syndrome 产物：第 0 轮信任调用方裸 Draft；第 1 轮信任调用方成套 Draft/RunSpec/RunArtifact；第 2 轮以可构造 PrivateAttr/内部 DTO 作为 capability，均可把伪造证型送入 Formula 模型 | L4-2 | 已关闭 | L4-1 公开执行包装器与 Formula consumer 共享闭包内弱引用身份注册表，只有真实 `execute_syndrome_draft` 成功返回的具体对象实例登记；Formula 以 id+weakref 双重确认并消费深拷贝权威记录。手工 result/passed report/PrivateAttr/内部 DTO、裸 Artifact/RunSpec、复制对象均不命中且 gateway 0 次；42 项专项、合并回归、全量与静态门禁通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -227,11 +228,20 @@
 | 2026-07-12 | L3-5 | 3 | 验收通过 | 专项 `15 passed`；L3-1～L3-5 合并回归 `183 passed, 4 warnings`；全量后端 `1328 passed, 1 xfailed, 14 warnings`；Ruff、mypy（108 files）、lock、diff check 全部通过。真实节点图、条件路由、Repository/Outbox 原子提交、数据库 claim 幂等、当前 Gate 推进、并发单调用、commit 后恢复和 checkpoint/Outbox 隐私负向检查均通过；关闭 AR-B-025，L3 完成 |
 | 2026-07-12 | L4-1 | 0 | 验收未通过 | 专项 `13 passed`，定向 Ruff、mypy（111 files）、lock、diff check 通过；但独立诊断确认明显不完整 Domain snapshot 配调用方自造的当前版本 `ready/PASSED` Gate 仍 `succeeded` 且模型调用 1 次，同 observation ID 下篡改 fact 内容后篡改值进入模型并 `succeeded`。现有测试只覆盖错误 policy version/过期 Gate，且 inactive/superseded 用允许 `RUN_PROVENANCE_MISMATCH` 的弱断言掩盖 fact-link 验证；登记 AR-B-026，未继续跑合并与全量后端门禁 |
 | 2026-07-12 | L4-1 | 4 | 验收通过 | L4-1、Repository、Advance 专项 `55 passed, 4 warnings`；L3-1～L4-1 合并回归 `205 passed, 4 warnings`；Repository/checkpoint/API 回归 `130 passed, 4 warnings`；全量后端 `1365 passed, 1 xfailed, 14 warnings`；Ruff、mypy（111 files）、lock、diff check 全部通过。独立审查确认 `/advance` 后当前 Domain State `V+1` 与来源 Gate `V` 分离绑定，推进前 inquiry、错误 stage/status/runtime/recovery、伪 Gate/State/Context、跨 run、重复或非 completed Gate 均在 gateway 前拒绝；关闭 AR-B-026，L4-1 完成 |
+| 2026-07-12 | L4-2 | 0 | 验收未通过 | 专项 `34 passed`，Ruff、mypy（114 files）、lock、diff check 通过；范围审查未发现提前实现 L4-3～L5。独立对抗诊断构造结构合法、引用全部真实 active fact IDs、但证型/治法/basis 文本由调用方凭空编造的 completed SyndromeDraft，公开 `execute_formula_draft()` 仍 `succeeded`、gateway 调用 1 次，伪造证型进入模型 Context。现有测试把“伪造报告”缩减为未知 fact ID 场景，未验证上游 L4-1 产物来源；登记 AR-B-027，未继续跑合并与全量后端门禁 |
+| 2026-07-12 | L4-2 | 1 | 验收未通过 | 独立对抗诊断同时伪造结构合法且引用真实 active facts 的 SyndromeDraft、与其自洽的 L4-1 RunSpec/RunArtifact，公开 Formula 入口仍 `succeeded`、gateway 调用 1 次且伪造证型进入 Context，证明调用方三件套重验/digest 并未建立可信来源。专项 `8 failed, 32 passed`：non-completed、缺 treatment principle、伪 State/context、同 ID 篡改、PII 和缺 artifact 等回归失败；其中 helper 对显式 `None` artifact 自动补默认 artifact，使缺 artifact 路径实际成功。交接文件仍是第 0 轮内容且未更新。AR-B-027 保持打开，未运行后续门禁 |
+| 2026-07-12 | L4-2 | 2 | 验收未通过 | 专项 `40 passed`，Ruff、mypy（114 files）、lock、diff check 通过，前轮 8 个测试失败和 None sentinel 已修复，交接文件已更新；但独立诊断直接导入 `_TrustedSyndromeExecution`，为手工构造且 canonical report=passed 的伪造 SyndromeExecutionResult 赋值 `_trusted_execution` 后，公开 Formula 入口仍 `succeeded`、gateway 调用 1 次且伪造证型进入 Context。PrivateAttr/下划线命名不是安全边界；AR-B-027 保持打开，未继续跑合并与全量后端门禁 |
+| 2026-07-12 | L4-2 | 3 | 验收通过 | 独立复现第 2 轮手工 canonical passed report、内部 DTO 与伪私有字段攻击，现固定返回 `FORMULA_SYNDROME_DRAFT_INVALID` 且 gateway 0 次；专项 `42 passed`，L4-1/L4-2/Repository/Advance 合并回归 `97 passed, 4 warnings`，全量后端 `1407 passed, 1 xfailed, 14 warnings`；Ruff、mypy（114 files）、lock、diff check 全部通过。身份注册只接受真实 L4-1 成功结果具体实例，复制/手工对象与裸 Artifact/RunSpec 均拒绝；关闭 AR-B-027，L4-2 完成 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-12 | Codex | L4-2 第 3 轮复验通过：L4-1 成功结果改由闭包内弱引用身份注册表登记，Formula 仅消费真实执行返回的具体对象；手工 passed report、内部 DTO、伪 PrivateAttr、裸 Artifact/RunSpec 和复制对象均固定拒绝且零模型调用。专项 42、合并 97、全量 1407 passed，静态门禁全部通过；关闭 AR-B-027，L4 完成度 50%，下一可发布 L4-3。 |
+| 2026-07-12 | Codex | L4-2 第 2 轮复验仍未通过：专项恢复 40 passed，静态门禁通过且交接已同步，但进程内“密封”仅依赖可导入 `_TrustedSyndromeExecution` 和可赋值 Pydantic PrivateAttr。独立对抗可手工铸造 passed result/private payload 并再次把伪造证型送入 Formula 模型。AR-B-027 继续打开；下一轮必须使用只有真实 L4-1 执行路径才能登记/解析的对象身份注册或受信存储引用，不得把 DTO 私有字段当 capability。 |
+| 2026-07-12 | Codex | L4-2 第 1 轮复验仍未通过：新增 L4-1 RunArtifact/RunSpec 重验与 digest，但这些输入仍可由调用方成套伪造，不构成可信产物来源；独立诊断再次成功把伪造证型送入 Formula 模型。专项同时出现 8 failures，缺 artifact 测试的 helper 会把显式 None 替换为默认 artifact，交接文件也未同步。AR-B-027 继续打开，返工必须改为受信执行边界或受信存储引用，并先修复专项回归。 |
+| 2026-07-12 | Codex | L4-2 第 0 轮验收未通过并发布限定返工：Formula Schema、单次 base/modifications/candidate 输出、无 RAG/只读/隐私边界和专项测试已落地，但 Formula 入口只校验调用方 SyndromeDraft 的形状与 fact ID 集合，未绑定 L4-1 已验证 RunArtifact/产物引用；任意伪造证型和治法只要引用真实 active facts 即可进入模型。登记 AR-B-027，返工仅收口上游 Syndrome 产物来源与对应零调用回归，不得扩展 L4-3～L5。 |
+| 2026-07-12 | Codex | 提交已验收的 L4-1（`73ba735`）；发布 L4-2 FormulaDraftAgent 合并基础方与加减。L4-2 只新增强类型 Formula Draft、固定 AgentSpec/RunSpec、以前置已验证 completed Syndrome Draft 为输入，并在一次模型输出中同时给出 base formula、modifications 与 candidate formula；保持 `model_knowledge_only`、`review_required=true`、只读无路由权，不得提前实现 L4-3 确定性一致性 Verifier、L4-4 ReasoningSubgraph/revision/回问、Safety/HITL、RAG 或切流。 |
 | 2026-07-12 | Codex | L4-1 第 4 轮复验通过：Repository authority 在同一读取边界锁定持久化会话阶段、当前 Domain State 与 `/advance` 来源 Gate，正确区分当前 `V+1` 和 Gate `V`；Syndrome Context 仅由权威 active observations 构建，缺 authority 与所有伪造/跨 run/重复 Gate 路径固定零模型调用。专项、合并、受影响回归、全量后端和静态门禁全部通过，关闭 AR-B-026；L4 完成度 25%，下一可发布 L4-2。 |
 | 2026-07-12 | Codex | L4-1 第 0 轮验收未通过并发布限定返工：强类型草案、无 RAG 契约和基础 Verifier 已落地，但模型前 Gate 与 Context 仍是调用方可伪造的第二输入源；当前版本伪 ready 可让不完整快照进入模型，同 observation ID 的事实内容也可被替换。登记 AR-B-026，返工仅收口 Gate 来源/重算、Context 精确投影和对应零调用回归，不得扩展到 L4-2～L4-4。 |
 | 2026-07-12 | Codex | 提交已验收的 L3-5 并关闭 L3；发布 L4-1 SyndromeDraftAgent 与 SyndromeVerifier。L4-1 只实现强类型 Syndrome 草案、固定 AgentSpec/RunSpec、READY_FOR_REASONING 前置检查与确定性 Verifier；明确无 RAG `model_knowledge_only`、置信度上限和医师复核要求，不得提前实现 Formula、ReasoningSubgraph、Safety/HITL 或 RAG。 |
@@ -288,8 +298,8 @@
 
 ## 8. 下一步
 
-1. L4-1 已完成；提交时只纳入已验收的 Syndrome Schema/Agent/Prompt/Verifier、Repository authority 扩展、对应测试和进度表，不提交 `docs/dev-handoff/*`，除非用户明确要求。
-2. 下一可发布 L4-2：`FormulaDraftAgent` 合并基础方与加减，一次输出 base formula、modifications 与 candidate formula；必须以前置已验证的 completed Syndrome Draft 为输入，保持无 RAG、医师复核和不得自行路由/通过安全 Gate 的边界，不得提前实现 L4-3/L4-4 或 L5。
+1. L4-2 已完成；提交时只纳入 Formula Schema/Agent/Prompt/边界 Verifier、L4-1 可信执行身份注册扩展、对应测试和进度表，不提交 `docs/dev-handoff/*`，除非用户明确要求。
+2. 下一可发布 L4-3：新增 `FormulaConsistencyVerifier`，根据 base formula + modifications 确定性重算 candidate，完成药味规范化、剂量/单位解析、修改动作与 composition 对应及症状/证型依据验证；保持 `model_knowledge_only`、医师复核和不得自行进入 Safety 的边界，不得提前实现 L4-4 或 L5。
 
 ## 9. 维护要求
 

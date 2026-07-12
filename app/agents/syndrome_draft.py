@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import weakref
+from collections.abc import Callable
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
@@ -11,7 +13,15 @@ from app.agent_runtime.context import ContextBuilder, ContextBuilderError, Conte
 from app.agent_runtime.reducer import DomainState
 from app.agent_runtime.repository import DomainRepository, ReasoningAuthoritySnapshot, RepositoryError
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
-from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunSpec, RuntimeErrorCode
+from app.agent_runtime.specs import (
+    AgentSpec,
+    Capability,
+    FailurePolicy,
+    ModelPolicy,
+    RunArtifact,
+    RunSpec,
+    RuntimeErrorCode,
+)
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_NAME,
     SYNDROME_AGENT_VERSION,
@@ -65,6 +75,17 @@ class SyndromeExecutionResult(BaseModel):
         elif self.output is not None or self.failure_code is None:
             raise ValueError("failed syndrome result contains only a fixed failure code")
         return self
+
+
+class _TrustedSyndromeExecution(BaseModel):
+    """Untrusted compatibility shape; constructing it grants no capability."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_spec: RunSpec
+    artifact: RunArtifact
+    input_payload: SyndromeDraftInput
+    output: SyndromeDraft
 
 
 def build_syndrome_agent_spec(*, model: str | None = None) -> AgentSpec:
@@ -131,7 +152,7 @@ def build_syndrome_context(
     return packet, template.prompt_version
 
 
-async def execute_syndrome_draft(
+async def _execute_syndrome_draft(
     *,
     runtime: AgentRuntime,
     repository: DomainRepository,
@@ -139,6 +160,7 @@ async def execute_syndrome_draft(
     input_payload: SyndromeDraftInput,
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
+    _register_success: Callable[[SyndromeExecutionResult, _TrustedSyndromeExecution], None],
 ) -> SyndromeExecutionResult:
     """Run once, verify the draft, and never route, persist, prescribe, or approve."""
 
@@ -201,11 +223,84 @@ async def execute_syndrome_draft(
     if not report.passed:
         assert report.failure_code is not None
         return _failed(report.failure_code, verification=report)
-    return SyndromeExecutionResult(
+    result = SyndromeExecutionResult(
         status=SyndromeExecutionStatus.SUCCEEDED,
         output=canonical_output,
         verification=report,
     )
+    _register_success(
+        result,
+        _TrustedSyndromeExecution(
+            run_spec=run_spec,
+            artifact=canonical_artifact,
+            input_payload=input_payload,
+            output=canonical_output,
+        ),
+    )
+    return result
+
+
+def _build_syndrome_execution_boundary() -> tuple[
+    Callable[..., object],
+    Callable[[SyndromeExecutionResult], _TrustedSyndromeExecution | None],
+]:
+    """Bind L4-1 execution to an identity registry unavailable to callers."""
+
+    trusted_instances: dict[
+        int,
+        tuple[weakref.ReferenceType[SyndromeExecutionResult], _TrustedSyndromeExecution],
+    ] = {}
+
+    def register_success(result: SyndromeExecutionResult, execution: _TrustedSyndromeExecution) -> None:
+        key = id(result)
+
+        def discard(reference: weakref.ReferenceType[SyndromeExecutionResult]) -> None:
+            current = trusted_instances.get(key)
+            if current is not None and current[0] is reference:
+                trusted_instances.pop(key, None)
+
+        trusted_instances[key] = (weakref.ref(result, discard), execution)
+
+    async def execute_syndrome_draft(
+        *,
+        runtime: AgentRuntime,
+        repository: DomainRepository,
+        run_spec: RunSpec,
+        input_payload: SyndromeDraftInput,
+        agent_spec: AgentSpec | None = None,
+        prompt_loader: PromptLoader | None = None,
+    ) -> SyndromeExecutionResult:
+        return await _execute_syndrome_draft(
+            runtime=runtime,
+            repository=repository,
+            run_spec=run_spec,
+            input_payload=input_payload,
+            agent_spec=agent_spec,
+            prompt_loader=prompt_loader,
+            _register_success=register_success,
+        )
+
+    def consume(result: SyndromeExecutionResult) -> _TrustedSyndromeExecution | None:
+        entry = trusted_instances.get(id(result))
+        if entry is None or entry[0]() is not result:
+            return None
+        trusted = entry[1]
+        if (
+            result.status is not SyndromeExecutionStatus.SUCCEEDED
+            or result.output != trusted.output
+            or result.verification is None
+            or not result.verification.passed
+        ):
+            return None
+        # Never expose the registry's stored record.  The consumer receives a
+        # fresh deep copy, so importing and calling this function cannot be
+        # used to mutate the authority retained by the execution boundary.
+        return trusted.model_copy(deep=True)
+
+    return execute_syndrome_draft, consume
+
+
+execute_syndrome_draft, _consume_trusted_syndrome_execution = _build_syndrome_execution_boundary()
 
 
 async def _load_reasoning_authority(
