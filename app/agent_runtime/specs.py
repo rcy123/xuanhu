@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
@@ -105,3 +107,35 @@ class RunArtifact(BaseModel):
     run_id: UUID
     agent_spec_version: str = Field(min_length=1)
     prompt_version: str = Field(min_length=1)
+
+
+def run_artifact_subject_digest(artifact: RunArtifact) -> str:
+    """Stable digest for the full model-run provenance and output."""
+
+    try:
+        subject = json.dumps(
+            {
+                "run_id": str(artifact.run_id),
+                "trace_id": artifact.trace_id,
+                "agent_spec_version": artifact.agent_spec_version,
+                "prompt_version": artifact.prompt_version,
+                "model_actual": artifact.model_actual,
+                "attempts": artifact.attempts,
+                "latency_ms": artifact.latency_ms,
+                "usage": artifact.usage.model_dump(mode="json"),
+                "evidence_ids": list(artifact.evidence_ids),
+                "type": f"{type(artifact.output).__module__}.{type(artifact.output).__qualname__}",
+                "output": artifact.output.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        subject = (
+            f"{artifact.run_id}:{artifact.trace_id}:{artifact.agent_spec_version}:"
+            f"{artifact.prompt_version}:{artifact.model_actual}:{artifact.attempts}:"
+            f"{artifact.latency_ms}:{type(artifact.output).__module__}.{type(artifact.output).__qualname__}"
+        )
+    return hashlib.sha256(subject.encode()).hexdigest()

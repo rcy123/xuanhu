@@ -24,7 +24,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.checkpoint import postgres_checkpointer
+from app.agent_runtime.commands import XuanhuCommand
+from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
+from app.agent_runtime.graph import build_main_graph
+from app.agent_runtime.runner import GraphRunner
+from app.agent_runtime.state import default_state
 from app.agents.supervisor import Supervisor, SupervisorResult
+from app.core.config import get_settings
 from app.core.exceptions import (
     InsufficientInquiryError,
     InvalidStageTransitionError,
@@ -164,6 +171,85 @@ def _safe_ref(prefix: str, value: str) -> str:
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
+async def _invoke_reasoning_graph(*, session_id: str, command_key: str, run_id: uuid.UUID) -> None:
+    graph_state = default_state(
+        session_id=session_id,
+        command=XuanhuCommand.ADVANCE.value,
+        command_id=command_key,
+        graph_version=DEFAULT_GRAPH_VERSION,
+        run_id=str(run_id),
+    )
+    config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
+    async with postgres_checkpointer(get_settings().database_url) as saver:
+        graph = build_main_graph(checkpointer=saver)
+        runner = GraphRunner(graph, timeout_seconds=120)
+        await runner.ainvoke(dict(graph_state), config=config)
+
+
+async def _completed_advance_response(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+) -> dict[str, Any]:
+    if db.in_transaction():
+        await db.rollback()
+    claim = await db.scalar(
+        select(IntakeCommandClaim)
+        .where(
+            IntakeCommandClaim.session_id == session_id,
+            IntakeCommandClaim.idempotency_key == command_key,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if claim is None:
+        raise SessionBusyError(detail=f"session_id={session_id} advance command did not create a claim")
+    if claim.payload_digest != payload_digest:
+        raise ValidationError(
+            message="相同幂等键不能复用不同 advance 命令",
+            detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
+            retryable=False,
+        )
+    if claim.status == "completed" and claim.response_payload is not None:
+        return dict(claim.response_payload)
+    if claim.status == "failed":
+        raise ModelGatewayUnavailableError(
+            f"session_id={session_id} advance reasoning graph failed: {claim.error_code or 'UNKNOWN'}",
+            retryable=True,
+        )
+    raise SessionBusyError(detail=f"session_id={session_id} advance command is still running")
+
+
+async def _mark_advance_failed(
+    db: AsyncSession,
+    *,
+    run_id: uuid.UUID,
+    session_id: uuid.UUID,
+    command_key: str,
+    error_code: str,
+) -> None:
+    if db.in_transaction():
+        await db.rollback()
+    async with db.begin():
+        claim = await db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_key,
+            )
+            .with_for_update()
+        )
+        if claim is not None and claim.status != "completed":
+            claim.status = "failed"
+            claim.error_code = error_code[:64]
+            claim.updated_at = func.now()
+        graph_run = await db.get(GraphRun, run_id, with_for_update=True)
+        if graph_run is not None and graph_run.status != "completed":
+            graph_run.status = "failed"
+            graph_run.completed_at = func.now()
+
+
 async def _run_langgraph_advance(
     db: AsyncSession,
     session: ConsultSession,
@@ -177,6 +263,7 @@ async def _run_langgraph_advance(
     sid = uuid.UUID(session_id)
     command_key = _advance_command_key(trace_id)
     payload_digest = _advance_payload_digest(force)
+    run_id: uuid.UUID | None = None
     async with session_lock(db, session_id, trace_id):
         if db.in_transaction():
             await db.rollback()
@@ -200,6 +287,9 @@ async def _run_langgraph_advance(
                     return dict(existing.response_payload)
                 if existing.status == "running" and not _advance_claim_is_stale(existing):
                     raise SessionBusyError(detail=f"session_id={session_id} advance command is still running")
+                if existing.status == "failed":
+                    existing.status = "running"
+                    existing.error_code = None
 
             run_id = (
                 existing.run_id
@@ -273,38 +363,27 @@ async def _run_langgraph_advance(
                     retryable=False,
                 )
 
-            input_version = max(gate_state_version or state_version or locked.state_version, 1)
+            input_version = locked.state_version
             graph_run = await db.get(GraphRun, run_id)
             if graph_run is None:
                 db.add(
                     GraphRun(
                         id=run_id,
                         session_id=sid,
-                        graph_version="main-graph.v1",
+                        graph_version=DEFAULT_GRAPH_VERSION,
                         command_id=command_key,
                         input_state_version=input_version,
-                        status="completed",
-                        completed_at=func.now(),
+                        status="running",
                     )
                 )
             else:
                 graph_run.input_state_version = input_version
-                graph_run.status = "completed"
-                graph_run.completed_at = func.now()
-
-            response_payload = {
-                "session_id": session_id,
-                "current_stage": locked.current_stage,
-                "from_stage": from_stage,
-                "state_version": locked.state_version,
-                "blocked_reason": locked.blocked_reason,
-                "agent_name": None,
-                "trace_id": trace_id,
-            }
+                graph_run.status = "running"
+                graph_run.completed_at = None
             db.add(
                 OutboxEvent(
                     id=uuid.uuid4(),
-                    event_type="advance.command_completed.v1",
+                    event_type="advance.command_started.v1",
                     session_id=sid,
                     graph_run_id=run_id,
                     state_version=locked.state_version,
@@ -322,7 +401,7 @@ async def _run_langgraph_advance(
             db.add(
                 AuditEvent(
                     session_id=sid,
-                    event_type="advance.completed",
+                    event_type="advance.started",
                     actor_type="system",
                     actor_id=None,
                     payload={
@@ -334,6 +413,14 @@ async def _run_langgraph_advance(
                     trace_id=trace_id,
                 )
             )
+            intermediate_payload = {
+                "advance": {
+                    "from_stage": from_stage,
+                    "trace_id": trace_id,
+                    "source_gate_id": str(gate_id) if gate_id else None,
+                    "source_gate_state_version": gate_state_version,
+                }
+            }
             if existing is None:
                 db.add(
                     IntakeCommandClaim(
@@ -342,18 +429,40 @@ async def _run_langgraph_advance(
                         idempotency_key=command_key,
                         payload_digest=payload_digest,
                         input_state_version=input_version,
-                        status="completed",
+                        status="running",
                         run_id=run_id,
-                        output_state_version=locked.state_version,
-                        response_payload=response_payload,
+                        intermediate_payload=intermediate_payload,
                     )
                 )
             else:
-                existing.status = "completed"
-                existing.output_state_version = locked.state_version
-                existing.response_payload = response_payload
+                existing.status = "running"
+                existing.input_state_version = input_version
+                existing.output_state_version = None
+                existing.response_payload = None
+                existing.error_code = None
+                existing.intermediate_payload = intermediate_payload
                 existing.updated_at = func.now()
-            return response_payload
+    assert run_id is not None
+    try:
+        await _invoke_reasoning_graph(session_id=session_id, command_key=command_key, run_id=run_id)
+    except Exception as exc:
+        await _mark_advance_failed(
+            db,
+            run_id=run_id,
+            session_id=sid,
+            command_key=command_key,
+            error_code="REASONING_GRAPH_FAILED",
+        )
+        raise ModelGatewayUnavailableError(
+            f"session_id={session_id} advance reasoning graph failed",
+            retryable=True,
+        ) from exc
+    return await _completed_advance_response(
+        db,
+        session_id=sid,
+        command_key=command_key,
+        payload_digest=payload_digest,
+    )
 
 
 @router.post("/sessions/{session_id}/advance")

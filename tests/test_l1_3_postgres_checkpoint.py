@@ -44,7 +44,7 @@ from app.agent_runtime.checkpoint import (
     extract_thread_id,
     postgres_checkpointer,
 )
-from app.agent_runtime.commands import XuanhuCommand
+from app.agent_runtime.commands import NODE_REASONING_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.config import (
     GRAPH_VERSION_V1,
     make_run_config,
@@ -102,6 +102,10 @@ def _make_initial_state(
         graph_version=graph_version,
         run_id=f"run-{uuid.uuid4().hex[:8]}" if command else "",
     )
+
+
+async def _reasoning_executor(_: XuanhuGraphState) -> dict[str, object]:
+    return {"route": NODE_REASONING_SUBGRAPH_V1}
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +200,7 @@ class TestWriteAndRead:
         state["domain_state_version"] = 99
 
         async with postgres_checkpointer(_pg_url()) as saver:
-            graph = build_main_graph(checkpointer=saver)
+            graph = build_main_graph(checkpointer=saver, reasoning_executor=_reasoning_executor)
             await graph.ainvoke(state, config=config)
             snapshot = await graph.aget_state(config)
             assert snapshot.values.get("domain_state_version") == 99
@@ -417,7 +421,7 @@ class TestThreadIsolation:
         state_b = _make_initial_state(command=XuanhuCommand.ADVANCE.value, session_id=session_b)
 
         async with postgres_checkpointer(_pg_url()) as saver:
-            graph = build_main_graph(checkpointer=saver)
+            graph = build_main_graph(checkpointer=saver, reasoning_executor=_reasoning_executor)
             await graph.ainvoke(state_a, config=config_a)
             await graph.ainvoke(state_b, config=config_b)
 
@@ -425,7 +429,7 @@ class TestThreadIsolation:
             snap_b = await graph.aget_state(config_b)
 
             assert snap_a.values.get("route") == "intake_subgraph_v1"
-            assert snap_b.values.get("route") == "reasoning_placeholder"
+            assert snap_b.values.get("route") == NODE_REASONING_SUBGRAPH_V1
             assert snap_a.values.get("session_id") == session_a
             assert snap_b.values.get("session_id") == session_b
 
@@ -458,7 +462,7 @@ class TestGraphVersionIsolation:
         )
 
         async with postgres_checkpointer(_pg_url()) as saver:
-            graph = build_main_graph(checkpointer=saver)
+            graph = build_main_graph(checkpointer=saver, reasoning_executor=_reasoning_executor)
             await graph.ainvoke(state_v1, config=config_v1)
             await graph.ainvoke(state_v2, config=config_v2)
 
@@ -466,7 +470,7 @@ class TestGraphVersionIsolation:
             snap_v2 = await graph.aget_state(config_v2)
 
             assert snap_v1.values.get("route") == "intake_subgraph_v1"
-            assert snap_v2.values.get("route") == "reasoning_placeholder"
+            assert snap_v2.values.get("route") == NODE_REASONING_SUBGRAPH_V1
             assert snap_v1.values.get("graph_version") == "v1"
             assert snap_v2.values.get("graph_version") == "v2"
 
@@ -765,10 +769,10 @@ class TestInMemorySaverCompatibility:
     @pytest.mark.asyncio
     async def test_main_graph_works_without_checkpointer(self) -> None:
         """MainGraph 不传 checkpointer 仍可正常路由。"""
-        graph = build_main_graph()
+        graph = build_main_graph(reasoning_executor=_reasoning_executor)
         session_id = _random_session_id()
         state = _make_initial_state(command=XuanhuCommand.ADVANCE.value, session_id=session_id)
 
         # 无 checkpointer 时 config 不是必需的
         result = await graph.ainvoke(state)
-        assert result["route"] == "reasoning_placeholder"
+        assert result["route"] == NODE_REASONING_SUBGRAPH_V1

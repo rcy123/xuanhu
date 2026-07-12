@@ -239,6 +239,57 @@ class ArtifactRevision(Base, UUIDPrimaryKeyMixin):
     )
 
 
+class ArtifactRevisionPayload(Base, UUIDPrimaryKeyMixin):
+    """Structured artifact payload bound to one artifact revision.
+
+    Payload rows are deliberately separate from ``artifact_revisions`` so the
+    DomainState ledger can keep returning metadata-only artifact references.
+    """
+
+    __tablename__ = "artifact_revision_payloads"
+    artifact_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifact_revisions.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload_schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="chk_artifact_revision_payloads_revision"),
+        CheckConstraint(
+            "char_length(payload_schema_version) > 0",
+            name="chk_artifact_revision_payloads_schema_nonempty",
+        ),
+        CheckConstraint(
+            "content_digest ~ '^[0-9a-f]{64}$'",
+            name="chk_artifact_revision_payloads_digest",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(payload) = 'object'",
+            name="chk_artifact_revision_payloads_payload_object",
+        ),
+        UniqueConstraint(
+            "session_id",
+            "artifact_id",
+            "revision",
+            name="uq_artifact_revision_payloads_revision",
+        ),
+        ForeignKeyConstraint(
+            ["artifact_id", "revision"],
+            ["artifact_revisions.artifact_id", "artifact_revisions.revision"],
+            name="fk_artifact_revision_payloads_artifact_revision",
+            ondelete="CASCADE",
+        ),
+        Index("idx_artifact_revision_payloads_session_artifact", "session_id", "artifact_id", "revision"),
+    )
+
+
 class GateResult(Base, UUIDPrimaryKeyMixin):
     __tablename__ = "gate_results"
     session_id: Mapped[uuid.UUID] = mapped_column(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Sequence
 from datetime import timedelta
@@ -26,6 +27,7 @@ from app.agent_runtime.verifiers import VerificationContext
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
+    ArtifactRevisionPayload,
     DomainCommandCommit,
     GateResult,
     GraphRun,
@@ -40,11 +42,23 @@ DOMAIN_STATE_COMMITTED = "domain.state_committed.v1"
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
+def artifact_payload_digest(payload_schema_version: str, payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        {"payload_schema_version": payload_schema_version, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class RepositoryErrorCode(StrEnum):
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
     STATE_VERSION_CONFLICT = "STATE_VERSION_CONFLICT"
     IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
     ARTIFACT_PARENT_INVALID = "ARTIFACT_PARENT_INVALID"
+    ARTIFACT_PAYLOAD_INVALID = "ARTIFACT_PAYLOAD_INVALID"
     UNSAFE_METADATA = "UNSAFE_METADATA"
     TRANSACTION_FAILED = "TRANSACTION_FAILED"
 
@@ -114,6 +128,48 @@ class GraphStepSpec(BaseModel):
     metadata: dict[str, object] | None = None
 
 
+class ArtifactPayloadSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    session_id: UUID
+    artifact_id: UUID
+    revision: int = Field(ge=1)
+    payload_schema_version: str = Field(min_length=1, max_length=64)
+    payload: dict[str, object]
+    content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def digest_matches_payload(self) -> ArtifactPayloadSpec:
+        if self.content_digest != artifact_payload_digest(self.payload_schema_version, self.payload):
+            raise ValueError("artifact payload digest mismatch")
+        return self
+
+
+class ArtifactPayloadRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    row_id: UUID
+    artifact_revision_row_id: UUID
+    session_id: UUID
+    artifact_id: UUID
+    artifact_type: str
+    revision: int = Field(ge=1)
+    input_state_version: int = Field(ge=1)
+    status: str = Field(min_length=1, max_length=16)
+    produced_by_run_id: UUID
+    parent_revision_id: UUID | None = None
+    parent_revision: int | None = None
+    payload_schema_version: str = Field(min_length=1, max_length=64)
+    payload: dict[str, object]
+    content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def digest_matches_payload(self) -> ArtifactPayloadRecord:
+        if self.content_digest != artifact_payload_digest(self.payload_schema_version, self.payload):
+            raise ValueError("artifact payload digest mismatch")
+        return self
+
+
 class ConsultMessageSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -147,6 +203,16 @@ class DomainRepository(Protocol):
     async def get_gate_results(self, session_id: UUID, state_version: int) -> tuple[GateResultSchema, ...]: ...
 
     async def get_reasoning_authority(self, session_id: UUID, state_version: int) -> ReasoningAuthoritySnapshot | None: ...
+
+    async def get_artifact_payload(
+        self,
+        session_id: UUID,
+        *,
+        artifact_type: str,
+        artifact_id: UUID | None = None,
+        revision: int | None = None,
+        status: str | None = "current",
+    ) -> ArtifactPayloadRecord | None: ...
 
     async def commit(
         self,
@@ -266,6 +332,69 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         except SQLAlchemyError:
             raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
 
+    async def get_artifact_payload(
+        self,
+        session_id: UUID,
+        *,
+        artifact_type: str,
+        artifact_id: UUID | None = None,
+        revision: int | None = None,
+        status: str | None = "current",
+    ) -> ArtifactPayloadRecord | None:
+        try:
+            async with self._session_factory() as session:
+                criteria = [
+                    ArtifactRevision.session_id == session_id,
+                    ArtifactRevision.artifact_type == artifact_type,
+                ]
+                if status is not None:
+                    criteria.append(ArtifactRevision.status == status)
+                if artifact_id is not None:
+                    criteria.append(ArtifactRevision.artifact_id == artifact_id)
+                if revision is not None:
+                    criteria.append(ArtifactRevision.revision == revision)
+                row = await session.execute(
+                    select(ArtifactRevision, ArtifactRevisionPayload)
+                    .join(
+                        ArtifactRevisionPayload,
+                        ArtifactRevisionPayload.artifact_revision_id == ArtifactRevision.id,
+                    )
+                    .where(*criteria)
+                    .order_by(ArtifactRevision.revision.desc(), ArtifactRevision.created_at.desc())
+                    .limit(1)
+                )
+                pair = row.one_or_none()
+                if pair is None:
+                    return None
+                artifact, payload = pair
+                record = ArtifactPayloadRecord(
+                    row_id=payload.id,
+                    artifact_revision_row_id=artifact.id,
+                    session_id=artifact.session_id,
+                    artifact_id=artifact.artifact_id,
+                    artifact_type=artifact.artifact_type,
+                    revision=artifact.revision,
+                    input_state_version=artifact.input_state_version,
+                    status=artifact.status,
+                    produced_by_run_id=artifact.produced_by_run_id,
+                    parent_revision_id=artifact.parent_revision_id,
+                    parent_revision=artifact.parent_revision,
+                    payload_schema_version=payload.payload_schema_version,
+                    payload=dict(payload.payload),
+                    content_digest=payload.content_digest,
+                )
+                if (
+                    payload.session_id != artifact.session_id
+                    or payload.artifact_id != artifact.artifact_id
+                    or payload.revision != artifact.revision
+                ):
+                    raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
+                return record
+        except RepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError, TypeError):
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
+
     async def commit(
         self,
         delta: DomainDelta,
@@ -274,6 +403,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         graph_version: str,
         gate_results: Sequence[GateResultSchema] = (),
         graph_steps: Sequence[GraphStepSpec] = (),
+        artifact_payloads: Sequence[ArtifactPayloadSpec] = (),
         consult_messages: Sequence[ConsultMessageSpec] = (),
         session_updates: dict[str, object] | None = None,
         outbox_event_type: str = DOMAIN_STATE_COMMITTED,
@@ -308,9 +438,6 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
 
                 state = await self._load_state(session, locked)
                 next_state = reduce_domain_state(state, delta, context)
-                await self._persist_state(session, state, next_state, delta)
-                locked.state_version = next_state.state_version
-
                 with session.no_autoflush:
                     graph_run = await session.get(GraphRun, delta.run_id)
                 if graph_run is None:
@@ -320,14 +447,14 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         graph_version=graph_version,
                         command_id=idempotency_ref,
                         input_state_version=delta.expected_state_version,
-                        status="completed",
-                        completed_at=func.now(),
+                        status="running",
                     )
                     session.add(graph_run)
                     await session.flush([graph_run])
-                else:
-                    graph_run.status = "completed"
-                    graph_run.completed_at = func.now()
+                await self._persist_state(session, state, next_state, delta, artifact_payloads=artifact_payloads)
+                locked.state_version = next_state.state_version
+                graph_run.status = "completed"
+                graph_run.completed_at = func.now()
                 session.add(
                     GraphRunStep(
                         id=uuid4(),
@@ -554,6 +681,8 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         previous: DomainState,
         current: DomainState,
         delta: DomainDelta,
+        *,
+        artifact_payloads: Sequence[ArtifactPayloadSpec],
     ) -> None:
         previous_observations = {item.observation_id for item in previous.observations}
         for observation_item in current.observations:
@@ -593,10 +722,17 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         }
         for key, artifact_row in by_key.items():
             artifact_row.status = next_by_key[key].status.value
+        if by_key:
+            await session.flush()
 
         incoming_keys = {
             (artifact_item.artifact_id, artifact_item.revision) for artifact_item in delta.artifact_revisions
         }
+        payload_by_key = {
+            (payload.artifact_id, payload.revision): payload for payload in artifact_payloads
+        }
+        if set(payload_by_key) - incoming_keys:
+            raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
         for artifact_item in current.artifacts:
             key = (artifact_item.artifact_id, artifact_item.revision)
             if key not in incoming_keys or key in by_key:
@@ -609,21 +745,36 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                     or parent.session_id != artifact_item.session_id
                 ):
                     raise RepositoryError(RepositoryErrorCode.ARTIFACT_PARENT_INVALID)
-            session.add(
-                ArtifactRevision(
-                    id=uuid4(),
-                    artifact_id=artifact_item.artifact_id,
-                    artifact_type=artifact_item.artifact_type,
-                    revision=artifact_item.revision,
-                    session_id=artifact_item.session_id,
-                    input_state_version=artifact_item.input_state_version,
-                    status=artifact_item.status.value,
-                    produced_by_run_id=artifact_item.produced_by_run_id,
-                    parent_revision_id=artifact_item.parent_revision_id,
-                    parent_revision=artifact_item.parent_revision,
-                    created_at=artifact_item.created_at,
-                )
+            revision_row = ArtifactRevision(
+                id=uuid4(),
+                artifact_id=artifact_item.artifact_id,
+                artifact_type=artifact_item.artifact_type,
+                revision=artifact_item.revision,
+                session_id=artifact_item.session_id,
+                input_state_version=artifact_item.input_state_version,
+                status=artifact_item.status.value,
+                produced_by_run_id=artifact_item.produced_by_run_id,
+                parent_revision_id=artifact_item.parent_revision_id,
+                parent_revision=artifact_item.parent_revision,
+                created_at=artifact_item.created_at,
             )
+            session.add(revision_row)
+            payload = payload_by_key.get(key)
+            if payload is not None:
+                if payload.session_id != artifact_item.session_id:
+                    raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
+                session.add(
+                    ArtifactRevisionPayload(
+                        id=uuid4(),
+                        artifact_revision_id=revision_row.id,
+                        session_id=payload.session_id,
+                        artifact_id=payload.artifact_id,
+                        revision=payload.revision,
+                        payload_schema_version=payload.payload_schema_version,
+                        payload=dict(payload.payload),
+                        content_digest=payload.content_digest,
+                    )
+                )
 
     @staticmethod
     def _observation_schema(row: Observation) -> ObservationSchema:
@@ -705,7 +856,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         except (TypeError, ValueError):
             return None
         source_state_version = raw_state_version
-        if source_state_version < 1 or source_state_version != current_state_version - 1:
+        if source_state_version < 1 or source_state_version >= current_state_version:
             return None
         return source_gate_id, source_state_version
 

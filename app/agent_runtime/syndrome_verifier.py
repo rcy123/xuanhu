@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Iterable
@@ -11,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec
+from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
 from app.schemas.syndrome import (
@@ -523,23 +522,9 @@ def _check(name: str, code: SyndromeVerificationFailureCode | None) -> SyndromeC
 
 def _report(checks: list[SyndromeCheckResult], artifact: RunArtifact) -> SyndromeVerificationReport:
     first = next((check.failure_code for check in checks if check.failure_code is not None), None)
-    try:
-        subject = json.dumps(
-            {
-                "run_id": str(artifact.run_id),
-                "type": f"{type(artifact.output).__module__}.{type(artifact.output).__qualname__}",
-                "output": artifact.output.model_dump(mode="json"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError, OverflowError):
-        subject = f"{artifact.run_id}:{type(artifact.output).__module__}.{type(artifact.output).__qualname__}"
     return SyndromeVerificationReport(
         passed=first is None,
         checks=tuple(checks),
         failure_code=first,
-        subject_digest=hashlib.sha256(subject.encode()).hexdigest(),
+        subject_digest=run_artifact_subject_digest(artifact),
     )

@@ -9,6 +9,7 @@ from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
+    ArtifactRevisionPayload,
     DomainCommandCommit,
     GateResult,
     GraphRun,
@@ -41,6 +42,7 @@ __all__ = [
     "OutboxEvent",
     "SafetyProfile",
     "ArtifactRevision",
+    "ArtifactRevisionPayload",
     "GateResult",
     "GraphRun",
     "GraphRunStep",

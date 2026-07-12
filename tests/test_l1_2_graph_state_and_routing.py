@@ -31,7 +31,7 @@ from app.agent_runtime.commands import (
     NODE_BLOCKED_TERMINAL,
     NODE_INTAKE_PLACEHOLDER,
     NODE_MANUAL_TERMINAL,
-    NODE_REASONING_PLACEHOLDER,
+    NODE_REASONING_SUBGRAPH_V1,
     NODE_RECOVERY_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
     VALID_COMMANDS,
@@ -103,12 +103,12 @@ class TestCommandRoutingPositive:
         assert result["route"] == NODE_INTAKE_PLACEHOLDER
 
     @pytest.mark.asyncio
-    async def test_advance_routes_to_reasoning_placeholder(self) -> None:
-        """command=advance -> reasoning_placeholder。"""
+    async def test_advance_routes_to_reasoning_subgraph(self) -> None:
+        """command=advance -> reasoning_subgraph_v1。"""
         graph = build_main_graph()
         state = _make_initial_state(command=XuanhuCommand.ADVANCE.value)
         result = await graph.ainvoke(state, config=make_run_config(state["session_id"]))
-        assert result["route"] == NODE_REASONING_PLACEHOLDER
+        assert result["route"] == NODE_REASONING_SUBGRAPH_V1
 
     @pytest.mark.asyncio
     async def test_review_routes_to_review_placeholder(self) -> None:
@@ -215,7 +215,7 @@ class TestConditionalEdges:
         "command,expected_node",
         [
             (XuanhuCommand.MESSAGE.value, NODE_INTAKE_PLACEHOLDER),
-            (XuanhuCommand.ADVANCE.value, NODE_REASONING_PLACEHOLDER),
+            (XuanhuCommand.ADVANCE.value, NODE_REASONING_SUBGRAPH_V1),
             (XuanhuCommand.REVIEW.value, NODE_REVIEW_PLACEHOLDER),
             (XuanhuCommand.RECOVER.value, NODE_RECOVERY_PLACEHOLDER),
             ("", NODE_BLOCKED_TERMINAL),
@@ -426,7 +426,7 @@ class TestThreadIdIsolation:
 
         # thread_a 路由到 intake，thread_b 路由到 reasoning
         assert snap_a.values.get("route") == NODE_INTAKE_PLACEHOLDER
-        assert snap_b.values.get("route") == NODE_REASONING_PLACEHOLDER
+        assert snap_b.values.get("route") == NODE_REASONING_SUBGRAPH_V1
 
         # session_id 隔离
         assert snap_a.values.get("session_id") == session_a
@@ -457,7 +457,7 @@ class TestThreadIdIsolation:
         )
         await graph.ainvoke(state_2, config=config)
         snap_2 = await graph.aget_state(config)
-        assert snap_2.values.get("route") == NODE_REASONING_PLACEHOLDER
+        assert snap_2.values.get("route") == NODE_REASONING_SUBGRAPH_V1
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +497,7 @@ class TestGraphVersionNamespaceIsolation:
 
         # v1 路由到 intake，v2 路由到 reasoning
         assert snap_v1.values.get("route") == NODE_INTAKE_PLACEHOLDER
-        assert snap_v2.values.get("route") == NODE_REASONING_PLACEHOLDER
+        assert snap_v2.values.get("route") == NODE_REASONING_SUBGRAPH_V1
 
         # graph_version 隔离
         assert snap_v1.values.get("graph_version") == "v1"
@@ -545,7 +545,7 @@ class TestMainGraphStructure:
         graph = build_main_graph()
         for command, expected_route in [
             (XuanhuCommand.MESSAGE.value, NODE_INTAKE_PLACEHOLDER),
-            (XuanhuCommand.ADVANCE.value, NODE_REASONING_PLACEHOLDER),
+            (XuanhuCommand.ADVANCE.value, NODE_REASONING_SUBGRAPH_V1),
             (XuanhuCommand.REVIEW.value, NODE_REVIEW_PLACEHOLDER),
             (XuanhuCommand.RECOVER.value, NODE_RECOVERY_PLACEHOLDER),
             ("", NODE_BLOCKED_TERMINAL),

@@ -167,6 +167,61 @@ def _install_fake_runtime(monkeypatch: pytest.MonkeyPatch, gateway: _E2EFakeGate
     monkeypatch.setattr(langgraph_intake_module, "AgentRuntime", lambda: AgentRuntime(gateway))
 
 
+def _install_fake_advance_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async def fake_invoke_reasoning_graph(*, session_id: str, command_key: str, run_id: uuid.UUID) -> None:
+        sid = uuid.UUID(session_id)
+        async with db_factory() as db, db.begin():
+            claim = await db.scalar(
+                select(IntakeCommandClaim)
+                .where(
+                    IntakeCommandClaim.session_id == sid,
+                    IntakeCommandClaim.idempotency_key == command_key,
+                )
+                .with_for_update()
+            )
+            session = await db.get(ConsultSession, sid, with_for_update=True)
+            graph_run = await db.get(GraphRun, run_id, with_for_update=True)
+            assert claim is not None and session is not None and graph_run is not None
+            advance = claim.intermediate_payload.get("advance", {}) if claim.intermediate_payload else {}
+            response_payload = {
+                "session_id": session_id,
+                "current_stage": session.current_stage,
+                "from_stage": advance.get("from_stage", "inquiry"),
+                "state_version": session.state_version,
+                "blocked_reason": session.blocked_reason,
+                "agent_name": None,
+                "trace_id": advance.get("trace_id"),
+            }
+            claim.status = "completed"
+            claim.output_state_version = session.state_version
+            claim.response_payload = response_payload
+            claim.updated_at = func.now()
+            graph_run.status = "completed"
+            graph_run.completed_at = func.now()
+            existing_completed = await db.scalar(
+                select(func.count())
+                .select_from(OutboxEvent)
+                .where(OutboxEvent.session_id == sid, OutboxEvent.event_type == "advance.command_completed.v1")
+            )
+            if existing_completed == 0:
+                db.add(
+                    OutboxEvent(
+                        id=uuid.uuid4(),
+                        event_type="advance.command_completed.v1",
+                        session_id=sid,
+                        graph_run_id=run_id,
+                        state_version=session.state_version,
+                        trace_id="trace:advance-test",
+                        payload=response_payload,
+                    )
+                )
+
+    monkeypatch.setattr("app.api.advance._invoke_reasoning_graph", fake_invoke_reasoning_graph)
+
+
 @pytest.fixture(scope="module")
 def migrated_database() -> str:
     import os
@@ -700,7 +755,9 @@ async def test_intake_running_claim_recovers_from_domain_commit(
 @pytest.mark.asyncio
 async def test_langgraph_advance_consumes_persisted_ready_gate(
     db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_advance_graph(monkeypatch, db_factory)
     session_id = uuid.uuid4()
     async with db_factory() as db, db.begin():
         db.add(
@@ -819,7 +876,9 @@ async def test_langgraph_advance_rejects_stale_ready_gate_after_state_changes(
 @pytest.mark.asyncio
 async def test_langgraph_advance_replay_is_stable_and_writes_one_outbox(
     db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_advance_graph(monkeypatch, db_factory)
     session_id = uuid.uuid4()
     async with db_factory() as db, db.begin():
         db.add(

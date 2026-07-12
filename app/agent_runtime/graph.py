@@ -12,7 +12,7 @@ START
 command_router
   │ (conditional edge: route_after_router)
   ├─ message  ──► intake_placeholder     ──► END
-  ├─ advance  ──► reasoning_placeholder  ──► END
+  ├─ advance  ──► reasoning_subgraph_v1  ──► END
   ├─ review   ──► review_placeholder     ──► END
   ├─ recover  ──► recovery_placeholder   ──► END
   ├─ empty    ──► blocked_terminal       ──► END
@@ -20,8 +20,8 @@ command_router
 ```
 
 L1-2 边界：
-- 所有占位节点只写入 ``route`` 标记，不执行业务逻辑。
-- 不接入 IntakeSubgraph、ReasoningSubgraph 等真实子图（留给 L3/L4）。
+- review/recover 等尚未实现节点只写入 ``route`` 标记，不执行业务逻辑。
+- message/advance 已接入 IntakeSubgraph、ReasoningSubgraph。
 - 不接入 AsyncPostgresSaver（留给 L1-3），测试使用 InMemorySaver。
 - 不实现 GraphRunner/stream（留给 L1-4）。
 """
@@ -41,17 +41,17 @@ from app.agent_runtime.commands import (
     NODE_COMMAND_ROUTER,
     NODE_INTAKE_SUBGRAPH_V1,
     NODE_MANUAL_TERMINAL,
-    NODE_REASONING_PLACEHOLDER,
+    NODE_REASONING_SUBGRAPH_V1,
     NODE_RECOVERY_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
 )
 from app.agent_runtime.intake_subgraph import IntakeExecutor, build_intake_subgraph
+from app.agent_runtime.reasoning_subgraph import ReasoningExecutor, build_reasoning_subgraph
 from app.agent_runtime.routing import command_router, route_after_router
 from app.agent_runtime.state import XuanhuGraphState
 
 # 占位节点列表（不含 command_router 和终端节点）。
 _PLACEHOLDER_NODES: tuple[str, ...] = (
-    NODE_REASONING_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
     NODE_RECOVERY_PLACEHOLDER,
     NODE_BLOCKED_TERMINAL,
@@ -90,11 +90,12 @@ def build_main_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     intake_executor: IntakeExecutor | None = None,
+    reasoning_executor: ReasoningExecutor | None = None,
 ) -> CompiledStateGraph[XuanhuGraphState, None, XuanhuGraphState, XuanhuGraphState]:
     """构造最小 MainGraph。
 
     图结构：
-        START -> command_router -> [conditional] -> placeholder -> END
+        START -> command_router -> [conditional] -> subgraph/placeholder -> END
 
     参数:
         checkpointer: LangGraph checkpointer 实例。支持 ``InMemorySaver``（单测）
@@ -110,6 +111,8 @@ def build_main_graph(
     graph.add_node(NODE_COMMAND_ROUTER, command_router)
     intake_node: Any = build_intake_subgraph(intake_executor=intake_executor)
     graph.add_node(NODE_INTAKE_SUBGRAPH_V1, intake_node)
+    reasoning_node: Any = build_reasoning_subgraph(reasoning_executor=reasoning_executor)
+    graph.add_node(NODE_REASONING_SUBGRAPH_V1, reasoning_node)
 
     # 注册占位节点（每个占位节点有独立的闭包函数）
     # LangGraph add_node 的类型签名使用 Never 作为输入类型参数，
@@ -126,7 +129,7 @@ def build_main_graph(
         route_after_router,
         {
             NODE_INTAKE_SUBGRAPH_V1: NODE_INTAKE_SUBGRAPH_V1,
-            NODE_REASONING_PLACEHOLDER: NODE_REASONING_PLACEHOLDER,
+            NODE_REASONING_SUBGRAPH_V1: NODE_REASONING_SUBGRAPH_V1,
             NODE_REVIEW_PLACEHOLDER: NODE_REVIEW_PLACEHOLDER,
             NODE_RECOVERY_PLACEHOLDER: NODE_RECOVERY_PLACEHOLDER,
             NODE_BLOCKED_TERMINAL: NODE_BLOCKED_TERMINAL,
@@ -136,6 +139,7 @@ def build_main_graph(
 
     # 所有占位节点 -> END
     graph.add_edge(NODE_INTAKE_SUBGRAPH_V1, END)
+    graph.add_edge(NODE_REASONING_SUBGRAPH_V1, END)
     for node_name in _PLACEHOLDER_NODES:
         graph.add_edge(node_name, END)
 

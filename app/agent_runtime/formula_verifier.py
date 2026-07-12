@@ -28,7 +28,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec
+from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_NAME,
     SYNDROME_AGENT_VERSION,
@@ -190,6 +190,7 @@ def validate_formula_preflight(
     gate_authority: FormulaGateAuthority | None = None,
     syndrome_artifact: RunArtifact | None = None,
     syndrome_run_spec: RunSpec | None = None,
+    syndrome_input_payload: SyndromeDraftInput | None = None,
 ) -> FormulaVerificationFailureCode | None:
     if not _valid_agent_spec(agent_spec):
         return FormulaVerificationFailureCode.AGENT_SPEC_INVALID
@@ -213,6 +214,7 @@ def validate_formula_preflight(
         gate_authority=gate_authority,
         syndrome_artifact=syndrome_artifact,
         syndrome_run_spec=syndrome_run_spec,
+        syndrome_input_payload=syndrome_input_payload,
     )
     if syndrome_failure is not None:
         return syndrome_failure
@@ -230,6 +232,7 @@ def verify_formula_artifact(
     gate_authority: FormulaGateAuthority | None = None,
     syndrome_artifact: RunArtifact | None = None,
     syndrome_run_spec: RunSpec | None = None,
+    syndrome_input_payload: SyndromeDraftInput | None = None,
 ) -> FormulaVerificationReport:
     checks: list[FormulaCheckResult] = []
     try:
@@ -250,6 +253,7 @@ def verify_formula_artifact(
                 gate_authority,
                 syndrome_artifact=syndrome_artifact,
                 syndrome_run_spec=syndrome_run_spec,
+                syndrome_input_payload=syndrome_input_payload,
             ),
         )
     )
@@ -258,11 +262,12 @@ def verify_formula_artifact(
             "upstream_syndrome",
             _verify_upstream_syndrome(
                 input_payload,
-                gate_authority=gate_authority,
-                syndrome_artifact=syndrome_artifact,
-                syndrome_run_spec=syndrome_run_spec,
-            ),
-        )
+            gate_authority=gate_authority,
+            syndrome_artifact=syndrome_artifact,
+            syndrome_run_spec=syndrome_run_spec,
+            syndrome_input_payload=syndrome_input_payload,
+        ),
+    )
     )
     checks.append(_check("fact_links", _verify_fact_links(output, input_payload)))
     checks.append(_check("decision_consistency", _verify_decision(output)))
@@ -357,6 +362,7 @@ def _verify_upstream_syndrome(
     gate_authority: FormulaGateAuthority | None = None,
     syndrome_artifact: RunArtifact | None = None,
     syndrome_run_spec: RunSpec | None = None,
+    syndrome_input_payload: SyndromeDraftInput | None = None,
 ) -> FormulaVerificationFailureCode | None:
     """Re-validate the unsealed process-internal L4-1 execution bundle.
 
@@ -365,6 +371,11 @@ def _verify_upstream_syndrome(
     only with immutable values recovered from a successful L4-1 result.
     """
     if syndrome_artifact is None or syndrome_run_spec is None:
+        return FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID
+    if (
+        syndrome_run_spec.session_id != input_payload.session_id
+        or syndrome_run_spec.state_version > input_payload.state_version
+    ):
         return FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID
 
     try:
@@ -395,18 +406,23 @@ def _verify_upstream_syndrome(
     # Build the syndrome agent spec using the same fixed parameters as L4-1.
     syndrome_spec = _build_syndrome_agent_spec_for_reverify()
 
-    # Build a SyndromeDraftInput from the current Formula input's authority
-    # data.  The caller's domain_state/gates/context have already been
-    # replaced by authoritative Repository values at this point.
-    syndrome_input = _build_syndrome_input_from_formula(input_payload)
+    syndrome_input = syndrome_input_payload or _build_syndrome_input_from_formula(input_payload)
+    if (
+        syndrome_input.session_id != input_payload.session_id
+        or syndrome_input.state_version != syndrome_run_spec.state_version
+        or syndrome_input.state_version > input_payload.state_version
+    ):
+        return FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID
 
-    # Convert FormulaGateAuthority → SyndromeGateAuthority (same shape).
-    l4_gate_authority: SyndromeGateAuthority | None = None
-    if gate_authority is not None:
-        l4_gate_authority = SyndromeGateAuthority(
-            triage_gate=gate_authority.triage_gate,
-            completeness_gate=gate_authority.completeness_gate,
-        )
+    l4_gate_authority = SyndromeGateAuthority(
+        triage_gate=syndrome_input.triage_gate,
+        completeness_gate=syndrome_input.completeness_gate,
+    )
+    if gate_authority is not None and (
+        gate_authority.triage_gate != syndrome_input.triage_gate
+        or gate_authority.completeness_gate != syndrome_input.completeness_gate
+    ):
+        return FormulaVerificationFailureCode.GATE_INVALID
 
     report: SyndromeVerificationReport = _verify_syndrome_artifact_l4(
         agent_spec=syndrome_spec,
@@ -787,23 +803,9 @@ def _check(name: str, code: FormulaVerificationFailureCode | None) -> FormulaChe
 
 def _report(checks: list[FormulaCheckResult], artifact: RunArtifact) -> FormulaVerificationReport:
     first = next((check.failure_code for check in checks if check.failure_code is not None), None)
-    try:
-        subject = json.dumps(
-            {
-                "run_id": str(artifact.run_id),
-                "type": f"{type(artifact.output).__module__}.{type(artifact.output).__qualname__}",
-                "output": artifact.output.model_dump(mode="json"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError, OverflowError):
-        subject = f"{artifact.run_id}:{type(artifact.output).__module__}.{type(artifact.output).__qualname__}"
     return FormulaVerificationReport(
         passed=first is None,
         checks=tuple(checks),
         failure_code=first,
-        subject_digest=hashlib.sha256(subject.encode()).hexdigest(),
+        subject_digest=run_artifact_subject_digest(artifact),
     )

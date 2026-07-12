@@ -243,9 +243,9 @@ async def _execute_formula_draft(
 
     if (
         trusted_syndrome.run_spec.session_id != run_spec.session_id
-        or trusted_syndrome.run_spec.state_version != run_spec.state_version
         or trusted_syndrome.input_payload.session_id != run_spec.session_id
-        or trusted_syndrome.input_payload.state_version != run_spec.state_version
+        or trusted_syndrome.run_spec.state_version > run_spec.state_version
+        or trusted_syndrome.input_payload.state_version != trusted_syndrome.run_spec.state_version
     ):
         return _failed(FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID)
 
@@ -258,6 +258,7 @@ async def _execute_formula_draft(
         gate_authority,
         syndrome_artifact=trusted_syndrome.artifact,
         syndrome_run_spec=trusted_syndrome.run_spec,
+        syndrome_input_payload=trusted_syndrome.input_payload,
     )
     if preflight_failure is not None:
         return _failed(preflight_failure)
@@ -275,6 +276,7 @@ async def _execute_formula_draft(
         gate_authority,
         syndrome_artifact=trusted_syndrome.artifact,
         syndrome_run_spec=trusted_syndrome.run_spec,
+        syndrome_input_payload=trusted_syndrome.input_payload,
     )
     if preflight_failure is not None:
         return _failed(preflight_failure)
@@ -311,6 +313,7 @@ async def _execute_formula_draft(
         gate_authority=gate_authority,
         syndrome_artifact=trusted_syndrome.artifact,
         syndrome_run_spec=trusted_syndrome.run_spec,
+        syndrome_input_payload=trusted_syndrome.input_payload,
     )
     if not report.passed:
         assert report.failure_code is not None

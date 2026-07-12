@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L4 进行中 |
-| 当前任务 | L4-3 FormulaConsistencyVerifier 与无 RAG 模式已验收、待提交；下一可发布 L4-4 |
-| LangGraph 新链路 | L2-1～L2-5、L3-1～L3-5、L4-1 与 L4-2 已验收并提交；L4-3 已验收通过 |
+| 当前阶段 | L4 已完成 |
+| 当前任务 | L4-4 ReasoningSubgraph、Revision 与回问闭环已验收、待提交；下一可发布 L5-1 |
+| LangGraph 新链路 | L2-1～L2-5、L3-1～L3-5、L4-1～L4-3 已验收并提交；L4-4 已验收通过，L4 关闭 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 已完成，L3 关闭 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -47,7 +47,7 @@
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 已完成 | 100% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
-| L4 | 临床推理与方药子图 | 进行中 | 75% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
+| L4 | 临床推理与方药子图 | 已完成 | 100% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
 | L7 | Evidence/RAG 增强 | 未开始 | 0% | L6 关闭 | Evidence policy、claim links、trace 和 RAG 评估通过 |
@@ -100,7 +100,7 @@
 | L4-1 | SyndromeDraftAgent 与 SyndromeVerifier | L3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-1.md` |
 | L4-2 | FormulaDraftAgent 合并基础方与加减 | L4-1 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-2.md` |
 | L4-3 | FormulaConsistencyVerifier 与无 RAG 模式 | L4-2 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-3.md` |
-| L4-4 | ReasoningSubgraph、Revision 与回问闭环 | L4-1～L4-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-4.md` |
+| L4-4 | ReasoningSubgraph、Revision 与回问闭环 | L4-1～L4-3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-4.md` |
 
 ### L5：Safety 与医师 HITL
 
@@ -179,6 +179,8 @@
 | AR-B-026 | P1 | L4-1 模型前权威边界可绕过：`validate_syndrome_preflight()` 只检查调用方传入的裸 `GateResultSchema` 名称、版本、state version、decision 和少量 details，不从当前 Domain snapshot 重算或验证持久化来源；仅有主诉和一项十问事实的明显不完整快照配自造 `ready/PASSED` Gate 仍调用模型并成功。`_verify_context()` 只比较 observation ID 集合及 session/status，不比较 fact key、value、normalized value；同一 ID 下篡改症状内容后，篡改文本被直接发送给模型并成功 | L4-1 | 已关闭 | 新增 Repository `ReasoningAuthoritySnapshot`：在同一持锁读取事务中验证 `syndrome/active/langgraph` 当前会话、当前 Domain State `V+1` 与 `/advance` 精确绑定的来源 Gate `V`；source Gate ID/version、同一 completed Intake GraphRun、Triage continue/零候选和 Completeness ready 全部固定重验。模型 Context 仅从权威 Domain State 投影，调用方 State/Context/Gate/stage 不再成为临床真源；缺 authority 固定失败，真实 PG 阶段/版本/跨 run/重复 Gate 与对抗回归全部通过 |
 | AR-B-027 | P1 | L4-2 未真正绑定上游已验证 Syndrome 产物：第 0 轮信任调用方裸 Draft；第 1 轮信任调用方成套 Draft/RunSpec/RunArtifact；第 2 轮以可构造 PrivateAttr/内部 DTO 作为 capability，均可把伪造证型送入 Formula 模型 | L4-2 | 已关闭 | L4-1 公开执行包装器与 Formula consumer 共享闭包内弱引用身份注册表，只有真实 `execute_syndrome_draft` 成功返回的具体对象实例登记；Formula 以 id+weakref 双重确认并消费深拷贝权威记录。手工 result/passed report/PrivateAttr/内部 DTO、裸 Artifact/RunSpec、复制对象均不命中且 gateway 0 次；42 项专项、合并回归、全量与静态门禁通过 |
 | AR-B-028 | P1 | L4-3 药名控制字符可绕过：`_normalize_text()` 先用 `\s+` 折叠空白，再检查 Unicode `Cc/Cf/Cs`，导致换行、回车、制表等控制字符在检查前消失。`herb="甘\n草"` 被规范为 `"甘 草"` 并得到 `passed=True`；同一药味可通过插入控制字符逃逸 alias/duplicate-herb 检测，污染后续候选方与 Safety 输入。现有 41 项专项未覆盖控制字符、format/surrogate 与规范化后重复组合 | L4-3 | 已关闭 | `_normalize_text()` 在任何空白折叠前依次检查原始字符串与 NFKC 结果，统一拒绝 `Cc/Cf/Cs`；药名、单位、name/note/rationale/basis 等 canonical 文本共享该顺序。新增换行、回车、制表、零宽字符、surrogate、单位与 `甘草 + 甘\n草` 碰撞回归，67 项专项及全门禁通过 |
+| AR-B-029 | P1 | L4-4 跨进程恢复可信边界曾可铸造：第 0 轮原始 DTO restore 可直接登记 trusted；第 1 轮调用方可注入伪 `PostgresDomainRepository` 子类返回手工 record/authority | L4-4 | 已关闭 | 恢复入口现只接受 session/artifact/revision/expected digest，并在闭包创建时捕获项目 session-factory 函数；Repository 与当前 authority 均由入口内部从 PostgreSQL 构造/加载。旧原始 restore 不存在，传入 Repository/record/Gate 固定 TypeError；原始 DTO、复制对象、伪 Repository 路径不命中 trusted consumer，真实 PostgreSQL restart 恢复保持通过 |
+| AR-B-030 | P1 | L4-4 曾丢弃真实 RunArtifact provenance，对 Syndrome/Formula payload 固定写 `model_actual="fake-model"`、`attempts=1`、`latency_ms=0`，恢复再以伪 provenance 自洽重验 | L4-4 | 已关闭 | Syndrome/Formula commit 现只消费各自 closure trusted execution 的 canonical RunArtifact，完整持久化 output、model、attempts、latency、usage、evidence、trace/run/spec/prompt；消费失败不写临床 artifact。Syndrome 恢复和 Formula replay 均绑定完整 subject digest/canonical payload，任一 provenance 字段篡改固定拒绝；26 项专项及全门禁通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -235,11 +237,20 @@
 | 2026-07-12 | L4-2 | 3 | 验收通过 | 独立复现第 2 轮手工 canonical passed report、内部 DTO 与伪私有字段攻击，现固定返回 `FORMULA_SYNDROME_DRAFT_INVALID` 且 gateway 0 次；专项 `42 passed`，L4-1/L4-2/Repository/Advance 合并回归 `97 passed, 4 warnings`，全量后端 `1407 passed, 1 xfailed, 14 warnings`；Ruff、mypy（114 files）、lock、diff check 全部通过。身份注册只接受真实 L4-1 成功结果具体实例，复制/手工对象与裸 Artifact/RunSpec 均拒绝；关闭 AR-B-027，L4-2 完成 |
 | 2026-07-12 | L4-3 | 0 | 验收未通过 | 专项 `41 passed`，Ruff、mypy（115 files）、lock、diff check 通过；确定性动作、Decimal 单位换算、候选重建、无 RAG 和可信 Formula 身份边界已落地，范围未扩展到 L4-4/L5。但独立诊断确认 `herb="甘\n草"` 的换行先被 `\s+` 折叠，最终一致性报告 `passed=True`，可逃逸药名别名和重复检测；登记 AR-B-028，未继续跑合并与全量后端门禁 |
 | 2026-07-12 | L4-3 | 1 | 验收通过 | 独立复测 `甘草 + 甘\n草` 已固定返回 `SCHEMA_INVALID`、`passed=false`、`requires_human=true`；专项 `67 passed`，L4/Repository/Advance 合并回归 `164 passed, 4 warnings`，Safety/Legacy `176 passed`，全量后端 `1474 passed, 1 xfailed, 14 warnings`；Ruff、mypy（115 files）、lock、diff check 全部通过。原始/NFKC `Cc/Cf/Cs` 在空白折叠前统一拒绝，药名、单位及 canonical 文本回归覆盖成立；关闭 AR-B-028，L4-3 完成 |
+| 2026-07-12 | L4-4 | 0 | 验收未通过 | PostgreSQL 专项 `6 passed, 3 warnings`，L1/L2/L3/L4/Advance 组合回归 `296 passed, 11 warnings`，Ruff、mypy（118 files）、lock、diff check 通过；真实子图、artifact payload、回问失效和 ready-for-safety 基础路径已落地，未提前执行 Safety。但独立对抗直接调用 `_restore_trusted_syndrome_execution()`，用手工 RunSpec/Artifact/Input/Gate 获得 `succeeded` 且命中 Formula trusted consumer，证明恢复未绑定 Repository revision/digest 并回归 AR-B-027 类权威铸造；登记 AR-B-029。专项仅 6 项，亦未覆盖发布要求中的完整 decision/verifier、幂等并发与版本冲突矩阵；未继续跑 Safety/Legacy 和全量门禁 |
+| 2026-07-12 | L4-4 | 1 | 验收未通过 | 旧原始 DTO restore 已删除，分支/恢复/并发回归扩充至 PostgreSQL 专项 `18 passed, 3 warnings`；Ruff、mypy（118 files）、lock、diff check 通过。但独立对抗以无数据库的 `ForgedRepository(PostgresDomainRepository)` 覆写三个读取方法，`isinstance` 校验仍通过，手工 record/authority 再次得到 `restored=True`、`trusted_capability_granted=True`。AR-B-029 保持打开；一次并行测试批次因 120 秒超时无可靠汇总，确认 P1 后未运行组合、Safety/Legacy 和全量门禁 |
+| 2026-07-12 | L4-4 | 2 | 验收未通过 | AR-B-029 历史原始 DTO 与伪 Repository 注入攻击已固定拒绝，PostgreSQL 专项增至 `21 passed, 3 warnings`，Ruff、mypy（118 files）、lock、diff check 通过，可关闭 AR-B-029。但源码和独立诊断确认持久化 helper 对实际 `mimo-v2.5` 运行统一写入 `model_actual=fake-model`，attempts/latency 亦为固定值，恢复重验使用伪 provenance 自洽通过；登记 AR-B-030。确认 P1 后未运行组合、Safety/Legacy 和全量门禁 |
+| 2026-07-12 | L4-4 | 3 | 验收通过 | 独立重放原始 DTO 与伪 Repository 注入均固定拒绝；Syndrome/Formula payload 精确来自 closure trusted RunArtifact，非默认模型及 model/attempts/latency/usage/evidence/trace/run/spec/prompt/output 篡改回归成立。PostgreSQL 专项 `26 passed, 3 warnings`，L1～L4/Repository/Advance 组合 `316 passed, 11 warnings`，Safety/Legacy `176 passed`，全量后端 `1500 passed, 1 xfailed, 17 warnings`；Ruff、mypy（118 files）、lock、diff check 全部通过。关闭 AR-B-030，L4-4 完成并关闭 L4 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-12 | Codex | L4-4 第 3 轮复验通过并关闭 L4：Syndrome/Formula 产物只从真实 closure trusted execution 持久化完整 RunArtifact provenance，恢复/replay 对所有 provenance 字段、payload digest、当前 authority 和 exact revision 精确校验；AR-B-029/030 对抗、全部 decision 分支、回问失效、revision、并发重放、state conflict 与 PostgreSQL restart 均通过。专项 26、组合 316、Safety/Legacy 176、全量 1500 passed，静态门禁全部通过；L4 完成度 100%，下一可提交 L4-4 并发布 L5-1。 |
+| 2026-07-12 | Codex | L4-4 第 2 轮复验仍未通过：恢复入口已取消 Repository/factory/record 注入，前两轮 capability 铸造攻击均拒绝，关闭 AR-B-029；但 Syndrome/Formula artifact payload 丢弃真实 AgentRuntime RunArtifact，将模型、attempts、latency 固定伪造为 `fake-model/1/0`。当前实际模型 `mimo-v2.5` 与持久化 provenance 明确不一致；登记 AR-B-030，下一轮仅改为从真实闭包 trusted execution 持久化并精确恢复 provenance。 |
+| 2026-07-12 | Codex | L4-4 第 1 轮复验仍未通过：旧 `_restore_trusted_syndrome_execution` 已移除，专项增至 18 项并覆盖主要 decision、恢复、并发和版本冲突；但新恢复函数仍接收调用方 Repository，`isinstance` 无法阻止伪造的 `PostgresDomainRepository` 子类覆写权威读取。独立攻击无需数据库即再次铸造 trusted Syndrome。AR-B-029 继续打开；下一轮仅取消 Repository/factory/record 注入并将真实持久化读取封入恢复边界。 |
+| 2026-07-12 | Codex | L4-4 第 0 轮验收未通过并发布限定返工：真实 ReasoningSubgraph、持久化 artifact payload、回问失效及 ready-for-safety 基础链路通过现有测试，但跨进程恢复新增的 `_restore_trusted_syndrome_execution()` 可被任意调用方用手工自洽 DTO 直接铸造 trusted Syndrome，绕过 Repository revision/digest 与真实 L4-1 执行来源。登记 AR-B-029；返工只收口持久化恢复 attestation 与缺失的分支/幂等/恢复回归，不得扩展 L5、RAG、Review、Record 或 UI。 |
+| 2026-07-12 | Codex | 提交已验收的 L4-3（`cbed449`）；发布 L4-4 ReasoningSubgraph、Revision 与回问闭环。L4-4 用真实版本化子图替换 `reasoning_placeholder`，串联权威 precheck、L4-1 Syndrome、L4-2 Formula 与 L4-3 consistency；确定性处理 completed/needs_more_info/abstained，持久化 syndrome/formula revision，并在回问时将下游产物标为 stale。只允许输出 ready-for-safety 边界，不得执行或伪造 L5 Safety/HITL、RAG、Legacy Prescription/Modification 或 UI。 |
 | 2026-07-12 | Codex | L4-3 第 1 轮复验通过：原始与 NFKC 文本均在空白折叠前拒绝 Unicode `Cc/Cf/Cs`，药名、单位和 canonical 文本共享确定性安全顺序；独立控制字符碰撞攻击已固定失败。专项 67、L4 合并 164、Safety/Legacy 176、全量 1474 passed，静态门禁全部通过；关闭 AR-B-028，L4 完成度 75%，下一可提交 L4-3 并发布 L4-4。 |
 | 2026-07-12 | Codex | L4-3 第 0 轮验收未通过并发布限定返工：核心确定性重建、单位/动作语义、可信 L4-2 来源与无副作用边界已完成，专项和静态门禁通过；但药名控制字符在安全检查前被空白折叠，`甘\n草` 可作为合法未知药名通过并逃逸 duplicate/alias 检测。登记 AR-B-028，返工仅调整原始文本控制字符检查顺序及药名/单位/碰撞回归，不得扩展 L4-4 或 L5。 |
 | 2026-07-12 | Codex | 提交已验收的 L4-2（`3e677f1`）；发布 L4-3 FormulaConsistencyVerifier 与无 RAG 模式。L4-3 只新增纯确定性、无模型调用的方药一致性验证：规范化药味/单位、按 base + modifications 重算 candidate、校验 action 与 composition 对应、剂量及 fact/证型依据，并再次固定 `model_knowledge_only`/医师复核边界；不得接 L4-4 ReasoningSubgraph/revision/回问、Safety/HITL、RAG、DB 或 API/UI。 |
@@ -304,8 +315,8 @@
 
 ## 8. 下一步
 
-1. 提交已验收的 L4-3；提交范围只包含 L4-3 实现、测试与本进度表，`docs/dev-handoff/*` 按仓库规则保留在本地，不混入 L4-4 或其他无关改动。
-2. 发布 L4-4 ReasoningSubgraph、Revision 与回问闭环；以已验收的 L4-1～L4-3 为依赖，发布前从源计划提取精确边界、禁止项与验收命令。
+1. 提交已验收的 L4-4；提交范围只包含 ReasoningSubgraph、artifact payload/revision/恢复、Advance 集成、对应迁移与测试及本进度表，`docs/dev-handoff/*` 保留本地，不混入 L5 或无关改动。
+2. 发布 L5-1 SafetyRuleEngine Graph Adapter 与回退修复；以已关闭的 L4 ready-for-safety artifact/gate 为唯一输入，接入现有确定性 SafetyRuleEngine，不得让模型改变 Safety 结果或提前实现 Doctor Review interrupt。
 
 ## 9. 维护要求
 

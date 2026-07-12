@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import json
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from typing import Any, cast
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.reducer import DomainState
-from app.agent_runtime.repository import DomainRepository, ReasoningAuthoritySnapshot, RepositoryError
+from app.agent_runtime.repository import (
+    DomainRepository,
+    PostgresDomainRepository,
+    ReasoningAuthoritySnapshot,
+    RepositoryError,
+    artifact_payload_digest,
+)
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import (
     AgentSpec,
@@ -21,6 +29,7 @@ from app.agent_runtime.specs import (
     RunArtifact,
     RunSpec,
     RuntimeErrorCode,
+    TokenUsage,
 )
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_NAME,
@@ -39,6 +48,7 @@ from app.agent_runtime.syndrome_verifier import (
 from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
 from app.core.config import get_settings
+from app.db import session as db_session
 from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.syndrome import SyndromeDraft, SyndromeDraftInput, SyndromeObservationContext
 
@@ -46,6 +56,9 @@ SYNDROME_CONTEXT_TOKEN_LIMIT = 4_000
 SYNDROME_MODEL_TIMEOUT_SECONDS = 20
 SYNDROME_MODEL_MAX_TOKENS = 1_500
 SYNDROME_MODEL_TEMPERATURE = 0.1
+SYNDROME_ARTIFACT_TYPE = "syndrome_draft"
+SYNDROME_PAYLOAD_SCHEMA_VERSION = "syndrome-artifact-payload.v1"
+SYNDROME_ARTIFACT_CURRENT_STATUS = "current"
 
 
 class SyndromeExecutionStatus(StrEnum):
@@ -243,9 +256,11 @@ async def _execute_syndrome_draft(
 def _build_syndrome_execution_boundary() -> tuple[
     Callable[..., object],
     Callable[[SyndromeExecutionResult], _TrustedSyndromeExecution | None],
+    Callable[..., Awaitable[SyndromeExecutionResult | None]],
 ]:
     """Bind L4-1 execution to an identity registry unavailable to callers."""
 
+    project_get_session_factory = db_session.get_session_factory
     trusted_instances: dict[
         int,
         tuple[weakref.ReferenceType[SyndromeExecutionResult], _TrustedSyndromeExecution],
@@ -297,10 +312,212 @@ def _build_syndrome_execution_boundary() -> tuple[
         # used to mutate the authority retained by the execution boundary.
         return trusted.model_copy(deep=True)
 
-    return execute_syndrome_draft, consume
+    async def recover_trusted_syndrome_from_repository(
+        *,
+        session_id: UUID,
+        artifact_id: UUID,
+        revision: int,
+        expected_content_digest: str,
+    ) -> SyndromeExecutionResult | None:
+        repository = PostgresDomainRepository(project_get_session_factory())
+        try:
+            record = await repository.get_artifact_payload(
+                session_id,
+                artifact_type=SYNDROME_ARTIFACT_TYPE,
+                artifact_id=artifact_id,
+                revision=revision,
+                status=SYNDROME_ARTIFACT_CURRENT_STATUS,
+            )
+        except RepositoryError:
+            return None
+        if record is None:
+            return None
+        if (
+            record.session_id != session_id
+            or record.artifact_id != artifact_id
+            or record.artifact_type != SYNDROME_ARTIFACT_TYPE
+            or record.revision != revision
+            or record.status != SYNDROME_ARTIFACT_CURRENT_STATUS
+            or record.payload_schema_version != SYNDROME_PAYLOAD_SCHEMA_VERSION
+            or record.content_digest != expected_content_digest
+            or record.content_digest != artifact_payload_digest(record.payload_schema_version, record.payload)
+        ):
+            return None
+        try:
+            current_state = await repository.get_state(session_id)
+            current_authority = await repository.get_reasoning_authority(session_id, current_state.state_version)
+        except RepositoryError:
+            return None
+        if current_authority is None or current_authority.session_id != session_id:
+            return None
+        payload = record.payload
+        if payload.get("kind") != SYNDROME_ARTIFACT_TYPE:
+            return None
+        try:
+            output = SyndromeDraft.model_validate(payload["output"])
+            input_payload = SyndromeDraftInput.model_validate(payload["input_payload"])
+            run_spec = RunSpec.model_validate(payload["run_spec"])
+            run_artifact_payload = cast(dict[str, Any], payload["run_artifact"])
+            stored_verification = SyndromeVerificationReport.model_validate(payload["verification"])
+            input_payload = canonicalize_syndrome_input(input_payload)
+            canonical_output = canonicalize_syndrome_output(output)
+            artifact = _run_artifact_from_payload(run_artifact_payload, canonical_output)
+        except (
+            KeyError,
+            SyndromeOutputBoundaryError,
+            ValidationError,
+            TypeError,
+            ValueError,
+            AttributeError,
+        ):
+            return None
+        if (
+            record.input_state_version != input_payload.state_version
+            or record.input_state_version != run_spec.state_version
+            or record.produced_by_run_id != run_spec.run_id
+            or run_spec.session_id != session_id
+            or artifact.run_id != run_spec.run_id
+            or artifact.output != canonical_output
+        ):
+            return None
+        if not _authority_still_matches_input(current_authority, input_payload):
+            return None
+        spec = build_syndrome_agent_spec(model=artifact.model_actual)
+        canonical_artifact = artifact.model_copy(update={"output": canonical_output})
+        gate_authority = SyndromeGateAuthority(
+            triage_gate=input_payload.triage_gate,
+            completeness_gate=input_payload.completeness_gate,
+        )
+        report = verify_syndrome_artifact(
+            agent_spec=spec,
+            run_spec=run_spec,
+            artifact=canonical_artifact,
+            input_payload=input_payload,
+            gate_authority=gate_authority,
+        )
+        if not report.passed:
+            return None
+        canonical_payload: dict[str, object] = {
+            "kind": SYNDROME_ARTIFACT_TYPE,
+            "output": canonical_output.model_dump(mode="json"),
+            "input_payload": input_payload.model_dump(mode="json"),
+            "run_spec": run_spec.model_dump(mode="json"),
+            "run_artifact": _canonical_run_artifact_payload(canonical_artifact),
+            "verification": report.model_dump(mode="json"),
+        }
+        if (
+            stored_verification != report
+            or payload != canonical_payload
+            or artifact_payload_digest(SYNDROME_PAYLOAD_SCHEMA_VERSION, canonical_payload) != record.content_digest
+        ):
+            return None
+        result = SyndromeExecutionResult(
+            status=SyndromeExecutionStatus.SUCCEEDED,
+            output=canonical_output,
+            verification=report,
+        )
+        register_success(
+            result,
+            _TrustedSyndromeExecution(
+                run_spec=run_spec,
+                artifact=canonical_artifact,
+                input_payload=input_payload,
+                output=canonical_output,
+            ),
+        )
+        return result
+
+    return execute_syndrome_draft, consume, recover_trusted_syndrome_from_repository
 
 
-execute_syndrome_draft, _consume_trusted_syndrome_execution = _build_syndrome_execution_boundary()
+(
+    execute_syndrome_draft,
+    _consume_trusted_syndrome_execution,
+    recover_trusted_syndrome_from_repository,
+) = _build_syndrome_execution_boundary()
+
+
+def _run_artifact_from_payload(payload: dict[str, Any], output: SyndromeDraft) -> RunArtifact:
+    if payload.get("output") != output.model_dump(mode="json"):
+        raise ValueError("run artifact output mismatch")
+    return RunArtifact(
+        output=output,
+        model_actual=str(payload["model_actual"]),
+        attempts=int(payload["attempts"]),
+        latency_ms=int(payload["latency_ms"]),
+        usage=TokenUsage.model_validate(payload["usage"]),
+        evidence_ids=tuple(str(item) for item in payload["evidence_ids"]),
+        trace_id=str(payload["trace_id"]),
+        run_id=UUID(str(payload["run_id"])),
+        agent_spec_version=str(payload["agent_spec_version"]),
+        prompt_version=str(payload["prompt_version"]),
+    )
+
+
+def _canonical_run_artifact_payload(artifact: RunArtifact) -> dict[str, object]:
+    return {
+        "output": artifact.output.model_dump(mode="json"),
+        "model_actual": artifact.model_actual,
+        "attempts": artifact.attempts,
+        "latency_ms": artifact.latency_ms,
+        "trace_id": artifact.trace_id,
+        "run_id": str(artifact.run_id),
+        "agent_spec_version": artifact.agent_spec_version,
+        "prompt_version": artifact.prompt_version,
+        "usage": artifact.usage.model_dump(mode="json"),
+        "evidence_ids": list(artifact.evidence_ids),
+    }
+
+
+def _authority_still_matches_input(
+    authority: ReasoningAuthoritySnapshot,
+    input_payload: SyndromeDraftInput,
+) -> bool:
+    if (
+        authority.session_id != input_payload.session_id
+        or authority.source_gate_state_version != input_payload.triage_gate.input_state_version
+        or authority.source_gate_state_version != input_payload.completeness_gate.input_state_version
+        or authority.triage_gate != input_payload.triage_gate
+        or authority.completeness_gate != input_payload.completeness_gate
+    ):
+        return False
+    return _active_fact_projection(authority.domain_state) == _context_fact_projection(input_payload)
+
+
+def _active_fact_projection(domain_state: DomainState) -> tuple[tuple[UUID, UUID, str, object, object], ...]:
+    return tuple(
+        sorted(
+            (
+                (
+                    item.observation_id,
+                    item.session_id,
+                    item.fact_key,
+                    item.value,
+                    item.normalized_value,
+                )
+                for item in _active_observations(domain_state.observations)
+            ),
+            key=lambda item: str(item[0]),
+        )
+    )
+
+
+def _context_fact_projection(input_payload: SyndromeDraftInput) -> tuple[tuple[UUID, UUID, str, object, object], ...]:
+    return tuple(
+        sorted(
+            (
+                (
+                    item.observation_id,
+                    item.session_id,
+                    item.fact_key,
+                    item.value,
+                    item.normalized_value,
+                )
+                for item in input_payload.context_observations
+            ),
+            key=lambda item: str(item[0]),
+        )
+    )
 
 
 async def _load_reasoning_authority(

@@ -1179,7 +1179,15 @@ async def test_graph_state_checkpoint_contains_only_formula_artifact_reference()
         "gate_results": [{"gate_name": "formula_verifier", "decision": "passed", "policy_version": "formula-draft-policy.no-rag.v1"}],
     }
     config = make_run_config(state["session_id"], graph_version=DEFAULT_GRAPH_VERSION)
-    graph = build_main_graph(checkpointer=InMemorySaver())
+
+    async def executor(_: dict[str, object]) -> dict[str, object]:
+        return {
+            "route": "reasoning_subgraph_v1",
+            "artifact_refs": state["artifact_refs"],
+            "gate_results": state["gate_results"],
+        }
+
+    graph = build_main_graph(checkpointer=InMemorySaver(), reasoning_executor=executor)
     result = await GraphRunner(graph).ainvoke(dict(state), config=config)
 
     serialized = repr(result)

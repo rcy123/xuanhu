@@ -23,7 +23,7 @@ import uuid
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app.agent_runtime.commands import XuanhuCommand
+from app.agent_runtime.commands import NODE_REASONING_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.config import make_run_config
 from app.agent_runtime.errors import (
     CheckpointConfigMismatchError,
@@ -99,7 +99,7 @@ class TestNormalInvoke:
         state = _make_state(command=XuanhuCommand.ADVANCE.value, session_id=session_id)
 
         result = await runner.ainvoke(state, config)
-        assert result["route"] == "reasoning_placeholder"
+        assert result["route"] == NODE_REASONING_SUBGRAPH_V1
         assert result["session_id"] == session_id
 
     @pytest.mark.asyncio

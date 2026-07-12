@@ -2,7 +2,7 @@
 
 对齐实施计划 §3 目标图结构：
 - ``message`` -> IntakeSubgraph（L1-2 占位为 ``intake_placeholder``）
-- ``advance`` -> ReasoningSubgraph（L1-2 占位为 ``reasoning_placeholder``）
+- ``advance`` -> ReasoningSubgraph（当前节点为 ``reasoning_subgraph_v1``，保留旧 placeholder 常量兼容测试/历史 checkpoint）
 - ``review`` -> ReviewRecordSubgraph（L1-2 占位为 ``review_placeholder``）
 - ``recover`` -> Recovery Router（L1-2 占位为 ``recovery_placeholder``）
 - unknown/invalid -> blocked/manual terminal
@@ -38,6 +38,7 @@ class XuanhuCommand(StrEnum):
 NODE_COMMAND_ROUTER: str = "command_router"
 NODE_INTAKE_SUBGRAPH_V1: str = "intake_subgraph_v1"
 NODE_INTAKE_PLACEHOLDER: str = NODE_INTAKE_SUBGRAPH_V1
+NODE_REASONING_SUBGRAPH_V1: str = "reasoning_subgraph_v1"
 NODE_REASONING_PLACEHOLDER: str = "reasoning_placeholder"
 NODE_REVIEW_PLACEHOLDER: str = "review_placeholder"
 NODE_RECOVERY_PLACEHOLDER: str = "recovery_placeholder"
@@ -48,6 +49,7 @@ NODE_MANUAL_TERMINAL: str = "manual_terminal"
 TERMINAL_NODES: frozenset[str] = frozenset(
     {
         NODE_INTAKE_SUBGRAPH_V1,
+        NODE_REASONING_SUBGRAPH_V1,
         NODE_REASONING_PLACEHOLDER,
         NODE_REVIEW_PLACEHOLDER,
         NODE_RECOVERY_PLACEHOLDER,
@@ -59,7 +61,7 @@ TERMINAL_NODES: frozenset[str] = frozenset(
 # 路由目标 -> 占位节点映射（正向路由）。
 COMMAND_ROUTE_MAP: dict[str, str] = {
     XuanhuCommand.MESSAGE.value: NODE_INTAKE_SUBGRAPH_V1,
-    XuanhuCommand.ADVANCE.value: NODE_REASONING_PLACEHOLDER,
+    XuanhuCommand.ADVANCE.value: NODE_REASONING_SUBGRAPH_V1,
     XuanhuCommand.REVIEW.value: NODE_REVIEW_PLACEHOLDER,
     XuanhuCommand.RECOVER.value: NODE_RECOVERY_PLACEHOLDER,
 }

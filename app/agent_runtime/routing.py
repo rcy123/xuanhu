@@ -1,11 +1,11 @@
 """命令路由逻辑。
 
 对齐实施计划 §3 目标图结构：
-START -> command_router -> [conditional edge] -> 占位节点 -> END/blocked/manual
+START -> command_router -> [conditional edge] -> 子图/占位节点 -> END/blocked/manual
 
 路由规则：
 - ``message``  -> ``intake_placeholder``
-- ``advance``  -> ``reasoning_placeholder``
+- ``advance``  -> ``reasoning_subgraph_v1``
 - ``review``   -> ``review_placeholder``
 - ``recover``  -> ``recovery_placeholder``
 - unknown/empty/invalid -> ``blocked_terminal`` 或 ``manual_terminal``
@@ -36,7 +36,7 @@ def resolve_command_route(command: str | None) -> RouteTarget:
 
     路由策略：
     - command 为 None 或空字符串 -> ``blocked_terminal``（缺少必需输入）
-    - command 在 VALID_COMMANDS 中 -> 对应占位节点
+    - command 在 VALID_COMMANDS 中 -> 对应子图或占位节点
     - command 不在 VALID_COMMANDS 中 -> ``manual_terminal``（未知命令，需人工介入）
 
     参数:
