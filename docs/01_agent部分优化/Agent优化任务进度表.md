@@ -31,8 +31,8 @@
 | 项目 | 当前状态 |
 |---|---|
 | 当前阶段 | L4 进行中 |
-| 当前任务 | L4-1 SyndromeDraftAgent 与 SyndromeVerifier 已发布，待交付验收 |
-| LangGraph 新链路 | L2-1～L2-5 与 L3-1～L3-5 已验收并提交；L3 无 RAG 问诊里程碑关闭；L4-1 已发布 |
+| 当前任务 | L4-1 SyndromeDraftAgent 与 SyndromeVerifier 已验收通过，待提交；下一可发布 L4-2 |
+| LangGraph 新链路 | L2-1～L2-5 与 L3-1～L3-5 已验收并提交；L4-1 已验收通过，AR-B-026 已关闭 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 已完成，L3 关闭 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -47,7 +47,7 @@
 | L1 | LangGraph Runtime 骨架 | 已完成 | 100% | L0 关闭 | MainGraph、checkpointer、恢复和 stream 骨架通过 |
 | L2 | Harness 核心与领域 State | 已完成 | 100% | L1 关闭 | AgentRuntime、Context、Verifier、Reducer、outbox 通过 |
 | L3 | Intake 问诊子图 | 已完成 | 100% | L2 关闭 | 无 RAG 多轮问诊、Triage、Completeness 和单一下一问通过 |
-| L4 | 临床推理与方药子图 | 进行中 | 0% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
+| L4 | 临床推理与方药子图 | 进行中 | 25% | L3 关闭 | Syndrome/Formula Draft、回问、revision 和一致性验证通过 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4 关闭 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
 | L7 | Evidence/RAG 增强 | 未开始 | 0% | L6 关闭 | Evidence policy、claim links、trace 和 RAG 评估通过 |
@@ -97,7 +97,7 @@
 
 | 任务 | 名称 | 依赖 | 状态 | 审核 | 交接文件 |
 |---|---|---|---|---|---|
-| L4-1 | SyndromeDraftAgent 与 SyndromeVerifier | L3 | 已发布 | 待验收 | `docs/dev-handoff/agent-refactor-l4-1.md` |
+| L4-1 | SyndromeDraftAgent 与 SyndromeVerifier | L3 | 已完成 | 验收通过 | `docs/dev-handoff/agent-refactor-l4-1.md` |
 | L4-2 | FormulaDraftAgent 合并基础方与加减 | L4-1 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-2.md` |
 | L4-3 | FormulaConsistencyVerifier 与无 RAG 模式 | L4-2 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-3.md` |
 | L4-4 | ReasoningSubgraph、Revision 与回问闭环 | L4-1～L4-3 | 未开始 | 未审核 | `docs/dev-handoff/agent-refactor-l4-4.md` |
@@ -176,6 +176,7 @@
 | AR-B-023 | P1 | L3-3 完备性权威语义不成立：`chief_complaint.category` 被当作主诉症状，只有类别没有症状即可 `ready/PASSED`；同一维度的不同合法子字段按 value fingerprint 互判冲突，补充真实 `chief_complaint.symptom` 后反而 `conflict`；女性年龄 30 但缺少绝经状态仍直接判妊娠/哺乳 `applicable`，与“必要事实缺失应 unknown”契约冲突；内部携带 candidate 的伪造 `continue/PASSED` Triage Gate 仍可被接受并进入 `ready`；第 1 轮返工后两个不同的当前 `chief_complaint.category` 因不属于覆盖维度而逃逸同 canonical fact key 冲突检测，动态十问类别由排序结果静默决定并可返回 `ready` | L3-3 | 已关闭 | 分类辅助事实与症状覆盖分离；冲突检测消费完整当前事实集并以独立辅助维度审计 category，同值重复幂等、异值乱序稳定 `conflict/FAILED`；缺绝经状态保持 unknown；Triage Gate 内部一致性固定重验；两轮对抗回归及全门禁通过 |
 | AR-B-024 | P1 | L3-4 权威边界可绕过：`compose_question()` 只重验裸 `GapSelectionResult` 形状，伪造 `source_completeness_disposition=ready` 的 selected 结果仍生成问题；公开 `select_gap(..., priority_registry=...)` 允许调用方替换权威优先级并把首选从过敏改为主诉；公开模板注入可返回与 selected dimension 不一致的问题；模型 fallback 接受与 selection 不同 `state_version` 的 RunSpec 并成功调用；单问验证遗漏英文 name/phone/ID 等身份索取；第 1 轮返工后 supplied selection 的隐藏 `route/force` 仍被 canonical 序列化静默丢弃并成功生成问题，且 fallback 接受 temperature=2、max_tokens=200000、timeout=86400、空 verifier chain 的宽松 AgentSpec 并请求模型 | L3-4 | 已关闭 | Composer 内部重算 Completeness→Gap 权威选择；生产优先级/模板固定为私有冻结权威引用；模板与 RunSpec/AgentSpec 完整绑定；supplied selection 递归拒绝未声明/授权字段；中英文身份语义拒绝；两轮对抗回归、L3 合并回归及全门禁通过 |
 | AR-B-025 | P1 | L3-5 集成未满足 Harness/LangGraph 权威边界：LangGraph 消息路径绕过 `PostgresDomainRepository`，未写 `DomainCommandCommit`/`OutboxEvent`，患者消息与领域结果分两次 commit；模型调用位于持锁数据库事务内；同 command 无数据库级幂等；ready 在 `/messages` 内直接改为 `syndrome`，而 `/advance` 不读取持久化 Completeness Gate、只运行 reasoning 占位并原样返回；所谓 IntakeSubgraph 只是依赖请求级 `ContextVar` executor 的单节点，进程恢复时未绑定即失败；L3-5 仅 2 个适配器单测，未覆盖 E2E、路由、并发、幂等、Outbox、调用次数和恢复；`mypy app` 另有 6 errors | L3-5 | 已关闭 | IntakeSubgraph 已拆为真实节点图并使用条件边路由；领域提交复用 Repository/Outbox 与数据库 claim 幂等，模型调用移出持锁事务；`/advance` 消费当前版本持久化 Gate；恢复元数据不保存临床事实，真实 PostgreSQL/Fake Gateway E2E 覆盖并发单调用、重放、commit 后恢复、路由和隐私，全部门禁通过 |
+| AR-B-026 | P1 | L4-1 模型前权威边界可绕过：`validate_syndrome_preflight()` 只检查调用方传入的裸 `GateResultSchema` 名称、版本、state version、decision 和少量 details，不从当前 Domain snapshot 重算或验证持久化来源；仅有主诉和一项十问事实的明显不完整快照配自造 `ready/PASSED` Gate 仍调用模型并成功。`_verify_context()` 只比较 observation ID 集合及 session/status，不比较 fact key、value、normalized value；同一 ID 下篡改症状内容后，篡改文本被直接发送给模型并成功 | L4-1 | 已关闭 | 新增 Repository `ReasoningAuthoritySnapshot`：在同一持锁读取事务中验证 `syndrome/active/langgraph` 当前会话、当前 Domain State `V+1` 与 `/advance` 精确绑定的来源 Gate `V`；source Gate ID/version、同一 completed Intake GraphRun、Triage continue/零候选和 Completeness ready 全部固定重验。模型 Context 仅从权威 Domain State 投影，调用方 State/Context/Gate/stage 不再成为临床真源；缺 authority 固定失败，真实 PG 阶段/版本/跨 run/重复 Gate 与对抗回归全部通过 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -224,11 +225,15 @@
 | 2026-07-11 | L3-4 | 2 | 验收通过 | 专项 `55 passed`、L3-1～L3-4 合并回归 `168 passed`；独立诊断确认 supplied selection 隐藏 `route/force` 固定拒绝、宽松 AgentSpec 在 gateway 前拒绝且请求数 0、ready 路径无问题、生产注册表不可公开替换及英文身份请求保持拒绝；全量后端 `1313 passed, 1 xfailed, 10 warnings`；Ruff、mypy（103 files）、lock、diff check 全部通过；关闭 AR-B-024，L3-4 完成 |
 | 2026-07-11 | L3-5 | 0 | 验收未通过 | L3-1～L3-5 合并回归 `170 passed`；Messages/Advance/Session API 回归 `58 passed`；真实 PostgreSQL migration、Repository、checkpoint 与 runner 回归 `87 passed, 8 warnings`；Ruff、lock、diff check 通过，但 `mypy app` 报 6 errors。静态审查确认消息/领域分段 commit、事务内模型调用、缺少 DomainCommandCommit/Outbox、`/advance` 不消费 Completeness Gate、ContextVar 单节点不可跨进程恢复且专项仅 2 个弱测试；登记 AR-B-025，未继续跑全量后端 |
 | 2026-07-12 | L3-5 | 3 | 验收通过 | 专项 `15 passed`；L3-1～L3-5 合并回归 `183 passed, 4 warnings`；全量后端 `1328 passed, 1 xfailed, 14 warnings`；Ruff、mypy（108 files）、lock、diff check 全部通过。真实节点图、条件路由、Repository/Outbox 原子提交、数据库 claim 幂等、当前 Gate 推进、并发单调用、commit 后恢复和 checkpoint/Outbox 隐私负向检查均通过；关闭 AR-B-025，L3 完成 |
+| 2026-07-12 | L4-1 | 0 | 验收未通过 | 专项 `13 passed`，定向 Ruff、mypy（111 files）、lock、diff check 通过；但独立诊断确认明显不完整 Domain snapshot 配调用方自造的当前版本 `ready/PASSED` Gate 仍 `succeeded` 且模型调用 1 次，同 observation ID 下篡改 fact 内容后篡改值进入模型并 `succeeded`。现有测试只覆盖错误 policy version/过期 Gate，且 inactive/superseded 用允许 `RUN_PROVENANCE_MISMATCH` 的弱断言掩盖 fact-link 验证；登记 AR-B-026，未继续跑合并与全量后端门禁 |
+| 2026-07-12 | L4-1 | 4 | 验收通过 | L4-1、Repository、Advance 专项 `55 passed, 4 warnings`；L3-1～L4-1 合并回归 `205 passed, 4 warnings`；Repository/checkpoint/API 回归 `130 passed, 4 warnings`；全量后端 `1365 passed, 1 xfailed, 14 warnings`；Ruff、mypy（111 files）、lock、diff check 全部通过。独立审查确认 `/advance` 后当前 Domain State `V+1` 与来源 Gate `V` 分离绑定，推进前 inquiry、错误 stage/status/runtime/recovery、伪 Gate/State/Context、跨 run、重复或非 completed Gate 均在 gateway 前拒绝；关闭 AR-B-026，L4-1 完成 |
 
 ## 7. 最近更新
 
 | 日期 | 更新人 | 内容 |
 |---|---|---|
+| 2026-07-12 | Codex | L4-1 第 4 轮复验通过：Repository authority 在同一读取边界锁定持久化会话阶段、当前 Domain State 与 `/advance` 来源 Gate，正确区分当前 `V+1` 和 Gate `V`；Syndrome Context 仅由权威 active observations 构建，缺 authority 与所有伪造/跨 run/重复 Gate 路径固定零模型调用。专项、合并、受影响回归、全量后端和静态门禁全部通过，关闭 AR-B-026；L4 完成度 25%，下一可发布 L4-2。 |
+| 2026-07-12 | Codex | L4-1 第 0 轮验收未通过并发布限定返工：强类型草案、无 RAG 契约和基础 Verifier 已落地，但模型前 Gate 与 Context 仍是调用方可伪造的第二输入源；当前版本伪 ready 可让不完整快照进入模型，同 observation ID 的事实内容也可被替换。登记 AR-B-026，返工仅收口 Gate 来源/重算、Context 精确投影和对应零调用回归，不得扩展到 L4-2～L4-4。 |
 | 2026-07-12 | Codex | 提交已验收的 L3-5 并关闭 L3；发布 L4-1 SyndromeDraftAgent 与 SyndromeVerifier。L4-1 只实现强类型 Syndrome 草案、固定 AgentSpec/RunSpec、READY_FOR_REASONING 前置检查与确定性 Verifier；明确无 RAG `model_knowledge_only`、置信度上限和医师复核要求，不得提前实现 Formula、ReasoningSubgraph、Safety/HITL 或 RAG。 |
 | 2026-07-12 | Codex | L3-5 第 3 轮复验通过：真实 Intake 节点图和条件边、Repository/Outbox 原子幂等、持久化 Gate 推进、并发单调用、commit 后恢复及中间载荷隐私边界均成立；专项、L3 合并回归、全量后端和全部静态门禁通过，关闭 AR-B-025，L3 阶段完成。 |
 | 2026-07-11 | Codex | L3-5 第 0 轮验收未通过并发布限定返工：现实现绕过 L2 Repository/Reducer 的原子幂等与 Outbox，模型运行于持锁事务，`/advance` 不消费持久化 Completeness Gate，ContextVar 单节点无法跨进程恢复，且缺少真实 E2E/幂等/并发/恢复测试并有 6 个 mypy 错误；登记 AR-B-025。返工仅收口 L3-5 集成，不得扩展到 L4～L9。 |
@@ -283,8 +288,8 @@
 
 ## 8. 下一步
 
-1. 实施 L4-1：新增强类型 `SyndromeDraft`、`SyndromeDraftAgent` 与确定性 `SyndromeVerifier`；只允许从当前版本 `READY_FOR_REASONING`、有效 Completeness policy、无未处理 red flag 且仅含 active observations 的去身份 Context 启动。
-2. 固定无 RAG 契约：`evidence_mode=model_knowledge_only`、限制最大 confidence、`review_required=true`，禁止伪造 citation；fact-linked basis/differential 必须引用 active fact，冲突事实阻断，`needs_more_info`/`abstained` 不得伪装 completed。保持 `AGENT_RUNTIME_VERSION=legacy`，本任务不得提前实现 L4-2～L4-4、Safety/HITL、RAG 或切流。
+1. L4-1 已完成；提交时只纳入已验收的 Syndrome Schema/Agent/Prompt/Verifier、Repository authority 扩展、对应测试和进度表，不提交 `docs/dev-handoff/*`，除非用户明确要求。
+2. 下一可发布 L4-2：`FormulaDraftAgent` 合并基础方与加减，一次输出 base formula、modifications 与 candidate formula；必须以前置已验证的 completed Syndrome Draft 为输入，保持无 RAG、医师复核和不得自行路由/通过安全 Gate 的边界，不得提前实现 L4-3/L4-4 或 L5。
 
 ## 9. 维护要求
 

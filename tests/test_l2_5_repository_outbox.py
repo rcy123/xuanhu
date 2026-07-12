@@ -39,6 +39,8 @@ from app.schemas.domain import (
     ArtifactRevisionSchema,
     ArtifactStatus,
     CollectionStatus,
+    GateDecision,
+    GateResultSchema,
     ObservationSchema,
     ObservationStatus,
     SafetyProfileSchema,
@@ -126,6 +128,91 @@ def _observation_delta(
             ),
         ),
     )
+
+
+def _gate(name: str, version: str, state_version: int, decision: GateDecision, details: dict[str, object]) -> GateResultSchema:
+    return GateResultSchema(
+        gate_name=name,
+        policy_version=version,
+        input_state_version=state_version,
+        decision=decision,
+        details=details,
+    )
+
+
+def _ready_triage_gate(state_version: int = 1) -> GateResultSchema:
+    return _gate(
+        "triage",
+        "triage-red-flag.v1",
+        state_version,
+        GateDecision.PASSED,
+        {"disposition": "continue", "candidate_count": 0, "rule_ids": [], "rules": []},
+    )
+
+
+def _blocked_triage_gate(state_version: int = 1) -> GateResultSchema:
+    return _gate(
+        "triage",
+        "triage-red-flag.v1",
+        state_version,
+        GateDecision.BLOCKED,
+        {"disposition": "emergency_referral", "candidate_count": 1, "rule_ids": ["red_flag.high_fever.emergency_referral.v1"]},
+    )
+
+
+def _ready_completeness_gate(state_version: int = 1) -> GateResultSchema:
+    return _gate(
+        "completeness",
+        "completeness-policy.v1",
+        state_version,
+        GateDecision.PASSED,
+        {"disposition": "ready"},
+    )
+
+
+async def _reasoning_ready_session(
+    repository: PostgresDomainRepository,
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    triage_gate: GateResultSchema | None = None,
+    completeness_gate: GateResultSchema | None = None,
+) -> tuple[UUID, UUID, UUID]:
+    session_id, message_id = await _session_and_message(factory)
+    async with factory() as db, db.begin():
+        session_row = await db.get(ConsultSession, session_id)
+        assert session_row is not None
+        session_row.agent_runtime = "langgraph"
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    result = await repository.commit(
+        delta,
+        _context(state, delta, idempotency_key=f"command-authority-{session_id}"),
+        graph_version="graph-v2",
+        gate_results=(triage_gate or _ready_triage_gate(), completeness_gate or _ready_completeness_gate()),
+    )
+    async with factory() as db, db.begin():
+        source_gate = await db.scalar(
+            select(GateResult).where(
+                GateResult.session_id == session_id,
+                GateResult.graph_run_id == result.graph_run_id,
+                GateResult.gate_name == "completeness",
+                GateResult.input_state_version == 1,
+            )
+        )
+        assert source_gate is not None
+        session_row = await db.get(ConsultSession, session_id)
+        assert session_row is not None
+        session_row.current_stage = "syndrome"
+        session_row.state_snapshot = {
+            "agent_runtime": "langgraph",
+            "current_stage": "syndrome",
+            "state_version": result.output_state_version,
+            "advance": {
+                "source_gate_id": str(source_gate.id),
+                "source_gate_state_version": source_gate.input_state_version,
+            },
+        }
+    return session_id, result.graph_run_id, source_gate.id
 
 
 def _context(
@@ -253,6 +340,163 @@ async def test_commit_rebuilds_state_and_atomically_writes_metadata_and_outbox(
     assert event.event_type == DOMAIN_STATE_COMMITTED
     assert event.status == "pending"
     assert event.payload["output_state_version"] == 2
+
+
+async def test_get_gate_results_loads_persisted_completed_run_gates_by_session_and_state(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    triage_gate = _gate(
+        "triage",
+        "triage-red-flag.v1",
+        2,
+        GateDecision.PASSED,
+        {"disposition": "continue", "candidate_count": 0},
+    )
+    completeness_gate = _gate(
+        "completeness",
+        "completeness-policy.v1",
+        2,
+        GateDecision.PASSED,
+        {"disposition": "ready"},
+    )
+
+    await repository.commit(
+        delta,
+        _context(state, delta, idempotency_key="command-gates"),
+        graph_version="graph-v2",
+        gate_results=(triage_gate, completeness_gate),
+    )
+
+    loaded = await repository.get_gate_results(session_id, 2)
+    assert loaded == (triage_gate, completeness_gate)
+    assert await repository.get_gate_results(session_id, 1) == ()
+
+
+async def test_get_reasoning_authority_loads_current_state_and_source_gate_versions(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, graph_run_id, source_gate_id = await _reasoning_ready_session(repository, factory)
+
+    authority = await repository.get_reasoning_authority(session_id, 2)
+
+    assert authority is not None
+    assert authority.current_state_version == 2
+    assert authority.current_stage == "syndrome"
+    assert authority.session_status == "active"
+    assert authority.agent_runtime == "langgraph"
+    assert authority.domain_state.state_version == 2
+    assert authority.source_gate_id == source_gate_id
+    assert authority.source_gate_state_version == 1
+    assert authority.triage_gate.input_state_version == 1
+    assert authority.completeness_gate.input_state_version == 1
+    assert authority.intake_graph_run_id == graph_run_id
+
+
+async def test_get_reasoning_authority_rejects_pre_advance_inquiry_even_with_ready_gates(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    async with factory() as db, db.begin():
+        session_row = await db.get(ConsultSession, session_id)
+        assert session_row is not None
+        session_row.agent_runtime = "langgraph"
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    await repository.commit(
+        delta,
+        _context(state, delta, idempotency_key="command-pre-advance"),
+        graph_version="graph-v2",
+        gate_results=(_ready_triage_gate(), _ready_completeness_gate()),
+    )
+
+    assert await repository.get_reasoning_authority(session_id, 2) is None
+
+
+async def test_get_reasoning_authority_rejects_state_version_mismatch_and_forged_source(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, _, _ = await _reasoning_ready_session(repository, factory)
+
+    assert await repository.get_reasoning_authority(session_id, 1) is None
+    async with factory() as db, db.begin():
+        session_row = await db.get(ConsultSession, session_id)
+        assert session_row is not None
+        snapshot = dict(session_row.state_snapshot or {})
+        advance = dict(snapshot["advance"])
+        advance["source_gate_id"] = str(uuid4())
+        snapshot["advance"] = advance
+        session_row.state_snapshot = snapshot
+
+    assert await repository.get_reasoning_authority(session_id, 2) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("current_stage", "inquiry"),
+        ("current_stage", "review"),
+        ("current_stage", "record"),
+        ("current_stage", "done"),
+        ("current_stage", "blocked"),
+        ("status", "blocked"),
+        ("status", "terminated"),
+        ("status", "pending_review"),
+        ("agent_runtime", "legacy"),
+        ("recovery_status", "manual_required"),
+    ),
+)
+async def test_get_reasoning_authority_rejects_session_stage_status_runtime_matrix(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+    field: str,
+    value: str,
+) -> None:
+    repository, factory = store
+    session_id, _, _ = await _reasoning_ready_session(repository, factory)
+    async with factory() as db, db.begin():
+        session_row = await db.get(ConsultSession, session_id)
+        assert session_row is not None
+        setattr(session_row, field, value)
+
+    assert await repository.get_reasoning_authority(session_id, 2) is None
+
+
+async def test_get_reasoning_authority_rejects_duplicate_cross_run_noncompleted_and_blocked_gates(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+
+    blocked_session, _, _ = await _reasoning_ready_session(repository, factory, triage_gate=_blocked_triage_gate())
+    assert await repository.get_reasoning_authority(blocked_session, 2) is None
+
+    duplicate_session, graph_run_id, _ = await _reasoning_ready_session(repository, factory)
+    async with factory() as db, db.begin():
+        db.add(
+            GateResult(
+                id=uuid4(),
+                session_id=duplicate_session,
+                graph_run_id=graph_run_id,
+                gate_name="triage",
+                policy_version="triage-red-flag.v1",
+                input_state_version=1,
+                decision="passed",
+                details={"disposition": "continue", "candidate_count": 0},
+            )
+        )
+    assert await repository.get_reasoning_authority(duplicate_session, 2) is None
+
+    running_session, graph_run_id, _ = await _reasoning_ready_session(repository, factory)
+    async with factory() as db, db.begin():
+        graph_run = await db.get(GraphRun, graph_run_id)
+        assert graph_run is not None
+        graph_run.status = "running"
+    assert await repository.get_reasoning_authority(running_session, 2) is None
 
 
 async def test_stale_version_has_zero_writes(

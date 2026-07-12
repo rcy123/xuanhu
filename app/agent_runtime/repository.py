@@ -7,10 +7,10 @@ import re
 from collections.abc import Sequence
 from datetime import timedelta
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -76,6 +76,36 @@ class CommitResult(BaseModel):
     changed: bool
 
 
+class ReasoningAuthoritySnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    session_id: UUID
+    current_state_version: int = Field(ge=1)
+    current_stage: str = Field(min_length=1, max_length=32)
+    session_status: str = Field(min_length=1, max_length=32)
+    agent_runtime: str = Field(min_length=1, max_length=16)
+    domain_state: DomainState
+    source_gate_id: UUID
+    source_gate_state_version: int = Field(ge=1)
+    triage_gate: GateResultSchema
+    completeness_gate: GateResultSchema
+    intake_graph_run_id: UUID
+    advance_run_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def authority_consistency(self) -> ReasoningAuthoritySnapshot:
+        if self.domain_state.session_id != self.session_id:
+            raise ValueError("domain_state session must match authority session")
+        if self.domain_state.state_version != self.current_state_version:
+            raise ValueError("domain_state version must match current authority version")
+        if (
+            self.triage_gate.input_state_version != self.source_gate_state_version
+            or self.completeness_gate.input_state_version != self.source_gate_state_version
+        ):
+            raise ValueError("gate input versions must match source gate version")
+        return self
+
+
 class GraphStepSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -114,6 +144,10 @@ class OutboxMessage(BaseModel):
 class DomainRepository(Protocol):
     async def get_state(self, session_id: UUID) -> DomainState: ...
 
+    async def get_gate_results(self, session_id: UUID, state_version: int) -> tuple[GateResultSchema, ...]: ...
+
+    async def get_reasoning_authority(self, session_id: UUID, state_version: int) -> ReasoningAuthoritySnapshot | None: ...
+
     async def commit(
         self,
         delta: DomainDelta,
@@ -150,6 +184,87 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             if session_row is None:
                 raise RepositoryError(RepositoryErrorCode.SESSION_NOT_FOUND)
             return await self._load_state(session, session_row)
+
+    async def get_gate_results(self, session_id: UUID, state_version: int) -> tuple[GateResultSchema, ...]:
+        try:
+            async with self._session_factory() as session:
+                session_row = await session.get(ConsultSession, session_id)
+                if session_row is None:
+                    raise RepositoryError(RepositoryErrorCode.SESSION_NOT_FOUND)
+                rows = await self._gate_rows(session, session_id, state_version)
+                if len({row.graph_run_id for row in rows}) > 1:
+                    return ()
+                return tuple(self._gate_schema(row) for row in self._ordered_gate_rows(rows))
+        except RepositoryError:
+            raise
+        except SQLAlchemyError:
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
+
+    async def get_reasoning_authority(self, session_id: UUID, state_version: int) -> ReasoningAuthoritySnapshot | None:
+        try:
+            async with self._session_factory() as session, session.begin():
+                session_row = await session.get(ConsultSession, session_id, with_for_update=True)
+                if session_row is None:
+                    raise RepositoryError(RepositoryErrorCode.SESSION_NOT_FOUND)
+                if (
+                    session_row.state_version != state_version
+                    or session_row.current_stage != "syndrome"
+                    or session_row.status != "active"
+                    or session_row.agent_runtime != "langgraph"
+                    or session_row.recovery_status == "manual_required"
+                ):
+                    return None
+                source = self._advance_source(session_row.state_snapshot, state_version)
+                if source is None:
+                    return None
+                source_gate_id, source_gate_state_version = source
+                domain_state = await self._load_state(session, session_row)
+                if domain_state.state_version != state_version:
+                    return None
+                source_gate = await session.scalar(
+                    select(GateResult)
+                    .join(GraphRun, GateResult.graph_run_id == GraphRun.id)
+                    .where(
+                        GateResult.id == source_gate_id,
+                        GateResult.session_id == session_id,
+                        GateResult.gate_name == "completeness",
+                        GateResult.input_state_version == source_gate_state_version,
+                        GraphRun.session_id == session_id,
+                        GraphRun.status == "completed",
+                    )
+                )
+                if source_gate is None or not self._completion_gate_is_ready(source_gate):
+                    return None
+                rows = await self._source_gate_rows(
+                    session,
+                    session_id=session_id,
+                    source_state_version=source_gate_state_version,
+                    graph_run_id=source_gate.graph_run_id,
+                )
+                authority = self._authority_gate_rows(rows)
+                if authority is None:
+                    return None
+                triage, completeness, graph_run_id = authority
+                if completeness.id != source_gate_id or not self._triage_gate_is_continue(triage):
+                    return None
+                return ReasoningAuthoritySnapshot(
+                    session_id=session_id,
+                    current_state_version=domain_state.state_version,
+                    current_stage=session_row.current_stage,
+                    session_status=session_row.status,
+                    agent_runtime=session_row.agent_runtime,
+                    domain_state=domain_state,
+                    source_gate_id=source_gate_id,
+                    source_gate_state_version=source_gate_state_version,
+                    triage_gate=self._gate_schema(triage),
+                    completeness_gate=self._gate_schema(completeness),
+                    intake_graph_run_id=graph_run_id,
+                    advance_run_id=None,
+                )
+        except RepositoryError:
+            raise
+        except SQLAlchemyError:
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
 
     async def commit(
         self,
@@ -524,6 +639,126 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 "confidence": row.confidence,
                 "supersedes_observation_id": row.supersedes_observation_id,
                 "created_at": row.created_at,
+            }
+        )
+
+    @staticmethod
+    async def _gate_rows(session: AsyncSession, session_id: UUID, state_version: int) -> list[GateResult]:
+        return list(
+            (
+                await session.scalars(
+                    select(GateResult)
+                    .join(GraphRun, GateResult.graph_run_id == GraphRun.id)
+                    .where(
+                        GateResult.session_id == session_id,
+                        GateResult.input_state_version == state_version,
+                        GateResult.gate_name.in_(("triage", "completeness")),
+                        GraphRun.session_id == session_id,
+                        GraphRun.status == "completed",
+                    )
+                    .order_by(GateResult.created_at, GateResult.id)
+                )
+            ).all()
+        )
+
+    @staticmethod
+    async def _source_gate_rows(
+        session: AsyncSession,
+        *,
+        session_id: UUID,
+        source_state_version: int,
+        graph_run_id: UUID | None,
+    ) -> list[GateResult]:
+        if graph_run_id is None:
+            return []
+        return list(
+            (
+                await session.scalars(
+                    select(GateResult)
+                    .join(GraphRun, GateResult.graph_run_id == GraphRun.id)
+                    .where(
+                        GateResult.session_id == session_id,
+                        GateResult.input_state_version == source_state_version,
+                        GateResult.graph_run_id == graph_run_id,
+                        GateResult.gate_name.in_(("triage", "completeness")),
+                        GraphRun.session_id == session_id,
+                        GraphRun.status == "completed",
+                    )
+                    .order_by(GateResult.created_at, GateResult.id)
+                )
+            ).all()
+        )
+
+    @staticmethod
+    def _advance_source(snapshot: dict[str, Any] | None, current_state_version: int) -> tuple[UUID, int] | None:
+        if not isinstance(snapshot, dict):
+            return None
+        advance = snapshot.get("advance")
+        if not isinstance(advance, dict):
+            return None
+        raw_gate_id = advance.get("source_gate_id")
+        raw_state_version = advance.get("source_gate_state_version")
+        if not isinstance(raw_gate_id, str) or not isinstance(raw_state_version, int) or isinstance(raw_state_version, bool):
+            return None
+        try:
+            source_gate_id = UUID(raw_gate_id)
+        except (TypeError, ValueError):
+            return None
+        source_state_version = raw_state_version
+        if source_state_version < 1 or source_state_version != current_state_version - 1:
+            return None
+        return source_gate_id, source_state_version
+
+    @staticmethod
+    def _ordered_gate_rows(rows: Sequence[GateResult]) -> tuple[GateResult, ...]:
+        priority = {"triage": 0, "completeness": 1}
+        return tuple(sorted(rows, key=lambda row: (priority.get(row.gate_name, 99), row.created_at, str(row.id))))
+
+    @classmethod
+    def _authority_gate_rows(cls, rows: Sequence[GateResult]) -> tuple[GateResult, GateResult, UUID] | None:
+        ordered = cls._ordered_gate_rows(rows)
+        if len(ordered) != 2 or ordered[0].gate_name != "triage" or ordered[1].gate_name != "completeness":
+            return None
+        graph_run_ids = {row.graph_run_id for row in ordered}
+        if len(graph_run_ids) != 1:
+            return None
+        graph_run_id = next(iter(graph_run_ids))
+        if graph_run_id is None:
+            return None
+        return ordered[0], ordered[1], graph_run_id
+
+    @staticmethod
+    def _completion_gate_is_ready(row: GateResult) -> bool:
+        details = row.details
+        return (
+            row.gate_name == "completeness"
+            and row.policy_version == "completeness-policy.v1"
+            and row.decision == "passed"
+            and isinstance(details, dict)
+            and details.get("disposition") == "ready"
+        )
+
+    @staticmethod
+    def _triage_gate_is_continue(row: GateResult) -> bool:
+        details = row.details
+        return (
+            row.gate_name == "triage"
+            and row.policy_version == "triage-red-flag.v1"
+            and row.decision == "passed"
+            and isinstance(details, dict)
+            and details.get("disposition") == "continue"
+            and details.get("candidate_count") == 0
+        )
+
+    @staticmethod
+    def _gate_schema(row: GateResult) -> GateResultSchema:
+        return GateResultSchema.model_validate(
+            {
+                "gate_name": row.gate_name,
+                "policy_version": row.policy_version,
+                "input_state_version": row.input_state_version,
+                "decision": row.decision,
+                "details": row.details,
             }
         )
 
