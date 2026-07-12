@@ -9,6 +9,8 @@ Safety, or approves doctor review.
 from __future__ import annotations
 
 import json
+import weakref
+from collections.abc import Callable
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
@@ -86,6 +88,17 @@ class FormulaExecutionResult(BaseModel):
         elif self.output is not None or self.failure_code is None:
             raise ValueError("failed formula result contains only a fixed failure code")
         return self
+
+
+class _TrustedFormulaExecution(BaseModel):
+    """Untrusted compatibility shape; construction alone grants no authority."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_spec: RunSpec
+    artifact: RunArtifact
+    input_payload: FormulaDraftInput
+    output: FormulaDraft
 
 
 def build_formula_agent_spec(*, model: str | None = None) -> AgentSpec:
@@ -175,7 +188,7 @@ def build_formula_context(
     return packet, template.prompt_version
 
 
-async def execute_formula_draft(
+async def _execute_formula_draft(
     *,
     runtime: AgentRuntime,
     repository: DomainRepository,
@@ -186,6 +199,7 @@ async def execute_formula_draft(
     syndrome_run_spec: RunSpec | None | object = _NOT_PROVIDED,
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
+    _register_success: Callable[[FormulaExecutionResult, _TrustedFormulaExecution], None],
 ) -> FormulaExecutionResult:
     """Run once, verify the draft, and never route, persist, prescribe, or approve.
 
@@ -301,11 +315,87 @@ async def execute_formula_draft(
     if not report.passed:
         assert report.failure_code is not None
         return _failed(report.failure_code, verification=report)
-    return FormulaExecutionResult(
+    result = FormulaExecutionResult(
         status=FormulaExecutionStatus.SUCCEEDED,
         output=canonical_output,
         verification=report,
     )
+    _register_success(
+        result,
+        _TrustedFormulaExecution(
+            run_spec=run_spec,
+            artifact=canonical_artifact,
+            input_payload=input_payload,
+            output=canonical_output,
+        ),
+    )
+    return result
+
+
+def _build_formula_execution_boundary() -> tuple[
+    Callable[..., object],
+    Callable[[FormulaExecutionResult], _TrustedFormulaExecution | None],
+]:
+    """Seal successful L4-2 object identity in a closure-owned weak registry."""
+
+    trusted_instances: dict[
+        int,
+        tuple[weakref.ReferenceType[FormulaExecutionResult], _TrustedFormulaExecution],
+    ] = {}
+
+    def register_success(result: FormulaExecutionResult, execution: _TrustedFormulaExecution) -> None:
+        key = id(result)
+
+        def discard(reference: weakref.ReferenceType[FormulaExecutionResult]) -> None:
+            current = trusted_instances.get(key)
+            if current is not None and current[0] is reference:
+                trusted_instances.pop(key, None)
+
+        trusted_instances[key] = (weakref.ref(result, discard), execution)
+
+    async def execute_formula_draft(
+        *,
+        runtime: AgentRuntime,
+        repository: DomainRepository,
+        run_spec: RunSpec,
+        input_payload: FormulaDraftInput,
+        syndrome_result: SyndromeExecutionResult | None = None,
+        syndrome_artifact: RunArtifact | None | object = _NOT_PROVIDED,
+        syndrome_run_spec: RunSpec | None | object = _NOT_PROVIDED,
+        agent_spec: AgentSpec | None = None,
+        prompt_loader: PromptLoader | None = None,
+    ) -> FormulaExecutionResult:
+        return await _execute_formula_draft(
+            runtime=runtime,
+            repository=repository,
+            run_spec=run_spec,
+            input_payload=input_payload,
+            syndrome_result=syndrome_result,
+            syndrome_artifact=syndrome_artifact,
+            syndrome_run_spec=syndrome_run_spec,
+            agent_spec=agent_spec,
+            prompt_loader=prompt_loader,
+            _register_success=register_success,
+        )
+
+    def consume(result: FormulaExecutionResult) -> _TrustedFormulaExecution | None:
+        entry = trusted_instances.get(id(result))
+        if entry is None or entry[0]() is not result:
+            return None
+        trusted = entry[1]
+        if (
+            result.status is not FormulaExecutionStatus.SUCCEEDED
+            or result.output != trusted.output
+            or result.verification is None
+            or not result.verification.passed
+        ):
+            return None
+        return trusted.model_copy(deep=True)
+
+    return execute_formula_draft, consume
+
+
+execute_formula_draft, _consume_trusted_formula_execution = _build_formula_execution_boundary()
 
 
 async def _load_reasoning_authority(
