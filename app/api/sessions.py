@@ -11,15 +11,22 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.request_context import (
+    WriteRequestContext,
+    execute_model_write,
+    get_trace_id,
+    write_request_context,
+)
+from app.core.config import get_settings
 from app.core.exceptions import (
     InvalidStageTransitionError,
+    LangGraphPublicDisabledError,
     SessionNotFoundError,
 )
 from app.core.exceptions import (
@@ -31,6 +38,7 @@ from app.schemas.session import (
     SessionCreateRequest,
     SessionTerminateRequest,
 )
+from app.services.http_idempotency import session_http_scope
 from app.services.session import SessionService
 
 router = APIRouter(prefix="/api/v1/consult", tags=["sessions"])
@@ -41,10 +49,7 @@ def _get_trace_id(request: Request) -> str:
 
     优先复用请求头 X-Request-Id / X-Trace-Id；否则生成 UUID v4。
     """
-    header = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-    if header:
-        return header
-    return str(uuid.uuid4())
+    return get_trace_id(request)
 
 
 def _doctor_id(x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id")) -> str | None:
@@ -58,14 +63,38 @@ async def create_session(
     body: SessionCreateRequest,
     db: AsyncSession = Depends(get_db),
     doctor_id: str | None = Depends(_doctor_id),
+    context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """创建问诊会话。"""
-    trace_id = _get_trace_id(request)
+    del request
+    trace_id = context.trace_id
+    settings = get_settings()
+    public_runtime = body.agent_runtime or settings.agent_runtime_version
+    if public_runtime == "langgraph" and not settings.langgraph_public_enabled:
+        raise LangGraphPublicDisabledError(
+            detail=(
+                "agent_runtime=langgraph 的公共会话创建未启用；"
+                "请使用 legacy 或由运维启用 XUANHU_LANGGRAPH_PUBLIC_ENABLED"
+            )
+        )
     service = SessionService(db)
-    data = await service.create_session(body, doctor_id=doctor_id, trace_id=trace_id)
+    result = await execute_model_write(
+        db,
+        context,
+        operation="session.create.v1",
+        scope_key="sessions",
+        concurrency_scope=None,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+        },
+        success_status=201,
+        success_message="ok",
+        handler=lambda: service.create_session(body, doctor_id=doctor_id, trace_id=trace_id),
+    )
     return JSONResponse(
-        status_code=201,
-        content=success_response(data=data.model_dump(mode="json"), trace_id=trace_id),
+        status_code=result.status_code,
+        content=success_response(data=result.data, trace_id=trace_id, message=result.message),
     )
 
 
@@ -121,22 +150,38 @@ async def terminate_session(
     body: SessionTerminateRequest,
     db: AsyncSession = Depends(get_db),
     doctor_id: str | None = Depends(_doctor_id),
+    context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """终止会话。"""
-    trace_id = _get_trace_id(request)
+    del request
+    trace_id = context.trace_id
     service = SessionService(db)
-    data = await service.terminate_session(
-        session_id,
-        body,
-        doctor_id=doctor_id,
-        trace_id=trace_id,
+    scope = session_http_scope(session_id)
+    result = await execute_model_write(
+        db,
+        context,
+        operation="session.terminate.v1",
+        scope_key=scope,
+        concurrency_scope=scope,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+        },
+        success_status=200,
+        success_message="会话已终止",
+        handler=lambda: service.terminate_session(
+            session_id,
+            body,
+            doctor_id=doctor_id,
+            trace_id=trace_id,
+        ),
     )
     return JSONResponse(
-        status_code=200,
+        status_code=result.status_code,
         content=success_response(
-            data=data.model_dump(mode="json"),
+            data=result.data,
             trace_id=trace_id,
-            message="会话已终止",
+            message=result.message,
         ),
     )
 
@@ -198,9 +243,28 @@ async def validation_error_handler(
     )
 
 
+async def langgraph_public_disabled_handler(
+    request: Request, exc: LangGraphPublicDisabledError
+) -> JSONResponse:
+    """LANGGRAPH_PUBLIC_DISABLED 异常处理。"""
+    trace_id = _get_trace_id(request)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
+
+
 # 导出路由级异常处理映射，供 main.py 注册
 session_exception_handlers: dict[Any, Any] = {
     SessionNotFoundError: session_not_found_handler,
     InvalidStageTransitionError: invalid_stage_transition_handler,
+    LangGraphPublicDisabledError: langgraph_public_disabled_handler,
     XuanhuValidationError: validation_error_handler,
 }

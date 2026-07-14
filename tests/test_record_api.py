@@ -115,8 +115,8 @@ async def _check_postgres() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except (OSError, ConnectionError) as exc:
-        pytest.skip(
-            f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}"
+        pytest.fail(
+            f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}"
         )
     except Exception as exc:  # noqa: BLE001
         pytest.fail(
@@ -659,7 +659,7 @@ async def test_edit_record_session_lock_conflict(
             lock_key = f"xuanhu:session_lock:{session.id}"
             await redis.set(lock_key, "other-trace", nx=True, ex=90)
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"Redis 不可用，跳过锁冲突测试: {exc}")
+            pytest.fail(f"Redis integration dependency unavailable: {type(exc).__name__}: {exc}")
 
         resp = await client.put(
             f"/api/v1/consult/sessions/{session.id}/record",

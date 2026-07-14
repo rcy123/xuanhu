@@ -6,6 +6,14 @@
 import '@testing-library/jest-dom/vitest'
 import { vi } from 'vitest'
 
+// Ant Design queries pseudo-element styles; jsdom logs a noisy "not implemented"
+// diagnostic for the optional second argument even though tests only need the
+// base computed style.  Drop that argument deterministically in the test DOM.
+if (typeof window !== 'undefined') {
+  const getComputedStyle = window.getComputedStyle.bind(window)
+  window.getComputedStyle = (element: Element) => getComputedStyle(element)
+}
+
 // jsdom 未实现 matchMedia，Ant Design 响应式监听会调用它。
 if (typeof window !== 'undefined' && typeof window.matchMedia !== 'function') {
   window.matchMedia = (query: string) => ({

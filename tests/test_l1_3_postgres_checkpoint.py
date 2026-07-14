@@ -27,7 +27,6 @@ Windows 事件循环：
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
@@ -59,18 +58,11 @@ from app.agent_runtime.errors import (
 )
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.state import XuanhuGraphState, default_state
+from tests._database_safety import require_destructive_test_database
 
 # ---------------------------------------------------------------------------
 # Windows 事件循环：psycopg v3 异步连接要求 SelectorEventLoop
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-    """在 Windows 上切换到 ``SelectorEventLoopPolicy`` 以兼容 psycopg v3 异步连接。"""
-    if sys.platform == "win32":
-        return asyncio.WindowsSelectorEventLoopPolicy()
-    return asyncio.DefaultEventLoopPolicy()
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +71,8 @@ def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
 
 
 def _pg_url() -> str:
-    """从环境变量获取 PostgreSQL 连接 URL。"""
-    return os.environ.get("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
+    """从显式、受保护的测试数据库配置获取 PostgreSQL URL。"""
+    return require_destructive_test_database()
 
 
 def _random_session_id() -> str:

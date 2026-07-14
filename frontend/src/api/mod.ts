@@ -14,6 +14,7 @@ export {
   listSessions,
   getSession,
   terminateSession,
+  advanceSession,
   submitMessage,
   submitMessageWithRetry,
   listMessages,

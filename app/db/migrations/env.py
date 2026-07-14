@@ -18,13 +18,17 @@ import app.models  # noqa: F401
 from app.core.config import get_settings
 from app.db.base import Base  # noqa: E402
 
-settings = get_settings()
-
 # -- Alembic Config --
 config = context.config
 
-# 将 Settings 中的 database_url 注入 Alembic 配置
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Normal CLI use keeps the sentinel from ``alembic.ini`` and resolves the URL
+# through application settings.  Guarded migration tests may instead inject an
+# explicit worker-database URL into their ``Config`` object; preserving that
+# value makes the migration target independent of process-global Settings cache
+# state during module teardown.
+configured_url = config.get_main_option("sqlalchemy.url")
+if not configured_url or configured_url == "override_in_env_py":
+    config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
 # 日志
 if config.config_file_name is not None:

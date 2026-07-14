@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session_factory
 
@@ -140,7 +141,7 @@ def split_chinese_text(
 
     chunks: list[str] = []
     start = 0
-    sentence_breaks = set("。！？；\n）」》》\"”")
+    sentence_breaks = set('。！？；\n）」》》"”')
 
     while start < len(text):
         end = start + chunk_size
@@ -266,9 +267,7 @@ class ChunkBuilder:
 
                 # 软删除不再匹配的旧 chunk（内容变化导致 hash 不同）
                 if not dry_run and stats.chunks_created > 0:
-                    deleted = await self._soft_delete_stale_chunks(
-                        session, source_type, source_id, chunks
-                    )
+                    deleted = await self._soft_delete_stale_chunks(session, source_type, source_id, chunks)
                     stats.chunks_deleted = deleted
 
                 if not dry_run:
@@ -331,103 +330,72 @@ class ChunkBuilder:
         return stats
 
     async def _fetch_source_records(
-        self, session: Any, source_type: str, limit: int | None
+        self, session: AsyncSession, source_type: str, limit: int | None
     ) -> list[dict[str, Any]]:
         """查询来源表获取待生成 chunk 的记录。"""
         from app.models.knowledge import Acupoint, Formula, Herb, TheoryCase
 
-        model_map = {
-            "herb": (Herb, "name"),
-            "formula": (Formula, "name"),
-            "acupoint": (Acupoint, "name"),
-            "theory": (TheoryCase, "title"),
-            "case": (TheoryCase, "title"),
-        }
-
-        model_cls, title_field = model_map[source_type]
-
+        records: list[dict[str, Any]] = []
         if source_type in ("theory", "case"):
             stmt = (
                 select(
-                    model_cls.id,
-                    model_cls.entry_type.label("source_type"),
-                    model_cls.title,
-                    model_cls.doc_text,
-                    model_cls.extra_meta,
+                    TheoryCase.id,
+                    TheoryCase.entry_type,
+                    TheoryCase.title,
+                    TheoryCase.doc_text,
+                    TheoryCase.extra_meta,
                 )
-                .where(model_cls.entry_type == source_type)
-                .where(model_cls.deleted_at.is_(None))
-                .order_by(model_cls.title)
+                .where(TheoryCase.entry_type == source_type)
+                .where(TheoryCase.deleted_at.is_(None))
+                .order_by(TheoryCase.title)
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            result = await session.execute(stmt)
+            for row in result.all():
+                records.append(
+                    {
+                        "source_type": row.entry_type,
+                        "id": row.id,
+                        "title": row.title,
+                        "doc_text": row.doc_text,
+                        "extra_meta": row.extra_meta,
+                    }
+                )
+            return records
+
+        model_cls: type[Herb] | type[Formula] | type[Acupoint]
+        if source_type == "herb":
+            model_cls = Herb
+        elif source_type == "formula":
+            model_cls = Formula
+        elif source_type == "acupoint":
+            model_cls = Acupoint
         else:
-            stmt = (
-                select(
-                    model_cls.id,
-                    model_cls.name.label("title"),
-                    model_cls.doc_text,
-                )
-                .where(model_cls.deleted_at.is_(None))
-                .order_by(model_cls.name)
-            )
-            # Add source_type literal and extra_meta placeholder
-            stmt = select(
+            raise ValueError(f"unsupported source_type: {source_type}")
+
+        stmt_by_name = (
+            select(
                 model_cls.id,
                 model_cls.name.label("title"),
                 model_cls.doc_text,
-            ).where(model_cls.deleted_at.is_(None)).order_by(model_cls.name)
-
+            )
+            .where(model_cls.deleted_at.is_(None))
+            .order_by(model_cls.name)
+        )
         if limit is not None:
-            stmt = stmt.limit(limit)
-
-        records: list[dict[str, Any]] = []
-        # Query with source_type literal
-        if source_type in ("theory", "case"):
-            model_cls2, _ = model_map[source_type]
-            stmt2 = (
-                select(
-                    model_cls2.id,
-                    model_cls2.entry_type,
-                    model_cls2.title,
-                    model_cls2.doc_text,
-                    model_cls2.extra_meta,
-                )
-                .where(model_cls2.entry_type == source_type)
-                .where(model_cls2.deleted_at.is_(None))
-                .order_by(model_cls2.title)
-            )
-            if limit is not None:
-                stmt2 = stmt2.limit(limit)
-            result2 = await session.execute(stmt2)
-            for row in result2.all():
-                records.append({
-                    "source_type": row.entry_type,
-                    "id": row.id,
-                    "title": row.title,
-                    "doc_text": row.doc_text,
-                    "extra_meta": row.extra_meta,
-                })
-        else:
-            model_cls2, title_field2 = model_map[source_type]
-            stmt2 = (
-                select(
-                    model_cls2.id,
-                    model_cls2.name.label("title"),
-                    model_cls2.doc_text,
-                )
-                .where(model_cls2.deleted_at.is_(None))
-                .order_by(model_cls2.name)
-            )
-            if limit is not None:
-                stmt2 = stmt2.limit(limit)
-            result2 = await session.execute(stmt2)
-            for row in result2.all():
-                records.append({
+            stmt_by_name = stmt_by_name.limit(limit)
+        result = await session.execute(stmt_by_name)
+        for row in result.all():
+            records.append(
+                {
                     "source_type": source_type,
                     "id": row.id,
                     "title": row.title,
                     "doc_text": row.doc_text,
                     "extra_meta": {},
-                })
+                }
+            )
 
         return records
 
@@ -516,10 +484,7 @@ class ChunkBuilder:
         """软删除同一 source 下不再出现在新 chunk 集合中的旧 active chunk。"""
         from app.models.knowledge import KnowledgeChunk
 
-        new_hashes = {
-            compute_content_hash(source_type, str(source_id), content)
-            for content, _title in new_chunks
-        }
+        new_hashes = {compute_content_hash(source_type, str(source_id), content) for content, _title in new_chunks}
 
         # 获取所有 active chunk 的 hash
         stmt = (
@@ -538,11 +503,7 @@ class ChunkBuilder:
 
         if stale_ids:
             now = datetime.now(UTC).replace(tzinfo=None)
-            stmt_update = (
-                update(KnowledgeChunk)
-                .where(KnowledgeChunk.id.in_(stale_ids))
-                .values(deleted_at=now)
-            )
+            stmt_update = update(KnowledgeChunk).where(KnowledgeChunk.id.in_(stale_ids)).values(deleted_at=now)
             await session.execute(stmt_update)
 
         return len(stale_ids)
@@ -657,9 +618,9 @@ class VectorSyncer:
             )
 
             # 创建向量索引
-            index_params = self._milvus.prepare_index_params() if hasattr(
-                self._milvus, "prepare_index_params"
-            ) else None
+            index_params = (
+                self._milvus.prepare_index_params() if hasattr(self._milvus, "prepare_index_params") else None
+            )
             if index_params is not None:
                 index_params.add_index(
                     field_name="embedding",
@@ -755,9 +716,7 @@ class VectorSyncer:
         # 逐个分组处理
         for (_st, _sid), group_chunks in groups.items():
             try:
-                group_stats = await self._sync_group(
-                    group_chunks, embeddings, texts, dry_run=dry_run
-                )
+                group_stats = await self._sync_group(group_chunks, embeddings, texts, dry_run=dry_run)
                 stats.chunks_embedded += group_stats.chunks_embedded
                 stats.chunks_failed += group_stats.chunks_failed
                 stats.vectors_inserted += group_stats.vectors_inserted
@@ -896,15 +855,17 @@ class VectorSyncer:
                 stats.errors.append(f"chunk {chunk['id']} 无对应 embedding")
                 continue
 
-            rows_to_insert.append({
-                "vector_id": str(chunk["id"]),
-                "chunk_id": str(chunk["id"]),
-                "source_type": chunk["source_type"],
-                "source_id": chunk["source_id"],
-                "title": chunk["title"][:512],
-                "content_hash": chunk["content_hash"],
-                "embedding": embedding,
-            })
+            rows_to_insert.append(
+                {
+                    "vector_id": str(chunk["id"]),
+                    "chunk_id": str(chunk["id"]),
+                    "source_type": chunk["source_type"],
+                    "source_id": chunk["source_id"],
+                    "title": chunk["title"][:512],
+                    "content_hash": chunk["content_hash"],
+                    "embedding": embedding,
+                }
+            )
             chunk_ids_ok.append(chunk["id"])
 
         if rows_to_insert and not dry_run:
@@ -997,9 +958,7 @@ class VectorSyncer:
                 # 校验维度
                 for emb in embeddings:
                     if len(emb) != self._embedding_dim:
-                        raise ValueError(
-                            f"Embedding 维度不一致: 期望 {self._embedding_dim}, 实际 {len(emb)}"
-                        )
+                        raise ValueError(f"Embedding 维度不一致: 期望 {self._embedding_dim}, 实际 {len(emb)}")
                 all_embeddings.extend(embeddings)
             except Exception:
                 logger.exception("embedding 批处理失败: batch_size=%d", len(batch))
@@ -1398,7 +1357,9 @@ async def _main() -> int:
     try:
         # --build-chunks
         if args.build_chunks or args.all:
-            print(f"\n[build-chunks] 开始生成 chunks (source_type={source_type}, limit={args.limit}, dry_run={args.dry_run})")
+            print(
+                f"\n[build-chunks] 开始生成 chunks (source_type={source_type}, limit={args.limit}, dry_run={args.dry_run})"
+            )
             builder = ChunkBuilder(session_factory)
             build_stats = await builder.build_all(
                 source_type=source_type,
@@ -1412,7 +1373,9 @@ async def _main() -> int:
             if milvus_client is None:
                 milvus_client = _create_milvus_client()
 
-            print(f"\n[sync-vectors] 开始向量同步 (source_type={source_type}, limit={args.limit}, dry_run={args.dry_run})")
+            print(
+                f"\n[sync-vectors] 开始向量同步 (source_type={source_type}, limit={args.limit}, dry_run={args.dry_run})"
+            )
             syncer = VectorSyncer(session_factory, milvus_client)
 
             # 确保 collection 存在

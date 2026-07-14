@@ -201,6 +201,54 @@ async def test_chat_structured_success(mock_settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_structured_observed_uses_response_model_and_usage(mock_settings: Settings) -> None:
+    """Observed calls expose only response-side serving metadata."""
+    client = ModelGatewayClient(mock_settings)
+
+    with respx.mock:
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={
+                    "model": "served-model-revision-42",
+                    "usage": {
+                        "prompt_tokens": 31,
+                        "completion_tokens": 7,
+                        "total_tokens": 38,
+                    },
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "arguments": json.dumps({"name": "observed", "value": 42})
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                },
+            )
+        )
+
+        result = await client.chat_structured_observed(
+            messages=[{"role": "user", "content": "Generate"}],
+            output_schema=SampleOutput,
+            model="requested-alias",
+            trace_id="test-trace-observed",
+        )
+
+    assert result.output == SampleOutput(name="observed", value=42)
+    assert result.model_actual == "served-model-revision-42"
+    assert result.model_actual != "requested-alias"
+    assert result.usage.prompt_tokens == 31
+    assert result.usage.completion_tokens == 7
+    assert result.usage.total_tokens == 38
+
+
+@pytest.mark.asyncio
 async def test_chat_structured_parse_from_content(mock_settings: Settings) -> None:
     """chat_structured 从 content 解析 JSON 测试。"""
     client = ModelGatewayClient(mock_settings)

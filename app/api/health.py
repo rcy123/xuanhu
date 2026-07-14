@@ -90,3 +90,10 @@ async def health_rag() -> JSONResponse:
     service = HealthService()
     result = await service.rag_check()
     return JSONResponse(content=result)
+
+
+@router.get("/health/outbox")
+async def health_outbox() -> JSONResponse:
+    """Outbox backlog/DLQ health with aggregate, privacy-safe metrics only."""
+    service = HealthService()
+    return JSONResponse(content=await service.outbox_check())

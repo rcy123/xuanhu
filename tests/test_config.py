@@ -102,6 +102,7 @@ def test_load_with_defaults(monkeypatch) -> None:
     assert settings.model_gateway_route_profile == "default"
     assert settings.rag_top_k_vector == 12
     assert settings.agent_max_retries == 2
+    assert settings.event_dedupe_ttl_seconds == 86_400
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +264,19 @@ def test_numeric_fields_have_correct_types(monkeypatch) -> None:
     assert isinstance(settings.api_port, int)
     assert isinstance(settings.model_gateway_timeout_seconds, int)
     assert isinstance(settings.model_gateway_max_retries, int)
+    assert isinstance(settings.event_dedupe_ttl_seconds, int)
+
+
+def test_event_dedupe_ttl_is_configurable_and_bounded(monkeypatch) -> None:
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("EVENT_DEDUPE_TTL_SECONDS", "120")
+
+    assert Settings(_env_file=None).event_dedupe_ttl_seconds == 120  # type: ignore[call-arg]
+
+    monkeypatch.setenv("EVENT_DEDUPE_TTL_SECONDS", "59")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 def test_numeric_fields_reject_invalid_values(monkeypatch) -> None:

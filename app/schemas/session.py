@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.domain import LactationValue
+from app.schemas.session_read_model import SessionReadModelV1
 from app.schemas.types import Gender, PregnancyStatus
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,9 @@ class PatientInfo(BaseModel):
     )
     menstruation_summary: str | None = Field(default=None)
     special_conditions: list[str] = Field(default_factory=list)
+    current_medications: list[str] = Field(default_factory=list)
+    major_conditions: list[str] = Field(default_factory=list)
+    lactation_status: LactationValue | None = Field(default=None, validate_default=True)
 
 
 class SessionListItem(BaseModel):
@@ -85,6 +90,8 @@ class SessionDetailResponse(BaseModel):
     blocked_reason: str | None
     rollback_counts: dict[str, Any]
     state_version: int
+    agent_runtime: Literal["legacy", "langgraph"]
+    read_model: SessionReadModelV1
     patient_info: PatientInfo
     chief_complaint: str | None
     present_illness: str | None = None

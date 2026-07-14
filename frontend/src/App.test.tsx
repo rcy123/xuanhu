@@ -12,6 +12,7 @@ import { ConfigProvider, App as AntdApp } from 'antd'
 import App from '@/App'
 import * as api from '@/api/index'
 import type { PageData, SessionListItem } from '@/types/api'
+import { emptySessionReadModel } from '@/utils/readModel'
 
 vi.mock('@/utils/id', () => ({ generateIdempotencyKey: () => 'idem-test' }))
 
@@ -31,6 +32,8 @@ vi.spyOn(api, 'getSession').mockResolvedValue({
   blocked_reason: null,
   rollback_counts: {},
   state_version: 1,
+  agent_runtime: 'legacy',
+  read_model: emptySessionReadModel('legacy', 1),
   patient_info: { name: '李明', gender: 'male', age: 35 },
   chief_complaint: '头痛',
   created_at: '',

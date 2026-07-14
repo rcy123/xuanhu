@@ -13,6 +13,7 @@ import {
 } from '@ant-design/icons'
 import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
 import type { ApiRequestError } from '@/api/errors'
+import { isReviewBlocked } from '@/utils/review'
 import { ErrorBanner } from './ErrorBanner'
 
 export interface ReviewActionsBarProps {
@@ -25,21 +26,6 @@ export interface ReviewActionsBarProps {
   onModify: () => void
   onReject: () => void
   onRetry: () => void
-}
-
-/**
- * 判定是否处于安全阻断态（不显示确认/修改按钮）。
- *
- * 阻断条件：safety_review.passed === false 或存在 blocker/high issue。
- * 此函数导出供测试复用。
- */
-export function isReviewBlocked(
-  detail: SessionDetail,
-  blockedIssues?: SafetyIssue[] | null,
-): boolean {
-  const issues = blockedIssues ?? (detail.safety_review?.issues as SafetyIssue[] | undefined) ?? []
-  if (detail.safety_review && !detail.safety_review.passed) return true
-  return issues.some((i) => i.severity === 'blocker' || i.severity === 'high')
 }
 
 export function ReviewActionsBar({

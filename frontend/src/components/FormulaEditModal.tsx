@@ -116,7 +116,7 @@ export function FormulaEditModal({
       confirmLoading={submitting}
       okButtonProps={{ disabled: submitting, 'data-testid': 'formula-edit-submit' } as ButtonProps}
       width={640}
-      destroyOnClose
+      destroyOnHidden
     >
       {reviewError ? (
         <Alert

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, NODE_REASONING_SUBGRAPH_V1
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
+from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.formula_consistency import (
     FORMULA_CONSISTENCY_POLICY_VERSION,
     FormulaConsistencyReport,
@@ -103,8 +104,11 @@ SYNDROME_PAYLOAD_SCHEMA_VERSION = "syndrome-artifact-payload.v1"
 FORMULA_PAYLOAD_SCHEMA_VERSION = "formula-artifact-payload.v1"
 CONTROL_PAYLOAD_SCHEMA_VERSION = "reasoning-control-payload.v1"
 
-_SYNDROME_RESULT_CACHE: dict[uuid.UUID, SyndromeExecutionResult] = {}
-_FORMULA_ROUTE_CACHE: dict[uuid.UUID, str] = {}
+_SYNDROME_RESULT_CACHE: BoundedTTLCache[uuid.UUID, SyndromeExecutionResult] = BoundedTTLCache(
+    max_size=256,
+    ttl_seconds=300,
+)
+_FORMULA_ROUTE_CACHE: BoundedTTLCache[uuid.UUID, str] = BoundedTTLCache(max_size=256, ttl_seconds=300)
 _execute_syndrome = cast(Callable[..., Awaitable[SyndromeExecutionResult]], execute_syndrome_draft)
 _execute_formula = cast(Callable[..., Awaitable[Any]], execute_formula_draft)
 
@@ -1232,7 +1236,7 @@ def _run_artifact_from_payload(payload: dict[str, Any], output: BaseModel) -> Ru
         raise ValueError("run artifact output mismatch")
     return RunArtifact(
         output=output,
-        model_actual=str(payload["model_actual"]),
+        model_actual=None if payload["model_actual"] is None else str(payload["model_actual"]),
         attempts=int(payload["attempts"]),
         latency_ms=int(payload["latency_ms"]),
         usage=TokenUsage.model_validate(payload["usage"]),
@@ -1401,39 +1405,49 @@ def _response_payload(
 
 
 async def _complete_claim(claim_id: uuid.UUID, response_payload: dict[str, Any], output_state_version: int) -> None:
-    factory = get_session_factory()
-    async with factory() as db:
-        if db.in_transaction():
-            await db.rollback()
-        async with db.begin():
-            claim = await db.get(IntakeCommandClaim, claim_id, with_for_update=True)
-            if claim is None:
-                return
-            claim.status = "completed"
-            claim.output_state_version = output_state_version
-            claim.response_payload = response_payload
-            claim.updated_at = func.now()
-            graph_run = await db.get(GraphRun, claim.run_id)
-            if graph_run is not None:
-                graph_run.status = "completed"
-                graph_run.completed_at = func.now()
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            if db.in_transaction():
+                await db.rollback()
+            async with db.begin():
+                claim = await db.get(IntakeCommandClaim, claim_id, with_for_update=True)
+                if claim is None:
+                    return
+                claim.status = "completed"
+                claim.output_state_version = output_state_version
+                claim.response_payload = response_payload
+                claim.updated_at = func.now()
+                graph_run = await db.get(GraphRun, claim.run_id)
+                if graph_run is not None:
+                    graph_run.status = "completed"
+                    graph_run.completed_at = func.now()
+    finally:
+        _SYNDROME_RESULT_CACHE.pop(claim_id, None)
+        _FORMULA_ROUTE_CACHE.pop(claim_id, None)
 
 
 async def _mark_claim_failed(claim_id: uuid.UUID, error_code: str) -> None:
-    factory = get_session_factory()
-    async with factory() as db:
-        if db.in_transaction():
-            await db.rollback()
-        async with db.begin():
-            claim = await db.get(IntakeCommandClaim, claim_id, with_for_update=True)
-            if claim is not None and claim.status != "completed":
-                claim.status = "failed"
-                claim.error_code = error_code[:64]
-                claim.updated_at = func.now()
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            if db.in_transaction():
+                await db.rollback()
+            async with db.begin():
+                claim = await db.get(IntakeCommandClaim, claim_id, with_for_update=True)
+                if claim is not None and claim.status != "completed":
+                    claim.status = "failed"
+                    claim.error_code = error_code[:64]
+                    claim.updated_at = func.now()
+    finally:
+        _SYNDROME_RESULT_CACHE.pop(claim_id, None)
+        _FORMULA_ROUTE_CACHE.pop(claim_id, None)
 
 
 async def _completed_graph_update(claim: IntakeCommandClaim) -> dict[str, Any] | None:
     if claim.status == "completed" and claim.response_payload is not None:
+        _SYNDROME_RESULT_CACHE.pop(claim.id, None)
+        _FORMULA_ROUTE_CACHE.pop(claim.id, None)
         return _graph_update_from_response(dict(claim.response_payload))
     return None
 

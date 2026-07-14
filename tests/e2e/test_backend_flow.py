@@ -537,7 +537,7 @@ async def test_e2e_session_lock_conflict(client: AsyncClient, db: AsyncSession) 
                 f"xuanhu:session_lock:{session_id}", "other-trace", ex=60
             )
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"Redis 不可用，跳过锁冲突测试: {type(exc).__name__}: {exc}")
+            pytest.fail(f"Redis integration dependency unavailable: {type(exc).__name__}: {exc}")
 
         # 提交消息 → SESSION_BUSY
         resp = await client.post(

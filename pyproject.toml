@@ -29,8 +29,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.3,<9.0",
-    "pytest-asyncio>=0.25,<1.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=1.0,<2.0",
+    "pytest-xdist>=3.8,<4.0",
     "ruff>=0.8,<1.0",
     "mypy>=1.13,<2.0",
     "respx>=0.22,<1.0",
@@ -90,17 +91,28 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "test_agent"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "-v",
     "--tb=short",
+    "--strict-markers",
+    "-m",
+    "not integration",
 ]
 markers = [
-    "integration: marks tests that require a real PostgreSQL database (deselect with '-m \"not integration\"')",
+    "integration: tests requiring real PostgreSQL, Redis, Milvus, network, or process-level infrastructure",
 ]
 
 [dependency-groups]
 dev = [
     "playwright>=1.61.0",
+    "mypy>=1.13,<2.0",
+    "psycopg-binary>=3.3.4,<4.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=1.0,<2.0",
+    "pytest-xdist>=3.8,<4.0",
+    "respx>=0.22,<1.0",
+    "ruff>=0.8,<1.0",
 ]

@@ -98,7 +98,10 @@ class TokenUsage(BaseModel):
 class RunArtifact(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     output: BaseModel
-    model_actual: str = Field(min_length=1, max_length=200)
+    # ``None`` means the gateway did not report an actual serving model.  It
+    # must never be filled from the requested model because those are distinct
+    # pieces of provenance (aliases and fallback routing can change the latter).
+    model_actual: str | None = Field(default=None, min_length=1, max_length=200)
     usage: TokenUsage = Field(default_factory=TokenUsage)
     attempts: int = Field(ge=1)
     latency_ms: int = Field(ge=0)
@@ -107,6 +110,25 @@ class RunArtifact(BaseModel):
     run_id: UUID
     agent_spec_version: str = Field(min_length=1)
     prompt_version: str = Field(min_length=1)
+
+
+def model_output_digest(output: BaseModel) -> str:
+    """Stable, non-reversible digest of a validated model output."""
+
+    try:
+        payload = json.dumps(
+            {
+                "type": f"{type(output).__module__}.{type(output).__qualname__}",
+                "output": output.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        payload = f"{type(output).__module__}.{type(output).__qualname__}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def run_artifact_subject_digest(artifact: RunArtifact) -> str:

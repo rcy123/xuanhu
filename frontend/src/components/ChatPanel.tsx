@@ -26,6 +26,7 @@ import { ReviewActionsBar } from './ReviewActionsBar'
 import { FormulaEditModal } from './FormulaEditModal'
 import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
+import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
@@ -480,6 +481,15 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           blockedIssues={blockedIssues}
           rollbackTarget={rollbackTarget}
         />
+        {detail ? (
+          <LangGraphAdvanceBar
+            detail={detail}
+            onAdvanced={async () => {
+              await refreshDetail()
+              if (sessionId) await loadMessages(sessionId)
+            }}
+          />
+        ) : null}
         {/* P8-4: 医师确认操作区 */}
         {detail ? (
           <ReviewActionsBar

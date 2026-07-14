@@ -51,6 +51,11 @@ from app.agent_runtime.gap_selector import (
     canonicalize_gap_selection_input,
     select_gap,
 )
+from app.agent_runtime.intake_grounding import (
+    IntakeGroundingFailureKind,
+    normalize_grounded_text,
+    verify_intake_grounding,
+)
 from app.agent_runtime.intake_verifier import (
     INTAKE_AGENT_NAME,
     INTAKE_AGENT_VERSION,
@@ -81,6 +86,7 @@ from app.agent_runtime.repository import (
     CommitResult,
     DomainRepository,
     OutboxErrorCode,
+    OutboxHealth,
     OutboxMessage,
     OutboxRepository,
     PostgresDomainRepository,
@@ -188,6 +194,9 @@ __all__ = [
     "canonicalize_intake_output",
     "validate_intake_preflight",
     "verify_intake_artifact",
+    "IntakeGroundingFailureKind",
+    "normalize_grounded_text",
+    "verify_intake_grounding",
     "DomainDelta",
     "DomainReducerError",
     "DomainState",
@@ -199,6 +208,7 @@ __all__ = [
     "CommitResult",
     "DomainRepository",
     "OutboxErrorCode",
+    "OutboxHealth",
     "OutboxMessage",
     "OutboxRepository",
     "PostgresDomainRepository",

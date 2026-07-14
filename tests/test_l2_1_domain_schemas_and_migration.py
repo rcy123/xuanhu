@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -22,6 +21,7 @@ from app.schemas.domain import (
     ObservationStatus,
     SafetyProfileSchema,
 )
+from tests._database_safety import destructive_database_environment
 
 
 def _observation(**changes: object) -> dict[str, object]:
@@ -88,19 +88,22 @@ def test_orm_metadata_has_partial_current_index_and_parent_fk() -> None:
 
 @pytest.fixture(scope="module")
 def postgres_connection() -> psycopg.Connection[tuple[object, ...]]:
-    db_url = os.getenv("DB_URL")
-    if not db_url:
-        pytest.skip("DB_URL is required for L2-1 PostgreSQL migration verification")
-    config = Config("alembic.ini")
-    command.downgrade(config, "20250624_0001")
-    command.upgrade(config, "20260710_0002")
-    command.downgrade(config, "20250624_0001")
-    command.upgrade(config, "20260710_0002")
-    connection = psycopg.connect(db_url)
-    try:
-        yield connection
-    finally:
-        connection.close()
+    with destructive_database_environment() as db_url:
+        config = Config("alembic.ini")
+        connection: psycopg.Connection[tuple[object, ...]] | None = None
+        try:
+            command.downgrade(config, "20250624_0001")
+            command.upgrade(config, "20260710_0002")
+            command.downgrade(config, "20250624_0001")
+            command.upgrade(config, "20260710_0002")
+            connection = psycopg.connect(db_url)
+            yield connection
+        finally:
+            if connection is not None:
+                connection.close()
+            # Even a failed setup must leave the isolated database at head so
+            # subsequent modules never depend on fixture ordering.
+            command.upgrade(config, "head")
 
 
 def _session(connection: psycopg.Connection[tuple[object, ...]]) -> UUID:
@@ -137,6 +140,7 @@ def _artifact(
     return row_id
 
 
+@pytest.mark.integration
 def test_postgres_fk_actions_match_orm(postgres_connection: psycopg.Connection[tuple[object, ...]]) -> None:
     rows = postgres_connection.execute(
         "SELECT conrelid::regclass::text, pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f' AND conrelid::regclass::text IN ('observations', 'safety_profiles', 'graph_runs', 'graph_run_steps', 'artifact_revisions', 'gate_results')"
@@ -154,6 +158,7 @@ def test_postgres_fk_actions_match_orm(postgres_connection: psycopg.Connection[t
         assert expected in definitions
 
 
+@pytest.mark.integration
 def test_postgres_enforces_safety_and_artifact_constraints(
     postgres_connection: psycopg.Connection[tuple[object, ...]],
 ) -> None:

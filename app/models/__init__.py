@@ -16,8 +16,11 @@ from app.models.domain import (
     GraphRunStep,
     Observation,
     OutboxEvent,
+    SafetyFactAssertion,
+    SafetyFactTransition,
     SafetyProfile,
 )
+from app.models.http_command import HttpCommandClaim
 from app.models.knowledge import (
     Acupoint,
     DosageUnit,
@@ -27,6 +30,7 @@ from app.models.knowledge import (
     KnowledgeSource,
     TheoryCase,
 )
+from app.models.model_run_audit import ModelRunAudit
 from app.models.review import DoctorReview, MedicalRecord
 from app.models.safety import SafetyRuleRun
 
@@ -40,12 +44,15 @@ __all__ = [
     "DomainCommandCommit",
     "Observation",
     "OutboxEvent",
+    "SafetyFactAssertion",
+    "SafetyFactTransition",
     "SafetyProfile",
     "ArtifactRevision",
     "ArtifactRevisionPayload",
     "GateResult",
     "GraphRun",
     "GraphRunStep",
+    "HttpCommandClaim",
     "DoctorReview",
     "DosageUnit",
     "Formula",
@@ -53,6 +60,7 @@ __all__ = [
     "KnowledgeChunk",
     "KnowledgeSource",
     "MedicalRecord",
+    "ModelRunAudit",
     "SafetyRuleRun",
     "TheoryCase",
 ]

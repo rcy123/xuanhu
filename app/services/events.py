@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -22,7 +22,9 @@ from app.schemas.events import EventAppendResult, SessionEvent, SupportedEventTy
 logger = logging.getLogger("xuanhu.events")
 
 EVENT_STREAM_PREFIX = "xuanhu:events:"
+EVENT_DEDUPE_PREFIX = "xuanhu:events:dedupe:"
 EVENT_STREAM_MAXLEN = 1000
+EVENT_DEDUPE_TTL_SECONDS = 86_400
 DEFAULT_READ_COUNT = 100
 
 _FORBIDDEN_PAYLOAD_KEYS = {
@@ -42,6 +44,68 @@ _FORBIDDEN_PAYLOAD_KEYS = {
 def session_event_stream_key(session_id: str) -> str:
     """构造会话事件 Redis Stream key。"""
     return f"{EVENT_STREAM_PREFIX}{session_id}"
+
+
+def session_event_dedupe_key(session_id: str) -> str:
+    """Build the Redis hash used by the atomic outbox publication script."""
+    return f"{EVENT_DEDUPE_PREFIX}{session_id}"
+
+
+def session_event_dedupe_order_key(session_id: str) -> str:
+    """Build the Redis list that orders retained outbox dedupe markers."""
+    return f"{EVENT_DEDUPE_PREFIX}{session_id}:order"
+
+
+_APPEND_ONCE_LUA = """
+local existing = redis.call('HGET', KEYS[2], ARGV[1])
+local stream_id = existing
+local created = 0
+if not existing then
+  stream_id = redis.call(
+    'XADD', KEYS[1], 'MAXLEN', '~', ARGV[2], '*',
+    'event_type', ARGV[4], 'payload', ARGV[5]
+  )
+  redis.call('HSET', KEYS[2], ARGV[1], stream_id)
+  redis.call('RPUSH', KEYS[3], ARGV[1])
+  created = 1
+elseif not redis.call('LPOS', KEYS[3], ARGV[1]) then
+  -- During a rolling upgrade an existing hash marker may not yet have an
+  -- order entry. Index it without publishing a duplicate event.
+  redis.call('RPUSH', KEYS[3], ARGV[1])
+end
+
+local cap = tonumber(ARGV[2])
+local overflow = redis.call('LLEN', KEYS[3]) - cap
+for _ = 1, overflow do
+  local evicted = redis.call('LPOP', KEYS[3])
+  if evicted then
+    redis.call('HDEL', KEYS[2], evicted)
+  end
+end
+
+-- Repair hashes created before the bounded order index existed.  This branch
+-- is normally a no-op, but guarantees the hard cap during a rolling upgrade.
+local hash_count = redis.call('HLEN', KEYS[2])
+if hash_count > cap then
+  local retained = {}
+  for _, marker in ipairs(redis.call('LRANGE', KEYS[3], 0, -1)) do
+    retained[marker] = true
+  end
+  for _, marker in ipairs(redis.call('HKEYS', KEYS[2])) do
+    if hash_count <= cap then
+      break
+    end
+    if not retained[marker] then
+      redis.call('HDEL', KEYS[2], marker)
+      hash_count = hash_count - 1
+    end
+  end
+end
+
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+redis.call('EXPIRE', KEYS[3], ARGV[3])
+return {stream_id, created}
+"""
 
 
 def _now_iso() -> str:
@@ -110,8 +174,16 @@ def _validate_event_payload(event_type: str, payload: dict[str, Any]) -> None:
 class EventService:
     """会话事件写入、读取和 SSE 格式化服务。"""
 
-    def __init__(self, redis: Redis | None = None) -> None:
+    def __init__(
+        self,
+        redis: Redis | None = None,
+        *,
+        dedupe_ttl_seconds: int = EVENT_DEDUPE_TTL_SECONDS,
+    ) -> None:
+        if dedupe_ttl_seconds < 1:
+            raise ValueError("dedupe_ttl_seconds must be positive")
         self._redis = redis
+        self._dedupe_ttl_seconds = dedupe_ttl_seconds
 
     async def _get_redis(self) -> Redis:
         if self._redis is not None:
@@ -164,6 +236,62 @@ class EventService:
             approximate=True,
         )
         return EventAppendResult(event_id=str(event_id), stream_key=key)
+
+    async def append_session_event_once(
+        self,
+        session_id: str,
+        event_type: SupportedEventType,
+        payload: dict[str, Any],
+        *,
+        dedupe_id: str,
+        maxlen: int = EVENT_STREAM_MAXLEN,
+    ) -> EventAppendResult:
+        """Atomically append one event for a durable outbox delivery token.
+
+        Redis executes the Lua script as one operation: either the stream row and
+        dedupe marker both exist, or neither does. While the marker remains in the
+        bounded retention window, re-delivery after a process crash returns the
+        original stream id without appending again. The marker hash is capped at
+        the same target length as the Stream and both marker keys use a deliberately
+        refreshed idle TTL. ``dedupe_id`` is an opaque internal reference and must
+        not contain payload text.
+        """
+        if not dedupe_id or len(dedupe_id) > 200:
+            raise ValueError("dedupe_id must contain 1..200 characters")
+        if maxlen < 1:
+            raise ValueError("maxlen must be positive")
+        payload = dict(payload)
+        payload.setdefault("session_id", session_id)
+        payload.setdefault("timestamp", _now_iso())
+        _validate_event_payload(event_type, payload)
+
+        redis = await self._get_redis()
+        stream_key = session_event_stream_key(session_id)
+        dedupe_key = session_event_dedupe_key(session_id)
+        dedupe_order_key = session_event_dedupe_order_key(session_id)
+        encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        result = await cast(
+            Awaitable[object],
+            redis.eval(
+                _APPEND_ONCE_LUA,
+                3,
+                stream_key,
+                dedupe_key,
+                dedupe_order_key,
+                dedupe_id,
+                str(maxlen),
+                str(self._dedupe_ttl_seconds),
+                event_type,
+                encoded_payload,
+            ),
+        )
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            raise RuntimeError("unexpected Redis append-once result")
+        return EventAppendResult(
+            event_id=str(result[0]),
+            stream_key=stream_key,
+            deduplicated=int(result[1]) == 0,
+        )
 
     async def read_events_after(
         self,

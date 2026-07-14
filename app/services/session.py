@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +27,8 @@ from app.schemas.session import (
     SessionTerminateRequest,
     SessionTerminateResponse,
 )
+from app.services.initial_domain_seed import InitialDomainSeeder
+from app.services.session_read_model import SessionReadModelService
 
 # 可被终止的会话状态
 _TERMINATABLE_STATUSES = {"active", "pending_review", "blocked"}
@@ -93,6 +95,14 @@ class SessionService:
         await self._db.flush()
         await self._db.refresh(session)
 
+        if agent_runtime == "langgraph":
+            await InitialDomainSeeder(self._db).seed(
+                session,
+                request,
+                doctor_id=doctor_id,
+                trace_id=trace_id,
+            )
+
         actor_type = "doctor" if doctor_id else "system"
         audit = _audit_event(
             session_id=session.id,
@@ -100,10 +110,10 @@ class SessionService:
             actor_type=actor_type,
             actor_id=doctor_id,
             payload={
-                "patient_ref": patient_ref,
-                "chief_complaint": request.chief_complaint,
+                "patient_ref_present": patient_ref is not None,
+                "chief_complaint_present": bool((request.chief_complaint or "").strip()),
                 "initial_stage": "inquiry",
-                "initial_status": "active",
+                "initial_status": session.status,
                 "agent_runtime": agent_runtime,
                 "created_by": doctor_id,
             },
@@ -191,6 +201,7 @@ class SessionService:
                 retryable=False,
             )
 
+        projection = await SessionReadModelService(self._db).build(session)
         return SessionDetailResponse(
             session_id=str(session.id),
             status=session.status,
@@ -200,8 +211,15 @@ class SessionService:
             blocked_reason=session.blocked_reason,
             rollback_counts=session.rollback_counts,
             state_version=session.state_version,
+            agent_runtime=cast(Literal["legacy", "langgraph"], session.agent_runtime),
+            read_model=projection.read_model,
             patient_info=PatientInfo.model_validate(session.patient_info),
             chief_complaint=session.chief_complaint,
+            sufficiency_report=projection.sufficiency_report,
+            syndrome_result=projection.syndrome_result,
+            base_formula=projection.base_formula,
+            modified_formula=projection.modified_formula,
+            modifications=projection.modifications,
             created_at=session.created_at,
             updated_at=session.updated_at,
         )
@@ -234,10 +252,7 @@ class SessionService:
         if session.status not in _TERMINATABLE_STATUSES:
             raise InvalidStageTransitionError(
                 message=f"当前状态 {session.status} 不允许终止",
-                detail=(
-                    f"session_id={session_id} 状态为 {session.status}，"
-                    "仅 active/pending_review/blocked 可终止"
-                ),
+                detail=(f"session_id={session_id} 状态为 {session.status}，仅 active/pending_review/blocked 可终止"),
                 retryable=False,
             )
 

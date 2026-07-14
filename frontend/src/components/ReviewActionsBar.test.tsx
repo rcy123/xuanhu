@@ -1,9 +1,11 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
-import { ReviewActionsBar, isReviewBlocked } from './ReviewActionsBar'
+import { isReviewBlocked } from '@/utils/review'
+import { ReviewActionsBar } from './ReviewActionsBar'
 import { ApiRequestError } from '@/api/errors'
 import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
 import { Modal } from 'antd'
+import { emptySessionReadModel } from '@/utils/readModel'
 
 function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
@@ -14,6 +16,8 @@ function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
     recovery_status: 'normal',
     rollback_counts: {},
     state_version: 5,
+    agent_runtime: 'legacy',
+    read_model: emptySessionReadModel('legacy', 5),
     patient_info: {},
     created_at: '2026-07-04T10:00:00+08:00',
     updated_at: '2026-07-04T10:00:00+08:00',

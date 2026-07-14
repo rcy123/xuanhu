@@ -138,6 +138,9 @@ export type SessionStatus =
 /** 恢复状态。 */
 export type RecoveryStatus = 'normal' | 'recovering' | 'manual_required'
 
+/** Persisted execution runtime; existing sessions never switch implicitly. */
+export type AgentRuntime = 'legacy' | 'langgraph'
+
 /** 患者性别。 */
 export type Gender = 'male' | 'female' | 'unknown'
 
@@ -218,12 +221,16 @@ export interface PatientInfo {
   pregnancy_status?: PregnancyStatus
   menstruation_summary?: string | null
   special_conditions?: string[]
+  current_medications?: string[]
+  major_conditions?: string[]
+  lactation_status?: 'lactating' | 'not_lactating' | null
 }
 
 /** 创建会话请求体。 */
 export interface SessionCreateRequest {
   patient_info?: PatientInfo
   chief_complaint?: string | null
+  agent_runtime?: AgentRuntime
 }
 
 /** 创建会话响应 data。 */
@@ -233,6 +240,66 @@ export interface SessionCreateData {
   status: SessionStatus
   patient_info: PatientInfo
   created_at: string
+}
+
+export interface SessionGateReadModel {
+  gate_id: string
+  graph_run_id?: string | null
+  gate_name: string
+  policy_version: string
+  input_state_version: number
+  decision: 'passed' | 'failed' | 'blocked'
+  details?: Record<string, unknown> | null
+}
+
+export interface SessionArtifactReadModel {
+  artifact_id: string
+  artifact_type: 'syndrome_draft' | 'formula_draft'
+  revision: number
+  input_state_version: number
+  status: 'current'
+  produced_by_run_id: string
+  payload_schema_version: string
+  content_digest: string
+  decision: 'completed' | 'needs_more_info' | 'abstained'
+  evidence_mode: string
+  review_required: boolean
+  unresolved: string[]
+  verification_gate: SessionGateReadModel
+  output: Record<string, unknown>
+}
+
+export interface SessionReadModel {
+  schema_version: 'session-read-model.v1'
+  agent_runtime: AgentRuntime
+  graph: {
+    graph_run_id?: string | null
+    graph_version?: string | null
+    revision: number
+    input_state_version?: number | null
+    status?: 'running' | 'completed' | 'failed' | 'cancelled' | null
+  }
+  gates: SessionGateReadModel[]
+  artifacts: SessionArtifactReadModel[]
+  evidence_mode?: string | null
+  review_required: boolean
+  unresolved: Array<{
+    source:
+      | 'triage'
+      | 'completeness'
+      | 'syndrome_draft'
+      | 'formula_draft'
+      | 'read_model'
+      | 'safety_confirmation'
+    kind:
+      | 'red_flag'
+      | 'missing_required'
+      | 'conflict'
+      | 'missing_input'
+      | 'artifact_unavailable'
+      | 'unconfirmed_safety_fact'
+    key: string
+  }>
 }
 
 /** 终止会话请求体。 */
@@ -286,6 +353,8 @@ export interface SessionDetail {
   blocked_reason?: string | null
   rollback_counts: Record<string, number>
   state_version: number
+  agent_runtime: AgentRuntime
+  read_model: SessionReadModel
   patient_info: PatientInfo
   chief_complaint?: string | null
   present_illness?: string | null

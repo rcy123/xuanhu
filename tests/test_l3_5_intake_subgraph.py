@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -10,6 +9,7 @@ from typing import Any
 import pytest
 from alembic import command
 from alembic.config import Config
+from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
@@ -25,12 +25,14 @@ from app.agent_runtime.state import XuanhuGraphState, default_state, validate_st
 from app.api.advance import _run_langgraph_advance
 from app.core.exceptions import InsufficientInquiryError
 from app.db.session import _build_async_pg_url
+from app.main import app
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import DomainCommandCommit, GateResult, GraphRun, IntakeCommandClaim, OutboxEvent
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.schemas.domain import CollectionStatus
 from app.schemas.intake import (
     CandidateSeverity,
+    EvidenceSpan,
     IntakeExtractionDecision,
     IntakeExtractionOutput,
     LactationDelta,
@@ -43,7 +45,11 @@ from app.schemas.intake import (
 )
 from app.schemas.message import MessageCreateRequest, MessageCreateResponse
 from app.schemas.question import QuestionComposerModelOutput
+from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 from app.services.langgraph_intake import LangGraphIntakeMessageRunner, _payload_digest
+from tests._database_safety import destructive_database_environment
+
+pytestmark = pytest.mark.integration
 
 
 def _state() -> XuanhuGraphState:
@@ -55,13 +61,6 @@ def _state() -> XuanhuGraphState:
         graph_version=DEFAULT_GRAPH_VERSION,
         run_id=str(uuid.uuid4()),
     )
-
-
-@pytest.fixture(scope="module")
-def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-    if sys.platform == "win32":
-        return asyncio.WindowsSelectorEventLoopPolicy()
-    return asyncio.DefaultEventLoopPolicy()
 
 
 class _E2EFakeGateway:
@@ -80,8 +79,8 @@ class _E2EFakeGateway:
         if self.delay:
             await asyncio.sleep(self.delay)
         if output_schema is IntakeExtractionOutput:
-            source_id = _source_message_id(messages)
-            return _intake_output(self.mode, source_id)
+            source_id, content = _source_message(messages)
+            return _intake_output(self.mode, source_id, content)
         if output_schema is QuestionComposerModelOutput:
             return QuestionComposerModelOutput(question="请补充一个关键信息。")
         raise AssertionError(f"unexpected output schema: {output_schema}")
@@ -95,10 +94,20 @@ class _E2EFakeGateway:
         return sum(1 for item in self.calls if item["output_schema"] is QuestionComposerModelOutput)
 
 
-def _source_message_id(messages: list[dict[str, Any]]) -> uuid.UUID:
+def _source_message(messages: list[dict[str, Any]]) -> tuple[uuid.UUID, str]:
     raw = messages[-1]["content"]
     payload = json.loads(raw)
-    return uuid.UUID(payload[0]["message_id"])
+    return uuid.UUID(payload[0]["message_id"]), str(payload[0]["content"])
+
+
+def _evidence_span(source: uuid.UUID, text: str, quote: str) -> EvidenceSpan:
+    start = text.index(quote)
+    return EvidenceSpan(
+        source_message_id=source,
+        start_char=start,
+        end_char=start + len(quote),
+        quote=quote,
+    )
 
 
 def _observation(source: uuid.UUID, fact_key: str, value: str) -> ObservationDelta:
@@ -111,18 +120,37 @@ def _observation(source: uuid.UUID, fact_key: str, value: str) -> ObservationDel
     )
 
 
-def _safety_none(source: uuid.UUID) -> PatientSafetyDelta:
-    empty = SafetyListDelta(status=CollectionStatus.EXPLICITLY_NONE, source_message_id=source)
+def _safety_none(source: uuid.UUID, text: str) -> PatientSafetyDelta:
     return PatientSafetyDelta(
-        allergy=empty,
-        pregnancy=PregnancyDelta(status=CollectionStatus.EXPLICITLY_NONE, source_message_id=source),
-        lactation=LactationDelta(status=CollectionStatus.EXPLICITLY_NONE, source_message_id=source),
-        medications=empty,
-        major_conditions=empty,
+        allergy=SafetyListDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            negation_span=_evidence_span(source, text, "no drug allergies"),
+        ),
+        pregnancy=PregnancyDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            span=_evidence_span(source, text, "not pregnant"),
+        ),
+        lactation=LactationDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            span=_evidence_span(source, text, "not breastfeeding"),
+        ),
+        medications=SafetyListDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            negation_span=_evidence_span(source, text, "no current medications"),
+        ),
+        major_conditions=SafetyListDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            negation_span=_evidence_span(source, text, "no major conditions"),
+        ),
     )
 
 
-def _intake_output(mode: str, source: uuid.UUID) -> IntakeExtractionOutput:
+def _intake_output(mode: str, source: uuid.UUID, text: str) -> IntakeExtractionOutput:
     if mode == "ready":
         return IntakeExtractionOutput(
             decision=IntakeExtractionDecision.EXTRACTED,
@@ -135,7 +163,7 @@ def _intake_output(mode: str, source: uuid.UUID) -> IntakeExtractionOutput:
                 _observation(source, "ten_questions.sleep", "normal"),
                 _observation(source, "ten_questions.stool_urine", "normal"),
             ),
-            patient_safety_delta=_safety_none(source),
+            patient_safety_delta=_safety_none(source, text),
         )
     if mode == "red_flag":
         return IntakeExtractionOutput(
@@ -144,6 +172,7 @@ def _intake_output(mode: str, source: uuid.UUID) -> IntakeExtractionOutput:
                 RedFlagCandidate(
                     category=RedFlagCategory.HIGH_FEVER,
                     source_message_id=source,
+                    span=_evidence_span(source, text, "39.2°C"),
                     severity=CandidateSeverity.HIGH,
                     evidence="high fever",
                     confidence=0.96,
@@ -224,17 +253,18 @@ def _install_fake_advance_graph(
 
 @pytest.fixture(scope="module")
 def migrated_database() -> str:
-    import os
-
-    db_url = os.environ.get("DB_URL")
-    if not db_url:
-        pytest.skip("DB_URL is required for L3-5 PostgreSQL verification")
-    config = Config("alembic.ini")
-    command.downgrade(config, "20260711_0004")
-    command.upgrade(config, "20260712_0006")
-    command.downgrade(config, "20260711_0004")
-    command.upgrade(config, "20260712_0006")
-    return db_url
+    with destructive_database_environment() as db_url:
+        config = Config("alembic.ini")
+        config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
+        try:
+            command.downgrade(config, "20260711_0004")
+            command.upgrade(config, "20260712_0006")
+            command.downgrade(config, "20260711_0004")
+            command.upgrade(config, "20260712_0006")
+            command.upgrade(config, "head")
+            yield db_url
+        finally:
+            command.upgrade(config, "head")
 
 
 @pytest.fixture
@@ -306,7 +336,45 @@ async def test_langgraph_messages_e2e_incomplete_uses_template_question_and_one_
 
 
 @pytest.mark.asyncio
-async def test_langgraph_messages_e2e_red_flag_blocks_without_question(
+async def test_langgraph_messages_e2e_raw_text_red_flag_blocks_when_model_would_miss(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
+
+    async with db_factory() as db:
+        response = await LangGraphIntakeMessageRunner(db).submit_message(
+            str(session_id),
+            MessageCreateRequest(role="patient_proxy", content="突然胸痛并且呼吸困难"),
+            doctor_id=None,
+            trace_id="messages-e2e-deterministic-red-flag",
+            x_state_version=1,
+        )
+
+    async with db_factory() as db:
+        claim = await db.scalar(select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id))
+        session = await db.get(ConsultSession, session_id)
+
+    assert response.agent_message is None
+    assert response.current_stage == "blocked"
+    assert session is not None
+    assert session.recovery_status == "manual_required"
+    assert gateway.intake_calls == 0
+    assert gateway.question_model_calls == 0
+    assert claim is not None
+    assert claim.intermediate_payload is not None
+    assert claim.intermediate_payload["triage_precheck"]["candidate_count"] == 2
+    assert claim.intermediate_payload["triage_precheck"]["policy_version"] == "triage-raw-text-precheck.v1"
+    assert claim.intermediate_payload["gates"]["route"] == "manual"
+    assert claim.intermediate_payload["gates"]["completeness_disposition"] == "triage_blocked"
+
+
+@pytest.mark.asyncio
+async def test_langgraph_messages_e2e_model_red_flag_supplements_clear_precheck(
     db_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -319,26 +387,74 @@ async def test_langgraph_messages_e2e_red_flag_blocks_without_question(
     async with db_factory() as db:
         response = await LangGraphIntakeMessageRunner(db).submit_message(
             str(session_id),
-            MessageCreateRequest(role="patient_proxy", content="high fever"),
+            MessageCreateRequest(role="patient_proxy", content="My temperature is 39.2°C"),
             doctor_id=None,
-            trace_id="messages-e2e-red-flag",
+            trace_id="messages-e2e-model-red-flag",
             x_state_version=1,
         )
 
-    async with db_factory() as db:
-        claim = await db.scalar(select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id))
-        session = await db.get(ConsultSession, session_id)
-
     assert response.agent_message is None
     assert response.current_stage == "blocked"
-    assert session is not None
-    assert session.recovery_status == "manual_required"
     assert gateway.intake_calls == 1
     assert gateway.question_model_calls == 0
-    assert claim is not None
-    assert claim.intermediate_payload is not None
-    assert claim.intermediate_payload["gates"]["route"] == "manual"
-    assert claim.intermediate_payload["gates"]["completeness_disposition"] == "triage_blocked"
+
+
+@pytest.mark.parametrize(
+    "content,expected_category",
+    [
+        ("突然胸痛", "severe_pain"),
+        ("现在喘不过气", "breathing_difficulty"),
+        ("患者意识不清，叫不醒", "altered_consciousness"),
+        ("伤口大出血且血流不止", "severe_bleeding"),
+        ("突然口角歪斜并且言语不清", "neurologic_deficit"),
+        ("体温40.2℃", "high_fever"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_messages_api_each_deterministic_red_flag_blocks_with_empty_model_candidates(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    expected_category: str,
+) -> None:
+    session_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json={"role": "patient_proxy", "content": content},
+            headers={
+                "X-Doctor-Id": "doctor-precheck",
+                "X-State-Version": "1",
+                "X-Request-Id": f"precheck-api-{expected_category}",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["current_stage"] == "blocked"
+    assert response.json()["data"].get("agent_message") is None
+    assert gateway.intake_calls == 0
+    assert gateway.question_model_calls == 0
+
+    async with db_factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        gate = await db.scalar(
+            select(GateResult)
+            .where(GateResult.session_id == session_id, GateResult.gate_name == TRIAGE_GATE_NAME)
+            .order_by(GateResult.created_at.desc())
+        )
+    assert session is not None
+    assert session.current_stage == "blocked"
+    assert session.recovery_status == "manual_required"
+    assert gate is not None
+    assert gate.policy_version == TRIAGE_POLICY_VERSION
+    assert gate.decision == "blocked"
+    assert expected_category in (gate.details or {}).get("category_counts", {})
 
 
 @pytest.mark.asyncio
@@ -353,17 +469,21 @@ async def test_langgraph_messages_same_command_concurrent_replays_single_intake_
     async with db_factory() as db, db.begin():
         db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
 
-    async def submit_once() -> MessageCreateResponse:
+    async def submit_once(trace_id: str) -> MessageCreateResponse:
         async with db_factory() as db:
             return await LangGraphIntakeMessageRunner(db).submit_message(
                 str(session_id),
                 body,
                 doctor_id=None,
-                trace_id="messages-e2e-concurrent",
+                trace_id=trace_id,
                 x_state_version=1,
+                idempotency_key="messages-public-concurrent",
             )
 
-    first, second = await asyncio.gather(submit_once(), submit_once())
+    first, second = await asyncio.gather(
+        submit_once("messages-e2e-concurrent-a"),
+        submit_once("messages-e2e-concurrent-b"),
+    )
 
     async with db_factory() as db:
         claim_count = await db.scalar(select(func.count()).select_from(IntakeCommandClaim))
@@ -401,7 +521,13 @@ async def test_langgraph_messages_recovers_when_claim_completion_is_interrupted_
     async with db_factory() as db:
         response = await LangGraphIntakeMessageRunner(db).submit_message(
             str(session_id),
-            MessageCreateRequest(role="patient_proxy", content="headache three days stable"),
+            MessageCreateRequest(
+                role="patient_proxy",
+                content=(
+                    "headache three days stable; no drug allergies; not pregnant; "
+                    "not breastfeeding; no current medications; no major conditions"
+                ),
+            ),
             doctor_id=None,
             trace_id="messages-e2e-recover-after-commit",
             x_state_version=1,
@@ -410,14 +536,27 @@ async def test_langgraph_messages_recovers_when_claim_completion_is_interrupted_
     async with db_factory() as db:
         claim = await db.scalar(select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id))
         commit = await db.scalar(select(DomainCommandCommit).where(DomainCommandCommit.session_id == session_id))
+        agent_message_count = await db.scalar(
+            text(
+                "SELECT count(*) FROM consult_messages "
+                "WHERE session_id = :sid AND role = 'agent'"
+            ),
+            {"sid": session_id},
+        )
 
-    assert response.agent_message is None
+    # Safety facts are now proposed assertions until explicitly confirmed, so
+    # the authoritative completeness gate correctly persists one follow-up.
+    # Recovery must reconstruct that exact response without duplicating it.
+    assert response.agent_message is not None
     assert response.current_stage == "inquiry"
     assert response.state_version == 3
     assert gateway.intake_calls == 1
     assert claim is not None
     assert claim.status == "completed"
     assert claim.response_payload is not None
+    assert claim.response_payload == response.model_dump(mode="json")
+    assert claim.question_message_id == uuid.UUID(response.agent_message.message_id)
+    assert agent_message_count == 1
     assert commit is not None
 
 
@@ -642,7 +781,7 @@ async def test_intake_command_claim_rejects_same_key_different_payload(
             )
         message_count = await db.scalar(text("SELECT count(*) FROM consult_messages"))
 
-    assert type(captured.value).__name__ == "ValidationError"
+    assert type(captured.value).__name__ == "IdempotencyConflictError"
     assert message_count == 1
 
 
@@ -910,7 +1049,8 @@ async def test_langgraph_advance_replay_is_stable_and_writes_one_outbox(
             session,
             session_id=str(session_id),
             state_version=2,
-            trace_id="advance-replay",
+            trace_id="advance-replay-first-trace",
+            idempotency_key="advance-public-replay",
         )
 
     async with db_factory() as db:
@@ -921,7 +1061,8 @@ async def test_langgraph_advance_replay_is_stable_and_writes_one_outbox(
             session,
             session_id=str(session_id),
             state_version=2,
-            trace_id="advance-replay",
+            trace_id="advance-replay-retry-trace",
+            idempotency_key="advance-public-replay",
         )
         outbox_count = await db.scalar(
             text("SELECT count(*) FROM outbox_events WHERE event_type = 'advance.command_completed.v1'")

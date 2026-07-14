@@ -48,6 +48,9 @@ class HealthService:
         # redis
         checks["redis"] = await self._check_redis()
 
+        # durable outbox publisher (aggregate counters only)
+        checks["outbox"] = await self._check_outbox()
+
         # milvus
         checks["milvus"] = await self._check_milvus()
 
@@ -56,7 +59,7 @@ class HealthService:
         checks["llm_gateway"] = gw_checks.get("chat", "unavailable")
         checks["embedding_gateway"] = gw_checks.get("embedding", "unavailable")
 
-        all_ok = all(v == "ok" for v in checks.values())
+        all_ok = all(v in {"ok", "disabled"} for v in checks.values())
         overall_status = "ready" if all_ok else "degraded"
 
         return {
@@ -127,6 +130,48 @@ class HealthService:
         except Exception as exc:
             logger.warning("redis 健康检查失败: %s", type(exc).__name__)
             return "unavailable"
+
+    async def outbox_check(self) -> dict[str, Any]:
+        """Return privacy-safe backlog, age and DLQ health metrics."""
+        settings = get_settings()
+        if not settings.outbox_publisher_enabled:
+            return {
+                "status": "disabled",
+                "backlog_count": 0,
+                "pending_count": 0,
+                "leased_count": 0,
+                "dead_letter_count": 0,
+                "oldest_unpublished_age_seconds": 0.0,
+                "timestamp": _now_iso(),
+            }
+        try:
+            from app.agent_runtime.repository import PostgresDomainRepository
+            from app.db.session import get_session_factory
+
+            metrics = await PostgresDomainRepository(get_session_factory()).get_outbox_health()
+            degraded = (
+                metrics.dead_letter_count > settings.outbox_ready_max_dead_letters
+                or metrics.oldest_unpublished_age_seconds > settings.outbox_ready_max_oldest_age_seconds
+            )
+            return {
+                "status": "degraded" if degraded else "ok",
+                **metrics.model_dump(),
+                "timestamp": _now_iso(),
+            }
+        except Exception as exc:
+            logger.warning("outbox 健康检查失败: %s", type(exc).__name__)
+            return {
+                "status": "unavailable",
+                "backlog_count": 0,
+                "pending_count": 0,
+                "leased_count": 0,
+                "dead_letter_count": 0,
+                "oldest_unpublished_age_seconds": 0.0,
+                "timestamp": _now_iso(),
+            }
+
+    async def _check_outbox(self) -> str:
+        return str((await self.outbox_check())["status"])
 
     async def _check_milvus(self) -> str:
         """检查 Milvus 连通性。"""

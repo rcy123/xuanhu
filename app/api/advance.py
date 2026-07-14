@@ -13,6 +13,7 @@ review 阶段必须挂起等待医师确认，不得自动推进。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -31,8 +32,10 @@ from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.state import default_state
 from app.agents.supervisor import Supervisor, SupervisorResult
+from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
 from app.core.config import get_settings
 from app.core.exceptions import (
+    IdempotencyConflictError,
     InsufficientInquiryError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
@@ -40,7 +43,6 @@ from app.core.exceptions import (
     PendingDoctorReviewError,
     SessionBusyError,
     SessionNotFoundError,
-    ValidationError,
 )
 from app.db.session import get_db
 from app.models.audit import AuditEvent
@@ -49,17 +51,15 @@ from app.models.domain import GateResult, GraphRun, IntakeCommandClaim, OutboxEv
 from app.schemas.advance import AdvanceRequest
 from app.schemas.common import success_response
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
-from app.services.session_lock import session_lock
+from app.services.http_idempotency import HttpCommandExecutor, session_http_scope
+from app.services.session_lock import SessionLock
 
 router = APIRouter(prefix="/api/v1/consult", tags=["advance"])
 
 
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
-    header = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-    if header:
-        return header
-    return str(uuid.uuid4())
+    return get_trace_id(request)
 
 
 def _doctor_id(
@@ -144,8 +144,12 @@ def _precheck_stage(session: ConsultSession, force: bool) -> None:
             )
 
 
-def _advance_command_key(trace_id: str) -> str:
-    return _safe_ref("advance", trace_id)[:128]
+def _advance_command_key(idempotency_key: str | None) -> str:
+    """Derive a durable command key independently from the attempt trace."""
+
+    logical_key = idempotency_key or uuid.uuid4().hex
+    digest = hashlib.sha256(f"advance\0{logical_key}".encode()).hexdigest()
+    return f"advance:{digest}"
 
 
 def _advance_payload_digest(force: bool) -> str:
@@ -206,7 +210,7 @@ async def _completed_advance_response(
     if claim is None:
         raise SessionBusyError(detail=f"session_id={session_id} advance command did not create a claim")
     if claim.payload_digest != payload_digest:
-        raise ValidationError(
+        raise IdempotencyConflictError(
             message="相同幂等键不能复用不同 advance 命令",
             detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
             retryable=False,
@@ -219,6 +223,87 @@ async def _completed_advance_response(
             retryable=True,
         )
     raise SessionBusyError(detail=f"session_id={session_id} advance command is still running")
+
+
+async def _wait_for_completed_advance_response(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+) -> dict[str, Any]:
+    """Wait for the owner of an in-flight idempotent command to finish."""
+
+    for _ in range(480):
+        await asyncio.sleep(0.25)
+        if db.in_transaction():
+            await db.rollback()
+        claim = await db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_key,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if claim is None:
+            break
+        if claim.payload_digest != payload_digest:
+            raise IdempotencyConflictError(
+                message="相同幂等键不能复用不同 advance 命令",
+                detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
+                retryable=False,
+            )
+        if claim.status == "completed" and claim.response_payload is not None:
+            return dict(claim.response_payload)
+        if claim.status == "failed":
+            raise ModelGatewayUnavailableError(
+                f"session_id={session_id} advance reasoning graph failed: {claim.error_code or 'UNKNOWN'}",
+                retryable=True,
+            )
+    raise SessionBusyError(detail=f"session_id={session_id} advance command is still running")
+
+
+async def _replay_advance_after_lock_conflict(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+) -> dict[str, Any] | None:
+    """Recognise a concurrently-created claim after losing the session lock."""
+
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        if db.in_transaction():
+            await db.rollback()
+        claim = await db.scalar(
+            select(IntakeCommandClaim).where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_key,
+            )
+        )
+        if claim is None:
+            continue
+        if claim.payload_digest != payload_digest:
+            raise IdempotencyConflictError(
+                message="相同幂等键不能复用不同 advance 命令",
+                detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
+                retryable=False,
+            )
+        if claim.status == "completed" and claim.response_payload is not None:
+            return dict(claim.response_payload)
+        return await _wait_for_completed_advance_response(
+            db,
+            session_id=session_id,
+            command_key=command_key,
+            payload_digest=payload_digest,
+        )
+    return None
+
+
+class _WaitForAdvanceReplay(Exception):
+    """Internal control flow used to leave the claim transaction before polling."""
 
 
 async def _mark_advance_failed(
@@ -258,13 +343,28 @@ async def _run_langgraph_advance(
     state_version: int | None,
     trace_id: str,
     force: bool = False,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     del session
     sid = uuid.UUID(session_id)
-    command_key = _advance_command_key(trace_id)
+    command_key = _advance_command_key(idempotency_key)
     payload_digest = _advance_payload_digest(force)
     run_id: uuid.UUID | None = None
-    async with session_lock(db, session_id, trace_id):
+    lock = SessionLock(db, session_id, trace_id)
+    try:
+        await lock.acquire()
+    except SessionBusyError:
+        replay = await _replay_advance_after_lock_conflict(
+            db,
+            session_id=sid,
+            command_key=command_key,
+            payload_digest=payload_digest,
+        )
+        if replay is not None:
+            return replay
+        raise
+    replay_running = False
+    try:
         if db.in_transaction():
             await db.rollback()
         async with db.begin():
@@ -278,7 +378,7 @@ async def _run_langgraph_advance(
             )
             if existing is not None:
                 if existing.payload_digest != payload_digest:
-                    raise ValidationError(
+                    raise IdempotencyConflictError(
                         message="相同幂等键不能复用不同 advance 命令",
                         detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
                         retryable=False,
@@ -286,10 +386,23 @@ async def _run_langgraph_advance(
                 if existing.status == "completed" and existing.response_payload is not None:
                     return dict(existing.response_payload)
                 if existing.status == "running" and not _advance_claim_is_stale(existing):
-                    raise SessionBusyError(detail=f"session_id={session_id} advance command is still running")
+                    raise _WaitForAdvanceReplay
                 if existing.status == "failed":
                     existing.status = "running"
                     existing.error_code = None
+
+            in_flight = await db.scalar(
+                select(IntakeCommandClaim.id).where(
+                    IntakeCommandClaim.session_id == sid,
+                    IntakeCommandClaim.status == "running",
+                    IntakeCommandClaim.idempotency_key != command_key,
+                )
+            )
+            if in_flight is not None:
+                raise SessionBusyError(
+                    detail=f"session_id={session_id} already has an in-flight command",
+                    retryable=True,
+                )
 
             run_id = (
                 existing.run_id
@@ -442,6 +555,17 @@ async def _run_langgraph_advance(
                 existing.error_code = None
                 existing.intermediate_payload = intermediate_payload
                 existing.updated_at = func.now()
+    except _WaitForAdvanceReplay:
+        replay_running = True
+    finally:
+        await lock.release()
+    if replay_running:
+        return await _wait_for_completed_advance_response(
+            db,
+            session_id=sid,
+            command_key=command_key,
+            payload_digest=payload_digest,
+        )
     assert run_id is not None
     try:
         await _invoke_reasoning_graph(session_id=session_id, command_key=command_key, run_id=run_id)
@@ -473,57 +597,74 @@ async def advance_session(
     db: AsyncSession = Depends(get_db),
     doctor_id: str | None = Depends(_doctor_id),
     state_version: int | None = Depends(_state_version),
+    context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """阶段推进（§4.3.1）。
 
     问诊完备性充分后，调用此接口依次执行辨证→开方→加减→安全审核。
     安全审核通过后挂起等待医师确认（不进病历生成）。
     """
-    trace_id = _get_trace_id(request)
-    del doctor_id  # MVP 审计由 Supervisor 内部完成
+    del request
+    trace_id = context.trace_id
 
-    # 预校验阶段
-    session = await _load_session_for_advance(db, session_id)
-    if getattr(session, "agent_runtime", "legacy") == "langgraph":
-        data = await _run_langgraph_advance(
-            db,
-            session,
-            session_id=session_id,
-            state_version=state_version,
-            trace_id=trace_id,
+    async def run_advance() -> dict[str, Any]:
+        session = await _load_session_for_advance(db, session_id)
+        if getattr(session, "agent_runtime", "legacy") == "langgraph":
+            return await _run_langgraph_advance(
+                db,
+                session,
+                session_id=session_id,
+                state_version=state_version,
+                trace_id=trace_id,
+                force=body.force,
+                idempotency_key=context.idempotency_key,
+            )
+
+        _precheck_stage(session, body.force)
+        supervisor = Supervisor(db)
+        supervisor_result: SupervisorResult = await supervisor.advance(
+            session_id,
+            trace_id,
+            expected_state_version=state_version,
             force=body.force,
         )
-        return JSONResponse(
-            status_code=200,
-            content=success_response(data=data, trace_id=trace_id),
-        )
+        return {
+            "session_id": session_id,
+            "current_stage": (
+                supervisor_result.to_stage.value
+                if hasattr(supervisor_result.to_stage, "value")
+                else str(supervisor_result.to_stage)
+            ),
+            "from_stage": (
+                supervisor_result.from_stage.value
+                if hasattr(supervisor_result.from_stage, "value")
+                else str(supervisor_result.from_stage)
+            ),
+            "state_version": supervisor_result.state.state_version,
+            "blocked_reason": supervisor_result.blocked_reason,
+            "agent_name": supervisor_result.agent_name,
+            "trace_id": trace_id,
+        }
 
-    _precheck_stage(session, body.force)
-
-    supervisor = Supervisor(db)
-    result: SupervisorResult = await supervisor.advance(
-        session_id,
-        trace_id,
-        expected_state_version=state_version,
-        force=body.force,
+    scope = session_http_scope(session_id)
+    result = await HttpCommandExecutor(db).execute(
+        operation="session.advance.v1",
+        scope_key=scope,
+        concurrency_scope=scope,
+        idempotency_key=context.idempotency_key,
+        is_idempotent=context.is_idempotent,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+        success_status=200,
+        success_message="ok",
+        handler=run_advance,
     )
-
-    data = {
-        "session_id": session_id,
-        "current_stage": (
-            result.to_stage.value if hasattr(result.to_stage, "value") else str(result.to_stage)
-        ),
-        "from_stage": (
-            result.from_stage.value if hasattr(result.from_stage, "value") else str(result.from_stage)
-        ),
-        "state_version": result.state.state_version,
-        "blocked_reason": result.blocked_reason,
-        "agent_name": result.agent_name,
-        "trace_id": trace_id,
-    }
     return JSONResponse(
-        status_code=200,
-        content=success_response(data=data, trace_id=trace_id),
+        status_code=result.status_code,
+        content=success_response(data=result.data, trace_id=trace_id, message=result.message),
     )
 
 
@@ -651,6 +792,22 @@ async def advance_model_gateway_handler(
     )
 
 
+async def advance_idempotency_conflict_handler(
+    request: Request, exc: IdempotencyConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": _get_trace_id(request),
+        },
+    )
+
+
 advance_exception_handlers: dict[Any, Any] = {
     SessionNotFoundError: advance_session_not_found_handler,
     SessionBusyError: advance_busy_handler,
@@ -659,4 +816,5 @@ advance_exception_handlers: dict[Any, Any] = {
     InsufficientInquiryError: insufficient_inquiry_handler,
     PendingDoctorReviewError: pending_doctor_review_handler,
     ModelGatewayUnavailableError: advance_model_gateway_handler,
+    IdempotencyConflictError: advance_idempotency_conflict_handler,
 }

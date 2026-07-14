@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.main import app
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
+from app.schemas.recovery import RecoveryRequest, RecoveryResponse
+from app.services.recovery import RecoveryService
+from app.services.session_lock import SessionLock
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -107,7 +111,7 @@ async def _check_postgres() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +139,14 @@ async def _get_session(db: AsyncSession, session_id: str) -> ConsultSession | No
     sid = uuid.UUID(session_id)
     result = await db.execute(select(ConsultSession).where(ConsultSession.id == sid))
     return result.scalar_one_or_none()
+
+
+def _persisted_session_state(session: ConsultSession) -> dict[str, Any]:
+    """复制会话所有持久化列，用于验证 fail-closed 路径无写入。"""
+    return {
+        column.name: deepcopy(getattr(session, column.name))
+        for column in ConsultSession.__table__.columns
+    }
 
 
 async def _set_session_blocked(
@@ -267,6 +279,142 @@ async def test_recover_invalid_uuid_format(client: AsyncClient) -> None:
     assert response.status_code == 404
     body = response.json()
     assert body["code"] == "SESSION_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# agent_runtime 恢复分流
+# ---------------------------------------------------------------------------
+
+
+async def test_langgraph_recover_fails_closed_before_legacy_and_preserves_session(
+    client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    enable_public_langgraph: None,
+) -> None:
+    """LangGraph 恢复不触碰 Legacy service/锁/Redis，也不修改 PG 会话。"""
+    created = await _create_session(
+        client,
+        {
+            "agent_runtime": "langgraph",
+            "patient_info": {
+                "patient_ref": f"{_TEST_PATIENT_REF_PREFIX}LGFAILCLOSED"
+            },
+        },
+    )
+    session_id = created["session_id"]
+    await _set_session_blocked(db, session_id, with_snapshot=True)
+
+    session = await _get_session(db, session_id)
+    assert session is not None
+    before_session = _persisted_session_state(session)
+    before_audit = await db.execute(
+        select(AuditEvent.id).where(AuditEvent.session_id == uuid.UUID(session_id))
+    )
+    before_audit_ids = set(before_audit.scalars().all())
+
+    legacy_calls: list[str] = []
+    lock_calls: list[str] = []
+    redis_calls: list[str] = []
+
+    async def _forbid_legacy_recover(
+        self: RecoveryService,
+        requested_session_id: str,
+        request: RecoveryRequest,
+        *,
+        doctor_id: str | None,
+        trace_id: str,
+    ) -> RecoveryResponse:
+        del self, request, doctor_id, trace_id
+        legacy_calls.append(requested_session_id)
+        raise AssertionError("LangGraph 请求不得调用 Legacy RecoveryService")
+
+    async def _forbid_lock(self: SessionLock) -> None:
+        del self
+        lock_calls.append("called")
+        raise AssertionError("LangGraph 请求不得调用 Legacy SessionLock")
+
+    async def _forbid_redis() -> None:
+        redis_calls.append("called")
+        raise AssertionError("LangGraph 请求不得访问 Legacy Redis")
+
+    monkeypatch.setattr(RecoveryService, "recover", _forbid_legacy_recover)
+    monkeypatch.setattr(SessionLock, "acquire", _forbid_lock)
+    monkeypatch.setattr(SessionLock, "release", _forbid_lock)
+    monkeypatch.setattr("app.services.session_lock.get_redis", _forbid_redis)
+
+    response = await client.post(
+        f"/api/v1/consult/sessions/{session_id}/recover",
+        json={"action": "retry_current_stage"},
+        headers={"X-Request-Id": "trace-langgraph-recovery-fail-closed"},
+    )
+
+    assert response.status_code == 501
+    body = response.json()
+    assert body["code"] == "LANGGRAPH_RECOVERY_NOT_IMPLEMENTED"
+    assert body["retryable"] is False
+    assert body["stage"] is None
+    assert body["trace_id"] == "trace-langgraph-recovery-fail-closed"
+    assert legacy_calls == []
+    assert lock_calls == []
+    assert redis_calls == []
+
+    await db.refresh(session)
+    assert _persisted_session_state(session) == before_session
+    after_audit = await db.execute(
+        select(AuditEvent.id).where(AuditEvent.session_id == uuid.UUID(session_id))
+    )
+    assert set(after_audit.scalars().all()) == before_audit_ids
+
+
+async def test_legacy_recover_dispatches_to_existing_service(
+    client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式 Legacy 会话保持既有恢复行为，并且只分发一次。"""
+    created = await _create_session(
+        client,
+        {
+            "agent_runtime": "legacy",
+            "patient_info": {
+                "patient_ref": f"{_TEST_PATIENT_REF_PREFIX}LEGACYDISPATCH"
+            },
+        },
+    )
+    session_id = created["session_id"]
+    await _set_session_blocked(db, session_id)
+
+    original_recover = RecoveryService.recover
+    dispatched: list[str] = []
+
+    async def _track_legacy_recover(
+        self: RecoveryService,
+        requested_session_id: str,
+        request: RecoveryRequest,
+        *,
+        doctor_id: str | None,
+        trace_id: str,
+    ) -> RecoveryResponse:
+        dispatched.append(requested_session_id)
+        return await original_recover(
+            self,
+            requested_session_id,
+            request,
+            doctor_id=doctor_id,
+            trace_id=trace_id,
+        )
+
+    monkeypatch.setattr(RecoveryService, "recover", _track_legacy_recover)
+
+    response = await client.post(
+        f"/api/v1/consult/sessions/{session_id}/recover",
+        json={"action": "retry_current_stage"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["code"] == "SUCCESS"
+    assert dispatched == [session_id]
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +889,7 @@ async def test_recover_returns_409_when_lock_preoccupied(
 
     redis = await _preoccupy_redis_lock(session_id)
     if redis is None:
-        pytest.skip("Redis 不可用，跳过确定性锁冲突测试")
+        pytest.fail("Redis integration dependency unavailable")
 
     lock_key = f"xuanhu:session_lock:{session_id}"
     try:
@@ -872,7 +1020,7 @@ async def test_resume_does_not_overwrite_pg_when_checkpoint_older(
         {"state_version": 2, "current_stage": "inquiry"},
     )
     if redis is None:
-        pytest.skip("Redis 不可用，跳过 checkpoint 版本比较测试")
+        pytest.fail("Redis integration dependency unavailable")
 
     ckpt_key = f"xuanhu:checkpoint:{session_id}"
     try:

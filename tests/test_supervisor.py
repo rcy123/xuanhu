@@ -21,9 +21,10 @@ from app.agents.registry import AgentRegistry
 from app.agents.supervisor import Supervisor
 from app.core.config import get_settings
 from app.core.exceptions import InvalidStageTransitionError, InvalidStateVersionError, SessionBusyError
-from app.core.redis import get_redis
+from app.core.redis import get_redis, reset_redis
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
+from app.models.knowledge import DosageUnit, Herb
 from app.schemas.agent import (
     FormulaResult,
     HerbDose,
@@ -407,10 +408,40 @@ async def db() -> AsyncSession:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"PostgreSQL 不可用，跳过 Supervisor 集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
-    async with factory() as session:
-        yield session
+    try:
+        async with factory() as session:
+            # The module owns its knowledge fixtures; it must not depend on a
+            # developer database having imported herbs or dosage units.
+            herb = await session.scalar(select(Herb).where(Herb.name == "党参", Herb.deleted_at.is_(None)))
+            if herb is None:
+                session.add(
+                    Herb(
+                        name="党参",
+                        aliases=["潞党参"],
+                        max_dose=30.0,
+                        pregnancy_contraindication="none",
+                        doc_text="党参 补中益气",
+                    )
+                )
+            dosage_unit = await session.scalar(select(DosageUnit).where(DosageUnit.unit_name == "g"))
+            if dosage_unit is None:
+                session.add(
+                    DosageUnit(
+                        unit_name="g",
+                        aliases=["克"],
+                        to_grams=1.0,
+                        conversion_type="standard",
+                        is_standard=True,
+                        enabled=True,
+                    )
+                )
+            await session.commit()
+            yield session
+    finally:
+        await reset_redis()
+        await reset_session_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +560,7 @@ async def test_safety_passed_to_review_suspend(db: AsyncSession) -> None:
     """P6-3: 安全规则通过进入 review 并挂起。
 
     使用 SafetyRuleEngine 路径（不再依赖 FakeSafetyAgent）。
-    复用 DB 中已导入的 herbs/dosage_units 种子数据（党参已存在）。
+    使用本模块 fixture 显式导入的 herbs/dosage_units 测试数据。
     """
     session = await _create_session(db, stage=Stage.SAFETY)
 
@@ -872,7 +903,7 @@ async def test_supervisor_lock_conflict_raises_session_busy(db: AsyncSession) ->
             redis = await get_redis()
             await redis.set(lock_key, "other-trace", ex=60)
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"Redis 不可用，跳过 Supervisor 锁冲突测试: {type(exc).__name__}: {exc}")
+            pytest.fail(f"Redis integration dependency unavailable: {type(exc).__name__}: {exc}")
 
         with pytest.raises(SessionBusyError) as exc_info:
             await supervisor.advance(str(session.id), "trace-lock-conflict")
@@ -2172,4 +2203,3 @@ async def test_record_missing_agent_blocked(db: AsyncSession) -> None:
             delete(MedicalRecord).where(MedicalRecord.session_id == session.id)
         )
         await db.commit()
-

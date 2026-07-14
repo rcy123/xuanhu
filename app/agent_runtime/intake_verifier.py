@@ -14,6 +14,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.agent_runtime.intake_grounding import (
+    IntakeGroundingFailureKind,
+    verify_intake_grounding,
+)
 from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec
 from app.schemas.intake import (
     IntakeExtractionDecision,
@@ -24,14 +28,15 @@ from app.schemas.intake import (
 )
 
 INTAKE_AGENT_NAME = "intake_extraction"
-INTAKE_AGENT_VERSION = "intake-extraction-agent.v1"
-INTAKE_PROMPT_VERSION = "intake_extraction_v1.jinja2"
+INTAKE_AGENT_VERSION = "intake-extraction-agent.v2"
+INTAKE_PROMPT_VERSION = "intake_extraction_v2.jinja2"
 INTAKE_ALLOWED_STAGES = frozenset({"inquiry"})
 INTAKE_VERIFIER_CHAIN = (
     "schema",
     "run_provenance",
     "stage",
     "source_provenance",
+    "grounding",
     "safety_semantics",
     "decision_consistency",
     "observation_legality",
@@ -44,6 +49,7 @@ class IntakeVerifierName(StrEnum):
     RUN_PROVENANCE = "run_provenance"
     STAGE = "stage"
     SOURCE_PROVENANCE = "source_provenance"
+    GROUNDING = "grounding"
     SAFETY_SEMANTICS = "safety_semantics"
     DECISION_CONSISTENCY = "decision_consistency"
     OBSERVATION_LEGALITY = "observation_legality"
@@ -57,6 +63,9 @@ class IntakeVerificationFailureCode(StrEnum):
     RUN_PROVENANCE_MISMATCH = "INTAKE_RUN_PROVENANCE_MISMATCH"
     STAGE_NOT_ALLOWED = "INTAKE_STAGE_NOT_ALLOWED"
     SOURCE_NOT_ALLOWED = "INTAKE_SOURCE_NOT_ALLOWED"
+    GROUNDING_SPAN_INVALID = "INTAKE_GROUNDING_SPAN_INVALID"
+    GROUNDING_VALUE_MISMATCH = "INTAKE_GROUNDING_VALUE_MISMATCH"
+    GROUNDING_CONTEXT_UNSAFE = "INTAKE_GROUNDING_CONTEXT_UNSAFE"
     SAFETY_SEMANTICS_INVALID = "INTAKE_SAFETY_SEMANTICS_INVALID"
     DECISION_CONTENT_MISMATCH = "INTAKE_DECISION_CONTENT_MISMATCH"
     DUPLICATE_OBSERVATION = "INTAKE_DUPLICATE_OBSERVATION"
@@ -146,6 +155,7 @@ def verify_intake_artifact(
         (IntakeVerifierName.RUN_PROVENANCE, _verify_run(agent_spec, run_spec, artifact)),
         (IntakeVerifierName.STAGE, _verify_stage(run_spec)),
         (IntakeVerifierName.SOURCE_PROVENANCE, _verify_sources(output, input_payload)),
+        (IntakeVerifierName.GROUNDING, _verify_grounding(output, input_payload)),
         (IntakeVerifierName.SAFETY_SEMANTICS, _verify_safety(output)),
         (IntakeVerifierName.DECISION_CONSISTENCY, _verify_decision(output)),
         (IntakeVerifierName.OBSERVATION_LEGALITY, _verify_observations(output, input_payload)),
@@ -230,6 +240,7 @@ def _verify_sources(
     allowed = {message.message_id for message in input_payload.current_messages}
     sources: list[Any] = [item.source_message_id for item in output.observations]
     sources.extend(item.source_message_id for item in output.red_flag_candidates)
+    sources.extend(item.span.source_message_id for item in output.red_flag_candidates)
     sources.extend(item.source_message_id for item in output.ambiguities)
     for field in (
         output.patient_safety_delta.allergy,
@@ -241,9 +252,40 @@ def _verify_sources(
     ):
         if field.source_message_id is not None:
             sources.append(field.source_message_id)
+    for field in (
+        output.patient_safety_delta.allergy,
+        output.patient_safety_delta.medications,
+        output.patient_safety_delta.major_conditions,
+        output.patient_safety_delta.contraindications,
+    ):
+        if field.value_spans is not None:
+            sources.extend(span.source_message_id for span in field.value_spans)
+        if field.negation_span is not None:
+            sources.append(field.negation_span.source_message_id)
+    for field in (
+        output.patient_safety_delta.pregnancy,
+        output.patient_safety_delta.lactation,
+    ):
+        if field.span is not None:
+            sources.append(field.span.source_message_id)
     if any(source not in allowed for source in sources):
         return IntakeVerificationFailureCode.SOURCE_NOT_ALLOWED
     return None
+
+
+_GROUNDING_FAILURE_MAP = {
+    IntakeGroundingFailureKind.SPAN_INVALID: IntakeVerificationFailureCode.GROUNDING_SPAN_INVALID,
+    IntakeGroundingFailureKind.VALUE_MISMATCH: IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH,
+    IntakeGroundingFailureKind.CONTEXT_UNSAFE: IntakeVerificationFailureCode.GROUNDING_CONTEXT_UNSAFE,
+}
+
+
+def _verify_grounding(
+    output: IntakeExtractionOutput,
+    input_payload: IntakeExtractionInput,
+) -> IntakeVerificationFailureCode | None:
+    failure = verify_intake_grounding(output, input_payload)
+    return _GROUNDING_FAILURE_MAP.get(failure) if failure is not None else None
 
 
 def _verify_safety(output: IntakeExtractionOutput) -> IntakeVerificationFailureCode | None:

@@ -3,9 +3,10 @@
 创建 ASGI 应用实例，注册路由，启动时输出脱敏配置。
 """
 
+import asyncio
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
@@ -23,10 +24,13 @@ from app.api.recovery import recovery_exception_handlers
 from app.api.recovery import router as recovery_router
 from app.api.review import review_exception_handlers
 from app.api.review import router as review_router
+from app.api.safety_confirmations import router as safety_confirmations_router
+from app.api.safety_confirmations import safety_confirmation_exception_handlers
 from app.api.sessions import router as sessions_router
 from app.api.sessions import session_exception_handlers
 from app.api.stream import router as stream_router
 from app.core.config import get_settings
+from app.core.exceptions import HttpCommandRecoveryRequiredError, HttpCommandReplayError
 from app.core.gateway import ModelGatewayClient
 
 logger = logging.getLogger("xuanhu")
@@ -37,7 +41,45 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """应用生命周期 — 启动时输出脱敏配置，确保不泄露敏感信息。"""
     settings = get_settings()
     logger.info("应用启动，当前配置（已脱敏）: %s", settings.safe_dump())
-    yield
+    stop: asyncio.Event | None = None
+    publisher_task: asyncio.Task[None] | None = None
+    if settings.outbox_publisher_enabled:
+        from app.agent_runtime.repository import PostgresDomainRepository
+        from app.db.session import get_session_factory
+        from app.services.events import EventService
+        from app.services.outbox_publisher import OutboxPublisher
+
+        stop = asyncio.Event()
+        publisher = OutboxPublisher(
+            PostgresDomainRepository(get_session_factory()),
+            EventService(dedupe_ttl_seconds=settings.event_dedupe_ttl_seconds),
+            worker_id=f"api-{uuid.uuid4().hex}",
+            batch_size=settings.outbox_publisher_batch_size,
+            lease_seconds=settings.outbox_publisher_lease_seconds,
+            max_attempts=settings.outbox_publisher_max_attempts,
+            base_retry_seconds=settings.outbox_publisher_base_retry_seconds,
+            max_retry_seconds=settings.outbox_publisher_max_retry_seconds,
+            poll_interval_seconds=settings.outbox_publisher_poll_interval_seconds,
+        )
+        app.state.outbox_publisher = publisher
+        publisher_task = asyncio.create_task(
+            publisher.run_forever(stop),
+            name="xuanhu-outbox-publisher",
+        )
+    try:
+        yield
+    finally:
+        if stop is not None and publisher_task is not None:
+            stop.set()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(publisher_task),
+                    timeout=settings.outbox_publisher_shutdown_grace_seconds,
+                )
+            except TimeoutError:
+                publisher_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await publisher_task
 
 
 app = FastAPI(
@@ -56,6 +98,7 @@ app.include_router(recovery_router)
 app.include_router(review_router)
 app.include_router(record_router)
 app.include_router(advance_router)
+app.include_router(safety_confirmations_router)
 
 # 注册会话、消息、恢复、review 与 record 路由自定义异常处理器
 for exc_cls, handler in {
@@ -65,8 +108,38 @@ for exc_cls, handler in {
     **review_exception_handlers,
     **record_exception_handlers,
     **advance_exception_handlers,
+    **safety_confirmation_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
+
+
+async def http_command_outcome_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    """Render a persisted error replay or a fail-closed ambiguous command."""
+
+    assert isinstance(exc, HttpCommandReplayError | HttpCommandRecoveryRequiredError)
+    trace_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-trace-id")
+        or str(uuid.uuid4())
+    )
+    payload = {
+        "code": exc.code,
+        "message": exc.message,
+        "detail": exc.detail,
+        "retryable": exc.retryable,
+        "stage": None,
+        "trace_id": trace_id,
+    }
+    if isinstance(exc, HttpCommandReplayError):
+        payload.update(exc.extra_payload)
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+app.add_exception_handler(HttpCommandReplayError, http_command_outcome_handler)
+app.add_exception_handler(HttpCommandRecoveryRequiredError, http_command_outcome_handler)
 
 
 @app.exception_handler(RequestValidationError)

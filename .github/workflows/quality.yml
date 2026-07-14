@@ -1,0 +1,186 @@
+name: L0-L4 quality gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  unit:
+    name: Unit + contract (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Sync locked environment
+        run: uv sync --locked --group dev
+      - name: Run isolated unit and L0 contract suites
+        run: uv run pytest
+
+  static:
+    name: Python static quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Strict mypy (application and operational scripts)
+        run: uv run mypy app scripts
+      - name: Verify lockfile is current
+        run: uv lock --check
+
+  integration:
+    name: Isolated PostgreSQL + Redis integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xuanhu_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d xuanhu_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xuanhu_test
+      TEST_REDIS_URL: redis://127.0.0.1:6379/8
+      XUANHU_ALLOW_DESTRUCTIVE_TESTS: "1"
+      MODEL_GATEWAY_BASE_URL: http://127.0.0.1:8080/v1
+      MODEL_GATEWAY_API_KEY: sk-ci-placeholder
+      CHAT_MODEL: ci-chat-model
+      EMBEDDING_MODEL: ci-embedding-model
+      EMBEDDING_DIM: "768"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - name: Run real-service tests in isolated xdist databases
+        run: >-
+          uv run pytest -o addopts="" -m integration -n 4 --dist=loadscope
+          --strict-markers tests
+      - name: Prove workers cannot collide on identical PG and Redis keys
+        run: >-
+          uv run pytest -o addopts="" -m integration -n 2 --dist=each
+          --strict-markers tests/test_infrastructure_isolation.py
+
+  frontend:
+    name: Frontend type, lint, test, build, audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  security:
+    name: Dependency, secret, and SBOM gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan repository history and clean working tree for secrets
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 \
+            git /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 \
+            dir /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Audit Python environment
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          virtual-environment: .venv/
+      - name: Install Node.js for SBOM
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Generate Python CycloneDX SBOM
+        run: >-
+          uv tool run --from cyclonedx-bom==7.3.0 cyclonedx-py environment
+          --pyproject pyproject.toml --output-format JSON
+          --output-file sbom-python.cdx.json "$(uv python find)"
+      - name: Install locked Node dependency tree for SBOM
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+      - name: Generate Node CycloneDX SBOM
+        working-directory: frontend
+        run: npm sbom --sbom-format cyclonedx > ../sbom-node.cdx.json
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v7
+        with:
+          name: cyclonedx-sboms
+          path: |
+            sbom-python.cdx.json
+            sbom-node.cdx.json
+          if-no-files-found: error

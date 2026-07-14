@@ -26,6 +26,7 @@ from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.completeness_policy import completeness_to_gate_result_schema, evaluate_completeness_policy
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
+from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.intake_verifier import INTAKE_AGENT_VERSION, INTAKE_PROMPT_VERSION
 from app.agent_runtime.reducer import DomainDelta, DomainState, reduce_domain_state
@@ -41,18 +42,24 @@ from app.agent_runtime.runtime import AgentRuntime
 from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunArtifact, RunSpec
 from app.agent_runtime.state import ArtifactRef, XuanhuGraphState, default_state
 from app.agent_runtime.triage_policy import evaluate_triage_policy, to_gate_result_schema
+from app.agent_runtime.triage_precheck import (
+    TRIAGE_PRECHECK_VERSION,
+    TriagePrecheckResult,
+    evaluate_raw_text_triage_precheck,
+    merge_red_flag_candidates,
+)
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
 from app.agents.intake_extraction import IntakeExecutionStatus, execute_intake_extraction
 from app.agents.question_composer import compose_question
 from app.core.config import get_settings
 from app.core.exceptions import (
     AgentTriggerFailedError,
+    IdempotencyConflictError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
     SessionBusyError,
     SessionNotFoundError,
     SessionTerminatedError,
-    ValidationError,
 )
 from app.db.session import get_session_factory
 from app.models.audit import AuditEvent
@@ -69,14 +76,13 @@ from app.schemas.completeness import (
 from app.schemas.domain import (
     ArtifactRevisionSchema,
     ArtifactStatus,
-    CollectionStatus,
     GateResultSchema,
     ObservationSchema,
     ObservationStatus,
-    SafetyProfileSchema,
 )
 from app.schemas.intake import (
     ActiveObservationContext,
+    IntakeExtractionDecision,
     IntakeExtractionInput,
     IntakeExtractionOutput,
     IntakeMessage,
@@ -88,6 +94,7 @@ from app.schemas.message import AgentMessageItem, MessageCreateRequest, MessageC
 from app.schemas.question import QuestionCompositionStatus
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
 from app.services.events import EventService
+from app.services.safety_confirmation import persist_intake_safety_assertions
 from app.services.session_lock import SessionLock
 
 logger = logging.getLogger("xuanhu.langgraph_intake")
@@ -138,7 +145,10 @@ class _ClaimResult:
     replay_response: MessageCreateResponse | None = None
 
 
-_INTAKE_OUTPUT_CACHE: dict[uuid.UUID, IntakeExtractionOutput] = {}
+_INTAKE_OUTPUT_CACHE: BoundedTTLCache[uuid.UUID, IntakeExtractionOutput] = BoundedTTLCache(
+    max_size=256,
+    ttl_seconds=300,
+)
 
 
 @dataclass(frozen=True)
@@ -177,9 +187,10 @@ class LangGraphIntakeMessageRunner:
         doctor_id: str | None,
         trace_id: str,
         x_state_version: int | None,
+        idempotency_key: str | None = None,
     ) -> MessageCreateResponse:
         sid = _parse_session_id(session_id)
-        command_key = _command_key(trace_id)
+        command_key = _command_key(idempotency_key)
         payload_digest = _payload_digest(body)
         claim = await self._claim_or_replay(
             sid,
@@ -242,7 +253,7 @@ class LangGraphIntakeMessageRunner:
                 )
                 if existing is not None:
                     if existing.payload_digest != payload_digest:
-                        raise ValidationError(
+                        raise IdempotencyConflictError(
                             message="相同幂等键不能复用不同消息",
                             detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
                             retryable=False,
@@ -257,6 +268,19 @@ class LangGraphIntakeMessageRunner:
                             existing.updated_at = func.now()
                             return _ClaimResult(existing, patient_message)
                     return _ClaimResult(existing, None)
+
+                in_flight = await self._db.scalar(
+                    select(IntakeCommandClaim.id).where(
+                        IntakeCommandClaim.session_id == session_id,
+                        IntakeCommandClaim.status == "running",
+                        IntakeCommandClaim.idempotency_key != command_key,
+                    )
+                )
+                if in_flight is not None:
+                    raise SessionBusyError(
+                        detail=f"session_id={session_id} already has an in-flight command",
+                        retryable=True,
+                    )
 
                 session = await self._db.get(ConsultSession, session_id, with_for_update=True)
                 if session is None:
@@ -388,7 +412,7 @@ class LangGraphIntakeMessageRunner:
             if existing is None:
                 continue
             if existing.payload_digest != payload_digest:
-                raise ValidationError(
+                raise IdempotencyConflictError(
                     message="相同幂等键不能复用不同消息",
                     detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
                     retryable=False,
@@ -413,8 +437,13 @@ class LangGraphIntakeMessageRunner:
                     IntakeCommandClaim.idempotency_key == command_key,
                 )
             )
-            if existing is None or existing.payload_digest != payload_digest:
+            if existing is None:
                 break
+            if existing.payload_digest != payload_digest:
+                raise IdempotencyConflictError(
+                    detail=f"session_id={session_id} command_id={command_key} payload_digest_mismatch",
+                    retryable=False,
+                )
             if existing.status == "completed" and existing.response_payload is not None:
                 return _response_from_payload(existing.response_payload)
             recovered = await self._recover_completed_claim(existing)
@@ -437,68 +466,21 @@ class LangGraphIntakeMessageRunner:
         state: XuanhuGraphState,
     ) -> tuple[dict[str, Any], MessageCreateResponse]:
         try:
-            repository = PostgresDomainRepository(get_session_factory())
-            domain_state = await repository.get_state(claim.session_id)
-            intake_input = _build_intake_input(domain_state, patient_message)
-            intake_result = await execute_intake_extraction(
-                runtime=AgentRuntime(),
-                run_spec=RunSpec(
-                    run_id=uuid.uuid4(),
-                    session_id=claim.session_id,
-                    state_version=claim.input_state_version,
-                    stage="inquiry",
-                    agent_spec_version=INTAKE_AGENT_VERSION,
-                    prompt_version=INTAKE_PROMPT_VERSION,
-                    deadline_at=_deadline(30),
-                    total_attempt_budget=1,
-                    idempotency_key=f"{claim.idempotency_key}:intake",
-                    trace_id=trace_id,
-                ),
-                input_payload=intake_input,
+            computation = await _compute_intake_from_claim(
+                claim,
+                patient_message,
+                trace_id,
+                runner=self,
             )
-            if intake_result.status is not IntakeExecutionStatus.SUCCEEDED or intake_result.output is None:
-                code = str(intake_result.failure_code or "INTAKE_FAILED")
-                await self._mark_claim_failed(claim.id, code)
-                raise AgentTriggerFailedError(
-                    detail=f"session_id={claim.session_id} intake extraction failed code={code}",
-                    agent_error_code=code,
-                    retryable=False,
-                )
-
-            delta = _intake_output_to_delta(
-                run_id=claim.run_id,
-                session_id=claim.session_id,
-                expected_state_version=claim.input_state_version,
-                source_message_id=patient_message.id,
-                state=domain_state,
-                observations=intake_result.output.observations,
-                safety_delta=intake_result.output.patient_safety_delta,
-            )
-            context = _verification_context(
-                delta=delta,
-                state=domain_state,
-                trace_id=trace_id,
-                idempotency_key=claim.idempotency_key,
-            )
-            next_state = reduce_domain_state(domain_state, delta, context)
-            new_fact_count = len(delta.observations) + (1 if delta.safety_profile is not None else 0)
-            triage_result = evaluate_triage_policy(
-                TriagePolicyInput(
-                    input_state_version=next_state.state_version,
-                    red_flag_candidates=intake_result.output.red_flag_candidates,
-                )
-            )
-            progress = await self._next_progress(claim.session_id, new_fact_count=new_fact_count)
-            completeness_result = evaluate_completeness_policy(
-                CompletenessPolicyInput(
-                    input_state_version=next_state.state_version,
-                    domain_snapshot=_completeness_snapshot(next_state),
-                    triage_gate=triage_result.gate_result,
-                    progress=progress,
-                )
-            )
-            triage_gate = to_gate_result_schema(triage_result)
-            completeness_gate = completeness_to_gate_result_schema(completeness_result)
+            repository = computation.repository
+            delta = computation.delta
+            context = computation.context
+            next_state = computation.next_state
+            triage_result = computation.triage_result
+            progress = computation.progress
+            completeness_result = computation.completeness_result
+            triage_gate = computation.triage_gate
+            completeness_gate = computation.completeness_gate
 
             question_message_id: uuid.UUID | None = None
             question_spec: ConsultMessageSpec | None = None
@@ -507,7 +489,12 @@ class LangGraphIntakeMessageRunner:
                 CompletenessDisposition.INCOMPLETE,
                 CompletenessDisposition.CONFLICT,
             }:
-                question = await self._compose_question(claim.session_id, completeness_result, trace_id)
+                question = await self._compose_question(
+                    claim.session_id,
+                    completeness_result,
+                    trace_id,
+                    claim.idempotency_key,
+                )
                 question_message_id = uuid.uuid4()
                 question_spec = ConsultMessageSpec(
                     message_id=question_message_id,
@@ -561,6 +548,11 @@ class LangGraphIntakeMessageRunner:
                     "question_message_id": str(question_message_id) if question_message_id else None,
                 },
             )
+            await _persist_safety_assertions(computation, claim, patient_message, trace_id)
+            if question_message_id is not None:
+                persisted_agent_item = await _load_agent_item(self._db, question_message_id)
+                if persisted_agent_item is not None:
+                    agent_item = persisted_agent_item
             patient_message_id = patient_message.id
             patient_role = patient_message.role
             patient_stage = patient_message.stage
@@ -596,7 +588,7 @@ class LangGraphIntakeMessageRunner:
                 ) from exc
             raise
         except Exception as exc:
-            if not isinstance(exc, (AgentTriggerFailedError, InvalidStateVersionError)):
+            if not isinstance(exc, AgentTriggerFailedError | InvalidStateVersionError):
                 await self._mark_claim_failed(claim.id, type(exc).__name__.upper()[:64])
             raise
 
@@ -618,12 +610,13 @@ class LangGraphIntakeMessageRunner:
         session_id: uuid.UUID,
         completeness_result: Any,
         trace_id: str,
+        command_key: str,
     ) -> dict[str, Any]:
         outcome = await compose_question(
             completeness_result=completeness_result,
             runtime=AgentRuntime(),
             run_spec=RunSpec(
-                run_id=uuid.uuid4(),
+                run_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-question:{session_id}:{command_key}"),
                 session_id=session_id,
                 state_version=completeness_result.input_state_version,
                 stage="intake_question",
@@ -631,7 +624,7 @@ class LangGraphIntakeMessageRunner:
                 prompt_version="question_composer_v1.jinja2",
                 deadline_at=_deadline(10),
                 total_attempt_budget=1,
-                idempotency_key=f"{trace_id}:question",
+                idempotency_key=f"{command_key}:question",
                 trace_id=trace_id,
             ),
         )
@@ -663,6 +656,7 @@ class LangGraphIntakeMessageRunner:
             claim.output_state_version = output_state_version
             claim.response_payload = payload
             claim.updated_at = func.now()
+        _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
 
     async def _recover_completed_claim(self, claim: IntakeCommandClaim) -> MessageCreateResponse | None:
         if claim.status != "running":
@@ -675,6 +669,7 @@ class LangGraphIntakeMessageRunner:
             if locked is None:
                 return None
             if locked.status == "completed" and locked.response_payload is not None:
+                _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
                 return _response_from_payload(locked.response_payload)
             commit = await self._db.scalar(
                 select(DomainCommandCommit).where(DomainCommandCommit.graph_run_id == locked.run_id)
@@ -708,6 +703,7 @@ class LangGraphIntakeMessageRunner:
             locked.output_state_version = commit.output_state_version
             locked.response_payload = response.model_dump(mode="json")
             locked.updated_at = func.now()
+            _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
             return response
 
     async def _mark_claim_failed(self, claim_id: uuid.UUID, error_code: str) -> None:
@@ -719,6 +715,7 @@ class LangGraphIntakeMessageRunner:
                 claim.status = "failed"
                 claim.error_code = error_code[:64]
                 claim.updated_at = func.now()
+        _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
 
 async def run_intake_persist_message_node(state: XuanhuGraphState) -> dict[str, Any]:
     try:
@@ -755,12 +752,17 @@ async def run_intake_triage_precheck_node(state: XuanhuGraphState) -> dict[str, 
     loaded = await _load_running_intake_context(state)
     if isinstance(loaded, dict):
         return loaded
-    db, claim, _, runner = loaded
+    db, claim, patient_message, runner = loaded
     try:
         completed = await _completed_graph_update(runner, claim)
         if completed is not None:
             return completed
-        await _save_intermediate_step(claim.id, "triage_precheck")
+        precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
+        await _save_intermediate(
+            claim.id,
+            {"triage_precheck": _triage_precheck_metadata(precheck)},
+            step="triage_precheck",
+        )
         return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
     finally:
         await db.close()
@@ -805,6 +807,17 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             return completed
         if claim.id in _INTAKE_OUTPUT_CACHE:
             await _save_intermediate_step(claim.id, "extract_intake")
+            return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
+
+        precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
+        if precheck.candidates:
+            output = _precheck_blocking_output(precheck)
+            _INTAKE_OUTPUT_CACHE[claim.id] = output
+            await _save_intermediate(
+                claim.id,
+                {"extraction": _precheck_extraction_metadata(output, claim.input_state_version)},
+                step="extract_intake",
+            )
             return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
 
         repository = PostgresDomainRepository(get_session_factory())
@@ -1057,6 +1070,7 @@ async def _completed_graph_update(
 ) -> dict[str, Any] | None:
     del runner
     if claim.status == "completed" and claim.response_payload is not None:
+        _INTAKE_OUTPUT_CACHE.pop(claim.id, None)
         return _graph_update_from_response(_response_from_payload(claim.response_payload))
     factory = get_session_factory()
     async with factory() as db:
@@ -1106,6 +1120,7 @@ async def _compute_intake_from_claim(
     repository = PostgresDomainRepository(get_session_factory())
     domain_state = await repository.get_state(claim.session_id)
     output = await _load_or_retry_intake_output(claim, patient_message, domain_state, trace_id)
+    precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
     delta = _intake_output_to_delta(
         run_id=claim.run_id,
         session_id=claim.session_id,
@@ -1122,11 +1137,13 @@ async def _compute_intake_from_claim(
         idempotency_key=claim.idempotency_key,
     )
     next_state = reduce_domain_state(domain_state, delta, context)
-    new_fact_count = len(delta.observations) + (1 if delta.safety_profile is not None else 0)
+    # An unconfirmed candidate is conversational progress, but it is not an
+    # authoritative SafetyProfile fact and therefore is absent from ``delta``.
+    new_fact_count = len(delta.observations) + (1 if output.patient_safety_delta.has_candidate() else 0)
     triage_result = evaluate_triage_policy(
         TriagePolicyInput(
             input_state_version=next_state.state_version,
-            red_flag_candidates=output.red_flag_candidates,
+            red_flag_candidates=merge_red_flag_candidates(precheck.candidates, output.red_flag_candidates),
         )
     )
     if runner is None:
@@ -1171,6 +1188,16 @@ async def _load_or_retry_intake_output(
     cached = _INTAKE_OUTPUT_CACHE.get(claim.id)
     if cached is not None:
         return cached
+    precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
+    if precheck.candidates:
+        output = _precheck_blocking_output(precheck)
+        _INTAKE_OUTPUT_CACHE[claim.id] = output
+        await _save_intermediate(
+            claim.id,
+            {"extraction": _precheck_extraction_metadata(output, claim.input_state_version)},
+            step="extract_intake",
+        )
+        return output
     run_id = _stable_intake_extraction_run_id(claim)
     intake_result = await execute_intake_extraction(
         runtime=AgentRuntime(),
@@ -1203,6 +1230,30 @@ def _stable_intake_extraction_run_id(claim: IntakeCommandClaim) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-extraction:{claim.run_id}:{claim.idempotency_key}")
 
 
+async def _persist_safety_assertions(
+    computation: _IntakeComputation,
+    claim: IntakeCommandClaim,
+    patient_message: ConsultMessage,
+    trace_id: str,
+) -> None:
+    if not (
+        computation.output.patient_safety_delta.has_candidate()
+        or computation.output.red_flag_candidates
+    ):
+        return
+    precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
+    deterministic = bool(precheck.candidates)
+    await persist_intake_safety_assertions(
+        session_id=claim.session_id,
+        source_message_id=patient_message.id,
+        output=computation.output,
+        extraction_run_id=_stable_intake_extraction_run_id(claim),
+        template_version=TRIAGE_PRECHECK_VERSION if deterministic else INTAKE_PROMPT_VERSION,
+        source_kind="deterministic_precheck" if deterministic else "model_extraction",
+        trace_id=trace_id,
+    )
+
+
 def _extraction_metadata(
     run_id: uuid.UUID,
     output: IntakeExtractionOutput,
@@ -1218,6 +1269,37 @@ def _extraction_metadata(
         "red_flag_candidate_count": len(output.red_flag_candidates),
         "ambiguity_count": len(output.ambiguities),
         "safety_delta_present": output.patient_safety_delta.has_candidate(),
+    }
+
+
+def _triage_precheck_metadata(result: TriagePrecheckResult) -> dict[str, Any]:
+    return {
+        "policy_version": TRIAGE_PRECHECK_VERSION,
+        "disposition": result.disposition.value,
+        "candidate_count": len(result.candidates),
+        "matched_rule_ids": list(result.matched_rule_ids),
+        "candidate_digest": _fingerprint([item.model_dump(mode="json") for item in result.candidates]),
+    }
+
+
+def _precheck_blocking_output(result: TriagePrecheckResult) -> IntakeExtractionOutput:
+    return IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        red_flag_candidates=result.candidates,
+    )
+
+
+def _precheck_extraction_metadata(output: IntakeExtractionOutput, input_state_version: int) -> dict[str, Any]:
+    return {
+        "source": "deterministic_triage_precheck",
+        "policy_version": TRIAGE_PRECHECK_VERSION,
+        "input_state_version": input_state_version,
+        "output_digest": _fingerprint(output.model_dump(mode="json")),
+        "decision": output.decision.value,
+        "observation_count": 0,
+        "red_flag_candidate_count": len(output.red_flag_candidates),
+        "ambiguity_count": 0,
+        "safety_delta_present": False,
     }
 
 
@@ -1281,7 +1363,12 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
         agent_item: AgentMessageItem | None = None
         progress = computation.progress
         if disposition in {CompletenessDisposition.INCOMPLETE, CompletenessDisposition.CONFLICT}:
-            question = await runner._compose_question(claim.session_id, computation.completeness_result, _node_trace_id(state))  # noqa: SLF001
+            question = await runner._compose_question(  # noqa: SLF001
+                claim.session_id,
+                computation.completeness_result,
+                _node_trace_id(state),
+                claim.idempotency_key,
+            )
             question_message_id = uuid.uuid4()
             question_spec = ConsultMessageSpec(
                 message_id=question_message_id,
@@ -1336,6 +1423,12 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                     "question_message_id": str(question_message_id) if question_message_id else None,
                 },
             )
+            await _persist_safety_assertions(
+                computation,
+                claim,
+                patient_message,
+                _node_trace_id(state),
+            )
         except RepositoryError as exc:
             await runner._mark_claim_failed(claim.id, exc.code.value)  # noqa: SLF001
             if exc.code is RepositoryErrorCode.STATE_VERSION_CONFLICT:
@@ -1345,6 +1438,10 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                 ) from exc
             raise
 
+        if question_message_id is not None:
+            persisted_agent_item = await _load_agent_item(db, question_message_id)
+            if persisted_agent_item is not None:
+                agent_item = persisted_agent_item
         patient_message_id = patient_message.id
         patient_role = patient_message.role
         patient_stage = patient_message.stage
@@ -1410,6 +1507,21 @@ async def _load_last_agent_item(
     )
 
 
+async def _load_agent_item(db: AsyncSession, message_id: uuid.UUID) -> AgentMessageItem | None:
+    """Load the canonical persisted message, including its database timestamp."""
+    message = await db.get(ConsultMessage, message_id)
+    if message is None:
+        return None
+    return AgentMessageItem(
+        message_id=str(message.id),
+        role="agent",
+        agent_name=message.agent_name,
+        stage=message.stage,
+        content=message.content,
+        created_at=message.created_at,
+    )
+
+
 def _graph_update_from_response(response: MessageCreateResponse) -> dict[str, Any]:
     artifact_refs: list[ArtifactRef] = [{"kind": "message", "artifact_id": response.message_id, "revision": 1}]
     if response.agent_message is not None:
@@ -1440,8 +1552,12 @@ def _parse_session_id(session_id: str) -> uuid.UUID:
         raise SessionNotFoundError(detail=f"session_id={session_id} format is invalid", retryable=False) from exc
 
 
-def _command_key(trace_id: str) -> str:
-    return _stable_ref("command", trace_id)[:128]
+def _command_key(idempotency_key: str | None) -> str:
+    """Derive a durable command key independently from the attempt trace."""
+
+    logical_key = idempotency_key or uuid.uuid4().hex
+    digest = hashlib.sha256(f"message\0{logical_key}".encode()).hexdigest()
+    return f"command:{digest}"
 
 
 def _payload_digest(body: MessageCreateRequest) -> str:
@@ -1507,8 +1623,11 @@ def _intake_output_to_delta(
         )
         for index, item in enumerate(observations)
     )
-    safety_profile = _merge_safety_profile(state.safety_profile, session_id, safety_delta)
-    if not observation_schemas and safety_profile is None:
+    # High-risk model output is candidate-only.  It is persisted separately as
+    # SafetyFactAssertion(proposed) and can reach SafetyProfile only through an
+    # explicit, evidence-verified confirmation transition.
+    del state, safety_delta
+    if not observation_schemas:
         artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-empty:{run_id}")
         artifact_revisions: tuple[ArtifactRevisionSchema, ...] = (
             ArtifactRevisionSchema(
@@ -1531,7 +1650,7 @@ def _intake_output_to_delta(
         expected_state_version=expected_state_version,
         source_message_ids=(source_message_id,),
         observations=observation_schemas,
-        safety_profile=safety_profile,
+        safety_profile=None,
         artifact_revisions=artifact_revisions,
     )
 
@@ -1542,83 +1661,6 @@ def _observation_status(operation: ObservationOperation) -> ObservationStatus:
     if operation is ObservationOperation.CORRECT:
         return ObservationStatus.CORRECTED
     return ObservationStatus.RETRACTED
-
-
-def _merge_safety_profile(
-    current: SafetyProfileSchema | None,
-    session_id: uuid.UUID,
-    delta: PatientSafetyDelta,
-) -> SafetyProfileSchema | None:
-    if not delta.has_candidate():
-        return None
-    values = (
-        current.model_dump(mode="python")
-        if current is not None
-        else {"session_id": session_id}
-    )
-    _merge_list_safety(values, "allergy_collection_status", "allergens", delta.allergy.status, delta.allergy.values)
-    _merge_scalar_safety(
-        values,
-        "pregnancy_collection_status",
-        "pregnancy_value",
-        delta.pregnancy.status,
-        delta.pregnancy.value.value if delta.pregnancy.value is not None else None,
-    )
-    _merge_scalar_safety(
-        values,
-        "lactation_collection_status",
-        "lactation_value",
-        delta.lactation.status,
-        delta.lactation.value.value if delta.lactation.value is not None else None,
-    )
-    _merge_list_safety(
-        values,
-        "medications_collection_status",
-        "medications",
-        delta.medications.status,
-        delta.medications.values,
-    )
-    _merge_list_safety(
-        values,
-        "major_conditions_collection_status",
-        "major_conditions",
-        delta.major_conditions.status,
-        delta.major_conditions.values,
-    )
-    _merge_list_safety(
-        values,
-        "contraindications_collection_status",
-        "contraindications",
-        delta.contraindications.status,
-        delta.contraindications.values,
-    )
-    return SafetyProfileSchema.model_validate(values)
-
-
-def _merge_list_safety(
-    values: dict[str, Any],
-    status_key: str,
-    value_key: str,
-    status: CollectionStatus,
-    raw_values: tuple[str, ...] | None,
-) -> None:
-    if status is CollectionStatus.UNKNOWN:
-        return
-    values[status_key] = status
-    values[value_key] = list(raw_values) if status is CollectionStatus.COLLECTED and raw_values else None
-
-
-def _merge_scalar_safety(
-    values: dict[str, Any],
-    status_key: str,
-    value_key: str,
-    status: CollectionStatus,
-    raw_value: str | None,
-) -> None:
-    if status is CollectionStatus.UNKNOWN:
-        return
-    values[status_key] = status
-    values[value_key] = raw_value if status is CollectionStatus.COLLECTED else None
 
 
 def _verification_context(
@@ -1880,7 +1922,7 @@ def _normalized_code(value: Any) -> str | None:
         raw = value.get("normalized_code") or value.get("code") or value.get("value")
     if isinstance(raw, bool):
         raw = "true" if raw else "false"
-    if isinstance(raw, (int, float)):
+    if isinstance(raw, int | float):
         raw = str(raw)
     if not isinstance(raw, str):
         return None

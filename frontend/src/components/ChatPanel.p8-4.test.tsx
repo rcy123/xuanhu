@@ -11,6 +11,7 @@ import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import * as api from '@/api/index'
 import type { SessionDetail } from '@/types/api'
+import { emptySessionReadModel } from '@/utils/readModel'
 
 // Mock SSE
 vi.mock('@/api/sse', () => ({
@@ -30,6 +31,8 @@ function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
     recovery_status: 'normal',
     rollback_counts: {},
     state_version: 1,
+    agent_runtime: 'legacy',
+    read_model: emptySessionReadModel('legacy', 1),
     patient_info: { name: '测试患者', gender: 'male', age: 35 },
     chief_complaint: '头痛',
     created_at: '2026-07-04T10:00:00+08:00',

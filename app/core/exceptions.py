@@ -49,6 +49,15 @@ class ValidationError(XuanhuError):
     retryable = False
 
 
+class LangGraphPublicDisabledError(XuanhuError):
+    """公共 API 的 LangGraph 会话创建尚未开放。"""
+
+    code = "LANGGRAPH_PUBLIC_DISABLED"
+    message = "LangGraph 公共会话创建尚未开放"
+    status_code = 403
+    retryable = False
+
+
 class SessionNotFoundError(XuanhuError):
     """会话不存在或已终止。"""
 
@@ -92,6 +101,38 @@ class InvalidStateVersionError(XuanhuError):
     message = "客户端状态版本落后，请刷新后重试"
     status_code = 409
     retryable = True
+
+
+class IdempotencyConflictError(XuanhuError):
+    """An idempotency key was already claimed by a different payload."""
+
+    code = "IDEMPOTENCY_KEY_REUSED"
+    message = "相同幂等键不能用于不同请求"
+    status_code = 409
+    retryable = False
+
+
+class HttpCommandRecoveryRequiredError(XuanhuError):
+    """A prior owner vanished after the command may have changed durable state."""
+
+    code = "HTTP_COMMAND_RECOVERY_REQUIRED"
+    message = "请求执行状态不明确，需要人工核对后恢复"
+    status_code = 409
+    retryable = False
+
+
+class HttpCommandReplayError(XuanhuError):
+    """Replay a previously persisted business error without executing again."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.code = str(payload.get("code") or "INTERNAL_ERROR")
+        self.status_code = int(payload.get("status_code") or 500)
+        self.extra_payload = dict(payload.get("extra_payload") or {})
+        super().__init__(
+            str(payload.get("message") or "请求执行失败"),
+            detail=(str(payload["detail"]) if payload.get("detail") is not None else None),
+            retryable=bool(payload.get("retryable", False)),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +239,15 @@ class StateRecoveryRequiredError(XuanhuError):
     code = "STATE_RECOVERY_REQUIRED"
     message = "无法自动恢复，需人工处理"
     status_code = 409
+    retryable = False
+
+
+class LangGraphRecoveryNotImplementedError(XuanhuError):
+    """LangGraph 会话恢复尚未实现，禁止回退到 Legacy 恢复链路。"""
+
+    code = "LANGGRAPH_RECOVERY_NOT_IMPLEMENTED"
+    message = "LangGraph 会话恢复尚未实现"
+    status_code = 501
     retryable = False
 
 

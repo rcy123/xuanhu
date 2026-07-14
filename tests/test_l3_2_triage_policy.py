@@ -19,7 +19,7 @@ from app.agent_runtime.triage_policy import (
     triage_gate_result,
 )
 from app.schemas.domain import GateDecision
-from app.schemas.intake import CandidateSeverity, RedFlagCandidate, RedFlagCategory
+from app.schemas.intake import CandidateSeverity, EvidenceSpan, RedFlagCandidate, RedFlagCategory
 from app.schemas.triage import (
     TRIAGE_GATE_NAME,
     TRIAGE_INPUT_SCHEMA_VERSION,
@@ -38,9 +38,16 @@ def candidate(
     confidence: float = 0.9,
     evidence: str = "sanitized red flag evidence",
 ) -> RedFlagCandidate:
+    actual_source = source or uuid4()
     return RedFlagCandidate(
         category=category,
-        source_message_id=source or uuid4(),
+        source_message_id=actual_source,
+        span=EvidenceSpan(
+            source_message_id=actual_source,
+            start_char=0,
+            end_char=8,
+            quote="evidence",
+        ),
         severity=severity,
         evidence=evidence,
         confidence=confidence,

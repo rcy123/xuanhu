@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
 from app.models.audit import AuditEvent
-from app.models.consult import ConsultSession
+from app.models.consult import ConsultMessage, ConsultSession
+from app.models.domain import GateResult, Observation, SafetyProfile
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -106,7 +107,7 @@ async def _check_postgres() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
 
 async def _create_session(
@@ -214,8 +215,167 @@ async def test_create_session_writes_audit_event(
     event = result.scalar_one()
     assert event.actor_type == "doctor"
     assert event.actor_id == "doctor_p3"
-    assert event.payload["patient_ref"] == f"{_TEST_PATIENT_REF_PREFIX}AUDIT001"
+    assert event.payload["patient_ref_present"] is True
+    assert "patient_ref" not in event.payload
+    assert "chief_complaint" not in event.payload
     assert event.payload["initial_stage"] == "inquiry"
+
+
+async def test_create_langgraph_session_seeds_identity_free_domain_state(
+    client: AsyncClient,
+    db: AsyncSession,
+    enable_public_langgraph: None,
+) -> None:
+    identity_name = "不得进入Domain的姓名"
+    identity_ref = f"{_TEST_PATIENT_REF_PREFIX}SEED-IDENTITY"
+    data = await _create_session(
+        client,
+        {
+            "agent_runtime": "langgraph",
+            "chief_complaint": "反复头痛",
+            "patient_info": {
+                "name": identity_name,
+                "patient_ref": identity_ref,
+                "age": 36,
+                "gender": "female",
+                "allergies": ["青霉素"],
+                "pregnancy_status": "no",
+                "current_medications": [],
+                "major_conditions": ["高血压"],
+            },
+        },
+    )
+    sid = uuid.UUID(data["session_id"])
+    await db.rollback()
+    observations = (
+        await db.execute(select(Observation).where(Observation.session_id == sid).order_by(Observation.fact_key))
+    ).scalars().all()
+    facts = {item.fact_key: item.value for item in observations}
+    assert facts == {
+        "chief_complaint.symptom": "反复头痛",
+        "patient.age": 36,
+        "patient.sex": "female",
+    }
+    safety = await db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == sid))
+    assert safety is not None
+    assert safety.allergy_collection_status == "collected"
+    assert safety.allergens == ["青霉素"]
+    assert safety.pregnancy_value == "not_pregnant"
+    assert safety.medications_collection_status == "explicitly_none"
+    assert safety.major_conditions == ["高血压"]
+
+    source = await db.scalar(
+        select(ConsultMessage).where(
+            ConsultMessage.session_id == sid,
+            ConsultMessage.agent_name == "initial_domain_seed",
+        )
+    )
+    audit = await db.scalar(
+        select(AuditEvent).where(
+            AuditEvent.session_id == sid,
+            AuditEvent.event_type == "initial_domain_seed.created",
+        )
+    )
+    assert source is not None and audit is not None
+    serialized_authority = f"{facts!r}{source.structured_delta!r}{audit.payload!r}"
+    assert identity_name not in serialized_authority
+    assert identity_ref not in serialized_authority
+
+    history = await client.get(f"/api/v1/consult/sessions/{sid}/messages")
+    assert history.status_code == 200
+    assert all(item.get("agent_name") != "initial_domain_seed" for item in history.json()["data"]["items"])
+
+
+async def test_create_langgraph_session_red_flag_chief_complaint_blocks_immediately(
+    client: AsyncClient,
+    db: AsyncSession,
+    enable_public_langgraph: None,
+) -> None:
+    data = await _create_session(
+        client,
+        {
+            "agent_runtime": "langgraph",
+            "chief_complaint": "突然胸痛并且呼吸困难",
+            "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}SEED-RED-FLAG"},
+        },
+    )
+    assert data["current_stage"] == "blocked"
+    assert data["status"] == "blocked"
+    sid = uuid.UUID(data["session_id"])
+    await db.rollback()
+    session = await db.get(ConsultSession, sid)
+    gate = await db.scalar(
+        select(GateResult).where(GateResult.session_id == sid, GateResult.gate_name == "triage")
+    )
+    assert session is not None and gate is not None
+    assert session.recovery_status == "manual_required"
+    assert gate.decision == "blocked"
+    assert (gate.details or {})["triage_precheck_version"] == "triage-raw-text-precheck.v1"
+
+
+async def test_create_langgraph_session_fails_closed_when_public_rollout_is_disabled(
+    client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    patient_ref = f"{_TEST_PATIENT_REF_PREFIX}LANGGRAPH-PUBLIC-DISABLED"
+    response = await client.post(
+        "/api/v1/consult/sessions",
+        json={
+            "agent_runtime": "langgraph",
+            "patient_info": {"patient_ref": patient_ref},
+        },
+        headers={"X-Request-Id": "trace-langgraph-public-disabled"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "code": "LANGGRAPH_PUBLIC_DISABLED",
+        "message": "LangGraph 公共会话创建尚未开放",
+        "detail": (
+            "agent_runtime=langgraph 的公共会话创建未启用；"
+            "请使用 legacy 或由运维启用 XUANHU_LANGGRAPH_PUBLIC_ENABLED"
+        ),
+        "retryable": False,
+        "stage": None,
+        "trace_id": "trace-langgraph-public-disabled",
+    }
+    assert await db.scalar(select(ConsultSession.id).where(ConsultSession.patient_ref == patient_ref)) is None
+
+
+async def test_default_langgraph_runtime_is_blocked_but_explicit_legacy_remains_available(
+    client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import get_settings
+
+    blocked_ref = f"{_TEST_PATIENT_REF_PREFIX}DEFAULT-LANGGRAPH-DISABLED"
+    legacy_ref = f"{_TEST_PATIENT_REF_PREFIX}EXPLICIT-LEGACY-ALLOWED"
+    monkeypatch.setenv("AGENT_RUNTIME_VERSION", "langgraph")
+    monkeypatch.setenv("XUANHU_LANGGRAPH_PUBLIC_ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        blocked = await client.post(
+            "/api/v1/consult/sessions",
+            json={"patient_info": {"patient_ref": blocked_ref}},
+        )
+        legacy = await client.post(
+            "/api/v1/consult/sessions",
+            json={
+                "agent_runtime": "legacy",
+                "patient_info": {"patient_ref": legacy_ref},
+            },
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert blocked.status_code == 403
+    assert blocked.json()["code"] == "LANGGRAPH_PUBLIC_DISABLED"
+    assert legacy.status_code == 201
+    assert await db.scalar(select(ConsultSession.id).where(ConsultSession.patient_ref == blocked_ref)) is None
+    legacy_session = await db.scalar(select(ConsultSession).where(ConsultSession.patient_ref == legacy_ref))
+    assert legacy_session is not None
+    assert legacy_session.agent_runtime == "legacy"
 
 
 async def test_create_session_default_values(client: AsyncClient, db: AsyncSession) -> None:

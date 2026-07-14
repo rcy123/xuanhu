@@ -142,6 +142,171 @@ class SafetyProfile(Base, UUIDPrimaryKeyMixin):
     )
 
 
+class SafetyFactAssertion(Base, UUIDPrimaryKeyMixin):
+    """Durable, provenance-bound candidate for one authoritative safety field.
+
+    Model output is stored here as ``proposed`` and cannot become part of the
+    authoritative ``SafetyProfile`` until an explicit confirmation transition
+    has re-validated its evidence against the immutable source-message ref.
+    """
+
+    __tablename__ = "safety_fact_assertions"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    field_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    value_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    assertion_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_messages.id", ondelete="RESTRICT"), nullable=False
+    )
+    extraction_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    template_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_spans: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    proposed_by_actor_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    proposed_by_actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    confirmed_by_actor_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    confirmed_by_actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by_actor_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    rejected_by_actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retracted_by_actor_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    retracted_by_actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    retracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    supersedes_assertion_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("safety_fact_assertions.id", ondelete="RESTRICT"), nullable=True
+    )
+
+    supersedes: Mapped[SafetyFactAssertion | None] = relationship(
+        "SafetyFactAssertion", remote_side="SafetyFactAssertion.id"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "field_name IN ('allergy','pregnancy','lactation','medications','major_conditions',"
+            "'contraindications','red_flag')",
+            name="chk_safety_fact_assertions_field",
+        ),
+        CheckConstraint(
+            "status IN ('proposed','confirmed','rejected','superseded','retracted')",
+            name="chk_safety_fact_assertions_status",
+        ),
+        CheckConstraint(
+            "source_kind IN ('model_extraction','deterministic_precheck','structured_form')",
+            name="chk_safety_fact_assertions_source_kind",
+        ),
+        CheckConstraint(
+            "proposed_by_actor_type IN ('model','doctor','system')",
+            name="chk_safety_fact_assertions_proposer_type",
+        ),
+        CheckConstraint(
+            "confirmed_by_actor_type IS NULL OR confirmed_by_actor_type IN ('doctor','system')",
+            name="chk_safety_fact_assertions_confirmer_type",
+        ),
+        CheckConstraint(
+            "rejected_by_actor_type IS NULL OR rejected_by_actor_type IN ('doctor','system')",
+            name="chk_safety_fact_assertions_rejecter_type",
+        ),
+        CheckConstraint(
+            "retracted_by_actor_type IS NULL OR retracted_by_actor_type IN ('doctor','system')",
+            name="chk_safety_fact_assertions_retractor_type",
+        ),
+        CheckConstraint("jsonb_typeof(value) = 'object'", name="chk_safety_fact_assertions_value_object"),
+        CheckConstraint(
+            "jsonb_typeof(evidence_spans) = 'array'",
+            name="chk_safety_fact_assertions_evidence_array",
+        ),
+        CheckConstraint("value_digest ~ '^[0-9a-f]{64}$'", name="chk_safety_fact_assertions_value_digest"),
+        CheckConstraint(
+            "assertion_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="chk_safety_fact_assertions_fingerprint",
+        ),
+        CheckConstraint(
+            "evidence_digest ~ '^[0-9a-f]{64}$'",
+            name="chk_safety_fact_assertions_evidence_digest",
+        ),
+        CheckConstraint(
+            "supersedes_assertion_id IS NULL OR supersedes_assertion_id <> id",
+            name="chk_safety_fact_assertions_no_self_supersede",
+        ),
+        CheckConstraint(
+            "(status = 'proposed' AND confirmed_at IS NULL AND rejected_at IS NULL AND retracted_at IS NULL "
+            "AND superseded_at IS NULL) OR "
+            "(status = 'confirmed' AND confirmed_at IS NOT NULL AND confirmed_by_actor_type IS NOT NULL "
+            "AND rejected_at IS NULL AND retracted_at IS NULL "
+            "AND superseded_at IS NULL) OR "
+            "(status = 'rejected' AND confirmed_at IS NULL AND rejected_at IS NOT NULL "
+            "AND rejected_by_actor_type IS NOT NULL AND retracted_at IS NULL "
+            "AND superseded_at IS NULL) OR "
+            "(status = 'superseded' AND confirmed_at IS NOT NULL AND confirmed_by_actor_type IS NOT NULL "
+            "AND rejected_at IS NULL AND retracted_at IS NULL "
+            "AND superseded_at IS NOT NULL) OR "
+            "(status = 'retracted' AND confirmed_at IS NOT NULL AND confirmed_by_actor_type IS NOT NULL "
+            "AND rejected_at IS NULL AND retracted_at IS NOT NULL AND retracted_by_actor_type IS NOT NULL "
+            "AND superseded_at IS NULL)",
+            name="chk_safety_fact_assertions_transition_state",
+        ),
+        UniqueConstraint("session_id", "assertion_fingerprint", name="uq_safety_fact_assertions_fingerprint"),
+        Index("idx_safety_fact_assertions_session_status", "session_id", "status", "proposed_at"),
+        Index("idx_safety_fact_assertions_source", "source_message_id", "extraction_run_id"),
+        Index(
+            "uq_safety_fact_assertions_one_confirmed_field",
+            "session_id",
+            "field_name",
+            unique=True,
+            postgresql_where=((status == "confirmed") & (field_name != "red_flag")),
+        ),
+    )
+
+
+class SafetyFactTransition(Base, UUIDPrimaryKeyMixin):
+    """Privacy-minimal idempotency ledger for assertion decisions."""
+
+    __tablename__ = "safety_fact_transitions"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    assertion_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("safety_fact_assertions.id", ondelete="CASCADE"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    idempotency_key_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    resulting_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("action IN ('confirm','reject','retract')", name="chk_safety_fact_transitions_action"),
+        CheckConstraint(
+            "resulting_status IN ('confirmed','rejected','retracted')",
+            name="chk_safety_fact_transitions_result",
+        ),
+        CheckConstraint(
+            "request_digest ~ '^[0-9a-f]{64}$'",
+            name="chk_safety_fact_transitions_request_digest",
+        ),
+        CheckConstraint(
+            "idempotency_key_digest ~ '^[0-9a-f]{64}$'",
+            name="chk_safety_fact_transitions_idempotency_digest",
+        ),
+        UniqueConstraint(
+            "session_id", "idempotency_key_digest", name="uq_safety_fact_transitions_idempotency"
+        ),
+        Index("idx_safety_fact_transitions_assertion", "assertion_id", "created_at"),
+    )
+
+
 class GraphRun(Base, UUIDPrimaryKeyMixin):
     """Minimal graph-execution metadata; never a source of clinical facts."""
 
@@ -336,12 +501,16 @@ class OutboxEvent(Base, UUIDPrimaryKeyMixin):
     last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (
         CheckConstraint("char_length(event_type) > 0", name="chk_outbox_events_type_nonempty"),
         CheckConstraint("state_version >= 1", name="chk_outbox_events_state_version"),
         CheckConstraint("attempt_count >= 0", name="chk_outbox_events_attempt_count"),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="chk_outbox_events_payload_object"),
-        CheckConstraint("status IN ('pending','leased','published')", name="chk_outbox_events_status"),
+        CheckConstraint(
+            "status IN ('pending','leased','published','dead_letter')",
+            name="chk_outbox_events_status",
+        ),
         CheckConstraint(
             "(status = 'leased' AND leased_by IS NOT NULL AND leased_until IS NOT NULL) OR "
             "(status <> 'leased' AND leased_by IS NULL AND leased_until IS NULL)",
@@ -352,10 +521,16 @@ class OutboxEvent(Base, UUIDPrimaryKeyMixin):
             name="chk_outbox_events_published_relation",
         ),
         CheckConstraint(
+            "(status = 'dead_letter' AND dead_lettered_at IS NOT NULL) OR "
+            "(status <> 'dead_letter' AND dead_lettered_at IS NULL)",
+            name="chk_outbox_events_dead_letter_relation",
+        ),
+        CheckConstraint(
             "last_error_code IS NULL OR last_error_code ~ '^[A-Z][A-Z0-9_]{0,63}$'",
             name="chk_outbox_events_error_code",
         ),
         Index("idx_outbox_events_claim", "status", "available_at", "leased_until", "created_at"),
+        Index("idx_outbox_events_dead_lettered", "status", "dead_lettered_at"),
         Index("idx_outbox_events_session_version", "session_id", "state_version"),
     )
 

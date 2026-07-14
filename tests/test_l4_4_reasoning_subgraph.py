@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-import os
-import sys
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -41,7 +39,8 @@ from app.agent_runtime.state import default_state, validate_state_json_safe
 from app.agent_runtime.syndrome_verifier import SyndromeCheckResult, SyndromeCheckStatus, SyndromeVerificationReport
 from app.agent_runtime.verifiers import VerificationContext
 from app.api.advance import _run_langgraph_advance
-from app.core.exceptions import InvalidStageTransitionError, InvalidStateVersionError, SessionBusyError
+from app.core.exceptions import InvalidStateVersionError
+from app.core.gateway import ModelTokenUsage, StructuredChatResponse
 from app.db.session import _build_async_pg_url, reset_session_factory
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
@@ -73,27 +72,23 @@ from app.schemas.syndrome import (
 )
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 from app.services.langgraph_reasoning import run_reasoning_draft_syndrome_node
+from tests._database_safety import destructive_database_environment
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
-def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-    if sys.platform == "win32":
-        return asyncio.WindowsSelectorEventLoopPolicy()
-    return asyncio.DefaultEventLoopPolicy()
-
-
-@pytest.fixture(scope="module")
 def migrated_database() -> str:
-    db_url = os.environ.get("DB_URL")
-    if not db_url:
-        pytest.skip("DB_URL is required for L4-4 PostgreSQL verification")
-    config = Config("alembic.ini")
-    command.upgrade(config, "head")
-    command.downgrade(config, "20260712_0006")
-    command.upgrade(config, "head")
-    return db_url
+    with destructive_database_environment() as db_url:
+        config = Config("alembic.ini")
+        config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
+        try:
+            command.upgrade(config, "head")
+            command.downgrade(config, "20260712_0006")
+            command.upgrade(config, "head")
+            yield db_url
+        finally:
+            command.upgrade(config, "head")
 
 
 @pytest.fixture
@@ -139,6 +134,20 @@ class _ReasoningFakeGateway:
         if not isinstance(outcome, output_schema):
             raise AssertionError(f"expected {type(outcome).__name__}, got request for {output_schema.__name__}")
         return outcome
+
+    async def chat_structured_observed(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        **kwargs: Any,
+    ) -> StructuredChatResponse:
+        requested_model = kwargs.get("model")
+        output = await self.chat_structured(messages, output_schema, **kwargs)
+        return StructuredChatResponse(
+            output=output,
+            model_actual=requested_model if isinstance(requested_model, str) else None,
+            usage=ModelTokenUsage(),
+        )
 
 
 def _install_gateway(monkeypatch: pytest.MonkeyPatch, gateway: _ReasoningFakeGateway) -> None:
@@ -1367,7 +1376,7 @@ async def test_concurrent_same_advance_command_does_not_duplicate_model_calls(
     gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
 
-    async def invoke() -> dict[str, Any] | BaseException:
+    async def invoke(trace_id: str) -> dict[str, Any] | BaseException:
         try:
             async with factory() as db:
                 session = await db.get(ConsultSession, session_id)
@@ -1377,17 +1386,22 @@ async def test_concurrent_same_advance_command_does_not_duplicate_model_calls(
                     session,
                     session_id=str(session_id),
                     state_version=1,
-                    trace_id="l4-4-concurrent-single-call",
+                    trace_id=trace_id,
+                    idempotency_key="advance-public-concurrent",
                 )
         except BaseException as exc:
             return exc
 
-    first, second = await asyncio.gather(invoke(), invoke())
+    first, second = await asyncio.gather(
+        invoke("l4-4-concurrent-first-trace"),
+        invoke("l4-4-concurrent-retry-trace"),
+    )
 
     responses = [item for item in (first, second) if isinstance(item, dict)]
     errors = [item for item in (first, second) if isinstance(item, BaseException)]
-    assert responses
-    assert all(isinstance(item, SessionBusyError | InvalidStageTransitionError) for item in errors)
+    assert len(responses) == 2
+    assert not errors
+    assert responses[0] == responses[1]
     assert gateway.calls == [SyndromeDraft, FormulaDraft]
 
 
@@ -1408,14 +1422,16 @@ async def test_completed_advance_command_replay_returns_cached_response_without_
             session,
             session_id=str(session_id),
             state_version=1,
-            trace_id="l4-4-replay",
+            trace_id="l4-4-replay-first-trace",
+            idempotency_key="advance-public-replay",
         )
         second = await _run_langgraph_advance(
             db,
             session,
             session_id=str(session_id),
             state_version=1,
-            trace_id="l4-4-replay",
+            trace_id="l4-4-replay-retry-trace",
+            idempotency_key="advance-public-replay",
         )
 
     assert first == second

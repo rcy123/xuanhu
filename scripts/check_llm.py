@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 # 确保项目根目录在 sys.path 中，以便 uv run python scripts/check_llm.py 可执行
 _project_root = Path(__file__).resolve().parent.parent
@@ -18,8 +19,8 @@ if str(_project_root) not in sys.path:
 # Windows 控制台 UTF-8 输出
 if sys.platform == "win32":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        cast(Any, sys.stdout).reconfigure(encoding="utf-8")
+        cast(Any, sys.stderr).reconfigure(encoding="utf-8")
     except Exception:
         pass
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -45,21 +44,27 @@ from app.schemas.domain import (
     ObservationStatus,
     SafetyProfileSchema,
 )
+from tests._database_safety import destructive_database_environment
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def migrated_database() -> str:
-    db_url = os.environ.get("DB_URL")
-    if not db_url:
-        pytest.skip("DB_URL is required for L2-5 PostgreSQL verification")
-    config = Config("alembic.ini")
-    command.downgrade(config, "20260710_0002")
-    command.upgrade(config, "20260711_0005")
-    command.downgrade(config, "20260710_0002")
-    command.upgrade(config, "20260711_0005")
-    return db_url
+    with destructive_database_environment() as db_url:
+        config = Config("alembic.ini")
+        config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
+        try:
+            command.downgrade(config, "20260710_0002")
+            command.upgrade(config, "20260711_0005")
+            command.downgrade(config, "20260710_0002")
+            command.upgrade(config, "20260711_0005")
+            # The round-trip above validates the historical L2.5 boundary. The
+            # repository itself must run against the current ORM schema.
+            command.upgrade(config, "head")
+            yield db_url
+        finally:
+            command.upgrade(config, "head")
 
 
 @pytest.fixture
@@ -82,6 +87,13 @@ async def store(
         async with engine.begin() as connection:
             await connection.execute(text("DROP TRIGGER IF EXISTS trg_l2_5_fail_outbox ON outbox_events"))
             await connection.execute(text("DROP FUNCTION IF EXISTS l2_5_fail_outbox()"))
+            await connection.execute(
+                text(
+                    "TRUNCATE domain_command_commits, outbox_events, gate_results, artifact_revisions, "
+                    "graph_run_steps, graph_runs, safety_profiles, observations, consult_messages, "
+                    "consult_sessions CASCADE"
+                )
+            )
         await engine.dispose()
 
 

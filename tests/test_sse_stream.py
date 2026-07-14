@@ -147,13 +147,13 @@ async def _check_postgres_and_redis() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"PostgreSQL 不可用，跳过 SSE 集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
     try:
         redis = await get_redis()
         await redis.ping()
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Redis 不可用，跳过 SSE 集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"Redis integration dependency unavailable: {type(exc).__name__}: {exc}")
 
 
 async def _create_session(client: AsyncClient) -> dict[str, Any]:

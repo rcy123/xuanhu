@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { StageResultsPanel } from './StageResultsPanel'
 import type { SessionDetail, Formula, SafetyReview } from '@/types/api'
+import { emptySessionReadModel } from '@/utils/readModel'
 
 function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
@@ -12,6 +13,8 @@ function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
     recovery_status: 'normal',
     rollback_counts: {},
     state_version: 1,
+    agent_runtime: 'legacy',
+    read_model: emptySessionReadModel('legacy', 1),
     patient_info: {},
     created_at: '2026-07-03T10:00:00+08:00',
     updated_at: '2026-07-03T10:00:00+08:00',

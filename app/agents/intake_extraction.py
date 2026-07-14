@@ -68,7 +68,7 @@ class IntakeExecutionResult(BaseModel):
 
 
 def build_intake_agent_spec(*, model: str | None = None) -> AgentSpec:
-    """Return the explicit v1 read-only spec.  No retry can add a request."""
+    """Return the explicit v2 read-only spec.  No retry can add a request."""
 
     return AgentSpec(
         name=INTAKE_AGENT_NAME,

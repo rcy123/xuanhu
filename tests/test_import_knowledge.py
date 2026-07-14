@@ -885,7 +885,7 @@ class TestIdempotency:
             # 不吞掉 AttributeError、TypeError 等代码逻辑错误。
             if isinstance(exc, (AttributeError, TypeError)):
                 raise
-            pytest.skip(f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}")
+            pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
         self._session_factory = session_factory
 

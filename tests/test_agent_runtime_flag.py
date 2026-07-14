@@ -53,3 +53,17 @@ def test_runtime_flag_is_visible_in_safe_config(
 ) -> None:
     settings = _settings(monkeypatch, "langgraph")
     assert settings.safe_dump()["agent_runtime_version"] == "langgraph"
+
+
+def test_langgraph_public_rollout_defaults_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XUANHU_LANGGRAPH_PUBLIC_ENABLED", raising=False)
+    settings = _settings(monkeypatch, None)
+    assert settings.langgraph_public_enabled is False
+
+
+def test_langgraph_public_rollout_uses_explicit_xuanhu_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XUANHU_LANGGRAPH_PUBLIC_ENABLED", "true")
+    settings = _settings(monkeypatch, None)
+    assert settings.langgraph_public_enabled is True

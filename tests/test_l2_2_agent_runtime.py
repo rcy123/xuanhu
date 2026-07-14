@@ -21,6 +21,7 @@ from app.agent_runtime.specs import (
     RuntimeErrorCode,
 )
 from app.core.exceptions import ChatStructuredParseError, ModelGatewayUnavailableError
+from app.core.gateway import ModelTokenUsage, StructuredChatResponse
 
 
 class InputPayload(BaseModel):
@@ -51,6 +52,21 @@ class FakeGateway:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class ObservedGateway(FakeGateway):
+    async def chat_structured_observed(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        **kwargs: Any,
+    ) -> StructuredChatResponse:
+        output = await self.chat_structured(messages, output_schema, **kwargs)
+        return StructuredChatResponse(
+            output=output_schema.model_validate(output),
+            model_actual="served-model-2026-07",
+            usage=ModelTokenUsage(prompt_tokens=17, completion_tokens=5, total_tokens=22),
+        )
 
 
 class FakeRecorder:
@@ -193,7 +209,9 @@ async def test_success_artifact_and_gateway_parameters_are_complete() -> None:
     artifact = await AgentRuntime(gateway, recorder).run(make_spec(), run, {"request": "ok"}, secret_messages())
     call = gateway.calls[0]
     assert artifact.output == OutputPayload(answer="ok")
-    assert artifact.model_actual == "fake-model"
+    # A legacy fake does not report serving metadata.  Requested model must not
+    # be copied into the actual-model field.
+    assert artifact.model_actual is None
     assert artifact.attempts == 1
     assert artifact.run_id == run.run_id
     assert artifact.trace_id == run.trace_id
@@ -208,6 +226,25 @@ async def test_success_artifact_and_gateway_parameters_are_complete() -> None:
     assert call["agent_name"] == "test-agent"
     assert call["max_requests"] == 1
     assert [event for event, _ in recorder.events] == ["started", "succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_observed_gateway_populates_actual_model_usage_and_output_digest() -> None:
+    gateway = ObservedGateway([{"answer": "ok"}])
+    recorder = FakeRecorder()
+    artifact = await AgentRuntime(gateway, recorder).run(
+        make_spec(), make_run(), {"request": "ok"}, secret_messages()
+    )
+
+    assert artifact.model_actual == "served-model-2026-07"
+    assert artifact.usage.prompt_tokens == 17
+    assert artifact.usage.completion_tokens == 5
+    assert artifact.usage.total_tokens == 22
+    succeeded = recorder.events[-1][1]
+    assert succeeded["model_requested"] == "fake-model"
+    assert succeeded["model_actual"] == "served-model-2026-07"
+    assert succeeded["output_digest"] is not None
+    assert len(succeeded["output_digest"]) == 64
 
 
 @pytest.mark.asyncio
@@ -325,11 +362,19 @@ async def test_recorder_is_minimal_and_its_failure_is_degraded() -> None:
     allowed = {
         "run_id",
         "session_id",
+        "agent_name",
+        "stage",
         "agent_spec_version",
         "prompt_version",
-        "model",
+        "output_schema_id",
+        "model_requested",
+        "model_actual",
         "attempts",
         "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "output_digest",
         "trace_id",
         "error_code",
     }

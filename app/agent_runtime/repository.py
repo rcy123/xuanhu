@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -197,6 +197,24 @@ class OutboxMessage(BaseModel):
     leased_by: str | None
 
 
+class OutboxHealth(BaseModel):
+    """Privacy-safe operational counters for the durable outbox."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    backlog_count: int = Field(ge=0)
+    pending_count: int = Field(ge=0)
+    leased_count: int = Field(ge=0)
+    dead_letter_count: int = Field(ge=0)
+    oldest_unpublished_age_seconds: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def backlog_matches_states(self) -> OutboxHealth:
+        if self.backlog_count != self.pending_count + self.leased_count:
+            raise ValueError("backlog_count must equal pending_count + leased_count")
+        return self
+
+
 class DomainRepository(Protocol):
     async def get_state(self, session_id: UUID) -> DomainState: ...
 
@@ -236,6 +254,16 @@ class OutboxRepository(Protocol):
         error_code: OutboxErrorCode,
         retry_after_seconds: int,
     ) -> bool: ...
+
+    async def dead_letter(
+        self,
+        event_id: UUID,
+        *,
+        worker_id: str,
+        error_code: OutboxErrorCode,
+    ) -> bool: ...
+
+    async def get_outbox_health(self) -> OutboxHealth: ...
 
 
 class PostgresDomainRepository(DomainRepository, OutboxRepository):
@@ -648,6 +676,81 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                     .returning(OutboxEvent.id)
                 )
                 return result.scalar_one_or_none() is not None
+        except SQLAlchemyError:
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
+
+    async def dead_letter(
+        self,
+        event_id: UUID,
+        *,
+        worker_id: str,
+        error_code: OutboxErrorCode,
+    ) -> bool:
+        """Move a currently owned lease to the durable terminal DLQ state."""
+        self._validate_worker(worker_id)
+        if not isinstance(error_code, OutboxErrorCode):
+            raise TypeError("error_code must be OutboxErrorCode")
+        try:
+            async with self._session_factory() as session, session.begin():
+                result = await session.execute(
+                    update(OutboxEvent)
+                    .where(
+                        OutboxEvent.id == event_id,
+                        OutboxEvent.status == "leased",
+                        OutboxEvent.leased_by == worker_id,
+                    )
+                    .values(
+                        status="dead_letter",
+                        leased_by=None,
+                        leased_until=None,
+                        last_error_code=error_code.value,
+                        dead_lettered_at=func.now(),
+                    )
+                    .returning(OutboxEvent.id)
+                )
+                return result.scalar_one_or_none() is not None
+        except SQLAlchemyError:
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
+
+    async def get_outbox_health(self) -> OutboxHealth:
+        """Return aggregate counters only; never return event payloads or identifiers."""
+        try:
+            async with self._session_factory() as session:
+                pending_count = int(
+                    await session.scalar(
+                        select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "pending")
+                    )
+                    or 0
+                )
+                leased_count = int(
+                    await session.scalar(
+                        select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "leased")
+                    )
+                    or 0
+                )
+                dead_letter_count = int(
+                    await session.scalar(
+                        select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "dead_letter")
+                    )
+                    or 0
+                )
+                oldest = await session.scalar(
+                    select(func.min(OutboxEvent.created_at)).where(
+                        OutboxEvent.status.in_(("pending", "leased"))
+                    )
+                )
+            age = 0.0
+            if oldest is not None:
+                if oldest.tzinfo is None:
+                    oldest = oldest.replace(tzinfo=UTC)
+                age = max(0.0, (datetime.now(UTC) - oldest).total_seconds())
+            return OutboxHealth(
+                backlog_count=pending_count + leased_count,
+                pending_count=pending_count,
+                leased_count=leased_count,
+                dead_letter_count=dead_letter_count,
+                oldest_unpublished_age_seconds=age,
+            )
         except SQLAlchemyError:
             raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
 

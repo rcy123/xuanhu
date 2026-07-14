@@ -12,15 +12,16 @@ P8-6: POST /messages 在 inquiry 阶段保存医生消息后触发 InquiryAgent
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
 from app.core.exceptions import (
     AgentTriggerFailedError,
+    IdempotencyConflictError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
     ModelGatewayUnavailableError,
@@ -34,6 +35,7 @@ from app.core.exceptions import (
 from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.message import MessageCreateRequest
+from app.services.http_idempotency import HttpCommandExecutor, session_http_scope
 from app.services.message import MessageService
 
 router = APIRouter(prefix="/api/v1/consult", tags=["messages"])
@@ -41,10 +43,7 @@ router = APIRouter(prefix="/api/v1/consult", tags=["messages"])
 
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
-    header = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-    if header:
-        return header
-    return str(uuid.uuid4())
+    return get_trace_id(request)
 
 
 def _doctor_id(
@@ -81,22 +80,46 @@ async def create_message(
     db: AsyncSession = Depends(get_db),
     doctor_id: str | None = Depends(_doctor_id),
     state_version: int | None = Depends(_state_version),
+    context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """提交问诊消息（P8-6: 触发 Agent 回复）。"""
-    trace_id = _get_trace_id(request)
+    del request
+    trace_id = context.trace_id
     service = MessageService(db)
-    data = await service.submit_message(
-        session_id,
-        body,
-        doctor_id=doctor_id,
-        trace_id=trace_id,
-        x_state_version=state_version,
+
+    async def submit() -> dict[str, Any]:
+        data = await service.submit_message(
+            session_id,
+            body,
+            doctor_id=doctor_id,
+            trace_id=trace_id,
+            x_state_version=state_version,
+            idempotency_key=context.idempotency_key,
+        )
+        return data.model_dump(mode="json", exclude_none=True)
+
+    scope = session_http_scope(session_id)
+    result = await HttpCommandExecutor(db).execute(
+        operation="session.message.create.v1",
+        scope_key=scope,
+        concurrency_scope=scope,
+        idempotency_key=context.idempotency_key,
+        is_idempotent=context.is_idempotent,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+        success_status=200,
+        success_message="ok",
+        handler=submit,
     )
     return JSONResponse(
-        status_code=200,
+        status_code=result.status_code,
         content=success_response(
-            data=data.model_dump(mode="json", exclude_none=True),
+            data=result.data,
             trace_id=trace_id,
+            message=result.message,
         ),
     )
 
@@ -263,6 +286,24 @@ async def model_gateway_unavailable_handler(
     )
 
 
+async def idempotency_conflict_handler(
+    request: Request, exc: IdempotencyConflictError
+) -> JSONResponse:
+    """Return a stable conflict when one public key is reused for another payload."""
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": _get_trace_id(request),
+        },
+    )
+
+
 # 导出路由级异常处理映射
 message_exception_handlers: dict[Any, Any] = {
     SessionBusyError: session_busy_handler,
@@ -272,4 +313,5 @@ message_exception_handlers: dict[Any, Any] = {
     InvalidStageTransitionError: message_invalid_stage_handler,
     AgentTriggerFailedError: agent_trigger_failed_handler,
     ModelGatewayUnavailableError: model_gateway_unavailable_handler,
+    IdempotencyConflictError: idempotency_conflict_handler,
 }

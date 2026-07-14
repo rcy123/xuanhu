@@ -9,13 +9,18 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.request_context import (
+    WriteRequestContext,
+    execute_model_write,
+    get_trace_id,
+    write_request_context,
+)
 from app.core.exceptions import (
     FormulaOverrideRequiredError,
     InvalidReviewActionError,
@@ -33,6 +38,7 @@ from app.core.exceptions import (
 from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.review import ReviewRequest
+from app.services.http_idempotency import session_http_scope
 from app.services.review import ReviewService
 
 router = APIRouter(prefix="/api/v1/consult", tags=["review"])
@@ -40,10 +46,7 @@ router = APIRouter(prefix="/api/v1/consult", tags=["review"])
 
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
-    header = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-    if header:
-        return header
-    return str(uuid.uuid4())
+    return get_trace_id(request)
 
 
 def _doctor_id(
@@ -80,6 +83,7 @@ async def review_prescription(
     db: AsyncSession = Depends(get_db),
     doctor_id: str | None = Depends(_doctor_id),
     state_version: int | None = Depends(_state_version),
+    context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """医师确认/修改/否决处方。
 
@@ -90,20 +94,37 @@ async def review_prescription(
 
     每次确认均写入 doctor_reviews 和 audit_events(doctor.reviewed)。
     """
-    trace_id = _get_trace_id(request)
+    del request
+    trace_id = context.trace_id
     service = ReviewService(db)
-    data = await service.review(
-        session_id,
-        body,
-        doctor_id=doctor_id,
-        trace_id=trace_id,
-        x_state_version=state_version,
+    scope = session_http_scope(session_id)
+    result = await execute_model_write(
+        db,
+        context,
+        operation="session.review.v1",
+        scope_key=scope,
+        concurrency_scope=scope,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+        success_status=200,
+        success_message="ok",
+        handler=lambda: service.review(
+            session_id,
+            body,
+            doctor_id=doctor_id,
+            trace_id=trace_id,
+            x_state_version=state_version,
+        ),
     )
     return JSONResponse(
-        status_code=200,
+        status_code=result.status_code,
         content=success_response(
-            data=data.model_dump(mode="json"),
+            data=result.data,
             trace_id=trace_id,
+            message=result.message,
         ),
     )
 

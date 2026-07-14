@@ -160,6 +160,7 @@ class MessageService:
         doctor_id: str | None,
         trace_id: str,
         x_state_version: int | None = None,
+        idempotency_key: str | None = None,
     ) -> MessageCreateResponse:
         """提交问诊消息。
 
@@ -189,6 +190,7 @@ class MessageService:
                 doctor_id=doctor_id,
                 trace_id=trace_id,
                 x_state_version=x_state_version,
+                idempotency_key=idempotency_key,
             )
 
         # 段 A：保存医生消息
@@ -683,7 +685,13 @@ class MessageService:
         await self._load_session(session_id)
         sid = uuid.UUID(session_id)
 
-        stmt = select(ConsultMessage).where(ConsultMessage.session_id == sid)
+        stmt = select(ConsultMessage).where(
+            ConsultMessage.session_id == sid,
+            ~(
+                (ConsultMessage.role == "system")
+                & (ConsultMessage.agent_name == "initial_domain_seed")
+            ),
+        )
 
         if stage is not None:
             stmt = stmt.where(ConsultMessage.stage == stage)

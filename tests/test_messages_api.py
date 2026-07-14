@@ -175,7 +175,7 @@ async def _check_postgres() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}")
+        pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +630,7 @@ async def test_post_message_with_preoccupied_lock_returns_409(
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
         await redis.ping()
     except Exception:  # noqa: BLE001
-        pytest.skip("Redis 不可用，跳过确定性锁冲突测试")
+        pytest.fail("Redis integration dependency unavailable")
 
     try:
         # 占用锁

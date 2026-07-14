@@ -24,6 +24,7 @@ from app.models.knowledge import (
     KnowledgeSource,
     TheoryCase,
 )
+from app.models.model_run_audit import ModelRunAudit
 from app.models.review import DoctorReview, MedicalRecord
 from app.models.safety import SafetyRuleRun
 
@@ -35,6 +36,7 @@ __all__ = [
     "SafetyRuleRun",
     "DoctorReview",
     "MedicalRecord",
+    "ModelRunAudit",
     "AuditEvent",
     "KnowledgeSource",
     "Formula",

@@ -53,6 +53,7 @@ class EventAppendResult(BaseModel):
 
     event_id: str
     stream_key: str
+    deduplicated: bool = False
 
 
 class HeartbeatPayload(BaseModel):

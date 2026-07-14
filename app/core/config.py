@@ -158,6 +158,11 @@ class Settings(BaseSettings):
             "该开关不得改变既有会话的运行时身份"
         ),
     )
+    langgraph_public_enabled: bool = Field(
+        default=False,
+        validation_alias="XUANHU_LANGGRAPH_PUBLIC_ENABLED",
+        description="允许公共会话创建 API 新建 LangGraph 会话；默认关闭并失败封闭",
+    )
     agent_max_retries: int = Field(default=2, ge=0, description="Agent 最大重试次数")
     safety_rollback_limit: int = Field(default=3, ge=1, description="安全审核回退次数上限")
     enable_streaming: bool = Field(default=False, description="是否启用 SSE 流式输出")
@@ -168,6 +173,27 @@ class Settings(BaseSettings):
     )
     prompt_manifest_path: str = Field(
         default="app/agents/prompts/manifest.yaml", description="Prompt 清单文件路径"
+    )
+
+    # ---- Durable Outbox Publisher ----
+    outbox_publisher_enabled: bool = Field(
+        default=True,
+        description="启动 PostgreSQL Outbox 到 Redis Stream 的后台发布器",
+    )
+    outbox_publisher_batch_size: int = Field(default=50, ge=1, le=500)
+    outbox_publisher_lease_seconds: int = Field(default=30, ge=1, le=3600)
+    outbox_publisher_max_attempts: int = Field(default=8, ge=1, le=100)
+    outbox_publisher_base_retry_seconds: int = Field(default=1, ge=0, le=3600)
+    outbox_publisher_max_retry_seconds: int = Field(default=300, ge=1, le=86_400)
+    outbox_publisher_poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
+    outbox_publisher_shutdown_grace_seconds: float = Field(default=10, gt=0, le=120)
+    outbox_ready_max_oldest_age_seconds: float = Field(default=300, ge=0)
+    outbox_ready_max_dead_letters: int = Field(default=0, ge=0)
+    event_dedupe_ttl_seconds: int = Field(
+        default=86_400,
+        ge=60,
+        le=2_592_000,
+        description="Redis Stream 每会话 Outbox 去重窗口的滑动 TTL（秒）",
     )
 
     # ---- 会话锁与导出 ----

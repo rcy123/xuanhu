@@ -3,6 +3,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { RecordPanel } from './RecordPanel'
 import type { SessionDetail, RecordResponse } from '@/types/api'
 import { ApiRequestError } from '@/api/errors'
+import { emptySessionReadModel } from '@/utils/readModel'
 
 afterEach(() => {
   cleanup()
@@ -18,6 +19,8 @@ function makeDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
     recovery_status: 'normal',
     rollback_counts: {},
     state_version: 10,
+    agent_runtime: 'legacy',
+    read_model: emptySessionReadModel('legacy', 10),
     patient_info: {},
     created_at: '2026-07-04T10:00:00+08:00',
     updated_at: '2026-07-04T10:00:00+08:00',

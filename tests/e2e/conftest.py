@@ -29,6 +29,7 @@ from app.main import app
 from app.models.agent import AgentRun
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
+from app.models.knowledge import DosageUnit, Herb
 from app.models.review import DoctorReview, MedicalRecord
 from app.models.safety import SafetyRuleRun
 
@@ -265,13 +266,9 @@ def build_fake_registry(
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
-async def _cleanup_e2e_data() -> None:
+async def _cleanup_e2e_data(_check_infra: None) -> None:
     """模块结束时级联清理本模块创建的所有会话及关联数据。"""
-    from app.core.config import get_settings
-    from app.db.session import get_session_factory, reset_session_factory
-
-    get_settings.cache_clear()
-    await reset_session_factory()
+    from app.db.session import get_session_factory
 
     yield
 
@@ -327,11 +324,12 @@ async def _cleanup_e2e_data() -> None:
 async def _check_infra() -> None:
     """检查 PostgreSQL / Redis 可用性。
 
-    连接类异常自动跳过；其他异常直接失败以暴露真实问题（不掩盖）。
+    任何连接异常都直接失败，防止 integration 门禁假绿。
     """
     from app.core.config import get_settings
     from app.db.session import get_session_factory, reset_session_factory
 
+    get_settings.cache_clear()
     get_settings()
     await reset_session_factory()
     factory = get_session_factory()
@@ -340,14 +338,50 @@ async def _check_infra() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except (OSError, ConnectionError) as exc:
-        pytest.skip(
-            f"PostgreSQL 不可用，跳过 E2E 测试: {type(exc).__name__}: {exc}"
+        pytest.fail(
+            f"PostgreSQL E2E dependency unavailable: {type(exc).__name__}: {exc}"
         )
     except Exception as exc:  # noqa: BLE001
         pytest.fail(
             f"PostgreSQL 检查出现非连接类异常: {type(exc).__name__}: {exc}",
             pytrace=True,
         )
+
+    async with factory() as session:
+        existing_herbs = set((await session.scalars(select(Herb.name))).all())
+        for name, aliases, max_dose, doc_text in (
+            ("党参", ["潞党参"], 30.0, "党参 补中益气"),
+            ("白术", ["于术"], 15.0, "白术 补气健脾"),
+            ("茯苓", [], 30.0, "茯苓 利水渗湿"),
+        ):
+            if name not in existing_herbs:
+                session.add(
+                    Herb(
+                        name=name,
+                        aliases=aliases,
+                        max_dose=max_dose,
+                        pregnancy_contraindication="none",
+                        doc_text=doc_text,
+                    )
+                )
+        dosage_unit = await session.scalar(select(DosageUnit).where(DosageUnit.unit_name == "g"))
+        if dosage_unit is None:
+            session.add(
+                DosageUnit(
+                    unit_name="g",
+                    aliases=["克"],
+                    to_grams=1.0,
+                    conversion_type="standard",
+                    is_standard=True,
+                    enabled=True,
+                )
+            )
+        await session.commit()
+
+    try:
+        yield
+    finally:
+        await reset_session_factory()
 
 
 @pytest_asyncio.fixture(loop_scope="module")
@@ -365,7 +399,7 @@ async def db() -> AsyncSession:
         yield session
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(loop_scope="module")
 async def fresh_db() -> AsyncSession:
     """函数级全新 AsyncSession，用于在 HTTP 请求后读取最新 DB 状态。
 

@@ -7,6 +7,7 @@
 
 import { request, requestWithRetry } from './client'
 import type { RequestContext } from './client'
+import { generateIdempotencyKey } from '@/utils/id'
 import type {
   AdvanceData,
   AdvanceRequest,
@@ -40,10 +41,11 @@ export function createSession(
   body: SessionCreateRequest,
   ctx?: RequestContext,
 ): Promise<SessionCreateData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<SessionCreateData>('consult/sessions', {
     method: 'POST',
     body: JSON.stringify(body),
-    ctx,
+    ctx: writeContext,
   })
 }
 
@@ -72,12 +74,13 @@ export function terminateSession(
   body: { reason?: string | null } = {},
   ctx?: RequestContext,
 ): Promise<SessionTerminateData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<SessionTerminateData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/terminate`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
 }
@@ -97,12 +100,13 @@ export function submitMessage(
   body: MessageCreateRequest,
   ctx?: RequestContext,
 ): Promise<MessageCreateData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<MessageCreateData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
 }
@@ -117,12 +121,13 @@ export function submitMessageWithRetry(
   ctx?: RequestContext,
   maxRetries = 3,
 ): Promise<MessageCreateData> {
+  const writeContext = withIdempotencyKey(ctx)
   return requestWithRetry<MessageCreateData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
       maxRetries,
     },
   )
@@ -153,12 +158,13 @@ export function recoverSession(
   body: RecoveryRequest,
   ctx?: RequestContext,
 ): Promise<RecoveryData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<RecoveryData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/recover`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
 }
@@ -179,12 +185,13 @@ export function reviewPrescription(
   body: ReviewRequest,
   ctx?: RequestContext,
 ): Promise<ReviewData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<ReviewData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/review`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
 }
@@ -230,12 +237,13 @@ export function updateRecord(
   body: RecordUpdateRequest,
   ctx?: RequestContext,
 ): Promise<RecordUpdateResponse> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<RecordUpdateResponse>(
     `consult/sessions/${encodeURIComponent(sessionId)}/record`,
     {
       method: 'PUT',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
 }
@@ -282,14 +290,22 @@ export function advanceSession(
   body: AdvanceRequest = {},
   ctx?: RequestContext,
 ): Promise<AdvanceData> {
+  const writeContext = withIdempotencyKey(ctx)
   return request<AdvanceData>(
     `consult/sessions/${encodeURIComponent(sessionId)}/advance`,
     {
       method: 'POST',
       body: JSON.stringify(body),
-      ctx,
+      ctx: writeContext,
     },
   )
+}
+
+function withIdempotencyKey(ctx?: RequestContext): RequestContext {
+  return {
+    ...ctx,
+    idempotencyKey: ctx?.idempotencyKey ?? generateIdempotencyKey(),
+  }
 }
 
 // ---------------------------------------------------------------------------

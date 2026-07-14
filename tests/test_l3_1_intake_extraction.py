@@ -37,6 +37,7 @@ from app.schemas.intake import (
     Ambiguity,
     AmbiguityCode,
     CandidateSeverity,
+    EvidenceSpan,
     IntakeExtractionDecision,
     IntakeExtractionInput,
     IntakeExtractionOutput,
@@ -126,6 +127,17 @@ def observation(source: UUID, key: str = "chief_complaint.headache", value: Any 
     )
 
 
+def evidence_span(source: UUID, text: str, quote: str | None = None) -> EvidenceSpan:
+    exact_quote = quote or text
+    start = text.index(exact_quote)
+    return EvidenceSpan(
+        source_message_id=source,
+        start_char=start,
+        end_char=start + len(exact_quote),
+        quote=exact_quote,
+    )
+
+
 def extracted(source: UUID, *items: ObservationDelta) -> IntakeExtractionOutput:
     return IntakeExtractionOutput(
         decision=IntakeExtractionDecision.EXTRACTED,
@@ -168,7 +180,7 @@ async def execute(
 def test_contract_is_versioned_strict_serializable_and_output_has_only_five_fields() -> None:
     source = uuid4()
     output = extracted(source)
-    assert output.schema_version == "intake-extraction.v1"
+    assert output.schema_version == "intake-extraction.v2"
     assert set(IntakeExtractionOutput.model_fields) == {
         "decision",
         "observations",
@@ -544,6 +556,7 @@ def test_safety_unknown_and_explicitly_none_are_distinct() -> None:
     explicitly_none = SafetyListDelta(
         status=CollectionStatus.EXPLICITLY_NONE,
         source_message_id=source,
+        negation_span=evidence_span(source, "无药物过敏史"),
     )
     assert unknown.status is CollectionStatus.UNKNOWN and unknown.source_message_id is None
     assert explicitly_none.status is CollectionStatus.EXPLICITLY_NONE
@@ -560,11 +573,13 @@ def test_pregnancy_and_lactation_three_state_value_domains() -> None:
         status=CollectionStatus.COLLECTED,
         value=PregnancyValue.POSSIBLE,
         source_message_id=source,
+        span=evidence_span(source, "可能怀孕"),
     )
     lactating = LactationDelta(
         status=CollectionStatus.COLLECTED,
         value=LactationValue.LACTATING,
         source_message_id=source,
+        span=evidence_span(source, "正在哺乳"),
     )
     assert pregnant.value is PregnancyValue.POSSIBLE
     assert lactating.value is LactationValue.LACTATING
@@ -580,10 +595,16 @@ async def test_medications_and_major_conditions_are_candidate_safety_fields() ->
     source = payload.current_messages[0].message_id
     safety = PatientSafetyDelta(
         medications=SafetyListDelta(
-            status=CollectionStatus.COLLECTED, values=("阿司匹林",), source_message_id=source
+            status=CollectionStatus.COLLECTED,
+            values=("阿司匹林",),
+            source_message_id=source,
+            value_spans=(evidence_span(source, payload.current_messages[0].content, "阿司匹林"),),
         ),
         major_conditions=SafetyListDelta(
-            status=CollectionStatus.COLLECTED, values=("高血压",), source_message_id=source
+            status=CollectionStatus.COLLECTED,
+            values=("高血压",),
+            source_message_id=source,
+            value_spans=(evidence_span(source, payload.current_messages[0].content, "高血压"),),
         ),
     )
     result, _ = await execute(
@@ -594,11 +615,217 @@ async def test_medications_and_major_conditions_are_candidate_safety_fields() ->
     assert result.output.patient_safety_delta.medications.values == ("阿司匹林",)
 
 
+@pytest.mark.asyncio
+async def test_high_risk_safety_values_are_grounded_to_exact_current_message_spans() -> None:
+    payload = make_input("我对青霉素过敏，目前服用阿司匹林，可能怀孕，目前没有哺乳")
+    source = payload.current_messages[0].message_id
+    text = payload.current_messages[0].content
+    safety = PatientSafetyDelta(
+        allergy=SafetyListDelta(
+            status=CollectionStatus.COLLECTED,
+            values=("青霉素",),
+            source_message_id=source,
+            value_spans=(evidence_span(source, text, "青霉素过敏"),),
+        ),
+        medications=SafetyListDelta(
+            status=CollectionStatus.COLLECTED,
+            values=("阿司匹林",),
+            source_message_id=source,
+            value_spans=(evidence_span(source, text, "服用阿司匹林"),),
+        ),
+        pregnancy=PregnancyDelta(
+            status=CollectionStatus.COLLECTED,
+            value=PregnancyValue.POSSIBLE,
+            source_message_id=source,
+            span=evidence_span(source, text, "可能怀孕"),
+        ),
+        lactation=LactationDelta(
+            status=CollectionStatus.COLLECTED,
+            value=LactationValue.NOT_LACTATING,
+            source_message_id=source,
+            span=evidence_span(source, text, "没有哺乳"),
+        ),
+    )
+
+    result, gateway = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            patient_safety_delta=safety,
+        ),
+    )
+
+    assert result.status is IntakeExecutionStatus.SUCCEEDED
+    assert result.verification is not None and result.verification.passed
+    assert gateway.actual_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_span_range_and_quote_mismatch_fails_closed_after_one_model_request() -> None:
+    payload = make_input("现在呼吸困难")
+    source = payload.current_messages[0].message_id
+    candidate = RedFlagCandidate(
+        category=RedFlagCategory.BREATHING_DIFFICULTY,
+        source_message_id=source,
+        span=EvidenceSpan(
+            source_message_id=source,
+            start_char=2,
+            end_char=6,
+            quote="呼吸很难",
+        ),
+        severity=CandidateSeverity.HIGH,
+        evidence="呼吸困难",
+        confidence=0.99,
+    )
+
+    result, gateway = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            red_flag_candidates=(candidate,),
+        ),
+    )
+
+    assert result.status is IntakeExecutionStatus.FAILED
+    assert result.failure_code is IntakeVerificationFailureCode.GROUNDING_SPAN_INVALID
+    assert result.output is None
+    assert gateway.actual_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_safety_value_must_match_its_quote_under_controlled_normalization() -> None:
+    payload = make_input("目前服用阿司匹林")
+    source = payload.current_messages[0].message_id
+    safety = PatientSafetyDelta(
+        medications=SafetyListDelta(
+            status=CollectionStatus.COLLECTED,
+            values=("华法林",),
+            source_message_id=source,
+            value_spans=(evidence_span(source, payload.current_messages[0].content, "阿司匹林"),),
+        )
+    )
+
+    result, gateway = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            patient_safety_delta=safety,
+        ),
+    )
+
+    assert result.failure_code is IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH
+    assert result.output is None
+    assert gateway.actual_request_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "没有呼吸困难",
+        "可能呼吸困难",
+        "以前呼吸困难",
+        "如果呼吸困难就去医院",
+    ),
+)
+async def test_negated_uncertain_historical_or_hypothetical_red_flag_is_not_grounded(
+    text: str,
+) -> None:
+    payload = make_input(text)
+    source = payload.current_messages[0].message_id
+    candidate = RedFlagCandidate(
+        category=RedFlagCategory.BREATHING_DIFFICULTY,
+        source_message_id=source,
+        span=evidence_span(source, text, "呼吸困难"),
+        severity=CandidateSeverity.HIGH,
+        evidence="呼吸困难",
+        confidence=0.95,
+    )
+
+    result, _ = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            red_flag_candidates=(candidate,),
+        ),
+    )
+
+    assert result.failure_code is IntakeVerificationFailureCode.GROUNDING_CONTEXT_UNSAFE
+    assert result.output is None
+
+
+@pytest.mark.asyncio
+async def test_contrast_limits_negation_scope_and_rejects_global_explicit_none() -> None:
+    text = "没有药物过敏，但是青霉素过敏；没有胸痛，但是呼吸困难"
+    payload = make_input(text)
+    source = payload.current_messages[0].message_id
+    breathing = RedFlagCandidate(
+        category=RedFlagCategory.BREATHING_DIFFICULTY,
+        source_message_id=source,
+        span=evidence_span(source, text, "呼吸困难"),
+        severity=CandidateSeverity.HIGH,
+        evidence="呼吸困难",
+        confidence=0.98,
+    )
+    grounded_red_flag, _ = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            red_flag_candidates=(breathing,),
+        ),
+    )
+    assert grounded_red_flag.status is IntakeExecutionStatus.SUCCEEDED
+
+    unsafe_none = PatientSafetyDelta(
+        allergy=SafetyListDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            negation_span=evidence_span(source, text, "没有药物过敏"),
+        )
+    )
+    rejected_none, _ = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            patient_safety_delta=unsafe_none,
+        ),
+    )
+    assert rejected_none.failure_code is IntakeVerificationFailureCode.GROUNDING_CONTEXT_UNSAFE
+    assert rejected_none.output is None
+
+
+@pytest.mark.asyncio
+async def test_one_named_negative_cannot_establish_field_wide_explicit_none() -> None:
+    text = "我对青霉素不过敏"
+    payload = make_input(text)
+    source = payload.current_messages[0].message_id
+    unsafe_none = PatientSafetyDelta(
+        allergy=SafetyListDelta(
+            status=CollectionStatus.EXPLICITLY_NONE,
+            source_message_id=source,
+            negation_span=evidence_span(source, text, "青霉素不过敏"),
+        )
+    )
+
+    result, gateway = await execute(
+        payload,
+        IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            patient_safety_delta=unsafe_none,
+        ),
+    )
+
+    assert result.failure_code is IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH
+    assert result.output is None
+    assert gateway.actual_request_count == 1
+
+
 def test_red_flag_is_candidate_only_and_authority_fields_are_forbidden() -> None:
     source = uuid4()
     candidate = RedFlagCandidate(
         category=RedFlagCategory.BREATHING_DIFFICULTY,
         source_message_id=source,
+        span=evidence_span(source, "呼吸困难"),
         severity=CandidateSeverity.HIGH,
         evidence="患者称呼吸困难",
         confidence=0.91,

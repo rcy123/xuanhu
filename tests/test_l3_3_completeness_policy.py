@@ -34,7 +34,7 @@ from app.schemas.completeness import (
     StagnationReasonCode,
 )
 from app.schemas.domain import CollectionStatus, GateDecision, ObservationStatus
-from app.schemas.intake import CandidateSeverity, RedFlagCandidate, RedFlagCategory
+from app.schemas.intake import CandidateSeverity, EvidenceSpan, RedFlagCandidate, RedFlagCategory
 from app.schemas.triage import (
     TriageCategoryCount,
     TriageDisposition,
@@ -50,13 +50,20 @@ def passed_triage(state_version: int = 7) -> TriageGateResult:
 
 
 def blocked_triage(state_version: int = 7) -> TriageGateResult:
+    source_message_id = uuid4()
     return evaluate_triage_policy(
         TriagePolicyInput(
             input_state_version=state_version,
             red_flag_candidates=(
                 RedFlagCandidate(
                     category=RedFlagCategory.BREATHING_DIFFICULTY,
-                    source_message_id=uuid4(),
+                    source_message_id=source_message_id,
+                    span=EvidenceSpan(
+                        source_message_id=source_message_id,
+                        start_char=0,
+                        end_char=4,
+                        quote="呼吸困难",
+                    ),
                     severity=CandidateSeverity.LOW,
                     evidence="sanitized evidence not retained by completeness",
                     confidence=0,

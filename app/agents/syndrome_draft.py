@@ -442,7 +442,7 @@ def _run_artifact_from_payload(payload: dict[str, Any], output: SyndromeDraft) -
         raise ValueError("run artifact output mismatch")
     return RunArtifact(
         output=output,
-        model_actual=str(payload["model_actual"]),
+        model_actual=None if payload["model_actual"] is None else str(payload["model_actual"]),
         attempts=int(payload["attempts"]),
         latency_ms=int(payload["latency_ms"]),
         usage=TokenUsage.model_validate(payload["usage"]),

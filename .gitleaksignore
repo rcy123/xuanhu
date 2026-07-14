@@ -1,0 +1,4 @@
+# Historical synthetic credential in the error-sanitization regression fixture.
+0257638b7953aacc9355bd9efe99dff87e7a6515:tests/test_sync_knowledge_chunks.py:generic-api-key:625
+# The same synthetic fixture in a clean working-tree scan mounted at /repo.
+/repo/tests/test_sync_knowledge_chunks.py:generic-api-key:625

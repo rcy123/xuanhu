@@ -3,8 +3,8 @@
 覆盖 confirm / modify 通过 / modify 阻断 / reject / 非法 action /
 缺 formula_override / 非 review 阶段拒绝 / state_version 冲突 / 会话锁冲突。
 
-本测试为集成测试，需要可连接的 PostgreSQL + Redis；不可用时自动跳过。
-依赖 DB 中已导入的 herbs/dosage_units 种子数据（党参已存在，max_dose=30）。
+本测试为集成测试，需要可连接的 PostgreSQL + Redis；依赖不可用时失败。
+药材与剂量单位由模块 fixture 显式写入隔离测试库。
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.main import app
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
+from app.models.knowledge import DosageUnit, Herb
 from app.models.review import DoctorReview
 from app.models.safety import SafetyRuleRun
 
@@ -37,7 +38,7 @@ _TEST_DOCTOR_ID = "doctor_p7_1_review"
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
-async def _cleanup_test_sessions() -> None:
+async def _cleanup_test_sessions(_check_postgres: None) -> None:
     """模块结束时清理本模块创建的会话及关联数据。
 
     B-012: 不在 fixture setup 阶段调用 reset_session_factory()。
@@ -131,8 +132,8 @@ async def _check_postgres() -> None:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
     except (OSError, ConnectionError) as exc:
-        pytest.skip(
-            f"PostgreSQL 不可用，跳过集成测试: {type(exc).__name__}: {exc}"
+        pytest.fail(
+            f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}"
         )
     except Exception as exc:  # noqa: BLE001
         # 连接类以外的异常（如已关闭 engine、asyncpg 内部错误）不掩盖，
@@ -142,6 +143,41 @@ async def _check_postgres() -> None:
             f"{type(exc).__name__}: {exc}",
             pytrace=True,
         )
+
+    async with factory() as session:
+        existing_herbs = set((await session.scalars(select(Herb.name))).all())
+        for name, aliases, max_dose, doc_text in (
+            ("党参", ["潞党参"], 30.0, "党参 补中益气"),
+            ("白术", ["于术"], 15.0, "白术 补气健脾"),
+        ):
+            if name not in existing_herbs:
+                session.add(
+                    Herb(
+                        name=name,
+                        aliases=aliases,
+                        max_dose=max_dose,
+                        pregnancy_contraindication="none",
+                        doc_text=doc_text,
+                    )
+                )
+        dosage_unit = await session.scalar(select(DosageUnit).where(DosageUnit.unit_name == "g"))
+        if dosage_unit is None:
+            session.add(
+                DosageUnit(
+                    unit_name="g",
+                    aliases=["克"],
+                    to_grams=1.0,
+                    conversion_type="standard",
+                    is_standard=True,
+                    enabled=True,
+                )
+            )
+        await session.commit()
+
+    try:
+        yield
+    finally:
+        await reset_session_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +741,7 @@ async def test_session_lock_conflict(
             lock_key = f"xuanhu:session_lock:{session.id}"
             await redis.set(lock_key, "other-trace", nx=True, ex=90)
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"Redis 不可用，跳过锁冲突测试: {exc}")
+            pytest.fail(f"Redis integration dependency unavailable: {type(exc).__name__}: {exc}")
 
         resp = await client.post(
             f"/api/v1/consult/sessions/{session.id}/review",

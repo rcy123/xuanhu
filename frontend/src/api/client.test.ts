@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiRequestError,
+  advanceSession,
   createSession,
   getHealth,
   getRecord,
@@ -328,7 +329,7 @@ describe('request - URL 拼接', () => {
 describe('requestWithRetry', () => {
   it('可重试错误在 maxRetries 内成功则返回', async () => {
     let calls = 0
-    mockFetch(() => {
+    const fn = mockFetch(() => {
       calls++
       if (calls < 3) {
         return mockResponse({
@@ -349,6 +350,11 @@ describe('requestWithRetry', () => {
     )
     expect(data).toMatchObject({ ok: true })
     expect(calls).toBe(3)
+    const keys = fn.mock.calls.map(
+      (call) => (call[1].headers as Record<string, string>)['X-Idempotency-Key'],
+    )
+    expect(keys[0]).toBeTruthy()
+    expect(new Set(keys).size).toBe(1)
   })
 
   it('不可重试错误立即抛出，不重试', async () => {
@@ -484,6 +490,26 @@ describe('业务方法签名', () => {
     expect(init.method).toBe('POST')
     const headers = init.headers as Record<string, string>
     expect(headers['X-State-Version']).toBe('1')
+    expect(headers['X-Idempotency-Key']).toBeTruthy()
+  })
+
+  it('advanceSession 自动生成幂等键并保留调用方提供的键', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: {
+          code: 'SUCCESS',
+          data: { session_id: 's', current_stage: 'review', state_version: 2 },
+          trace_id: 't',
+        },
+      }),
+    )
+    await advanceSession('s')
+    await advanceSession('s', {}, { idempotencyKey: 'caller-key' })
+
+    const firstHeaders = fn.mock.calls[0][1]?.headers as Record<string, string>
+    const secondHeaders = fn.mock.calls[1][1]?.headers as Record<string, string>
+    expect(firstHeaders['X-Idempotency-Key']).toBeTruthy()
+    expect(secondHeaders['X-Idempotency-Key']).toBe('caller-key')
   })
 
   it('terminateSession 发送 POST terminate 请求体', async () => {

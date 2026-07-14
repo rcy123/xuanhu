@@ -38,7 +38,7 @@ export function RejectModal({ open, submitting, onCancel, onSubmit }: RejectModa
         disabled: submitting,
         'data-testid': 'reject-submit-btn',
       } as ButtonProps}
-      destroyOnClose
+      destroyOnHidden
     >
       <div style={{ marginBottom: 'var(--xh-space-m)' }}>
         <Text type="secondary" style={{ fontSize: 12 }}>

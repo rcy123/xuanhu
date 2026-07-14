@@ -16,8 +16,9 @@
 环境变量：
     P9_2_BASE_URL  — 前端地址（默认 http://127.0.0.1:5173）
     P9_2_API_BASE  — 后端 API 地址（默认 http://127.0.0.1:8000/api/v1）
-    DB_URL         — 数据库连接串（用于种子数据写入）
-    REDIS_URL      — Redis 连接串（用于 SSE 事件写入）
+    P9_2_DATABASE_URL — 专用 ``*_test`` 数据库（用于种子数据写入）
+    P9_2_REDIS_URL    — 专用 Redis logical DB 8-15（用于 SSE 事件写入）
+    XUANHU_ALLOW_DESTRUCTIVE_TESTS=1 — 必需的破坏性操作确认哨兵
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ import pathlib
 import sys
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -38,8 +43,8 @@ from typing import Any
 
 BASE_URL = os.getenv("P9_2_BASE_URL", "http://127.0.0.1:5173")
 API_BASE = os.getenv("P9_2_API_BASE", "http://127.0.0.1:8000/api/v1")
-DB_URL = os.getenv("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
-REDIS_URL = os.getenv("REDIS_URL", "redis://:xuanhu_dev@localhost:6379/0")
+DB_URL = os.getenv("P9_2_DATABASE_URL", "").strip()
+REDIS_URL = os.getenv("P9_2_REDIS_URL", "").strip()
 
 PREFIX = "P9-2-INTEGRATION-"
 DOCTOR_ID = "doctor_p9_2_integration"
@@ -79,7 +84,7 @@ def record(
         print(f"      {detail}")
 
 
-def shot(page, name: str) -> str:
+def shot(page: Page, name: str) -> str:
     path = SCREEN_DIR / name
     page.screenshot(path=str(path), full_page=True)
     if name not in screenshots:
@@ -91,6 +96,49 @@ def shot(page, name: str) -> str:
 # ---------------------------------------------------------------------------
 # DB 种子数据 —— 构造 review/record/done 代表性状态
 # ---------------------------------------------------------------------------
+
+
+def _require_safe_seed_targets() -> None:
+    """Fail closed before the verification script mutates PostgreSQL/Redis."""
+    if os.getenv("XUANHU_ALLOW_DESTRUCTIVE_TESTS") != "1":
+        raise RuntimeError("set XUANHU_ALLOW_DESTRUCTIVE_TESTS=1 before seeding")
+    if not DB_URL:
+        raise RuntimeError("P9_2_DATABASE_URL is required before seeding")
+    if not REDIS_URL:
+        raise RuntimeError("P9_2_REDIS_URL is required before seeding")
+
+    database = urlsplit(DB_URL)
+    database_name = unquote(database.path.rsplit("/", 1)[-1]).strip()
+    database_query_keys = {key.casefold() for key, _ in parse_qsl(database.query)}
+    forbidden_database_keys = {
+        "database",
+        "dbname",
+        "host",
+        "hostaddr",
+        "port",
+        "service",
+        "servicefile",
+        "user",
+    }
+    if (
+        database.scheme not in {"postgres", "postgresql"}
+        or not database.hostname
+        or not database_name.casefold().endswith("_test")
+        or database_query_keys & forbidden_database_keys
+    ):
+        raise RuntimeError("P9_2_DATABASE_URL must identify an explicit PostgreSQL *_test database")
+
+    redis = urlsplit(REDIS_URL)
+    redis_query_keys = {key.casefold() for key, _ in parse_qsl(redis.query)}
+    redis_database = redis.path.removeprefix("/")
+    if (
+        redis.scheme not in {"redis", "rediss"}
+        or not redis.hostname
+        or not redis_database.isdigit()
+        or not 8 <= int(redis_database) <= 15
+        or redis_query_keys & {"database", "db", "host", "password", "port", "username"}
+    ):
+        raise RuntimeError("P9_2_REDIS_URL must identify Redis logical database 8 through 15")
 
 REVIEW_SESSION_ID = "ed83bf4d-ec5f-47f7-9e0d-bce42451f64a"
 MODIFY_SESSION_ID = "a1b2c3d4-0001-4000-8000-000000000001"
@@ -218,12 +266,13 @@ def session_snapshot(
 
 def seed_database() -> None:
     """写入构造状态会话到 PostgreSQL + Redis Stream。"""
-    import asyncpg
-    import redis.asyncio as aioredis
+    _require_safe_seed_targets()
+    import asyncpg  # type: ignore[import-untyped]
+    from redis.asyncio import Redis
 
-    async def _seed():
+    async def _seed() -> None:
         conn = await asyncpg.connect(DB_URL)
-        redis_client = aioredis.from_url(REDIS_URL)
+        redis_client = Redis.from_url(REDIS_URL)
 
         try:
             now = datetime.now(UTC)
@@ -578,7 +627,11 @@ def verify_browser() -> None:
         def _go(path: str) -> None:
             page.goto(f"{BASE_URL}{path}", wait_until="domcontentloaded")
 
-        def _api(path: str, method: str = "GET", body: dict | None = None) -> dict:
+        def _api(
+            path: str,
+            method: str = "GET",
+            body: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
             import requests
 
             url = f"{API_BASE}/{path.lstrip('/')}"
@@ -594,7 +647,7 @@ def verify_browser() -> None:
             if resp.status_code >= 400:
                 print(f"      API {method} {path} → {resp.status_code} {resp.text[:200]}")
                 return {"_status": resp.status_code, "_body": resp.text}
-            return resp.json()
+            return cast(dict[str, Any], resp.json())
 
         try:
             # ================================================================
@@ -1202,7 +1255,7 @@ def verify_browser() -> None:
             browser.close()
 
 
-def _get_session_id_from_url(page) -> str | None:
+def _get_session_id_from_url(page: Page) -> str | None:
     url = page.url
     parts = url.split("/sessions/")
     if len(parts) > 1:

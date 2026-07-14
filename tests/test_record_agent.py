@@ -53,14 +53,6 @@ from app.schemas.types import (
 # Fake gateway
 # ---------------------------------------------------------------------------
 
-class FakeRecordOutput(BaseModel):
-    """Fake LLM 返回的 MedicalRecord 兼容 dict。"""
-    text: str = "病历文本"
-    json: dict[str, Any] = {}
-    disclaimer: str = "本记录由悬壶 AI 辅助生成，仅供执业中医师参考。"
-    doctor_review: dict[str, Any] = {}
-
-
 class FakeGateway:
     """可控 fake gateway。"""
 

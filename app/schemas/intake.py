@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.schemas.domain import CollectionStatus, LactationValue, PregnancyValue
 
-INTAKE_SCHEMA_VERSION = "intake-extraction.v1"
+INTAKE_SCHEMA_VERSION = "intake-extraction.v2"
 
 
 class _IntakeModel(BaseModel):
@@ -85,6 +85,29 @@ class IntakeExtractionDecision(StrEnum):
     ABSTAINED = "abstained"
 
 
+class EvidenceSpan(_IntakeModel):
+    """Half-open character range copied verbatim from one current message.
+
+    The schema only owns the shape of the range.  The deterministic grounding
+    verifier resolves ``source_message_id`` against the raw request and proves
+    that ``message.content[start_char:end_char] == quote`` before any
+    high-risk candidate may leave the model boundary.
+    """
+
+    source_message_id: UUID
+    start_char: int = Field(ge=0, le=4_000)
+    end_char: int = Field(gt=0, le=4_000)
+    quote: str = Field(min_length=1, max_length=4_000)
+
+    @model_validator(mode="after")
+    def range_is_forward(self) -> EvidenceSpan:
+        if self.end_char <= self.start_char:
+            raise ValueError("evidence span must be a non-empty half-open range")
+        if not self.quote:
+            raise ValueError("evidence quote must not be empty")
+        return self
+
+
 class ObservationOperation(StrEnum):
     ADD = "add"
     CORRECT = "correct"
@@ -128,6 +151,8 @@ class SafetyListDelta(_IntakeModel):
     status: CollectionStatus = CollectionStatus.UNKNOWN
     values: tuple[str, ...] | None = Field(default=None, max_length=32)
     source_message_id: UUID | None = None
+    value_spans: tuple[EvidenceSpan, ...] | None = Field(default=None, max_length=32)
+    negation_span: EvidenceSpan | None = None
 
     @field_validator("values")
     @classmethod
@@ -142,12 +167,31 @@ class SafetyListDelta(_IntakeModel):
     @model_validator(mode="after")
     def status_matches_values(self) -> SafetyListDelta:
         if self.status is CollectionStatus.COLLECTED:
-            if not self.values or self.source_message_id is None:
-                raise ValueError("collected requires values and provenance")
+            if (
+                not self.values
+                or self.source_message_id is None
+                or not self.value_spans
+                or len(self.value_spans) != len(self.values)
+                or self.negation_span is not None
+            ):
+                raise ValueError("collected requires one evidence span per value")
         elif self.status is CollectionStatus.EXPLICITLY_NONE:
-            if self.values is not None or self.source_message_id is None:
-                raise ValueError("explicitly_none requires provenance and no values")
-        elif self.values is not None or self.source_message_id is not None:
+            if (
+                self.values is not None
+                or self.source_message_id is None
+                or self.value_spans is not None
+                or self.negation_span is None
+            ):
+                raise ValueError("explicitly_none requires one negation span and no values")
+        elif any(
+            value is not None
+            for value in (
+                self.values,
+                self.source_message_id,
+                self.value_spans,
+                self.negation_span,
+            )
+        ):
             raise ValueError("unknown cannot carry values or provenance")
         return self
 
@@ -156,10 +200,11 @@ class PregnancyDelta(_IntakeModel):
     status: CollectionStatus = CollectionStatus.UNKNOWN
     value: PregnancyValue | None = None
     source_message_id: UUID | None = None
+    span: EvidenceSpan | None = None
 
     @model_validator(mode="after")
     def status_matches_value(self) -> PregnancyDelta:
-        _validate_scalar_safety(self.status, self.value, self.source_message_id)
+        _validate_scalar_safety(self.status, self.value, self.source_message_id, self.span)
         return self
 
 
@@ -167,10 +212,11 @@ class LactationDelta(_IntakeModel):
     status: CollectionStatus = CollectionStatus.UNKNOWN
     value: LactationValue | None = None
     source_message_id: UUID | None = None
+    span: EvidenceSpan | None = None
 
     @model_validator(mode="after")
     def status_matches_value(self) -> LactationDelta:
-        _validate_scalar_safety(self.status, self.value, self.source_message_id)
+        _validate_scalar_safety(self.status, self.value, self.source_message_id, self.span)
         return self
 
 
@@ -215,6 +261,7 @@ class CandidateSeverity(StrEnum):
 class RedFlagCandidate(_IntakeModel):
     category: RedFlagCategory
     source_message_id: UUID
+    span: EvidenceSpan
     severity: CandidateSeverity
     evidence: str = Field(min_length=1, max_length=240)
     confidence: float = Field(ge=0, le=1)
@@ -258,14 +305,19 @@ class IntakeExtractionOutput(_IntakeModel):
     ambiguities: tuple[Ambiguity, ...] = Field(default=(), max_length=16)
 
 
-def _validate_scalar_safety(status: CollectionStatus, value: object | None, source: UUID | None) -> None:
+def _validate_scalar_safety(
+    status: CollectionStatus,
+    value: object | None,
+    source: UUID | None,
+    span: EvidenceSpan | None,
+) -> None:
     if status is CollectionStatus.COLLECTED:
-        if value is None or source is None:
-            raise ValueError("collected requires a value and provenance")
+        if value is None or source is None or span is None:
+            raise ValueError("collected requires a value and evidence span")
     elif status is CollectionStatus.EXPLICITLY_NONE:
-        if value is not None or source is None:
-            raise ValueError("explicitly_none requires provenance and no value")
-    elif value is not None or source is not None:
+        if value is not None or source is None or span is None:
+            raise ValueError("explicitly_none requires a negation span and no value")
+    elif value is not None or source is not None or span is not None:
         raise ValueError("unknown cannot carry a value or provenance")
 
 

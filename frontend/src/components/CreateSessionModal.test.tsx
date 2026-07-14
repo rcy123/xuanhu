@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, fireEvent, waitFor } from '@testing-library/react'
+import { cleanup, render, fireEvent, screen, waitFor } from '@testing-library/react'
 import { ConfigProvider, App as AntdApp } from 'antd'
 import { CreateSessionModal } from './CreateSessionModal'
 import type { SessionCreateRequest } from '@/types/api'
@@ -36,9 +36,19 @@ function okButton(): HTMLButtonElement {
 afterEach(() => {
   cleanup()
   document.body.innerHTML = ''
+  vi.unstubAllEnvs()
 })
 
 describe('CreateSessionModal', () => {
+  it('keeps the LangGraph create option hidden when the feature flag is off by default', () => {
+    wrap(
+      <CreateSessionModal open={true} creating={false} onClose={() => {}} onSubmit={vi.fn()} />,
+    )
+
+    expect(currentModal().querySelector('#agent_runtime')).not.toBeInTheDocument()
+    expect(screen.queryByText(/LangGraph/)).not.toBeInTheDocument()
+  })
+
   it('rejects empty chief complaint without calling onSubmit', async () => {
     const onSubmit = vi.fn()
     wrap(
@@ -70,6 +80,34 @@ describe('CreateSessionModal', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
     expect(onSubmit.mock.calls[0][0].chief_complaint).toBe('headache for three days')
+    expect(onSubmit.mock.calls[0][0].agent_runtime).toBe('legacy')
     expect(onClose).toHaveBeenCalled()
+  })
+
+  it('shows a non-clinical limited-rollout option and submits LangGraph only when enabled', async () => {
+    vi.stubEnv('VITE_LANGGRAPH_UI_ENABLED', 'true')
+    const onSubmit = vi.fn<(b: SessionCreateRequest) => Promise<string>>().mockResolvedValue('s-lg')
+    wrap(
+      <CreateSessionModal open={true} creating={false} onClose={() => {}} onSubmit={onSubmit} />,
+    )
+
+    expect(screen.getByText('问诊运行时（非临床 / 限量灰度）')).toBeInTheDocument()
+    expect(screen.getByText(/LangGraph 仅用于非临床验证与限量灰度/)).toBeInTheDocument()
+
+    const runtimeSelect = screen.getByTestId('agent-runtime-select')
+    const runtimeControl = runtimeSelect.querySelector('.ant-select-content')
+    if (!runtimeControl) throw new Error('agent_runtime select not found')
+    fireEvent.mouseDown(runtimeControl)
+    const langGraphOption = await screen.findByText('LangGraph（非临床 · 限量灰度）', {
+      selector: '.ant-select-item-option-content',
+    })
+    fireEvent.click(langGraphOption)
+    await waitFor(() => expect(runtimeSelect).toHaveTextContent('LangGraph（非临床 · 限量灰度）'))
+
+    fireEvent.change(chiefComplaintInput(), { target: { value: 'non-clinical validation' } })
+    fireEvent.click(okButton())
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    expect(onSubmit.mock.calls[0][0].agent_runtime).toBe('langgraph')
   })
 })

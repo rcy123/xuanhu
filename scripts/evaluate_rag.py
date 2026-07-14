@@ -239,13 +239,15 @@ class FakeRetriever:
         top_k: int = 8,
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
-        self.call_log.append({
-            "query": query,
-            "primary_sources": primary_sources,
-            "allow_cross_source": allow_cross_source,
-            "top_k": top_k,
-            "filters": filters,
-        })
+        self.call_log.append(
+            {
+                "query": query,
+                "primary_sources": primary_sources,
+                "allow_cross_source": allow_cross_source,
+                "top_k": top_k,
+                "filters": filters,
+            }
+        )
         if self._always_raise is not None:
             raise self._always_raise
         if self._always_empty:
@@ -376,19 +378,19 @@ async def run_evaluation(
 
         # 命中判定
         result.topic_hit, result.topics_matched = judge_topic_hit(
-            evidences[:top_k], expected_topics,
+            evidences[:top_k],
+            expected_topics,
         )
         result.source_type_hit, result.source_types_matched = judge_source_type_hit(
-            evidences[:top_k], expected_source_types,
+            evidences[:top_k],
+            expected_source_types,
         )
         result.title_hit = judge_title_hit(evidences[:top_k], must_hit_titles)
 
         # 综合 pass/fail 判定
         if negative_case:
             # 无结果场景：无结果 = pass；有结果但无 topic 命中也 = pass
-            result.passed = not result.has_results or (
-                not result.topic_hit and not result.source_type_hit
-            )
+            result.passed = not result.has_results or (not result.topic_hit and not result.source_type_hit)
         else:
             # 正常场景：topic 命中 or source_type 命中即可 pass（宽松判定）
             # 如果两者都有期望，则两者都需命中
@@ -441,10 +443,7 @@ def _compute_aggregate_metrics(report: EvalReport) -> None:
     report.pass_rate = report.pass_count / total if total > 0 else 0.0
 
     # 低召回 query（非 negative_case 但有结果但未 pass）
-    report.low_recall_queries = [
-        r for r in normal_results
-        if r.has_results and not r.passed
-    ]
+    report.low_recall_queries = [r for r in normal_results if r.has_results and not r.passed]
 
 
 # ---------------------------------------------------------------------------
@@ -465,9 +464,7 @@ def _format_evidence_table(evidences: list[EvidenceSummary]) -> str:
         snippet = ev.snippet.replace("|", "\\|").replace("\n", " ")
         if len(snippet) > 80:
             snippet = snippet[:80] + "…"
-        lines.append(
-            f"| {ev.rank} | {title} | {ev.source_type} | {ev.score:.4f} | {snippet} |"
-        )
+        lines.append(f"| {ev.rank} | {title} | {ev.source_type} | {ev.score:.4f} | {snippet} |")
     return "\n".join(lines)
 
 
@@ -484,7 +481,9 @@ def generate_markdown_report(report: EvalReport) -> str:
     lines.append(f"> 生成时间：{report.generated_at}")
     lines.append(f"> 评估 query 数：{report.total_queries}")
     lines.append(f"> 每 query 返回 top-k：{report.top_k}")
-    lines.append("> 数据说明：当前知识库为模拟样例数据，本报告仅用于验证 RAG 工程链路、评估脚本和 baseline 表现，不代表真实医学知识质量或临床可用性。")
+    lines.append(
+        "> 数据说明：当前知识库为模拟样例数据，本报告仅用于验证 RAG 工程链路、评估脚本和 baseline 表现，不代表真实医学知识质量或临床可用性。"
+    )
     lines.append("")
 
     # ---- 总体指标 ----
@@ -511,8 +510,12 @@ def generate_markdown_report(report: EvalReport) -> str:
         lines.append(f"### {r.index}. [{status}] {r.query}")
         lines.append("")
         lines.append(f"- **分类**: {r.category}")
-        lines.append(f"- **期望 topic**: {', '.join(r.expected_topics) if r.expected_topics else '(无 — negative_case)'}")
-        lines.append(f"- **期望 source_type**: {', '.join(r.expected_source_types) if r.expected_source_types else '(无 — negative_case)'}")
+        lines.append(
+            f"- **期望 topic**: {', '.join(r.expected_topics) if r.expected_topics else '(无 — negative_case)'}"
+        )
+        lines.append(
+            f"- **期望 source_type**: {', '.join(r.expected_source_types) if r.expected_source_types else '(无 — negative_case)'}"
+        )
         lines.append(f"- **negative_case**: {r.negative_case}")
         lines.append(f"- **备注**: {r.notes}")
         lines.append("")
@@ -524,8 +527,12 @@ def generate_markdown_report(report: EvalReport) -> str:
 
         lines.append(f"- **返回 Evidence 数**: {r.total_returned}")
         lines.append(f"- **has_results**: {r.has_results}")
-        lines.append(f"- **topic_hit**: {r.topic_hit}（匹配: {', '.join(r.topics_matched) if r.topics_matched else '无'}）")
-        lines.append(f"- **source_type_hit**: {r.source_type_hit}（匹配: {', '.join(r.source_types_matched) if r.source_types_matched else '无'}）")
+        lines.append(
+            f"- **topic_hit**: {r.topic_hit}（匹配: {', '.join(r.topics_matched) if r.topics_matched else '无'}）"
+        )
+        lines.append(
+            f"- **source_type_hit**: {r.source_type_hit}（匹配: {', '.join(r.source_types_matched) if r.source_types_matched else '无'}）"
+        )
         if r.must_hit_titles:
             lines.append(f"- **title_hit (must_hit_titles)**: {r.title_hit}")
         lines.append("")
@@ -544,7 +551,9 @@ def generate_markdown_report(report: EvalReport) -> str:
         lines.append("")
         for r in report.low_recall_queries:
             lines.append(f"- **#{r.index}** `{r.query}`")
-            lines.append(f"  - 返回 {r.total_returned} 条，topic_hit={r.topic_hit}，source_type_hit={r.source_type_hit}")
+            lines.append(
+                f"  - 返回 {r.total_returned} 条，topic_hit={r.topic_hit}，source_type_hit={r.source_type_hit}"
+            )
             if r.topics_matched:
                 lines.append(f"  - 部分匹配 topic: {', '.join(r.topics_matched)}")
             lines.append("")
@@ -608,8 +617,7 @@ def _append_improvement_suggestions(lines: list[str], report: EvalReport) -> Non
         )
 
     suggestions.append(
-        "- **评估集持续维护**：随着知识库扩充，应同步更新评估集，增加新药物、方剂、"
-        "证型的 query，并持续监控召回率变化。"
+        "- **评估集持续维护**：随着知识库扩充，应同步更新评估集，增加新药物、方剂、证型的 query，并持续监控召回率变化。"
     )
     suggestions.append(
         "- **引入 cross-encoder 重排**：当前 MVP 使用加权分数重排，"
@@ -630,19 +638,21 @@ def generate_json_report(report: EvalReport) -> dict[str, Any]:
     """生成 JSON 格式评估报告。"""
     query_results = []
     for r in report.query_results:
-        query_results.append({
-            "index": r.index,
-            "query": r.query,
-            "category": r.category,
-            "has_results": r.has_results,
-            "total_returned": r.total_returned,
-            "topic_hit": r.topic_hit,
-            "topics_matched": r.topics_matched,
-            "source_type_hit": r.source_type_hit,
-            "source_types_matched": r.source_types_matched,
-            "passed": r.passed,
-            "error": r.error,
-        })
+        query_results.append(
+            {
+                "index": r.index,
+                "query": r.query,
+                "category": r.category,
+                "has_results": r.has_results,
+                "total_returned": r.total_returned,
+                "topic_hit": r.topic_hit,
+                "topics_matched": r.topics_matched,
+                "source_type_hit": r.source_type_hit,
+                "source_types_matched": r.source_types_matched,
+                "passed": r.passed,
+                "error": r.error,
+            }
+        )
 
     return {
         "generated_at": report.generated_at,
@@ -656,13 +666,8 @@ def generate_json_report(report: EvalReport) -> dict[str, Any]:
             "low_recall_count": len(report.low_recall_queries),
             "error_count": len(report.error_queries),
         },
-        "low_recall_queries": [
-            {"index": r.index, "query": r.query} for r in report.low_recall_queries
-        ],
-        "error_queries": [
-            {"index": r.index, "query": r.query, "error": r.error}
-            for r in report.error_queries
-        ],
+        "low_recall_queries": [{"index": r.index, "query": r.query} for r in report.low_recall_queries],
+        "error_queries": [{"index": r.index, "query": r.query, "error": r.error} for r in report.error_queries],
         "query_results": query_results,
     }
 
@@ -694,9 +699,13 @@ def generate_markdown_handoff(
     lines.append("")
     lines.append("| 完成项 | 说明 |")
     lines.append("|---|---|")
-    lines.append(f"| 评估集扩充 | `data/rag_eval_queries.json` 从 6 条扩充到 {report.total_queries} 条，覆盖主诉到证型、证型到方剂、药物禁忌、剂量上限、穴位、理论、医案、无结果场景 |")
+    lines.append(
+        f"| 评估集扩充 | `data/rag_eval_queries.json` 从 6 条扩充到 {report.total_queries} 条，覆盖主诉到证型、证型到方剂、药物禁忌、剂量上限、穴位、理论、医案、无结果场景 |"
+    )
     lines.append("| 评估脚本 | `scripts/evaluate_rag.py` — 使用 `RAGRetriever` 执行检索、命中判定、报告生成 |")
-    lines.append("| 命中判定逻辑 | 关键词模糊匹配 topic；source_type 集合匹配；must_hit_titles 精确匹配；negative_case 判定 |")
+    lines.append(
+        "| 命中判定逻辑 | 关键词模糊匹配 topic；source_type 集合匹配；must_hit_titles 精确匹配；negative_case 判定 |"
+    )
     lines.append("| 报告生成 | Markdown 报告 + JSON 报告双格式 |")
     lines.append("| 测试 | 评估集 schema 校验、命中判定、无结果处理、报告生成的单元测试 |")
     lines.append("| 交接 | 本文档 + `docs/dev-handoff/rag-eval-report.md` |")
@@ -768,15 +777,25 @@ def generate_markdown_handoff(
     # 8. 下游事实
     lines.append("## 8. 下游 Phase 3 / P4 / P5 需要知道的事实")
     lines.append("")
-    lines.append("1. **RAGRetriever 就绪**：`RAGRetriever.retrieve()` 可在 Agent 中直接调用，返回 `list[Evidence]`。评估已验证检索可用性。")
+    lines.append(
+        "1. **RAGRetriever 就绪**：`RAGRetriever.retrieve()` 可在 Agent 中直接调用，返回 `list[Evidence]`。评估已验证检索可用性。"
+    )
     lines.append("")
-    lines.append(f"2. **中文全文检索限制**：当前使用 `to_tsvector('simple')` 不分词。topic 命中率 {report.topic_hit_rate:.1%}，后续如需提升需引入 zhparser 或分词预处理。")
+    lines.append(
+        f"2. **中文全文检索限制**：当前使用 `to_tsvector('simple')` 不分词。topic 命中率 {report.topic_hit_rate:.1%}，后续如需提升需引入 zhparser 或分词预处理。"
+    )
     lines.append("")
-    lines.append("3. **评估集 baseline**：本评估集 18 条 query 可作为后续知识库扩充后的回归 benchmark。每次知识库变更后应重新运行评估。")
+    lines.append(
+        "3. **评估集 baseline**：本评估集 18 条 query 可作为后续知识库扩充后的回归 benchmark。每次知识库变更后应重新运行评估。"
+    )
     lines.append("")
-    lines.append("4. **无结果处理**：RAGRetriever 在无结果时返回空列表。Agent 需处理 Evidence 不足的场景并生成 'evidence_insufficient' 状态提示。")
+    lines.append(
+        "4. **无结果处理**：RAGRetriever 在无结果时返回空列表。Agent 需处理 Evidence 不足的场景并生成 'evidence_insufficient' 状态提示。"
+    )
     lines.append("")
-    lines.append("5. **评估脚本可独立运行**：`scripts/evaluate_rag.py` 支持 `--mock` 模式不依赖外部服务，可在 CI 中运行。`--queries` 参数支持自定义评估集。")
+    lines.append(
+        "5. **评估脚本可独立运行**：`scripts/evaluate_rag.py` 支持 `--mock` 模式不依赖外部服务，可在 CI 中运行。`--queries` 参数支持自定义评估集。"
+    )
     lines.append("")
 
     return "\n".join(lines)
@@ -941,12 +960,14 @@ async def _main(argv: list[str] | None = None) -> int:
         return 0
 
     # 创建 retriever
+    retriever: Any
     if args.mock:
         print("使用 Mock Retriever（不依赖外部服务）")
         retriever = FakeRetriever()
     else:
         print("使用真实 RAGRetriever")
         from app.rag.retriever import RAGRetriever
+
         retriever = RAGRetriever()
         print("RAGRetriever 初始化完成")
 

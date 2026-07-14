@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -26,6 +27,24 @@ from app.core.exceptions import (
 )
 
 logger = logging.getLogger("xuanhu.gateway")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTokenUsage:
+    """Sanitized token counters reported by the model gateway."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredChatResponse:
+    """Parsed output plus response-side metadata, never the raw response."""
+
+    output: BaseModel
+    model_actual: str | None
+    usage: ModelTokenUsage
 
 
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -269,6 +288,67 @@ class ModelGatewayClient:
         agent_name: str | None = None,
         max_requests: int | None = None,
     ) -> BaseModel:
+        """Return only the validated output for backwards-compatible callers."""
+        result = await self._chat_structured_impl(
+            messages,
+            output_schema,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            trace_id=trace_id,
+            session_id=session_id,
+            agent_name=agent_name,
+            max_requests=max_requests,
+            capture_observation=False,
+        )
+        if isinstance(result, StructuredChatResponse):  # pragma: no cover - invariant guard
+            return result.output
+        return result
+
+    async def chat_structured_observed(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        *,
+        model: str | None = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        trace_id: str,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        max_requests: int | None = None,
+    ) -> StructuredChatResponse:
+        """Return validated output with actual-model and token observations."""
+        result = await self._chat_structured_impl(
+            messages,
+            output_schema,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            trace_id=trace_id,
+            session_id=session_id,
+            agent_name=agent_name,
+            max_requests=max_requests,
+            capture_observation=True,
+        )
+        if isinstance(result, StructuredChatResponse):
+            return result
+        raise RuntimeError("structured gateway observation invariant failed")
+
+    async def _chat_structured_impl(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        *,
+        model: str | None = None,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        trace_id: str,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        max_requests: int | None = None,
+        capture_observation: bool,
+    ) -> BaseModel | StructuredChatResponse:
         """结构化输出，通过 tools/function calling 强制 schema。
 
         解析失败时按 retry 策略重试，最终失败时抛出 ChatStructuredParseError，
@@ -354,7 +434,7 @@ class ModelGatewayClient:
                         output_schema.__name__,
                         trace_id,
                     )
-                    return result
+                    return self._observed_result(result, data) if capture_observation else result
 
                 # 如果没有 tool_calls，尝试从 content 解析 JSON
                 content = data["choices"][0]["message"]["content"]
@@ -367,7 +447,7 @@ class ModelGatewayClient:
                         output_schema.__name__,
                         trace_id,
                     )
-                    return result
+                    return self._observed_result(result, data) if capture_observation else result
 
                 last_parse_error = "模型返回内容为空"
             except (json.JSONDecodeError, KeyError, IndexError, ValidationError) as exc:
@@ -398,6 +478,7 @@ class ModelGatewayClient:
                 agent_name=agent_name,
                 attempt=attempt + 1,
                 max_attempts=max_attempts,
+                capture_observation=capture_observation,
             )
             if fallback_result is not None:
                 return fallback_result
@@ -443,7 +524,8 @@ class ModelGatewayClient:
         agent_name: str | None,
         attempt: int,
         max_attempts: int,
-    ) -> BaseModel | None:
+        capture_observation: bool,
+    ) -> BaseModel | StructuredChatResponse | None:
         """Fallback to JSON mode when tool-call structured output is malformed."""
         schema_json = json.dumps(output_schema.model_json_schema(), ensure_ascii=False)
         fallback_messages = [
@@ -493,7 +575,7 @@ class ModelGatewayClient:
                 output_schema.__name__,
                 trace_id,
             )
-            return result
+            return self._observed_result(result, data) if capture_observation else result
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValidationError):
             logger.warning(
                 "chat_structured JSON fallback parse failed: schema=%s, trace_id=%s, attempt=%d/%d",
@@ -503,6 +585,39 @@ class ModelGatewayClient:
                 max_attempts,
             )
             return None
+
+    @staticmethod
+    def _observed_result(output: BaseModel, data: Any) -> StructuredChatResponse:
+        """Extract only allowlisted metadata from an OpenAI-compatible response."""
+
+        model_actual: str | None = None
+        usage_payload: Any = None
+        if isinstance(data, dict):
+            candidate = data.get("model")
+            if isinstance(candidate, str) and candidate.strip():
+                model_actual = candidate.strip()[:200]
+            usage_payload = data.get("usage")
+
+        def non_negative_int(name: str) -> int:
+            if not isinstance(usage_payload, dict):
+                return 0
+            value = usage_payload.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+            return 0
+
+        prompt_tokens = non_negative_int("prompt_tokens")
+        completion_tokens = non_negative_int("completion_tokens")
+        total_tokens = non_negative_int("total_tokens")
+        return StructuredChatResponse(
+            output=output,
+            model_actual=model_actual,
+            usage=ModelTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            ),
+        )
 
     def _validate_or_repair_structured_payload(
         self,

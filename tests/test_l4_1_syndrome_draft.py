@@ -9,6 +9,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, ValidationError
 
+from app.agent_runtime.commands import NODE_REASONING_SUBGRAPH_V1
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.reducer import DomainState
@@ -16,6 +17,7 @@ from app.agent_runtime.repository import ReasoningAuthoritySnapshot
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.runtime import AgentRuntime
 from app.agent_runtime.specs import RunArtifact, RunSpec
+from app.agent_runtime.state import XuanhuGraphState
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_VERSION,
     SYNDROME_PROMPT_VERSION,
@@ -791,7 +793,16 @@ async def test_graph_state_checkpoint_contains_only_syndrome_artifact_reference(
         "gate_results": [{"gate_name": "syndrome_verifier", "decision": "passed", "policy_version": "syndrome-draft-policy.no-rag.v1"}],
     }
     config = make_run_config(state["session_id"], graph_version=DEFAULT_GRAPH_VERSION)
-    graph = build_main_graph(checkpointer=InMemorySaver())
+
+    async def preserve_authoritative_references(_state: XuanhuGraphState) -> dict[str, Any]:
+        # This contract test exercises checkpoint serialization, not the
+        # production ReasoningSubgraph's PostgreSQL command-claim lookup.
+        return {"route": NODE_REASONING_SUBGRAPH_V1}
+
+    graph = build_main_graph(
+        checkpointer=InMemorySaver(),
+        reasoning_executor=preserve_authoritative_references,
+    )
     result = await GraphRunner(graph).ainvoke(dict(state), config=config)
 
     serialized = repr(result)

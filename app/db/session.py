@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator
 
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 
@@ -49,15 +51,27 @@ def get_engine() -> AsyncEngine:
     if _engine is None:
         settings = get_settings()
         async_url = _build_async_pg_url(settings.database_url)
-        _engine = create_async_engine(
-            async_url,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            echo=False,
-        )
+        if os.environ.get("XUANHU_ALLOW_DESTRUCTIVE_TESTS") == "1":
+            # pytest-asyncio intentionally creates loops at different scopes.
+            # asyncpg pooled connections cannot cross those loops; NullPool
+            # gives every isolated integration-test session a loop-local
+            # connection while production retains the configured pool.
+            _engine = create_async_engine(
+                async_url,
+                poolclass=NullPool,
+                pool_pre_ping=True,
+                echo=False,
+            )
+        else:
+            _engine = create_async_engine(
+                async_url,
+                pool_size=10,
+                max_overflow=20,
+                pool_timeout=30,
+                pool_recycle=3600,
+                pool_pre_ping=True,
+                echo=False,
+            )
     return _engine
 
 

@@ -416,38 +416,24 @@ class TestDocumentConsistency:
 
 
 class TestL0Scope:
-    """验证 L0 基线约束在 L1+ 阶段仍被遵守。
-
-    L1-2 已合法创建 ``app/agent_runtime`` 骨架，因此本类不再断言该目录不存在，
-    而是验证该目录只包含 L1 运行时骨架（不含业务 Agent 实现）。
-    """
-
-    # L1 允许的 agent_runtime 骨架文件（不含业务 Agent）。
-    _ALLOWED_RUNTIME_FILES: frozenset[str] = frozenset(
-        {
-            "__init__.py",
-            "config.py",
-            "errors.py",
-            "commands.py",
-            "state.py",
-            "routing.py",
-            "graph.py",
-            "checkpoint.py",
-            "runner.py",
-            "events.py",
-        }
-    )
+    """验证 L0 迁移边界在 L2～L4 实现后仍被遵守。"""
 
     def test_agent_runtime_is_skeleton_only(self) -> None:
-        """``app/agent_runtime`` 若存在，只包含 L1 骨架文件，不含业务 Agent。"""
+        """运行时目录可含 L2～L4 policy/verifier，但不定义业务 Agent。"""
+        import ast
+
         runtime_dir = REPO_ROOT / "app" / "agent_runtime"
-        if not runtime_dir.exists():
-            return  # L1 尚未创建，无需检查
-        py_files = {p.name for p in runtime_dir.glob("*.py")}
-        unexpected = py_files - self._ALLOWED_RUNTIME_FILES
-        assert not unexpected, (
-            f"app/agent_runtime 包含非 L1-2 骨架文件: {unexpected}"
-        )
+        assert runtime_dir.exists(), "L4 阶段必须存在 app/agent_runtime"
+        for py_file in runtime_dir.glob("*.py"):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            business_agents = [
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef)
+                and node.name.endswith("Agent")
+                and node.name != "AgentRuntime"
+            ]
+            assert not business_agents, f"{py_file.name} 在 runtime 层定义业务 Agent: {business_agents}"
 
     def test_no_harness_implementation(self) -> None:
         assert not (REPO_ROOT / "app" / "harness").exists()
@@ -554,34 +540,22 @@ class TestProhibitions:
             assert ph not in content, f"迁移边界包含占位符: {ph}"
 
     def test_no_langgraph_implementation(self) -> None:
-        """不得提前实现 Harness（L2）或业务 Agent。
-
-        L1-2 已合法创建 ``app/agent_runtime`` 骨架，因此只检查 ``app/harness``
-        不存在（L2 负责），并验证 ``app/agent_runtime`` 不包含业务 Agent 文件。
-        """
-        # L0-1 不得创建 harness 目录（L2 负责）
+        """L2～L4 保持 Harness/运行时与业务 Agent 的目录边界。"""
         harper_dir = REPO_ROOT / "app" / "harness"
         assert not harper_dir.exists(), (
-            f"L0-1 不得创建 app/harness 目录（L2 负责），但检测到: {harper_dir}"
+            f"Harness 已统一落在 app/agent_runtime，不应再创建并行真源: {harper_dir}"
         )
-        # L1-2 允许 agent_runtime 骨架，但不得包含业务 Agent
         agent_runtime_dir = REPO_ROOT / "app" / "agent_runtime"
-        if agent_runtime_dir.exists():
-            forbidden_patterns = [
-                "intake_extraction",
-                "syndrome_draft",
-                "formula_draft",
-                "safety_explanation",
-                "record_narration",
-                "question_composer",
-            ]
-            for py_file in agent_runtime_dir.glob("*.py"):
-                content = py_file.read_text(encoding="utf-8")
-                for pattern in forbidden_patterns:
-                    assert pattern not in content.lower(), (
-                        f"app/agent_runtime/{py_file.name} 包含业务 Agent "
-                        f"模式 {pattern!r}，超出 L1 骨架范围"
-                    )
+        forbidden_agent_files = {
+            "intake_extraction.py",
+            "syndrome_draft.py",
+            "formula_draft.py",
+            "safety_explanation.py",
+            "record_narration.py",
+            "question_composer.py",
+        }
+        present = {path.name for path in agent_runtime_dir.glob("*.py")}
+        assert not (present & forbidden_agent_files), "业务 Agent 必须留在 app/agents 层"
 
     def test_agent_runtime_version_defaults_legacy(self) -> None:
         """``agent_runtime_version`` 必须默认 ``legacy``（L0-3 约束，L1 不得改变）。"""

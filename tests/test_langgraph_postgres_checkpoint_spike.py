@@ -13,8 +13,8 @@
 
 Windows 注意：psycopg v3 异步连接在 Windows 上要求 ``SelectorEventLoop``（默认的
 ``ProactorEventLoop`` 会被 psycopg 拒绝，抛 ``InterfaceError``）。本文件通过
-``event_loop_policy`` fixture 在模块级别把 asyncio 策略切换为
-``WindowsSelectorEventLoopPolicy``，确保 pytest-asyncio 创建的事件循环兼容 psycopg。
+全局测试配置在 Windows 使用 ``WindowsSelectorEventLoopPolicy``，确保
+pytest-asyncio 创建的事件循环兼容 psycopg。
 
 注意：这是 L1-1 Spike 在 Windows 环境下的执行约束，不是生产运行时决策；生产
 asyncpg / FastAPI / uvicorn 仍使用各自的默认事件循环。L1-2/L1-3 引入生产
@@ -25,8 +25,6 @@ checkpointer 时需评估与 uvicorn ProactorEventLoop 的共存方式。
 
 from __future__ import annotations
 
-import asyncio
-import sys
 import uuid
 
 import pytest
@@ -41,19 +39,6 @@ from typing_extensions import TypedDict
 # Windows 事件循环：psycopg v3 异步连接要求 SelectorEventLoop
 # ---------------------------------------------------------------------------
 
-
-@pytest.fixture(scope="module")
-def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-    """在 Windows 上切换到 ``SelectorEventLoopPolicy`` 以兼容 psycopg v3 异步连接。
-
-    pytest-asyncio (mode=auto) 默认使用全局 ``asyncio.get_event_loop_policy()``
-    创建测试事件循环；在 Windows 上该策略返回 ``ProactorEventLoop``，psycopg v3
-    的异步连接会直接拒绝并抛 ``InterfaceError``。这里在模块作用域内把策略替换为
-    ``WindowsSelectorEventLoopPolicy``，仅影响本文件的集成测试，不会污染其他测试。
-    """
-    if sys.platform == "win32":
-        return asyncio.WindowsSelectorEventLoopPolicy()
-    return asyncio.DefaultEventLoopPolicy()
 
 # ---------------------------------------------------------------------------
 # 纯数据 state schema
@@ -280,10 +265,10 @@ async def test_async_postgres_saver_setup_is_idempotent() -> None:
 
 
 def _pg_url() -> str:
-    """从环境变量或 conftest 默认值获取 PostgreSQL 连接 URL。"""
-    import os
+    """从显式、受保护的测试数据库配置获取 PostgreSQL URL。"""
+    from tests._database_safety import require_destructive_test_database
 
-    return os.environ.get("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
+    return require_destructive_test_database()
 
 
 def _config(thread_id: str, *, graph_version: str = "spike") -> dict:
