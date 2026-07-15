@@ -171,6 +171,58 @@ def test_embedded_python_literals_survive_windows_powershell_native_argument_pas
     assert smoke.returncode == 0, smoke.stdout + smoke.stderr
 
 
+def test_native_helpers_fail_closed_on_real_nonzero_exit_codes() -> None:
+    executable = _powershell()
+    escaped_script = str(SCRIPT_PATH.resolve()).replace("'", "''")
+    escaped_python = sys.executable.replace("'", "''")
+    escaped_working_directory = str(SCRIPT_PATH.parents[1].resolve()).replace("'", "''")
+    smoke_command = (
+        f"$path = '{escaped_script}'; "
+        "$tokens = $null; $errors = $null; "
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+        "$path, [ref]$tokens, [ref]$errors); "
+        "$functions = $ast.FindAll({ param($node) "
+        "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+        "-and ($node.Name -eq 'Invoke-NativeGate' "
+        "-or $node.Name -eq 'Invoke-NativeCapture') }, $true); "
+        "foreach ($function in $functions) { "
+        ". ([ScriptBlock]::Create($function.Extent.Text)) }; "
+        "$gateCaught = $false; "
+        "try { "
+        f"Invoke-NativeGate -Command '{escaped_python}' "
+        "-Arguments @('-c', 'import sys; sys.exit(23)') "
+        f"-WorkingDirectory '{escaped_working_directory}' "
+        "} catch { "
+        "if ($_.Exception.Message -notmatch 'exit code 23') { exit 92 }; "
+        "$gateCaught = $true }; "
+        "if (-not $gateCaught) { exit 91 }; "
+        "$captureCaught = $false; "
+        "try { "
+        f"Invoke-NativeCapture -Command '{escaped_python}' "
+        "-Arguments @('-c', 'import sys; sys.exit(23)') "
+        f"-WorkingDirectory '{escaped_working_directory}' | Out-Null "
+        "} catch { "
+        "if ($_.Exception.Message -notmatch 'exit code 23') { exit 94 }; "
+        "$captureCaught = $true }; "
+        "if (-not $captureCaught) { exit 93 }; "
+        f"Invoke-NativeGate -Command '{escaped_python}' "
+        "-Arguments @('-c', 'import sys; sys.exit(0)') "
+        f"-WorkingDirectory '{escaped_working_directory}'; "
+        f"$captured = Invoke-NativeCapture -Command '{escaped_python}' "
+        "-Arguments @('-c', \"print('captured-ok')\") "
+        f"-WorkingDirectory '{escaped_working_directory}'; "
+        "if ($captured -ne 'captured-ok') { exit 95 }"
+    )
+    smoke = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-Command", smoke_command],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert smoke.returncode == 0, smoke.stdout + smoke.stderr
+
+
 def test_gate_script_has_exact_dependency_sbom_workflow_and_secret_scan_commands() -> None:
     script = _script()
     assert RULES_PATH.is_file()
@@ -179,7 +231,7 @@ def test_gate_script_has_exact_dependency_sbom_workflow_and_secret_scan_commands
     for fragment in (
         (
             '"export", "--locked", "--no-dev", "--no-emit-project", "--format", '
-            '"requirements.txt", "--output-file", $RequirementsPath'
+            '"requirements.txt", "--output-file", $RequirementsPartialPath'
         ),
         '"pip-audit==2.10.1", "pip-audit", "--strict", "--requirement", $RequirementsPath',
         '"cyclonedx-bom==7.3.0", "cyclonedx-py", "requirements"',
@@ -204,6 +256,19 @@ def test_gate_script_has_exact_dependency_sbom_workflow_and_secret_scan_commands
 
     assert 'if ($pythonSbom.bomFormat -ne "CycloneDX"' in script
     assert 'if ($nodeSbom.bomFormat -ne "CycloneDX")' in script
+    assert script.count("$global:LASTEXITCODE") == 4
+    assert "function Assert-NonEmptyFile" in script
+    assert "function Publish-GateArtifact" in script
+    assert "[IO.File]::Move($sourceFull, $destinationFull)" in script
+    assert "destination already exists" in script
+    assert "requirements-production.txt.partial" in script
+    assert "sbom-python.cdx.json.partial" in script
+    assert "sbom-node.cdx.json.partial" in script
+    assert "reacceptance-result.json" in script
+    assert "reacceptance-result.json.partial" in script
+    assert 'status = "passed"' in script
+    assert script.index('status = "passed"') > script.index('"dir", "/repo"')
+    assert "Final reacceptance result manifest did not satisfy the exact-HEAD success contract" in script
 
     workflow = _compact(WORKFLOW_PATH.read_text(encoding="utf-8"))
     assert 'docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro"' in workflow
@@ -218,13 +283,17 @@ def test_clean_worktree_scan_and_cleanup_are_path_guarded() -> None:
 
     assert '"status", "--porcelain=v1", "--untracked-files=all"' in script
     assert "requires a clean worktree" in script
-    assert script.count("Assert-CleanRepository -RepoRoot $RepoRoot") == 2
+    assert script.count("Assert-CleanRepository -RepoRoot $RepoRoot") == 3
+    assert script.count("Assert-ExactHead -RepoRoot $RepoRoot -ExpectedHead $ExpectedGitHead") == 2
     assert "function Assert-SafeTemporaryWorktreePath" in script
     assert "[IO.Path]::GetTempPath()" in script
     assert script.count("[IO.Path]::GetFullPath") >= 4
     assert ".StartsWith($systemTempPrefix, $comparison)" in script
     assert ".StartsWith($approvedPrefix, $comparison)" in script
-    assert '"worktree", "add", "--detach", $CleanWorktreePath, "HEAD"' in _compact(script)
+    assert (
+        '"worktree", "add", "--detach", $CleanWorktreePath, $ExpectedGitHead'
+        in _compact(script)
+    )
     assert '$cleanMount = "${CleanWorktreePath}:/repo:ro"' in script
 
     cleanup_fragment = '"worktree", "remove", "--force", $CleanWorktreePath'

@@ -118,7 +118,7 @@
 | L4.5-07 | Outbox Publisher、Redis Stream 与 SSE 闭环 | L4.5-01 | 已完成 | 验收通过 | claim/publish/ack/retry/DLQ/重启接管/有界去重可验证，两个独立 SSE 客户端同步成立 |
 | L4.5-08 | 模型运行审计与临床缓存治理 | L4.5-03 | 已完成 | 验收通过 | required PostgreSQL recorder 在模型调用前/后 fail-closed；policy、canonical DTO + 有序消息 digest、actual model/attempt/latency/usage/输出摘要可审计；冲突重放拒绝；10k key 证明缓存有界并清理 |
 | L4.5-09 | WebUI LangGraph 灰度入口与 L3/L4 结果闭环 | L4.5-04/L4.5-06/L4.5-07 | 已完成 | 验收通过 | 双 feature flag 默认关闭；启用后可创建/推进并显示 runtime/revision/unresolved，刷新后恢复 |
-| L4.5-10 | CI、全量回归、故障注入与 L0～L4 重新验收 | L4.5-01～L4.5-09 | 已完成 | 技术验收通过 | 单命令 locked-dependency 门禁覆盖 Python 3.11/3.12、真实 PG/Redis、串行性能、worker 碰撞、前端、静态、安全、SBOM、promtool 行为、actionlint、Gitleaks 与 detached clean tree；证据见重新验收报告 |
+| L4.5-10 | CI、全量回归、故障注入与 L0～L4 重新验收 | L4.5-01～L4.5-09 | 已完成 | 技术验收通过 | 单命令 locked-dependency 门禁覆盖 Python 3.11/3.12、真实 PG/Redis、串行性能、worker 碰撞、前端、静态、安全、SBOM、promtool 行为、actionlint、Gitleaks 与 detached clean tree；仅在全门禁完成后发布绑定 exact HEAD 的 `reacceptance-result.json`；证据见重新验收报告 |
 
 #### 2026-07-15 终审加固
 
@@ -129,7 +129,7 @@
 | L2 | 模型审计 provenance、冲突和不可用语义不足 | migration `20260715_0011` 增加 `policy_version` 与 input digest；生产 recorder 必需，started/terminal 写入失败不调用/不返回模型结果；provenance、终态和 terminal→started 冲突 fail-closed | model-audit unit `54 passed`；真实 PG 集成 `15 passed` |
 | L0/L3 | 旧性能基线不是生产池同口径 | Legacy/LangGraph 均改为 20 个独立新会话、首轮消息、生产 SQLAlchemy pool；LangGraph 保留真实 PG checkpointer、Domain、公开 claim 与 required audit，模型为确定性本地 gateway | 两次串行复跑均 `2 passed`；LangGraph P95 `1.15s` / `1.82s`，阈值 `<5s` |
 | 运维 | Outbox 仅有健康信号，缺少可部署规则和缺指标行为验证 | 新增隐私安全聚合 metrics、5 条 Prometheus 规则、按 target 的 missing-metric 判断及 promtool rule tests | `promtool check rules`：5 rules；`promtool test rules`：SUCCESS |
-| 复验 | 旧证据无法证明 exact HEAD/工具链 | 新增 clean-worktree、版本约束、环境证据 manifest、供应链审计与 SBOM 的单命令脚本；不宣称基础设施镜像/工具完全离线可复现 | `scripts/verify_l0_l4_reacceptance.ps1` |
+| 复验 | 旧证据无法证明 exact HEAD/工具链 | 新增 clean-worktree、版本约束、环境证据 manifest、供应链审计与 SBOM 的单命令脚本；PowerShell 5.1 原生命令退出码 fail-closed，已知旧产物先清理，临时产物校验后发布，最终 `passed` 回执只在所有门禁完成后写入；不宣称基础设施镜像/工具完全离线可复现 | `scripts/verify_l0_l4_reacceptance.ps1`、`tests/test_reacceptance_gate_script.py` |
 
 ### L5：Safety 与医师 HITL
 
@@ -347,8 +347,9 @@
 | 2026-07-14 | Codex | 发布并执行 L4.5-10，修复最终全量门禁发现的迁移 teardown、GraphRun 排序和共享 worker Outbox 顺序污染；最终 Python 3.11/3.12 各 1469 passed，integration 344 passed/1 个既定 Legacy xfail，前端 171 passed，静态、安全、密钥扫描和双 SBOM 全绿；技术提交为 `3a92faa`。 |
 | 2026-07-14 | Codex | L0～L4 工程重新验收通过；L4.5-02 仍等待具名临床专业人员按 `临床红旗规则人工审定签署单-2026-07-14.md` 签署。签署前两个 LangGraph 公共开关保持默认关闭，不得进入真实临床或患者试点。 |
 | 2026-07-15 | Codex | 终审重新打开 L0/L1/L2/L4.5-07/L4.5-10，关闭 runtime 切换台账、进程级 LangGraph 生命周期、required 模型审计、Outbox 可部署告警和 exact-HEAD 复验的证据缺口；技术实现提交 `c9148c2`，唯一 Alembic head 为 `20260715_0012`。 |
-| 2026-07-15 | Codex | 当前门禁证据：Python 3.11/3.12 各 `1547 passed, 362 deselected`；真实服务（排除串行性能）`359 passed, 1 xfailed`；碰撞 `2 passed`；串行双基线连续两次 `2 passed`；前端 `23 files / 171 tests`；Ruff、mypy（154 source files）、lock、pip/npm audit、双 SBOM、promtool、actionlint 和 Gitleaks 全绿。工程种子 `29/29` 只记为 `not_for_clinical_signoff`。 |
+| 2026-07-15 | Codex | 当前门禁证据：Python 3.11/3.12 各 `1549 passed, 362 deselected`；真实服务（排除串行性能）`359 passed, 1 xfailed`；碰撞 `2 passed`；串行双基线连续两次 `2 passed`；前端 `23 files / 171 tests`；Ruff、mypy（154 source files）、lock、pip/npm audit、双 SBOM、promtool、actionlint 和 Gitleaks 全绿。工程种子 `29/29` 只记为 `not_for_clinical_signoff`。 |
 | 2026-07-15 | Codex | 首次 exact-HEAD 一键执行发现 Windows PowerShell 5.1 会剥离多行 Python `-c` 中的双引号，环境探针在测试开始前 fail-closed；提交 `f37e758` 改为 Windows-safe 单引号字面量并增加真实 PowerShell native argument smoke test，安全目标与 PG/Redis 版本探针复测通过。 |
+| 2026-07-15 | Codex | 后续一键执行发现 PowerShell 5.1 函数局部 `$LASTEXITCODE` 会遮蔽原生命令写入的全局退出码，导致 export/audit/SBOM 失败被延迟暴露；现已改为读取真实全局退出码，增加真实 `exit 23` 回归测试、非空/格式校验、临时发布和最终成功回执，禁止将半成品 manifest 误作整轮通过证据。 |
 
 ## 8. 下一步
 

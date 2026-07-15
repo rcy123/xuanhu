@@ -4,7 +4,7 @@
 
 - 任务范围：重新打开 L0～L4 的工程验收，关闭中期审查列出的 2 个 P0 与 10 个 P1，不扩展 L5 Safety/HITL 业务语义。
 - 实施分支：`codex/l4-5-integration-safety-hardening`。
-- 初次技术提交：`3a92faa`；终审加固技术提交：`c9148c2`；PowerShell exact-HEAD 门禁参数修复：`f37e758`。
+- 初次技术提交：`3a92faa`；终审加固技术提交：`c9148c2`；PowerShell exact-HEAD 门禁参数修复：`f37e758`；原生命令退出码与最终成功回执加固位于本交接对应的最终 HEAD。
 - 工程状态：L4.5-01～L4.5-10 已通过技术验收；L4.5-02 的自动化与工程验收通过，但临床红旗规则人工审定尚未完成。
 - 阶段状态：L0～L4 可表述为“工程重新验收通过”，L4.5 不能表述为临床关闭、临床发布完成或真实患者试点获准。
 - 临床门禁：`docs/01_agent部分优化/临床红旗规则人工审定签署单-2026-07-14.md` 当前明确为待具名临床专业人员审定；本交接不填写、不推定也不替代该签署。
@@ -112,7 +112,7 @@
 - 执行证据：`.github/workflows/quality.yml` 固化 CI；`scripts/verify_l0_l4_reacceptance.ps1` 固化本地/验收环境的精确命令，并在 integration 前验证三项显式安全变量。
 - 直接文件：`.github/workflows/quality.yml`、`pyproject.toml`、`frontend/package-lock.json`、`.gitleaksignore`、`scripts/verify_l0_l4_reacceptance.ps1`。
 - 直接测试：`tests/test_reacceptance_gate_script.py`、`tests/test_database_safety.py`、`tests/test_infrastructure_isolation.py`，以及脚本调用的全量 suites。
-- 技术验收状态：通过。当前证据为 Python 3.11/3.12 各 `1547 passed, 362 deselected`；真实服务 `359 passed, 1 xfailed`；碰撞 `2 passed`；双性能基线连续两轮 `2 passed`；前端 `23 files / 171 tests`；静态、安全、SBOM、promtool 和 Gitleaks 均通过。完整证据见重新验收报告。
+- 技术验收状态：通过。当前证据为 Python 3.11/3.12 各 `1549 passed, 362 deselected`；真实服务 `359 passed, 1 xfailed`；碰撞 `2 passed`；双性能基线连续两轮 `2 passed`；前端 `23 files / 171 tests`；静态、安全、SBOM、promtool 和 Gitleaks 均通过。完整证据见重新验收报告。
 - 明确边界：可复跑脚本要求 clean HEAD 和显式 `TEST_DATABASE_URL`、`TEST_REDIS_URL`、`XUANHU_ALLOW_DESTRUCTIVE_TESTS=1`；它不会自动启动、猜测或清空开发基础设施，也不会把临床签署变成自动化检查。
 
 ## 精确复跑入口
@@ -128,7 +128,7 @@ powershell -NoProfile -File scripts/verify_l0_l4_reacceptance.ps1
 
 上面的值仅为结构示例，执行人必须提供实际隔离测试资源；脚本会再次调用 `tests._database_safety` 拒绝不安全目标。脚本不接受跳过 integration/security 的开关，所有命令均为完整参数，不含省略项。
 
-脚本会把环境证据 manifest、生产依赖导出、Python CycloneDX 1.6 SBOM 和 Node CycloneDX SBOM 写入 `.codex_tmp/l0-l4-reacceptance`，并对 Git 历史和从 exact HEAD 创建的 detached clean worktree 分别执行 Gitleaks。clean worktree 在 `finally` 中移除；移除前必须同时证明目标位于操作系统临时目录的批准子目录内，并且该目录确为预期 Git worktree root。
+脚本会把环境证据 manifest、生产依赖导出、Python CycloneDX 1.6 SBOM 和 Node CycloneDX SBOM 写入 `.codex_tmp/l0-l4-reacceptance`，并对 Git 历史和从 exact HEAD 创建的 detached clean worktree 分别执行 Gitleaks。clean worktree 在 `finally` 中移除；移除前必须同时证明目标位于操作系统临时目录的批准子目录内，并且该目录确为预期 Git worktree root。每轮开始先删除固定名称的旧证据；requirements 与双 SBOM 先写 `.partial` 并完成非空/格式校验，再发布最终文件。只有所有门禁和 worktree 清理均成功后才生成 `reacceptance-result.json`，其 `status=passed`、`git_head` 与四个输入/产物 SHA-256 共同构成整轮成功证据。
 
 ## `3a92faa` 后的终审加固
 

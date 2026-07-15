@@ -34,9 +34,12 @@ function Invoke-NativeGate {
     Write-Host "==> $Command $($Arguments -join ' ')"
     Push-Location -LiteralPath $WorkingDirectory
     try {
-        $LASTEXITCODE = 0
+        # Windows PowerShell 5.1 writes native exit codes to the global scope.
+        # A local assignment here would shadow that value and silently turn
+        # every native failure into exit code 0.
+        $global:LASTEXITCODE = 0
         & $Command @Arguments
-        $exitCode = $LASTEXITCODE
+        $exitCode = $global:LASTEXITCODE
     }
     finally {
         Pop-Location
@@ -59,9 +62,9 @@ function Invoke-NativeCapture {
 
     Push-Location -LiteralPath $WorkingDirectory
     try {
-        $LASTEXITCODE = 0
+        $global:LASTEXITCODE = 0
         $output = @(& $Command @Arguments)
-        $exitCode = $LASTEXITCODE
+        $exitCode = $global:LASTEXITCODE
     }
     finally {
         Pop-Location
@@ -70,6 +73,57 @@ function Invoke-NativeCapture {
         throw "Gate command failed with exit code ${exitCode}: $Command"
     }
     return ($output -join [Environment]::NewLine).Trim()
+}
+
+function Assert-NonEmptyFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    if (-not [IO.File]::Exists($Path)) {
+        throw "$Description was not created: $Path"
+    }
+    $fileInfo = [IO.FileInfo]::new($Path)
+    if ($fileInfo.Length -le 0) {
+        throw "$Description is empty: $Path"
+    }
+}
+
+function Publish-GateArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $sourceFull = [IO.Path]::GetFullPath($SourcePath)
+    $destinationFull = [IO.Path]::GetFullPath($DestinationPath)
+    $sourceDirectory = [IO.Path]::GetDirectoryName($sourceFull)
+    $destinationDirectory = [IO.Path]::GetDirectoryName($destinationFull)
+    $comparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    if (-not $sourceDirectory.Equals($destinationDirectory, $comparison)) {
+        throw "$Description must be published inside its validated artifact directory"
+    }
+    if ([IO.File]::Exists($destinationFull)) {
+        throw "$Description destination already exists: $destinationFull"
+    }
+
+    Assert-NonEmptyFile -Path $sourceFull -Description $Description
+    [IO.File]::Move($sourceFull, $destinationFull)
+    Assert-NonEmptyFile -Path $destinationFull -Description $Description
 }
 
 function Assert-IntegrationEnvironment {
@@ -116,6 +170,23 @@ function Assert-CleanRepository {
     ) -WorkingDirectory $RepoRoot
     if (-not [string]::IsNullOrWhiteSpace($worktreeStatus)) {
         throw "L0-L4 reacceptance requires a clean worktree so every result maps to exact HEAD"
+    }
+}
+
+function Assert-ExactHead {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedHead
+    )
+
+    $currentHead = Invoke-NativeCapture -Command "git" -Arguments @(
+        "-C", $RepoRoot, "rev-parse", "HEAD"
+    ) -WorkingDirectory $RepoRoot
+    if ($currentHead -ne $ExpectedHead) {
+        throw "Repository HEAD changed while the L0-L4 reacceptance gate was running"
     }
 }
 
@@ -187,13 +258,27 @@ $RepoRoot = [IO.Path]::GetFullPath($repoOutput[0].Trim())
 $FrontendRoot = Join-Path $RepoRoot "frontend"
 
 Assert-CleanRepository -RepoRoot $RepoRoot
-Assert-IntegrationEnvironment -RepoRoot $RepoRoot
 
 if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) {
     $ArtifactDirectory = Join-Path $RepoRoot ".codex_tmp/l0-l4-reacceptance"
 }
 $ArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
 New-Item -ItemType Directory -Path $ArtifactDirectory -Force | Out-Null
+$KnownArtifactNames = @(
+    "environment-evidence.json",
+    "requirements-production.txt",
+    "requirements-production.txt.partial",
+    "sbom-python.cdx.json",
+    "sbom-python.cdx.json.partial",
+    "sbom-node.cdx.json",
+    "sbom-node.cdx.json.partial",
+    "reacceptance-result.json",
+    "reacceptance-result.json.partial"
+)
+foreach ($artifactName in $KnownArtifactNames) {
+    [IO.File]::Delete((Join-Path $ArtifactDirectory $artifactName))
+}
+Assert-IntegrationEnvironment -RepoRoot $RepoRoot
 
 Write-Host "==> Toolchain and infrastructure evidence manifest"
 $uvVersion = Invoke-NativeCapture -Command "uv" -Arguments @("--version") -WorkingDirectory $RepoRoot
@@ -227,10 +312,11 @@ $infrastructureVersions = (
         $infrastructureVersionCode
     ) -WorkingDirectory $RepoRoot
 ) | ConvertFrom-Json
+$ExpectedGitHead = Invoke-NativeCapture -Command "git" -Arguments @(
+    "-C", $RepoRoot, "rev-parse", "HEAD"
+) -WorkingDirectory $RepoRoot
 $evidenceManifest = [ordered]@{
-    git_head = Invoke-NativeCapture -Command "git" -Arguments @(
-        "-C", $RepoRoot, "rev-parse", "HEAD"
-    ) -WorkingDirectory $RepoRoot
+    git_head = $ExpectedGitHead
     powershell = $PSVersionTable.PSVersion.ToString()
     uv = $uvVersion
     python_3_11 = Invoke-NativeCapture -Command "uv" -Arguments @(
@@ -311,10 +397,15 @@ Invoke-NativeGate -Command "npm" -Arguments @(
 
 Write-Host "==> Python locked dependency audit"
 $RequirementsPath = Join-Path $ArtifactDirectory "requirements-production.txt"
+$RequirementsPartialPath = Join-Path $ArtifactDirectory "requirements-production.txt.partial"
 Invoke-NativeGate -Command "uv" -Arguments @(
     "export", "--locked", "--no-dev", "--no-emit-project", "--format", "requirements.txt",
-    "--output-file", $RequirementsPath
-) -WorkingDirectory $RepoRoot
+    "--output-file", $RequirementsPartialPath
+) -WorkingDirectory $RepoRoot | Out-Null
+Publish-GateArtifact `
+    -SourcePath $RequirementsPartialPath `
+    -DestinationPath $RequirementsPath `
+    -Description "Locked production requirements"
 Invoke-NativeGate -Command "uv" -Arguments @(
     "tool", "run", "--from", "pip-audit==2.10.1", "pip-audit", "--strict",
     "--requirement", $RequirementsPath
@@ -322,32 +413,44 @@ Invoke-NativeGate -Command "uv" -Arguments @(
 
 Write-Host "==> Reproducible Python CycloneDX SBOM"
 $PythonSbomPath = Join-Path $ArtifactDirectory "sbom-python.cdx.json"
+$PythonSbomPartialPath = Join-Path $ArtifactDirectory "sbom-python.cdx.json.partial"
 Invoke-NativeGate -Command "uv" -Arguments @(
     "tool", "run", "--from", "cyclonedx-bom==7.3.0", "cyclonedx-py", "requirements",
     $RequirementsPath, "--pyproject", (Join-Path $RepoRoot "pyproject.toml"),
     "--spec-version", "1.6", "--output-reproducible", "--output-format", "JSON",
-    "--output-file", $PythonSbomPath
+    "--output-file", $PythonSbomPartialPath
 ) -WorkingDirectory $RepoRoot
-$pythonSbom = Get-Content -LiteralPath $PythonSbomPath -Raw -Encoding utf8 | ConvertFrom-Json
+Assert-NonEmptyFile -Path $PythonSbomPartialPath -Description "Python CycloneDX SBOM"
+$pythonSbom = Get-Content -LiteralPath $PythonSbomPartialPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ($pythonSbom.bomFormat -ne "CycloneDX" -or $pythonSbom.specVersion -ne "1.6") {
     throw "Python SBOM did not satisfy the CycloneDX 1.6 contract"
 }
+Publish-GateArtifact `
+    -SourcePath $PythonSbomPartialPath `
+    -DestinationPath $PythonSbomPath `
+    -Description "Python CycloneDX SBOM"
 
 Write-Host "==> Locked Node CycloneDX SBOM"
 Invoke-NativeGate -Command "npm" -Arguments @("ci", "--ignore-scripts") -WorkingDirectory $FrontendRoot
 $NodeSbomPath = Join-Path $ArtifactDirectory "sbom-node.cdx.json"
+$NodeSbomPartialPath = Join-Path $ArtifactDirectory "sbom-node.cdx.json.partial"
 $nodeSbomText = Invoke-NativeCapture -Command "npm" -Arguments @(
     "sbom", "--sbom-format", "cyclonedx"
 ) -WorkingDirectory $FrontendRoot
 [IO.File]::WriteAllText(
-    $NodeSbomPath,
+    $NodeSbomPartialPath,
     $nodeSbomText + [Environment]::NewLine,
     [Text.UTF8Encoding]::new($false)
 )
-$nodeSbom = Get-Content -LiteralPath $NodeSbomPath -Raw -Encoding utf8 | ConvertFrom-Json
+Assert-NonEmptyFile -Path $NodeSbomPartialPath -Description "Node CycloneDX SBOM"
+$nodeSbom = Get-Content -LiteralPath $NodeSbomPartialPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ($nodeSbom.bomFormat -ne "CycloneDX") {
     throw "Node SBOM did not satisfy the CycloneDX contract"
 }
+Publish-GateArtifact `
+    -SourcePath $NodeSbomPartialPath `
+    -DestinationPath $NodeSbomPath `
+    -Description "Node CycloneDX SBOM"
 
 $repoReadOnlyMount = "${RepoRoot}:/repo:ro"
 Write-Host "==> Prometheus Outbox alerting rule syntax gate"
@@ -370,6 +473,7 @@ Invoke-NativeGate -Command "docker" -Arguments @(
 
 Write-Host "==> Gitleaks repository history gate"
 Assert-CleanRepository -RepoRoot $RepoRoot
+Assert-ExactHead -RepoRoot $RepoRoot -ExpectedHead $ExpectedGitHead
 $repoMount = "${RepoRoot}:/repo:ro"
 Invoke-NativeGate -Command "docker" -Arguments @(
     "run", "--rm", "--volume", $repoMount,
@@ -387,7 +491,7 @@ $CleanWorktreePath = Assert-SafeTemporaryWorktreePath `
 $worktreeAdded = $false
 try {
     Invoke-NativeGate -Command "git" -Arguments @(
-        "-C", $RepoRoot, "worktree", "add", "--detach", $CleanWorktreePath, "HEAD"
+        "-C", $RepoRoot, "worktree", "add", "--detach", $CleanWorktreePath, $ExpectedGitHead
     ) -WorkingDirectory $RepoRoot
     $worktreeAdded = $true
     $CleanWorktreePath = Assert-SafeTemporaryWorktreePath `
@@ -419,5 +523,42 @@ finally {
     }
 }
 
+Assert-CleanRepository -RepoRoot $RepoRoot
+Assert-ExactHead -RepoRoot $RepoRoot -ExpectedHead $ExpectedGitHead
+$ResultManifestPath = Join-Path $ArtifactDirectory "reacceptance-result.json"
+$ResultManifestPartialPath = Join-Path $ArtifactDirectory "reacceptance-result.json.partial"
+$resultManifest = [ordered]@{
+    status = "passed"
+    git_head = $ExpectedGitHead
+    passed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    artifact_sha256 = [ordered]@{
+        environment_evidence = (Get-FileHash -LiteralPath $EvidenceManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        production_requirements = (Get-FileHash -LiteralPath $RequirementsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        python_sbom = (Get-FileHash -LiteralPath $PythonSbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        node_sbom = (Get-FileHash -LiteralPath $NodeSbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+[IO.File]::WriteAllText(
+    $ResultManifestPartialPath,
+    ($resultManifest | ConvertTo-Json -Depth 4) + [Environment]::NewLine,
+    [Text.UTF8Encoding]::new($false)
+)
+Assert-NonEmptyFile -Path $ResultManifestPartialPath -Description "Final reacceptance result manifest"
+$validatedResultManifest = Get-Content `
+    -LiteralPath $ResultManifestPartialPath `
+    -Raw `
+    -Encoding utf8 | ConvertFrom-Json
+if (
+    $validatedResultManifest.status -ne "passed" -or
+    $validatedResultManifest.git_head -ne $ExpectedGitHead
+) {
+    throw "Final reacceptance result manifest did not satisfy the exact-HEAD success contract"
+}
+Publish-GateArtifact `
+    -SourcePath $ResultManifestPartialPath `
+    -DestinationPath $ResultManifestPath `
+    -Description "Final reacceptance result manifest"
+
 Write-Host "L0-L4 engineering reacceptance gates passed for exact HEAD."
 Write-Host "SBOM and audit inputs: $ArtifactDirectory"
+Write-Host "Final success receipt: $ResultManifestPath"
