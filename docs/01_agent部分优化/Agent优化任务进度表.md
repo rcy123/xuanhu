@@ -1,7 +1,7 @@
 # 悬壶 Agent 整体大修任务进度表
 
-> 版本：v1.2
-> 日期：2026-07-14
+> 版本：v1.3
+> 日期：2026-07-15
 > 目标架构：Harness + LangGraph
 > 总计划：`docs/01_agent部分优化/Agent整体大修实施计划-LangGraph版.md`
 > 状态说明：本文档是任务发布、验收、返工和阶段关闭的唯一进度看板
@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L4.5 工程重新验收通过；红旗规则人工审定待签 |
-| 当前任务 | L4.5-01～L4.5-10 技术验收完成；L4.5-02 等待具名临床专业人员审定红旗规则 |
-| LangGraph 新链路 | L0～L4 工程完成度恢复为 100%；后端与 WebUI 灰度开关默认关闭，保持非默认、非临床限量验证 |
+| 当前阶段 | L0～L4 工程重新验收通过；L4.5 红旗规则人工审定待外部签署 |
+| 当前任务 | L4.5-01～L4.5-10 技术闭环完成；等待具名临床专业人员审定 `triage-raw-text-precheck.v1` |
+| LangGraph 新链路 | L0～L4 工程完成度为 100%；后端与 WebUI 灰度开关默认关闭，保持非默认、非临床验证 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 已完成，L3 关闭 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -116,9 +116,20 @@
 | L4.5-05 | LangGraph Recovery 运行时隔离 | L4.5-01 | 已完成 | 验收通过（fail-closed） | LangGraph 会话绝不读取或修改 Legacy checkpoint；未实现路径固定 501，不宣称具备恢复能力 |
 | L4.5-06 | Session Read Model 与版本化 L3/L4 DTO | L4.5-03 | 已完成 | 验收通过 | GET session 从权威 Domain/Gate/current artifact 重建，刷新和进程重建后结果不丢失 |
 | L4.5-07 | Outbox Publisher、Redis Stream 与 SSE 闭环 | L4.5-01 | 已完成 | 验收通过 | claim/publish/ack/retry/DLQ/重启接管/有界去重可验证，两个独立 SSE 客户端同步成立 |
-| L4.5-08 | 模型运行审计与临床缓存治理 | L4.5-03 | 已完成 | 验收通过 | actual model/版本/attempt/latency/usage/digest 可审计；10k key 与失败路径证明缓存有界并清理 |
+| L4.5-08 | 模型运行审计与临床缓存治理 | L4.5-03 | 已完成 | 验收通过 | required PostgreSQL recorder 在模型调用前/后 fail-closed；policy、canonical DTO + 有序消息 digest、actual model/attempt/latency/usage/输出摘要可审计；冲突重放拒绝；10k key 证明缓存有界并清理 |
 | L4.5-09 | WebUI LangGraph 灰度入口与 L3/L4 结果闭环 | L4.5-04/L4.5-06/L4.5-07 | 已完成 | 验收通过 | 双 feature flag 默认关闭；启用后可创建/推进并显示 runtime/revision/unresolved，刷新后恢复 |
-| L4.5-10 | CI、全量回归、故障注入与 L0～L4 重新验收 | L4.5-01～L4.5-09 | 已完成 | 技术验收通过 | Python 3.11/3.12、unit/integration/contract/frontend/static/security/SBOM 全绿，证据见重新验收报告 |
+| L4.5-10 | CI、全量回归、故障注入与 L0～L4 重新验收 | L4.5-01～L4.5-09 | 已完成 | 技术验收通过 | 单命令 locked-dependency 门禁覆盖 Python 3.11/3.12、真实 PG/Redis、串行性能、worker 碰撞、前端、静态、安全、SBOM、promtool 行为、actionlint、Gitleaks 与 detached clean tree；证据见重新验收报告 |
+
+#### 2026-07-15 终审加固
+
+| 层级 | 终审发现 | 完善结果 | 证据 |
+|---|---|---|---|
+| L0 | 默认 runtime 只靠环境变量，缺少持久切换事实 | 新增 allowlist-only `runtime.switched` 全局审计、deployment 唯一约束、事务 advisory lock 与部署 CLI；配置和台账不一致时 readiness 503、创建前 fail-closed | migration `20260715_0012`；真实并发/重复集成测试 |
+| L1 | 请求级 checkpointer/compiled graph 与 Windows loop 启动风险 | FastAPI lifespan 每 worker 持有一个连接池、saver 和 compiled graph；生产无 request-local fallback；Windows 提供 Selector loop 的 `xuanhu-api` 入口；liveness/503 readiness 分离 | `tests/test_l1_application_lifecycle.py` |
+| L2 | 模型审计 provenance、冲突和不可用语义不足 | migration `20260715_0011` 增加 `policy_version` 与 input digest；生产 recorder 必需，started/terminal 写入失败不调用/不返回模型结果；provenance、终态和 terminal→started 冲突 fail-closed | model-audit unit `54 passed`；真实 PG 集成 `15 passed` |
+| L0/L3 | 旧性能基线不是生产池同口径 | Legacy/LangGraph 均改为 20 个独立新会话、首轮消息、生产 SQLAlchemy pool；LangGraph 保留真实 PG checkpointer、Domain、公开 claim 与 required audit，模型为确定性本地 gateway | 两次串行复跑均 `2 passed`；LangGraph P95 `1.15s` / `1.82s`，阈值 `<5s` |
+| 运维 | Outbox 仅有健康信号，缺少可部署规则和缺指标行为验证 | 新增隐私安全聚合 metrics、5 条 Prometheus 规则、按 target 的 missing-metric 判断及 promtool rule tests | `promtool check rules`：5 rules；`promtool test rules`：SUCCESS |
+| 复验 | 旧证据无法证明 exact HEAD/工具链 | 新增 clean-worktree、版本约束、环境证据 manifest、供应链审计与 SBOM 的单命令脚本；不宣称基础设施镜像/工具完全离线可复现 | `scripts/verify_l0_l4_reacceptance.ps1` |
 
 ### L5：Safety 与医师 HITL
 
@@ -335,11 +346,13 @@
 | 2026-07-14 | Codex | 依次发布并执行 L4.5-04～L4.5-09：完成公开耐久幂等与真实双进程验收、Recovery 501 隔离、PG 权威 Read Model、Outbox/Redis/SSE/DLQ、模型审计、有界缓存及前后端默认关闭的非临床灰度入口。 |
 | 2026-07-14 | Codex | 发布并执行 L4.5-10，修复最终全量门禁发现的迁移 teardown、GraphRun 排序和共享 worker Outbox 顺序污染；最终 Python 3.11/3.12 各 1469 passed，integration 344 passed/1 个既定 Legacy xfail，前端 171 passed，静态、安全、密钥扫描和双 SBOM 全绿；技术提交为 `3a92faa`。 |
 | 2026-07-14 | Codex | L0～L4 工程重新验收通过；L4.5-02 仍等待具名临床专业人员按 `临床红旗规则人工审定签署单-2026-07-14.md` 签署。签署前两个 LangGraph 公共开关保持默认关闭，不得进入真实临床或患者试点。 |
+| 2026-07-15 | Codex | 终审重新打开 L0/L1/L2/L4.5-07/L4.5-10，关闭 runtime 切换台账、进程级 LangGraph 生命周期、required 模型审计、Outbox 可部署告警和 exact-HEAD 复验的证据缺口；技术实现提交 `c9148c2`，唯一 Alembic head 为 `20260715_0012`。 |
+| 2026-07-15 | Codex | 当前门禁证据：Python 3.11/3.12 各 `1547 passed, 362 deselected`；真实服务（排除串行性能）`359 passed, 1 xfailed`；碰撞 `2 passed`；串行双基线连续两次 `2 passed`；前端 `23 files / 171 tests`；Ruff、mypy（154 source files）、lock、pip/npm audit、双 SBOM、promtool、actionlint 和 Gitleaks 全绿。工程种子 `29/29` 只记为 `not_for_clinical_signoff`。 |
 
 ## 8. 下一步
 
 1. 由具名临床专业人员审定 `triage-raw-text-precheck.v1` 的规则、同义词、否定/时态、数值阈值和去标识化召回评估集，填写并签署 `临床红旗规则人工审定签署单-2026-07-14.md`。
-2. 签署完成且规则摘要与 `3a92faa` 一致后，只关闭 L4.5-02 红旗规则人工审定门禁；任何规则变更都必须重新审定。该签署不是临床上线许可，真实患者服务或临床试点仍须完成 L5～L9 和机构正式审批。在此之前保持 Legacy 默认和两个 LangGraph 公共开关关闭。
+2. 签署完成且规则摘要与技术实现提交 `c9148c2` 一致后，只关闭 L4.5-02 红旗规则人工审定门禁；任何规则变更都必须重新审定。该签署不是临床上线许可，真实患者服务或临床试点仍须完成 L5～L9 和机构正式审批。在此之前保持 Legacy 默认和两个 LangGraph 公共开关关闭。
 3. L5 只能在产品/医疗安全负责人明确确认临床门禁与后续范围后重新发布；不得把本次 501 Recovery 隔离、健康端点或 L0～L4 工程完成误写成 L5～L9 已完成。
 
 ## 9. 维护要求
@@ -349,5 +362,5 @@
 - 验收失败时登记 `AR-B-xxx`，状态改为 `返工中`，发布限定返工任务。
 - 验收通过时记录测试证据、关闭关联阻塞，并更新阶段完成度。
 - 不因对话摘要或交接声明覆盖本地代码事实。
-- 不提交 `docs/dev-handoff/*`，除非用户明确要求。
-- `docs/` 当前被 `.gitignore` 忽略；进度更新仍必须落盘，但不会自动显示在 `git status`。
+- 正式验收引用的 `docs/dev-handoff/*` 必须显式纳入对应交付提交，不能只留在被忽略的工作树。
+- `docs/` 默认被 `.gitignore` 忽略；正式进度/交接证据须使用显式 pathspec 纳入版本控制。

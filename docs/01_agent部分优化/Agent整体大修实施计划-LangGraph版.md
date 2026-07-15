@@ -87,8 +87,8 @@ Graph 节点通过 Repository 读取 Domain State，并通过 Reducer/Repository
 ### 2.4 Checkpoint 策略
 
 - 生产使用 `langgraph-checkpoint-postgres` 的异步 PostgreSQL checkpointer。
-- `thread_id = session_id`。
-- `checkpoint_ns` 包含 graph major version，避免 v1/v2 状态混用。
+- root `thread_id = {graph_version}:{session_id}`，以 graph major version 与会话 ID 组成不可混用的持久化命名空间。
+- root config 不写 `checkpoint_ns`：LangGraph 1.2.x 将该字段解释为子图 namespace；根图版本隔离由上述 `thread_id` 完成，子图 namespace 由框架管理。
 - 测试使用 `InMemorySaver`。
 - Checkpoint 中不保存姓名、门诊号、完整 Prompt 和完整原始模型输出。
 - Domain 写入与 checkpoint 无法天然形成同一业务事务时，通过幂等键、版本校验和 outbox 保证可恢复。

@@ -37,7 +37,7 @@ LangGraph 的 checkpointer 会对整个 State 序列化（pickle 或 jsonpatch�
 
 - **存储位置**：LangGraph checkpointer（`AsyncPostgresSaver` 管理的 `checkpoints` 和 `checkpoint_writes` 表）。
 - **内容**：仅包含图执行所需的最小数据，严格对齐《Agent整体大修实施计划-LangGraph版.md》§6.2 `XuanhuGraphState` 定义：
-  - `session_id`：会话标识，对应 `thread_id`
+  - `session_id`：会话标识，与 `graph_version` 一起组成 root `thread_id={graph_version}:{session_id}`
   - `domain_state_version`：Domain State 版本指针（整型引用，不是完整 Domain State）
   - `command`：当前待执行命令类型（如 `advance`、`review`、`recover`），不包含患者输入或临床载荷
   - `command_id`：命令幂等键

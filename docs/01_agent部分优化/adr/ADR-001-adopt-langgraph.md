@@ -22,7 +22,7 @@
 具体决策如下：
 
 1. **StateGraph** 建模完整临床流程为有向图，每个阶段为节点，阶段间迁移为条件边。
-2. **checkpointer**（`AsyncPostgresSaver`）替代当前 PG `state_snapshot` + Redis checkpoint 双写，`thread_id` 等于 `session_id`。
+2. **checkpointer**（`AsyncPostgresSaver`）替代当前 PG `state_snapshot` + Redis checkpoint 双写。根图 `thread_id` 使用 `{graph_version}:{session_id}`；LangGraph 1.2.x 的 root config 不写 `checkpoint_ns`，避免把 graph version 错当成子图 namespace。
 3. **`interrupt()` / `Command(resume=...)`** 替代当前 `pending_review` 标志，实现 Doctor Review 的 Human-in-the-loop 暂停/恢复。
 4. **子图（Subgraph）** 封装 Intake（问诊）、Reasoning（辨证+处方+加减）、ReviewRecord（复核+病历）为独立可测试单元。
 5. **Recovery Router** 作为条件边，根据 `RecoveryStatus` 决定是继续执行、回退到指定节点还是终止。
