@@ -138,6 +138,7 @@ def validate_syndrome_preflight(
     if (
         run_spec.agent_spec_version != agent_spec.version
         or run_spec.prompt_version != SYNDROME_PROMPT_VERSION
+        or run_spec.policy_version != SYNDROME_POLICY_VERSION
         or run_spec.total_attempt_budget != 1
         or run_spec.session_id != input_payload.session_id
         or run_spec.state_version != input_payload.state_version

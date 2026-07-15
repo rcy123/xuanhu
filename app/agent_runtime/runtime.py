@@ -12,10 +12,24 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
-from app.core.exceptions import ChatStructuredParseError, ModelGatewayTimeoutError, ModelGatewayUnavailableError
+from app.core.exceptions import (
+    ChatStructuredParseError,
+    ModelGatewayTimeoutError,
+    ModelGatewayUnavailableError,
+    ModelRunAuditIntegrityError,
+    ModelRunAuditUnavailableError,
+)
 from app.core.gateway import ModelGatewayClient, StructuredChatResponse
 
-from .specs import AgentSpec, RunArtifact, RunSpec, RuntimeErrorCode, TokenUsage, model_output_digest
+from .specs import (
+    AgentSpec,
+    RunArtifact,
+    RunSpec,
+    RuntimeErrorCode,
+    TokenUsage,
+    model_input_digest,
+    model_output_digest,
+)
 
 
 class RuntimeErrorBase(Exception):
@@ -28,7 +42,7 @@ class RuntimeErrorBase(Exception):
 
 
 class RuntimeRunRecorder(Protocol):
-    """Async-only minimal observability seam; recorder failures are ignored."""
+    """Async recorder; generic failures degrade, integrity violations fail closed."""
 
     async def record(self, event: str, data: dict[str, Any]) -> None: ...
 
@@ -75,29 +89,44 @@ async def _record_safely(
     *,
     timeout_seconds: float,
 ) -> bool:
-    """Bound recorder work without changing the primary execution result.
+    """Bound recorder work while preserving durable-audit integrity failures.
 
     Returns whether the recorder was stopped by its timeout.
     """
     if recorder is None:
         return False
+    required = getattr(recorder, "required", False) is True
     if timeout_seconds <= 0:
+        if required:
+            raise ModelRunAuditUnavailableError
         return True
     task = asyncio.create_task(_invoke_recorder(recorder, event, data), name="agent-runtime-recorder")
+    required_failure = False
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
     except TimeoutError:
         await _cancel_recorder_task(task)
-        return True
+        if not required:
+            return True
+        required_failure = True
     except asyncio.CancelledError:
         # A recorder may cancel itself; external cancellation leaves the
         # shielded task pending and must keep propagating to the caller.
         if task.done() and task.cancelled():
-            return False
-        await _cancel_recorder_task(task)
+            if not required:
+                return False
+            required_failure = True
+        else:
+            await _cancel_recorder_task(task)
+            raise
+    except ModelRunAuditIntegrityError:
         raise
     except Exception:
-        return False
+        if not required:
+            return False
+        required_failure = True
+    if required_failure:
+        raise ModelRunAuditUnavailableError
     return False
 
 
@@ -112,13 +141,10 @@ class AgentRuntime:
         # Only the runtime's constructed client has retries disabled.  Legacy
         # BaseAgentImpl retains its configured ModelGatewayClient unchanged.
         resolved_recorder: RuntimeRunRecorder | None
-        if isinstance(recorder, _DefaultRecorder):
-            # Production LangGraph sites construct ``AgentRuntime()``.  Tests
-            # and injected gateways keep the old no-recorder behavior, while a
-            # zero-argument production runtime receives a lazy durable recorder.
-            resolved_recorder = self._production_recorder() if gateway is None else None
-        else:
-            resolved_recorder = recorder
+        # Omitting the recorder is always the production-safe path, even when
+        # a caller injects a gateway implementation.  Tests that intentionally
+        # run without persistence must opt out with ``recorder=None``.
+        resolved_recorder = self._production_recorder() if isinstance(recorder, _DefaultRecorder) else recorder
         if resolved_recorder is not None and not self._is_async_recorder(resolved_recorder):
             raise RuntimeErrorBase(
                 RuntimeErrorCode.RECORDER_ASYNC_REQUIRED,
@@ -150,7 +176,11 @@ class AgentRuntime:
         input_payload: Any,
         messages: list[dict[str, Any]],
     ) -> RunArtifact:
-        self._validate_preflight(agent_spec, run_spec, input_payload)
+        canonical_input = self._validate_preflight(agent_spec, run_spec, input_payload)
+        try:
+            input_digest = model_input_digest(canonical_input, messages)
+        except ValueError as exc:
+            raise RuntimeErrorBase(RuntimeErrorCode.INPUT_SCHEMA_INVALID, "model input digest failed") from exc
         started = time.perf_counter()
         attempts = 0
 
@@ -160,7 +190,7 @@ class AgentRuntime:
                 started_timed_out = await _record_safely(
                     self.recorder,
                     "started",
-                    self._record_data(run_spec, agent_spec, attempts, started),
+                    self._record_data(run_spec, agent_spec, attempts, started, input_digest=input_digest),
                     timeout_seconds=started_timeout,
                 )
                 if started_timed_out and started_timeout < RECORDER_TIMEOUT_SECONDS:
@@ -207,6 +237,7 @@ class AgentRuntime:
                                 agent_spec,
                                 attempts,
                                 started,
+                                input_digest=input_digest,
                                 artifact=artifact,
                             ),
                             timeout_seconds=self._run_recorder_timeout(run_spec),
@@ -229,7 +260,7 @@ class AgentRuntime:
                 await _record_safely(
                     self.recorder,
                     "cancelled",
-                    self._record_data(run_spec, agent_spec, attempts, started),
+                    self._record_data(run_spec, agent_spec, attempts, started, input_digest=input_digest),
                     timeout_seconds=self._finalization_recorder_timeout(),
                 )
             raise
@@ -238,18 +269,34 @@ class AgentRuntime:
                 await _record_safely(
                     self.recorder,
                     "failed",
-                    self._record_data(run_spec, agent_spec, attempts, started, error_code=exc.code),
+                    self._record_data(
+                        run_spec,
+                        agent_spec,
+                        attempts,
+                        started,
+                        input_digest=input_digest,
+                        error_code=exc.code,
+                    ),
                     timeout_seconds=self._finalization_recorder_timeout(),
                 )
             raise
 
-    def _validate_preflight(self, agent_spec: AgentSpec, run_spec: RunSpec, input_payload: Any) -> None:
+    def _validate_preflight(
+        self,
+        agent_spec: AgentSpec,
+        run_spec: RunSpec,
+        input_payload: Any,
+    ) -> BaseModel:
         if run_spec.agent_spec_version != agent_spec.version:
             raise RuntimeErrorBase(RuntimeErrorCode.AGENT_SPEC_VERSION_MISMATCH, "AgentSpec version mismatch")
         try:
-            if not isinstance(input_payload, agent_spec.input_schema):
-                agent_spec.input_schema.model_validate(input_payload)
-        except ValidationError as exc:
+            raw_payload = (
+                input_payload.model_dump(mode="python", round_trip=True)
+                if isinstance(input_payload, BaseModel)
+                else input_payload
+            )
+            return agent_spec.input_schema.model_validate(raw_payload)
+        except (ValidationError, TypeError, ValueError) as exc:
             raise RuntimeErrorBase(RuntimeErrorCode.INPUT_SCHEMA_INVALID, "input schema invalid") from exc
 
     async def _one_attempt(
@@ -272,24 +319,36 @@ class AgentRuntime:
         except asyncio.CancelledError:
             raise
         except TimeoutError:
-            return None, None, RuntimeErrorBase(
-                RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT, "model call timed out", retryable=True
+            return (
+                None,
+                None,
+                RuntimeErrorBase(RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT, "model call timed out", retryable=True),
             )
         except ModelGatewayTimeoutError:
-            return None, None, RuntimeErrorBase(
-                RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT, "model call timed out", retryable=True
+            return (
+                None,
+                None,
+                RuntimeErrorBase(RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT, "model call timed out", retryable=True),
             )
         except ModelGatewayUnavailableError as exc:
-            return None, None, RuntimeErrorBase(
-                RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE,
-                "model gateway unavailable",
-                retryable=exc.retryable,
+            return (
+                None,
+                None,
+                RuntimeErrorBase(
+                    RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE,
+                    "model gateway unavailable",
+                    retryable=exc.retryable,
+                ),
             )
         except ChatStructuredParseError:
-            return None, None, RuntimeErrorBase(
-                RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID,
-                "structured output invalid",
-                retryable=True,
+            return (
+                None,
+                None,
+                RuntimeErrorBase(
+                    RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID,
+                    "structured output invalid",
+                    retryable=True,
+                ),
             )
         except ValidationError:
             return None, None, RuntimeErrorBase(RuntimeErrorCode.OUTPUT_SCHEMA_INVALID, "output schema invalid")
@@ -359,6 +418,7 @@ class AgentRuntime:
         attempts: int,
         started: float,
         *,
+        input_digest: str,
         error_code: RuntimeErrorCode | None = None,
         artifact: RunArtifact | None = None,
     ) -> dict[str, Any]:
@@ -369,6 +429,8 @@ class AgentRuntime:
             "stage": run_spec.stage,
             "agent_spec_version": agent_spec.version,
             "prompt_version": run_spec.prompt_version,
+            "policy_version": run_spec.policy_version,
+            "input_digest": input_digest,
             "output_schema_id": self._output_schema_id(agent_spec.output_schema),
             "model_requested": agent_spec.model_policy.model,
             "model_actual": artifact.model_actual if artifact is not None else None,

@@ -44,6 +44,7 @@ from app.schemas.domain import (
 from app.schemas.syndrome import (
     SYNDROME_EVIDENCE_MODE,
     SYNDROME_NO_RAG_CONFIDENCE_MAX,
+    SYNDROME_POLICY_VERSION,
     SYNDROME_READY_STAGE,
     SyndromeDraft,
     SyndromeDraftDecision,
@@ -62,7 +63,9 @@ class FakeGateway:
         self.calls: list[dict[str, Any]] = []
         self.actual_request_count = 0
 
-    async def chat_structured(self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any) -> Any:
+    async def chat_structured(
+        self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any
+    ) -> Any:
         self.calls.append({"messages": messages, "output_schema": output_schema, **kwargs})
         self.actual_request_count += kwargs.get("max_requests", 1)
         outcome = self.outcomes.pop(0)
@@ -121,7 +124,16 @@ class FakeGateRepository:
         raise AssertionError("syndrome draft execution must use the authority bundle, not standalone state loading")
 
 
-def _run(*, state_version: int = 3, stage: str = SYNDROME_READY_STAGE, agent_version: str = SYNDROME_AGENT_VERSION, prompt_version: str = SYNDROME_PROMPT_VERSION, budget: int = 1, session_id: uuid.UUID | None = None) -> RunSpec:
+def _run(
+    *,
+    state_version: int = 3,
+    stage: str = SYNDROME_READY_STAGE,
+    agent_version: str = SYNDROME_AGENT_VERSION,
+    prompt_version: str = SYNDROME_PROMPT_VERSION,
+    policy_version: str = SYNDROME_POLICY_VERSION,
+    budget: int = 1,
+    session_id: uuid.UUID | None = None,
+) -> RunSpec:
     return RunSpec(
         run_id=uuid.uuid4(),
         session_id=session_id or uuid.uuid4(),
@@ -129,6 +141,7 @@ def _run(*, state_version: int = 3, stage: str = SYNDROME_READY_STAGE, agent_ver
         stage=stage,
         agent_spec_version=agent_version,
         prompt_version=prompt_version,
+        policy_version=policy_version,
         deadline_at=datetime.now(UTC) + timedelta(seconds=2),
         total_attempt_budget=budget,
         idempotency_key="l4-1-command",
@@ -159,7 +172,9 @@ def _observation(
     )
 
 
-def _gate(name: str, version: str, state_version: int, decision: GateDecision, details: dict[str, Any]) -> GateResultSchema:
+def _gate(
+    name: str, version: str, state_version: int, decision: GateDecision, details: dict[str, Any]
+) -> GateResultSchema:
     return GateResultSchema(
         gate_name=name,
         policy_version=version,
@@ -350,7 +365,7 @@ async def _execute(
         input_payload.domain_state,
     )
     result = await execute_syndrome_draft(
-        runtime=AgentRuntime(actual_gateway),
+        runtime=AgentRuntime(actual_gateway, recorder=None),
         repository=actual_repository,
         run_spec=actual_run,
         input_payload=input_payload,
@@ -548,7 +563,13 @@ async def test_non_ready_and_stale_or_forged_completeness_gate_are_zero_call() -
     stale_payload = _input(
         session_id=payload.session_id,
         state_version=payload.state_version,
-        completeness_gate=_gate(COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION, payload.state_version - 1, GateDecision.PASSED, {"disposition": "ready"}),
+        completeness_gate=_gate(
+            COMPLETENESS_GATE_NAME,
+            COMPLETENESS_POLICY_VERSION,
+            payload.state_version - 1,
+            GateDecision.PASSED,
+            {"disposition": "ready"},
+        ),
     )
     stale_gateway = FakeGateway([_completed(stale_payload)])
     stale_result, stale_gateway = await _execute(stale_payload, stale_gateway.outcomes[0], gateway=stale_gateway)
@@ -556,7 +577,13 @@ async def test_non_ready_and_stale_or_forged_completeness_gate_are_zero_call() -
     assert stale_gateway.actual_request_count == 0
 
     forged_payload = _input(
-        completeness_gate=_gate(COMPLETENESS_GATE_NAME, "forged-policy.v9", payload.state_version, GateDecision.PASSED, {"disposition": "ready"}),
+        completeness_gate=_gate(
+            COMPLETENESS_GATE_NAME,
+            "forged-policy.v9",
+            payload.state_version,
+            GateDecision.PASSED,
+            {"disposition": "ready"},
+        ),
     )
     forged_gateway = FakeGateway([_completed(forged_payload)])
     forged_result, forged_gateway = await _execute(forged_payload, forged_gateway.outcomes[0], gateway=forged_gateway)
@@ -567,7 +594,13 @@ async def test_non_ready_and_stale_or_forged_completeness_gate_are_zero_call() -
 @pytest.mark.asyncio
 async def test_unhandled_red_flag_and_fact_conflict_are_zero_call() -> None:
     red_payload = _input(
-        triage_gate=_gate(TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION, 3, GateDecision.BLOCKED, {"disposition": "emergency_referral", "candidate_count": 1}),
+        triage_gate=_gate(
+            TRIAGE_GATE_NAME,
+            TRIAGE_POLICY_VERSION,
+            3,
+            GateDecision.BLOCKED,
+            {"disposition": "emergency_referral", "candidate_count": 1},
+        ),
     )
     red_gateway = FakeGateway([_completed(red_payload)])
     red_result, red_gateway = await _execute(red_payload, red_gateway.outcomes[0], gateway=red_gateway)
@@ -583,7 +616,9 @@ async def test_unhandled_red_flag_and_fact_conflict_are_zero_call() -> None:
         ),
     )
     conflict_gateway = FakeGateway([_completed(conflict_payload)])
-    conflict_result, conflict_gateway = await _execute(conflict_payload, conflict_gateway.outcomes[0], gateway=conflict_gateway)
+    conflict_result, conflict_gateway = await _execute(
+        conflict_payload, conflict_gateway.outcomes[0], gateway=conflict_gateway
+    )
     assert conflict_result.failure_code in {
         SyndromeVerificationFailureCode.GATE_INVALID,
         SyndromeVerificationFailureCode.FACT_CONFLICT_BLOCKING,
@@ -610,7 +645,9 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
 
     sid = uuid.uuid4()
     old = _observation(sid, "symptom.old", "old")
-    corrected = _observation(sid, "symptom.old", "new", status=ObservationStatus.CORRECTED, supersedes=old.observation_id)
+    corrected = _observation(
+        sid, "symptom.old", "new", status=ObservationStatus.CORRECTED, supersedes=old.observation_id
+    )
     superseded_payload = _input(session_id=sid, observations=(*_ready_observations(sid), old, corrected))
     superseded_run = _run(session_id=superseded_payload.session_id, state_version=superseded_payload.state_version)
     invalid = _completed(superseded_payload).model_copy(
@@ -625,7 +662,9 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
     )
     assert stale_report.failure_code is SyndromeVerificationFailureCode.FACT_LINK_INVALID
 
-    retracted = _observation(sid, "symptom.inactive", "inactive", status=ObservationStatus.RETRACTED, supersedes=old.observation_id)
+    retracted = _observation(
+        sid, "symptom.inactive", "inactive", status=ObservationStatus.RETRACTED, supersedes=old.observation_id
+    )
     inactive_payload = _input(session_id=sid, observations=(*_ready_observations(sid), old, retracted))
     inactive_run = _run(session_id=inactive_payload.session_id, state_version=inactive_payload.state_version)
     inactive = _completed(inactive_payload).model_copy(
@@ -720,6 +759,7 @@ async def test_run_spec_agent_spec_and_policy_mismatch_are_zero_call() -> None:
         _run(session_id=payload.session_id, state_version=payload.state_version + 1),
         _run(session_id=payload.session_id, state_version=payload.state_version, agent_version="wrong"),
         _run(session_id=payload.session_id, state_version=payload.state_version, prompt_version="wrong.jinja2"),
+        _run(session_id=payload.session_id, state_version=payload.state_version, policy_version="wrong-policy.v2"),
         _run(session_id=payload.session_id, state_version=payload.state_version, budget=2),
     ):
         gateway = FakeGateway([_completed(payload)])
@@ -727,12 +767,10 @@ async def test_run_spec_agent_spec_and_policy_mismatch_are_zero_call() -> None:
         assert result.failure_code is SyndromeVerificationFailureCode.RUN_PROVENANCE_MISMATCH
         assert gateway.actual_request_count == 0
 
-    bad_spec = build_syndrome_agent_spec(model="fake-model").model_copy(
-        update={"version": "syndrome-draft-agent.v2"}
-    )
+    bad_spec = build_syndrome_agent_spec(model="fake-model").model_copy(update={"version": "syndrome-draft-agent.v2"})
     gateway = FakeGateway([_completed(payload)])
     result = await execute_syndrome_draft(
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         repository=FakeGateRepository((payload.triage_gate, payload.completeness_gate), payload.domain_state),
         run_spec=_run(session_id=payload.session_id, state_version=payload.state_version),
         input_payload=payload,
@@ -765,7 +803,9 @@ async def test_prompt_injection_cannot_change_route_evidence_mode_or_permissions
 @pytest.mark.asyncio
 async def test_context_privacy_rejects_pii_before_gateway() -> None:
     sid = uuid.uuid4()
-    payload = _input(session_id=sid, observations=(*_ready_observations(sid), _observation(sid, "clinical.note", "13800138000")))
+    payload = _input(
+        session_id=sid, observations=(*_ready_observations(sid), _observation(sid, "clinical.note", "13800138000"))
+    )
     gateway = FakeGateway([_completed(payload)])
     result, gateway = await _execute(payload, gateway.outcomes[0], gateway=gateway)
     assert result.failure_code is SyndromeVerificationFailureCode.CONTEXT_PRIVACY_INVALID
@@ -790,7 +830,13 @@ async def test_graph_state_checkpoint_contains_only_syndrome_artifact_reference(
         "graph_version": DEFAULT_GRAPH_VERSION,
         "run_id": str(uuid.uuid4()),
         "artifact_refs": [{"kind": "syndrome_draft", "artifact_id": str(uuid.uuid4()), "revision": 1}],
-        "gate_results": [{"gate_name": "syndrome_verifier", "decision": "passed", "policy_version": "syndrome-draft-policy.no-rag.v1"}],
+        "gate_results": [
+            {
+                "gate_name": "syndrome_verifier",
+                "decision": "passed",
+                "policy_version": "syndrome-draft-policy.no-rag.v1",
+            }
+        ],
     }
     config = make_run_config(state["session_id"], graph_version=DEFAULT_GRAPH_VERSION)
 

@@ -14,7 +14,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.exceptions import InvalidStageTransitionError, SessionNotFoundError
+from app.core.exceptions import (
+    InvalidStageTransitionError,
+    RuntimeSwitchAuditMismatchError,
+    SessionNotFoundError,
+)
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
 from app.schemas.session import (
@@ -28,6 +32,11 @@ from app.schemas.session import (
     SessionTerminateResponse,
 )
 from app.services.initial_domain_seed import InitialDomainSeeder
+from app.services.runtime_switch_audit import (
+    PostgresRuntimeSwitchAuditRepository,
+    RuntimeSwitchAuditMismatch,
+    RuntimeSwitchAuditService,
+)
 from app.services.session_read_model import SessionReadModelService
 
 # 可被终止的会话状态
@@ -78,6 +87,24 @@ class SessionService:
         patient_info_dict = request.patient_info.model_dump()
         patient_ref = request.patient_info.patient_ref
         agent_runtime = request.agent_runtime or get_settings().agent_runtime_version
+
+        # An omitted runtime consumes the deployment default and therefore
+        # requires a matching durable ``runtime.switched`` chain.  Explicit
+        # per-session selection remains the separately guarded development /
+        # canary path.  Keeping this check inside the idempotent handler means
+        # a persisted replay remains stable after a later deployment switch.
+        if request.agent_runtime is None:
+            try:
+                await RuntimeSwitchAuditService(
+                    PostgresRuntimeSwitchAuditRepository(self._db)
+                ).ensure_configured_runtime(agent_runtime)
+            except RuntimeSwitchAuditMismatch as exc:
+                raise RuntimeSwitchAuditMismatchError(
+                    detail=(
+                        "AGENT_RUNTIME_VERSION 与最近一次 runtime.switched "
+                        "发布审计不一致；请由发布人员核对后重试"
+                    )
+                ) from exc
 
         session = ConsultSession(
             patient_ref=patient_ref,

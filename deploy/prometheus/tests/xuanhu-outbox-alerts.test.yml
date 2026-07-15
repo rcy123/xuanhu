@@ -1,0 +1,28 @@
+rule_files:
+  - ../rules/xuanhu-outbox-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: missing metric is isolated per API target
+    interval: 1m
+    input_series:
+      - series: 'up{job="xuanhu-api",instance="api-a:8000"}'
+        values: '1x10'
+      - series: 'xuanhu_outbox_health_available{job="xuanhu-api",instance="api-a:8000"}'
+        values: '1x10'
+      - series: 'up{job="xuanhu-api",instance="api-b:8000"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: XuanhuOutboxMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: outbox
+              job: xuanhu-api
+              instance: api-b:8000
+            exp_annotations:
+              summary: Xuanhu Outbox metrics are missing
+              description: A configured xuanhu-api target is down or has omitted the privacy-safe Outbox health gauge for five minutes.

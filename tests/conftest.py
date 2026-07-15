@@ -48,6 +48,25 @@ def _set_test_defaults() -> None:
 _set_test_defaults()
 
 
+@pytest.fixture(autouse=True)
+def _allow_request_local_langgraph_test_runtime() -> Iterator[None]:
+    """Opt the shared test ASGI app into its explicit no-lifespan fallback."""
+
+    from app.main import app
+
+    attribute = "allow_request_local_langgraph_test_runtime"
+    had_previous = hasattr(app.state, attribute)
+    previous = getattr(app.state, attribute, None)
+    setattr(app.state, attribute, True)
+    try:
+        yield
+    finally:
+        if had_previous:
+            setattr(app.state, attribute, previous)
+        else:
+            delattr(app.state, attribute)
+
+
 @pytest.fixture
 def enable_public_langgraph(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Explicitly opt API tests into the controlled LangGraph rollout."""

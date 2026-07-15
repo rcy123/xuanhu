@@ -46,6 +46,9 @@ coverage.xml
 # pytest
 .pytest_cache/
 
+# Local reacceptance artifacts
+.codex_tmp/
+
 # Node (frontend, if any)
 node_modules/
 

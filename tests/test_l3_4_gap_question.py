@@ -26,6 +26,7 @@ from app.agent_runtime.runtime import AgentRuntime
 from app.agent_runtime.specs import Capability, FailurePolicy, RunSpec, RuntimeErrorCode
 from app.agent_runtime.triage_policy import evaluate_triage_policy
 from app.agents.question_composer import (
+    QUESTION_COMPOSER_POLICY_VERSION,
     QUESTION_TEMPLATES,
     FrozenQuestionTemplateRegistry,
     QuestionTemplate,
@@ -75,7 +76,9 @@ class FakeGateway:
         self.actual_request_count = 0
         self.entered = asyncio.Event()
 
-    async def chat_structured(self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any) -> Any:
+    async def chat_structured(
+        self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any
+    ) -> Any:
         self.calls.append({"messages": messages, "output_schema": output_schema, **kwargs})
         self.actual_request_count += kwargs.get("max_requests", 1)
         self.entered.set()
@@ -200,6 +203,7 @@ def build_run_spec(selection: GapSelectionResult, **overrides: Any) -> RunSpec:
         "stage": "intake_question",
         "agent_spec_version": QUESTION_COMPOSER_AGENT_VERSION,
         "prompt_version": QUESTION_COMPOSER_PROMPT_VERSION,
+        "policy_version": QUESTION_COMPOSER_POLICY_VERSION,
         "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
         "total_attempt_budget": 1,
         "idempotency_key": f"test:{selection.input_state_version}",
@@ -382,9 +386,7 @@ def test_public_select_gap_uses_private_authority_even_if_export_is_rebound() ->
                     for _, rule in original_export.items()
                     if rule.dimension is not InquiryDimension.CHIEF_COMPLAINT_SYMPTOM
                 ),
-                original_export[InquiryDimension.CHIEF_COMPLAINT_SYMPTOM].model_copy(
-                    update={"required_priority": 1}
-                ),
+                original_export[InquiryDimension.CHIEF_COMPLAINT_SYMPTOM].model_copy(update={"required_priority": 1}),
             )
         )
         selection = select_gap(completeness)
@@ -467,7 +469,7 @@ async def test_supplied_selection_hidden_authority_fields_are_rejected_before_qu
     outcome = await compose_question(
         completeness_result=completeness,
         selection=forged,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
     )
 
     assert outcome.status is QuestionCompositionStatus.FAILED
@@ -489,7 +491,7 @@ async def test_supplied_selection_subclass_with_authority_field_is_rejected() ->
     outcome = await compose_question(
         completeness_result=completeness,
         selection=forged,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
     )
 
     assert outcome.status is QuestionCompositionStatus.FAILED
@@ -513,7 +515,7 @@ async def test_supplied_constructed_selection_invalid_combination_is_rejected() 
     outcome = await compose_question(
         completeness_result=completeness,
         selection=forged,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
     )
 
     assert outcome.status is QuestionCompositionStatus.FAILED
@@ -539,7 +541,10 @@ async def test_template_hit_generates_one_question_and_zero_model_requests() -> 
     completeness = evaluate_completeness_policy(policy_input(*missing_symptom_facts()))
     gateway = fallback_gateway("unused？")
 
-    outcome = await compose_question(completeness_result=completeness, runtime=AgentRuntime(gateway))
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+    )
 
     assert outcome.status is QuestionCompositionStatus.SUCCEEDED
     assert outcome.result is not None
@@ -557,7 +562,10 @@ async def test_no_selection_does_not_generate_question_or_call_model() -> None:
     completeness = evaluate_completeness_policy(policy_input(*complete_general_facts()))
     gateway = fallback_gateway("unused？")
 
-    outcome = await compose_question(completeness_result=completeness, runtime=AgentRuntime(gateway))
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+    )
 
     assert outcome.status is QuestionCompositionStatus.NO_QUESTION
     assert outcome.result is None
@@ -585,13 +593,13 @@ async def test_public_composer_does_not_accept_replacement_template_registry_or_
     with pytest.raises(TypeError):
         await compose_question(  # type: ignore[call-arg]
             completeness_result=completeness,
-            runtime=AgentRuntime(gateway),
+            runtime=AgentRuntime(gateway, recorder=None),
             run_spec=build_run_spec(selection),
             template_registry=FrozenQuestionTemplateRegistry(()),
         )
     outcome = await compose_question(
         completeness_result=completeness,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         run_spec=build_run_spec(selection),
     )
     assert outcome.status is QuestionCompositionStatus.SUCCEEDED
@@ -621,7 +629,7 @@ async def test_template_key_dimension_or_kind_mismatch_is_fixed_failure_without_
     for template in (wrong_dimension, wrong_kind):
         outcome = await question_composer._compose_question_with_template_registry(
             selection=selection,
-            runtime=AgentRuntime(gateway),
+            runtime=AgentRuntime(gateway, recorder=None),
             run_spec=build_run_spec(selection),
             template_registry={(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, GapSelectionKind.REQUIRED): template},
         )
@@ -638,7 +646,7 @@ async def test_template_missing_private_seam_uses_agent_runtime_once_with_saniti
 
     outcome = await question_composer._compose_question_with_template_registry(
         selection=selection,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         run_spec=build_run_spec(selection),
         agent_spec=build_question_composer_agent_spec(model="fake-question-model"),
         template_registry=FrozenQuestionTemplateRegistry(()),
@@ -670,6 +678,7 @@ async def test_fallback_missing_or_mismatched_run_spec_fails_before_gateway_call
         build_run_spec(selection, state_version=106),
         build_run_spec(selection, agent_spec_version="wrong-agent-version"),
         build_run_spec(selection, prompt_version="wrong_prompt.jinja2"),
+        build_run_spec(selection, policy_version="wrong-question-policy.v2"),
         build_run_spec(selection, total_attempt_budget=2),
         build_run_spec(selection, stage="wrong_stage"),
         build_run_spec(selection, deadline_at=datetime.now(UTC) - timedelta(seconds=1)),
@@ -679,7 +688,7 @@ async def test_fallback_missing_or_mismatched_run_spec_fails_before_gateway_call
         gateway = fallback_gateway()
         outcome = await question_composer._compose_question_with_template_registry(
             selection=selection,
-            runtime=AgentRuntime(gateway),
+            runtime=AgentRuntime(gateway, recorder=None),
             run_spec=run,
             template_registry=FrozenQuestionTemplateRegistry(()),
         )
@@ -710,9 +719,7 @@ async def test_fallback_mismatched_agent_spec_fails_before_gateway_call() -> Non
         base.model_copy(update={"verifier_chain": base.verifier_chain + ("extra_verifier",)}),
         base.model_copy(
             update={
-                "failure_policy": FailurePolicy(
-                    retryable_codes=frozenset({RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT})
-                )
+                "failure_policy": FailurePolicy(retryable_codes=frozenset({RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT}))
             }
         ),
         base.model_copy(update={"tool_permissions": frozenset({Capability.READ_STATE, Capability.READ_EVIDENCE})}),
@@ -733,7 +740,7 @@ async def test_fallback_mismatched_agent_spec_fails_before_gateway_call() -> Non
         gateway = fallback_gateway()
         outcome = await question_composer._compose_question_with_template_registry(
             selection=selection,
-            runtime=AgentRuntime(gateway),
+            runtime=AgentRuntime(gateway, recorder=None),
             run_spec=build_run_spec(selection, agent_spec_version=spec.version),
             agent_spec=spec,
             template_registry=FrozenQuestionTemplateRegistry(()),
@@ -760,7 +767,7 @@ async def test_model_cannot_override_selected_dimension_or_emit_authority_fields
 
     outcome = await question_composer._compose_question_with_template_registry(
         selection=selection,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         run_spec=build_run_spec(selection),
         template_registry=FrozenQuestionTemplateRegistry(()),
     )
@@ -800,7 +807,7 @@ async def test_model_multi_question_identity_connector_and_authority_text_are_re
 
     outcome = await question_composer._compose_question_with_template_registry(
         selection=selection,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         run_spec=build_run_spec(selection),
         template_registry=FrozenQuestionTemplateRegistry(()),
     )
@@ -825,7 +832,7 @@ async def test_constructed_model_output_with_hidden_fields_is_rejected() -> None
 
     outcome = await question_composer._compose_question_with_template_registry(
         selection=selection,
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         run_spec=build_run_spec(selection),
         template_registry=FrozenQuestionTemplateRegistry(()),
     )

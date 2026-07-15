@@ -249,6 +249,7 @@ def _context(
         stage="inquiry",
         agent_spec_version=agent_version,
         prompt_version="prompt-v1",
+        policy_version="test-repository-policy.v1",
         deadline_at=datetime.now(UTC) + timedelta(minutes=5),
         total_attempt_budget=1,
         idempotency_key=idempotency_key,

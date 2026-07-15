@@ -29,6 +29,11 @@ from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import XuanhuCommand
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.graph import build_main_graph
+from app.agent_runtime.lifecycle import (
+    LangGraphRuntimeUnavailableError,
+    SharedLangGraphRuntime,
+    allow_request_local_runtime_fallback,
+)
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.state import default_state
 from app.agents.supervisor import Supervisor, SupervisorResult
@@ -138,8 +143,7 @@ def _precheck_stage(session: ConsultSession, force: bool) -> None:
         if not sufficient:
             raise InsufficientInquiryError(
                 detail=(
-                    f"session_id={session.id} current_stage=inquiry "
-                    f"sufficient={sufficient}，问诊信息不充分，不能推进"
+                    f"session_id={session.id} current_stage=inquiry sufficient={sufficient}，问诊信息不充分，不能推进"
                 ),
             )
 
@@ -188,6 +192,26 @@ async def _invoke_reasoning_graph(*, session_id: str, command_key: str, run_id: 
         graph = build_main_graph(checkpointer=saver)
         runner = GraphRunner(graph, timeout_seconds=120)
         await runner.ainvoke(dict(graph_state), config=config)
+
+
+async def _invoke_shared_reasoning_graph(
+    runtime: SharedLangGraphRuntime,
+    *,
+    session_id: str,
+    command_key: str,
+    run_id: uuid.UUID,
+) -> None:
+    """Invoke the lifespan-owned compiled graph without setup/recompile."""
+
+    graph_state = default_state(
+        session_id=session_id,
+        command=XuanhuCommand.ADVANCE.value,
+        command_id=command_key,
+        graph_version=DEFAULT_GRAPH_VERSION,
+        run_id=str(run_id),
+    )
+    config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
+    await runtime.runner(timeout_seconds=120).ainvoke(dict(graph_state), config=config)
 
 
 async def _completed_advance_response(
@@ -344,7 +368,10 @@ async def _run_langgraph_advance(
     trace_id: str,
     force: bool = False,
     idempotency_key: str | None = None,
+    shared_runtime: SharedLangGraphRuntime | None = None,
+    allow_request_local_runtime: bool = False,
 ) -> dict[str, Any]:
+    _require_langgraph_runtime(shared_runtime, allow_request_local_runtime)
     del session
     sid = uuid.UUID(session_id)
     command_key = _advance_command_key(idempotency_key)
@@ -568,7 +595,21 @@ async def _run_langgraph_advance(
         )
     assert run_id is not None
     try:
-        await _invoke_reasoning_graph(session_id=session_id, command_key=command_key, run_id=run_id)
+        if shared_runtime is not None:
+            await _invoke_shared_reasoning_graph(
+                shared_runtime,
+                session_id=session_id,
+                command_key=command_key,
+                run_id=run_id,
+            )
+        elif allow_request_local_runtime:
+            await _invoke_reasoning_graph(
+                session_id=session_id,
+                command_key=command_key,
+                run_id=run_id,
+            )
+        else:
+            raise LangGraphRuntimeUnavailableError
     except Exception as exc:
         await _mark_advance_failed(
             db,
@@ -589,6 +630,19 @@ async def _run_langgraph_advance(
     )
 
 
+def _require_langgraph_runtime(
+    shared_runtime: SharedLangGraphRuntime | None,
+    allow_request_local_runtime: bool,
+) -> None:
+    """Fail before any domain or HTTP-idempotency mutation."""
+
+    if shared_runtime is None and not allow_request_local_runtime:
+        raise ModelGatewayUnavailableError(
+            "shared LangGraph runtime is unavailable",
+            retryable=True,
+        )
+
+
 @router.post("/sessions/{session_id}/advance")
 async def advance_session(
     request: Request,
@@ -604,8 +658,25 @@ async def advance_session(
     问诊完备性充分后，调用此接口依次执行辨证→开方→加减→安全审核。
     安全审核通过后挂起等待医师确认（不进病历生成）。
     """
-    del request
+    runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
+    test_runtime_fallback = allow_request_local_runtime_fallback(
+        runtime_state,
+        test_fallback_enabled=bool(
+            getattr(
+                request.app.state,
+                "allow_request_local_langgraph_test_runtime",
+                False,
+            )
+        ),
+    )
+    shared_runtime = runtime_state.runtime if runtime_state is not None else None
     trace_id = context.trace_id
+
+    preflight_session = await _load_session_for_advance(db, session_id)
+    if getattr(preflight_session, "agent_runtime", "legacy") == "langgraph":
+        # Do not persist a retryable runtime-startup failure as the terminal
+        # outcome for this HTTP idempotency key.
+        _require_langgraph_runtime(shared_runtime, test_runtime_fallback)
 
     async def run_advance() -> dict[str, Any]:
         session = await _load_session_for_advance(db, session_id)
@@ -618,6 +689,8 @@ async def advance_session(
                 trace_id=trace_id,
                 force=body.force,
                 idempotency_key=context.idempotency_key,
+                shared_runtime=shared_runtime,
+                allow_request_local_runtime=test_runtime_fallback,
             )
 
         _precheck_stage(session, body.force)
@@ -673,9 +746,7 @@ async def advance_session(
 # ---------------------------------------------------------------------------
 
 
-async def advance_session_not_found_handler(
-    request: Request, exc: SessionNotFoundError
-) -> JSONResponse:
+async def advance_session_not_found_handler(request: Request, exc: SessionNotFoundError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -690,9 +761,7 @@ async def advance_session_not_found_handler(
     )
 
 
-async def advance_busy_handler(
-    request: Request, exc: SessionBusyError
-) -> JSONResponse:
+async def advance_busy_handler(request: Request, exc: SessionBusyError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -707,9 +776,7 @@ async def advance_busy_handler(
     )
 
 
-async def advance_invalid_state_version_handler(
-    request: Request, exc: InvalidStateVersionError
-) -> JSONResponse:
+async def advance_invalid_state_version_handler(request: Request, exc: InvalidStateVersionError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -724,9 +791,7 @@ async def advance_invalid_state_version_handler(
     )
 
 
-async def advance_invalid_stage_handler(
-    request: Request, exc: InvalidStageTransitionError
-) -> JSONResponse:
+async def advance_invalid_stage_handler(request: Request, exc: InvalidStageTransitionError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -741,9 +806,7 @@ async def advance_invalid_stage_handler(
     )
 
 
-async def insufficient_inquiry_handler(
-    request: Request, exc: InsufficientInquiryError
-) -> JSONResponse:
+async def insufficient_inquiry_handler(request: Request, exc: InsufficientInquiryError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -758,9 +821,7 @@ async def insufficient_inquiry_handler(
     )
 
 
-async def pending_doctor_review_handler(
-    request: Request, exc: PendingDoctorReviewError
-) -> JSONResponse:
+async def pending_doctor_review_handler(request: Request, exc: PendingDoctorReviewError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=exc.status_code,
@@ -775,9 +836,7 @@ async def pending_doctor_review_handler(
     )
 
 
-async def advance_model_gateway_handler(
-    request: Request, exc: ModelGatewayUnavailableError
-) -> JSONResponse:
+async def advance_model_gateway_handler(request: Request, exc: ModelGatewayUnavailableError) -> JSONResponse:
     trace_id = _get_trace_id(request)
     return JSONResponse(
         status_code=503,
@@ -792,9 +851,7 @@ async def advance_model_gateway_handler(
     )
 
 
-async def advance_idempotency_conflict_handler(
-    request: Request, exc: IdempotencyConflictError
-) -> JSONResponse:
+async def advance_idempotency_conflict_handler(request: Request, exc: IdempotencyConflictError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={

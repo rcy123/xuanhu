@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, String, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,4 +44,13 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin):
         Index("idx_audit_events_session_created", "session_id", created_at.desc()),
         Index("idx_audit_events_type_created", "event_type", created_at.desc()),
         Index("idx_audit_events_trace_id", "trace_id"),
+        Index(
+            "uq_audit_events_runtime_switch_deployment",
+            "event_type",
+            "trace_id",
+            unique=True,
+            postgresql_where=text(
+                "event_type = 'runtime.switched' AND trace_id IS NOT NULL"
+            ),
+        ),
     )

@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.lifecycle import allow_request_local_runtime_fallback
 from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
 from app.core.exceptions import (
     AgentTriggerFailedError,
@@ -83,9 +84,29 @@ async def create_message(
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """提交问诊消息（P8-6: 触发 Agent 回复）。"""
-    del request
+    runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
+    test_runtime_fallback = allow_request_local_runtime_fallback(
+        runtime_state,
+        test_fallback_enabled=bool(
+            getattr(
+                request.app.state,
+                "allow_request_local_langgraph_test_runtime",
+                False,
+            )
+        ),
+    )
     trace_id = context.trace_id
-    service = MessageService(db)
+    service = MessageService(
+        db,
+        shared_langgraph_runtime=(runtime_state.runtime if runtime_state is not None else None),
+        # ASGITransport does not run lifespan automatically.  The fallback is
+        # restricted to explicit test configuration; every non-test process
+        # fails closed when startup state is absent or degraded.
+        allow_request_local_langgraph_runtime=test_runtime_fallback,
+    )
+    # Keep retryable infrastructure failures outside HttpCommandExecutor so
+    # the idempotency key can execute after the process runtime recovers.
+    await service.ensure_submission_runtime_available(session_id)
 
     async def submit() -> dict[str, Any]:
         data = await service.submit_message(
@@ -154,9 +175,7 @@ async def get_messages(
 # ---------------------------------------------------------------------------
 
 
-async def session_busy_handler(
-    request: Request, exc: SessionBusyError
-) -> JSONResponse:
+async def session_busy_handler(request: Request, exc: SessionBusyError) -> JSONResponse:
     """SESSION_BUSY 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -172,9 +191,7 @@ async def session_busy_handler(
     )
 
 
-async def invalid_state_version_handler(
-    request: Request, exc: InvalidStateVersionError
-) -> JSONResponse:
+async def invalid_state_version_handler(request: Request, exc: InvalidStateVersionError) -> JSONResponse:
     """INVALID_STATE_VERSION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -190,9 +207,7 @@ async def invalid_state_version_handler(
     )
 
 
-async def session_terminated_handler(
-    request: Request, exc: SessionTerminatedError
-) -> JSONResponse:
+async def session_terminated_handler(request: Request, exc: SessionTerminatedError) -> JSONResponse:
     """SESSION_TERMINATED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -208,9 +223,7 @@ async def session_terminated_handler(
     )
 
 
-async def message_not_found_handler(
-    request: Request, exc: SessionNotFoundError
-) -> JSONResponse:
+async def message_not_found_handler(request: Request, exc: SessionNotFoundError) -> JSONResponse:
     """SESSION_NOT_FOUND 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -226,9 +239,7 @@ async def message_not_found_handler(
     )
 
 
-async def message_invalid_stage_handler(
-    request: Request, exc: InvalidStageTransitionError
-) -> JSONResponse:
+async def message_invalid_stage_handler(request: Request, exc: InvalidStageTransitionError) -> JSONResponse:
     """INVALID_STAGE_TRANSITION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -244,9 +255,7 @@ async def message_invalid_stage_handler(
     )
 
 
-async def agent_trigger_failed_handler(
-    request: Request, exc: AgentTriggerFailedError
-) -> JSONResponse:
+async def agent_trigger_failed_handler(request: Request, exc: AgentTriggerFailedError) -> JSONResponse:
     """AGENT_TRIGGER_FAILED 异常处理（P8-6）。
 
     医生消息已落库，Agent 回复失败。返回 503，携带 agent_error_code。
@@ -268,9 +277,7 @@ async def agent_trigger_failed_handler(
     )
 
 
-async def model_gateway_unavailable_handler(
-    request: Request, exc: ModelGatewayUnavailableError
-) -> JSONResponse:
+async def model_gateway_unavailable_handler(request: Request, exc: ModelGatewayUnavailableError) -> JSONResponse:
     """MODEL_GATEWAY_UNAVAILABLE 异常处理（P8-6）。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -286,9 +293,7 @@ async def model_gateway_unavailable_handler(
     )
 
 
-async def idempotency_conflict_handler(
-    request: Request, exc: IdempotencyConflictError
-) -> JSONResponse:
+async def idempotency_conflict_handler(request: Request, exc: IdempotencyConflictError) -> JSONResponse:
     """Return a stable conflict when one public key is reused for another payload."""
 
     return JSONResponse(

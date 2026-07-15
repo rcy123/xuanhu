@@ -1,0 +1,68 @@
+groups:
+  - name: xuanhu-outbox
+    interval: 30s
+    rules:
+      - alert: XuanhuOutboxBacklogAgeHigh
+        expr: >-
+          (xuanhu_outbox_oldest_unpublished_age_seconds
+          > xuanhu_outbox_ready_max_oldest_age_seconds)
+          and (xuanhu_outbox_publisher_enabled == 1)
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: outbox
+        annotations:
+          summary: Xuanhu Outbox oldest unpublished event exceeds its configured limit
+          description: The aggregate oldest-event age has exceeded the readiness threshold for five minutes.
+
+      - alert: XuanhuOutboxDeadLettersPresent
+        expr: >-
+          (xuanhu_outbox_dead_letter_events
+          > xuanhu_outbox_ready_max_dead_letter_events)
+          and (xuanhu_outbox_publisher_enabled == 1)
+        for: 1m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: outbox
+        annotations:
+          summary: Xuanhu Outbox dead-letter threshold exceeded
+          description: Durable dead-letter events exceed the configured readiness threshold and require operator review.
+
+      - alert: XuanhuOutboxHealthUnavailable
+        expr: xuanhu_outbox_health_available == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: outbox
+        annotations:
+          summary: Xuanhu Outbox health query is unavailable
+          description: The exporter could not obtain a valid aggregate Outbox health snapshot for two minutes.
+
+      - alert: XuanhuOutboxPublisherDisabled
+        expr: xuanhu_outbox_publisher_enabled == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: outbox
+        annotations:
+          summary: Xuanhu durable Outbox publisher is disabled
+          description: The API reports that durable Outbox publication has been disabled for five minutes.
+
+      - alert: XuanhuOutboxMetricsMissing
+        expr: >-
+          (up{job="xuanhu-api"} == 0)
+          or
+          ((up{job="xuanhu-api"} == 1)
+          unless on(job, instance) xuanhu_outbox_health_available)
+        for: 5m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: outbox
+        annotations:
+          summary: Xuanhu Outbox metrics are missing
+          description: A configured xuanhu-api target is down or has omitted the privacy-safe Outbox health gauge for five minutes.

@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.lifecycle import SharedLangGraphRuntime
 from app.agents.base import AgentResult, BaseAgent
 from app.agents.errors import AgentRunError
 from app.agents.inquiry import InquiryAgent, merge_inquiry_output_to_state
@@ -114,6 +115,8 @@ class MessageService:
         event_service: EventService | None = None,
         inquiry_agent: BaseAgent | None = None,
         sufficiency_agent: BaseAgent | None = None,
+        shared_langgraph_runtime: SharedLangGraphRuntime | None = None,
+        allow_request_local_langgraph_runtime: bool = False,
     ) -> None:
         self._db = db
         self._registry = registry or _default_inquiry_registry()
@@ -122,6 +125,8 @@ class MessageService:
         # 生产路径留空，走 _registry 的真实 InquiryAgent/SufficiencyAgent。
         self._inquiry_agent_override = inquiry_agent
         self._sufficiency_agent_override = sufficiency_agent
+        self._shared_langgraph_runtime = shared_langgraph_runtime
+        self._allow_request_local_langgraph_runtime = allow_request_local_langgraph_runtime
 
     # ------------------------------------------------------------------
     # 会话加载（与 SessionService 共享逻辑，P3-2 内联避免循环引用）
@@ -137,9 +142,7 @@ class MessageService:
                 retryable=False,
             ) from exc
 
-        result = await self._db.execute(
-            select(ConsultSession).where(ConsultSession.id == sid)
-        )
+        result = await self._db.execute(select(ConsultSession).where(ConsultSession.id == sid))
         session = result.scalar_one_or_none()
         if session is None:
             raise SessionNotFoundError(
@@ -181,9 +184,12 @@ class MessageService:
         """
         session = await self._load_session(session_id)
         if getattr(session, "agent_runtime", "legacy") == "langgraph":
+            self._require_langgraph_runtime()
             return await LangGraphIntakeMessageRunner(
                 self._db,
                 event_service=self._event_service,
+                shared_runtime=self._shared_langgraph_runtime,
+                allow_request_local_runtime=(self._allow_request_local_langgraph_runtime),
             ).submit_message(
                 session_id,
                 body,
@@ -223,6 +229,21 @@ class MessageService:
             sufficiency_report=sufficiency,
         )
 
+    async def ensure_submission_runtime_available(self, session_id: str) -> None:
+        """Fail before HTTP idempotency claims when LangGraph is unavailable."""
+
+        session = await self._load_session(session_id)
+        if getattr(session, "agent_runtime", "legacy") == "langgraph":
+            self._require_langgraph_runtime()
+
+    def _require_langgraph_runtime(self) -> None:
+        if self._shared_langgraph_runtime is None and not self._allow_request_local_langgraph_runtime:
+            raise AgentTriggerFailedError(
+                detail="shared LangGraph runtime is unavailable",
+                agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
+                retryable=True,
+            )
+
     async def _save_doctor_message_locked(
         self,
         session_id: str,
@@ -247,18 +268,14 @@ class MessageService:
             if session.current_stage != "inquiry":
                 raise InvalidStageTransitionError(
                     message=f"当前阶段 {session.current_stage} 不允许提交消息",
-                    detail=(
-                        f"session_id={session_id} 处于 {session.current_stage}，"
-                        "仅 inquiry 阶段可提交消息"
-                    ),
+                    detail=(f"session_id={session_id} 处于 {session.current_stage}，仅 inquiry 阶段可提交消息"),
                     retryable=False,
                 )
 
             if x_state_version is not None and x_state_version != session.state_version:
                 raise InvalidStateVersionError(
                     detail=(
-                        f"session_id={session_id} 客户端版本 {x_state_version} "
-                        f"!= 服务端版本 {session.state_version}"
+                        f"session_id={session_id} 客户端版本 {x_state_version} != 服务端版本 {session.state_version}"
                     ),
                     retryable=True,
                 )
@@ -347,10 +364,7 @@ class MessageService:
             inquiry_output = inquiry_result.output
             if not isinstance(inquiry_output, InquiryAgentOutput):
                 raise AgentTriggerFailedError(
-                    detail=(
-                        f"session_id={session_id} InquiryAgent 输出类型非法: "
-                        f"{type(inquiry_output).__name__}"
-                    ),
+                    detail=(f"session_id={session_id} InquiryAgent 输出类型非法: {type(inquiry_output).__name__}"),
                     agent_error_code="INQUIRY_OUTPUT_INVALID",
                 )
 
@@ -365,11 +379,7 @@ class MessageService:
                 agent_name="inquiry",
                 stage=session.current_stage,
                 content=inquiry_output.next_question,
-                agent_run_id=(
-                    uuid.UUID(inquiry_result.agent_run_id)
-                    if inquiry_result.agent_run_id
-                    else None
-                ),
+                agent_run_id=(uuid.UUID(inquiry_result.agent_run_id) if inquiry_result.agent_run_id else None),
                 structured_delta=inquiry_output.model_dump(mode="json", exclude_none=True),
                 trace_id=trace_id,
             )
@@ -385,9 +395,7 @@ class MessageService:
                 suff_output = suff_result.output
                 if isinstance(suff_output, SufficiencyReport):
                     sufficiency_report = suff_output
-                    state = state.model_copy(
-                        update={"sufficiency_report": suff_output}
-                    )
+                    state = state.model_copy(update={"sufficiency_report": suff_output})
 
             # 更新 state_snapshot + state_version
             session.state_version = session.state_version + 1
@@ -405,11 +413,7 @@ class MessageService:
                         "role": "agent",
                         "agent_name": "inquiry",
                         "stage": session.current_stage,
-                        "agent_run_id": (
-                            str(agent_message.agent_run_id)
-                            if agent_message.agent_run_id
-                            else None
-                        ),
+                        "agent_run_id": (str(agent_message.agent_run_id) if agent_message.agent_run_id else None),
                         "content_length": len(agent_message.content),
                     },
                     trace_id=trace_id,
@@ -430,11 +434,7 @@ class MessageService:
                 agent_name="inquiry",
                 stage=agent_message.stage,
                 content=agent_message.content,
-                agent_run_id=(
-                    str(agent_message.agent_run_id)
-                    if agent_message.agent_run_id
-                    else None
-                ),
+                agent_run_id=(str(agent_message.agent_run_id) if agent_message.agent_run_id else None),
                 created_at=agent_message.created_at,
             )
 
@@ -455,10 +455,7 @@ class MessageService:
             await self._db.rollback()
             await self._record_agent_failed(session_id, "inquiry", exc, trace_id)
             raise AgentTriggerFailedError(
-                detail=(
-                    f"session_id={session_id} Agent 执行失败 code={exc.code} "
-                    f"retryable={exc.retryable}"
-                ),
+                detail=(f"session_id={session_id} Agent 执行失败 code={exc.code} retryable={exc.retryable}"),
                 agent_error_code=exc.code,
                 retryable=exc.retryable,
             ) from exc
@@ -466,10 +463,7 @@ class MessageService:
             await self._db.rollback()
             await self._record_agent_failed(session_id, "inquiry", exc, trace_id)
             raise AgentTriggerFailedError(
-                detail=(
-                    f"session_id={session_id} Agent 触发异常: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                detail=(f"session_id={session_id} Agent 触发异常: {type(exc).__name__}: {exc}"),
                 agent_error_code="AGENT_TRIGGER_EXCEPTION",
                 retryable=False,
             ) from exc
@@ -540,14 +534,10 @@ class MessageService:
             "session_id": str(session.id),
             "current_stage": current_stage,
             "pending_review": snapshot.get("pending_review", session.pending_review),
-            "rollback_counts": snapshot.get(
-                "rollback_counts", dict(session.rollback_counts or {})
-            ),
+            "rollback_counts": snapshot.get("rollback_counts", dict(session.rollback_counts or {})),
             "blocked_reason": snapshot.get("blocked_reason", session.blocked_reason),
             "state_version": session.state_version,
-            "recovery_status": snapshot.get(
-                "recovery_status", session.recovery_status or "normal"
-            ),
+            "recovery_status": snapshot.get("recovery_status", session.recovery_status or "normal"),
             "trace_id": trace_id,
         }
         for key in (
@@ -687,10 +677,7 @@ class MessageService:
 
         stmt = select(ConsultMessage).where(
             ConsultMessage.session_id == sid,
-            ~(
-                (ConsultMessage.role == "system")
-                & (ConsultMessage.agent_name == "initial_domain_seed")
-            ),
+            ~((ConsultMessage.role == "system") & (ConsultMessage.agent_name == "initial_domain_seed")),
         )
 
         if stage is not None:

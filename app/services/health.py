@@ -10,8 +10,16 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from app.agent_runtime.lifecycle import (
+    LangGraphRuntimeState,
+    check_shared_langgraph_runtime,
+)
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient
+from app.services.runtime_switch_audit import (
+    PostgresRuntimeSwitchAuditRepository,
+    RuntimeSwitchAuditService,
+)
 
 logger = logging.getLogger("xuanhu.health")
 
@@ -27,6 +35,13 @@ def _now_iso() -> str:
 
 class HealthService:
     """就绪检查与 RAG 健康检查服务。"""
+
+    def __init__(
+        self,
+        *,
+        langgraph_runtime_state: LangGraphRuntimeState | None = None,
+    ) -> None:
+        self._langgraph_runtime_state = langgraph_runtime_state
 
     # -------------------------------------------------------------------
     # Ready 健康检查
@@ -51,6 +66,15 @@ class HealthService:
         # durable outbox publisher (aggregate counters only)
         checks["outbox"] = await self._check_outbox()
 
+        # The configured default runtime is deploy-time state; it must match
+        # the independent durable switch ledger before this worker is ready.
+        checks["runtime_switch_audit"] = await self._check_runtime_switch_audit()
+
+        # Process-scoped LangGraph runtime.  These checks use the saver and
+        # compiled-graph identity created by the ASGI lifespan; they never
+        # create a request-local checkpointer.
+        checks.update(await check_shared_langgraph_runtime(self._langgraph_runtime_state))
+
         # milvus
         checks["milvus"] = await self._check_milvus()
 
@@ -59,7 +83,9 @@ class HealthService:
         checks["llm_gateway"] = gw_checks.get("chat", "unavailable")
         checks["embedding_gateway"] = gw_checks.get("embedding", "unavailable")
 
-        all_ok = all(v in {"ok", "disabled"} for v in checks.values())
+        # The durable publisher is part of the production write contract.
+        # ``disabled`` is observable but is not a ready state.
+        all_ok = all(v == "ok" for v in checks.values())
         overall_status = "ready" if all_ok else "degraded"
 
         return {
@@ -173,6 +199,25 @@ class HealthService:
     async def _check_outbox(self) -> str:
         return str((await self.outbox_check())["status"])
 
+    async def _check_runtime_switch_audit(self) -> str:
+        """Validate the deployment default against the durable global ledger."""
+
+        try:
+            from app.db.session import get_session_factory
+
+            factory = get_session_factory()
+            async with factory() as session:
+                result = await RuntimeSwitchAuditService(PostgresRuntimeSwitchAuditRepository(session)).status(
+                    get_settings().agent_runtime_version
+                )
+            return result.status
+        except Exception as exc:
+            logger.warning(
+                "runtime-switch audit readiness failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return "unavailable"
+
     async def _check_milvus(self) -> str:
         """检查 Milvus 连通性。"""
         try:
@@ -220,9 +265,7 @@ class HealthService:
                     select(func.count())
                     .where(
                         KnowledgeChunk.deleted_at.is_(None),
-                        func.to_tsvector("simple", KnowledgeChunk.content).op("@@")(
-                            ts_query
-                        ),
+                        func.to_tsvector("simple", KnowledgeChunk.content).op("@@")(ts_query),
                     )
                     .limit(1)
                 )

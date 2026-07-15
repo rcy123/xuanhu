@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from contextlib import asynccontextmanager
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -338,8 +339,13 @@ async def test_application_lifespan_starts_and_gracefully_stops_configured_worke
             await stop.wait()
             stopped.set()
 
+    @asynccontextmanager
+    async def fake_langgraph_runtime(_db_url: str):  # type: ignore[no-untyped-def]
+        yield cast(Any, object())
+
     monkeypatch.setenv("OUTBOX_PUBLISHER_ENABLED", "true")
     monkeypatch.setattr("app.services.outbox_publisher.OutboxPublisher", LifecyclePublisher)
+    monkeypatch.setattr("app.main.shared_langgraph_runtime", fake_langgraph_runtime)
     get_settings.cache_clear()
     try:
         async with lifespan(app):

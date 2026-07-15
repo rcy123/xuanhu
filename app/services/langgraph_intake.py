@@ -28,7 +28,8 @@ from app.agent_runtime.completeness_policy import completeness_to_gate_result_sc
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
-from app.agent_runtime.intake_verifier import INTAKE_AGENT_VERSION, INTAKE_PROMPT_VERSION
+from app.agent_runtime.intake_verifier import INTAKE_AGENT_VERSION, INTAKE_POLICY_VERSION, INTAKE_PROMPT_VERSION
+from app.agent_runtime.lifecycle import SharedLangGraphRuntime
 from app.agent_runtime.reducer import DomainDelta, DomainState, reduce_domain_state
 from app.agent_runtime.repository import (
     ConsultMessageSpec,
@@ -50,7 +51,7 @@ from app.agent_runtime.triage_precheck import (
 )
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
 from app.agents.intake_extraction import IntakeExecutionStatus, execute_intake_extraction
-from app.agents.question_composer import compose_question
+from app.agents.question_composer import QUESTION_COMPOSER_POLICY_VERSION, compose_question
 from app.core.config import get_settings
 from app.core.exceptions import (
     AgentTriggerFailedError,
@@ -175,9 +176,13 @@ class LangGraphIntakeMessageRunner:
         db: AsyncSession,
         *,
         event_service: EventService | None = None,
+        shared_runtime: SharedLangGraphRuntime | None = None,
+        allow_request_local_runtime: bool = False,
     ) -> None:
         self._db = db
         self._event_service = event_service
+        self._shared_runtime = shared_runtime
+        self._allow_request_local_runtime = allow_request_local_runtime
 
     async def submit_message(
         self,
@@ -189,6 +194,12 @@ class LangGraphIntakeMessageRunner:
         x_state_version: int | None,
         idempotency_key: str | None = None,
     ) -> MessageCreateResponse:
+        if self._shared_runtime is None and not self._allow_request_local_runtime:
+            raise AgentTriggerFailedError(
+                detail="shared LangGraph runtime is unavailable",
+                agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
+                retryable=True,
+            )
         sid = _parse_session_id(session_id)
         command_key = _command_key(idempotency_key)
         payload_digest = _payload_digest(body)
@@ -214,10 +225,27 @@ class LangGraphIntakeMessageRunner:
             run_id=str(claim.claim.run_id),
         )
         config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
-        async with postgres_checkpointer(get_settings().database_url) as saver:
-            graph = build_main_graph(checkpointer=saver)
-            runner = GraphRunner(graph, timeout_seconds=60)
+        if self._shared_runtime is not None:
+            runner = self._shared_runtime.runner(timeout_seconds=60)
             await runner.ainvoke(dict(graph_state), config=config)
+        elif self._allow_request_local_runtime:
+            # Explicit fallback for direct service/integration-test invocation.
+            # Production HTTP requests always receive the lifespan-owned state
+            # and therefore never enter this branch.
+            async with postgres_checkpointer(get_settings().database_url) as saver:
+                graph = build_main_graph(checkpointer=saver)
+                runner = GraphRunner(graph, timeout_seconds=60)
+                await runner.ainvoke(dict(graph_state), config=config)
+        else:
+            await self._mark_claim_failed(
+                claim.claim.id,
+                "LANGGRAPH_RUNTIME_UNAVAILABLE",
+            )
+            raise AgentTriggerFailedError(
+                detail="shared LangGraph runtime is unavailable",
+                agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
+                retryable=True,
+            )
         return await self._wait_for_completed_claim(sid, command_key, payload_digest)
 
     async def _claim_or_replay(
@@ -428,8 +456,12 @@ class LangGraphIntakeMessageRunner:
         command_key: str,
         payload_digest: str,
     ) -> MessageCreateResponse:
-        for _ in range(120):
-            await asyncio.sleep(0.25)
+        for attempt in range(120):
+            # A synchronous graph invocation normally completes the durable
+            # claim before returning here.  Read once immediately; only an
+            # actually in-flight replay needs the polling delay.
+            if attempt > 0:
+                await asyncio.sleep(0.25)
             await self._db.rollback()
             existing = await self._db.scalar(
                 select(IntakeCommandClaim).where(
@@ -622,6 +654,7 @@ class LangGraphIntakeMessageRunner:
                 stage="intake_question",
                 agent_spec_version="question-composer-agent.v1",
                 prompt_version="question_composer_v1.jinja2",
+                policy_version=QUESTION_COMPOSER_POLICY_VERSION,
                 deadline_at=_deadline(10),
                 total_attempt_budget=1,
                 idempotency_key=f"{command_key}:question",
@@ -717,6 +750,7 @@ class LangGraphIntakeMessageRunner:
                 claim.updated_at = func.now()
         _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
 
+
 async def run_intake_persist_message_node(state: XuanhuGraphState) -> dict[str, Any]:
     try:
         session_id = uuid.UUID(state.get("session_id", ""))
@@ -791,7 +825,11 @@ async def run_intake_build_context_node(state: XuanhuGraphState) -> dict[str, An
             },
             step="build_intake_context",
         )
-        return {"route": NODE_INTAKE_SUBGRAPH_V1, "domain_state_version": domain_state.state_version, "last_error": None}
+        return {
+            "route": NODE_INTAKE_SUBGRAPH_V1,
+            "domain_state_version": domain_state.state_version,
+            "last_error": None,
+        }
     finally:
         await db.close()
 
@@ -832,6 +870,7 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                 stage="inquiry",
                 agent_spec_version=INTAKE_AGENT_VERSION,
                 prompt_version=INTAKE_PROMPT_VERSION,
+                policy_version=INTAKE_POLICY_VERSION,
                 deadline_at=_deadline(30),
                 total_attempt_budget=1,
                 idempotency_key=f"{claim.idempotency_key}:intake",
@@ -872,7 +911,12 @@ async def run_intake_verify_node(state: XuanhuGraphState) -> dict[str, Any]:
             raise
         await _save_intermediate(
             claim.id,
-            {"verified": {"delta_id": str(computation.delta.delta_id), "input_state_version": claim.input_state_version}},
+            {
+                "verified": {
+                    "delta_id": str(computation.delta.delta_id),
+                    "input_state_version": claim.input_state_version,
+                }
+            },
             step="verify_intake",
         )
         return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
@@ -1021,10 +1065,10 @@ async def _load_intake_claim(
     return cast(
         IntakeCommandClaim | None,
         await db.scalar(
-        select(IntakeCommandClaim).where(
-            IntakeCommandClaim.session_id == session_id,
-            IntakeCommandClaim.idempotency_key == command_id,
-        )
+            select(IntakeCommandClaim).where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_id,
+            )
         ),
     )
 
@@ -1208,6 +1252,7 @@ async def _load_or_retry_intake_output(
             stage="inquiry",
             agent_spec_version=INTAKE_AGENT_VERSION,
             prompt_version=INTAKE_PROMPT_VERSION,
+            policy_version=INTAKE_POLICY_VERSION,
             deadline_at=_deadline(30),
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:intake",
@@ -1236,10 +1281,7 @@ async def _persist_safety_assertions(
     patient_message: ConsultMessage,
     trace_id: str,
 ) -> None:
-    if not (
-        computation.output.patient_safety_delta.has_candidate()
-        or computation.output.red_flag_candidates
-    ):
+    if not (computation.output.patient_safety_delta.has_candidate() or computation.output.red_flag_candidates):
         return
     precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
     deterministic = bool(precheck.candidates)
@@ -1677,6 +1719,7 @@ def _verification_context(
         stage="intake_reduce",
         agent_spec_version="intake-domain-delta.v1",
         prompt_version="intake-domain-delta.v1",
+        policy_version="intake-domain-delta-policy.v1",
         deadline_at=_deadline(30),
         total_attempt_budget=1,
         idempotency_key=idempotency_key,
@@ -1713,15 +1756,19 @@ def _verification_context(
             satisfied_prerequisites=frozenset({"message_persisted"}),
         )
     )
-    return VerificationContext(
-        agent_spec=agent_spec,
-        run_spec=run_spec,
-        artifact=artifact,
-        state=state,
-        allowed_source_message_ids=frozenset(delta.source_message_ids),
-        allowed_stages=frozenset({"intake_reduce"}),
-        satisfied_prerequisites=frozenset({"message_persisted"}),
-    ).model_copy(update={"artifact": artifact}) if report.passed else _raise_verification_failed(report.failure_code)
+    return (
+        VerificationContext(
+            agent_spec=agent_spec,
+            run_spec=run_spec,
+            artifact=artifact,
+            state=state,
+            allowed_source_message_ids=frozenset(delta.source_message_ids),
+            allowed_stages=frozenset({"intake_reduce"}),
+            satisfied_prerequisites=frozenset({"message_persisted"}),
+        ).model_copy(update={"artifact": artifact})
+        if report.passed
+        else _raise_verification_failed(report.failure_code)
+    )
 
 
 def _raise_verification_failed(code: object) -> VerificationContext:
@@ -1795,7 +1842,10 @@ def _session_updates(
     progress: CompletenessProgress,
     output_state_version: int,
 ) -> dict[str, object]:
-    if disposition is CompletenessDisposition.READY or disposition in {CompletenessDisposition.INCOMPLETE, CompletenessDisposition.CONFLICT}:
+    if disposition is CompletenessDisposition.READY or disposition in {
+        CompletenessDisposition.INCOMPLETE,
+        CompletenessDisposition.CONFLICT,
+    }:
         current_stage = "inquiry"
         status = "active"
         recovery_status = "normal"
@@ -1883,9 +1933,7 @@ def _graph_update(
     triage_gate: GateResultSchema,
     completeness_gate: GateResultSchema,
 ) -> dict[str, Any]:
-    artifact_refs: list[ArtifactRef] = [
-        {"kind": "message", "artifact_id": str(patient_message_id), "revision": 1}
-    ]
+    artifact_refs: list[ArtifactRef] = [{"kind": "message", "artifact_id": str(patient_message_id), "revision": 1}]
     if agent_item is not None:
         artifact_refs.append({"kind": "message", "artifact_id": agent_item.message_id, "revision": 1})
     return {

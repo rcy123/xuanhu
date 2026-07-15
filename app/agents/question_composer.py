@@ -40,6 +40,7 @@ QUESTION_CONTEXT_TOKEN_LIMIT = 1_000
 QUESTION_MODEL_TIMEOUT_SECONDS = 10
 QUESTION_MODEL_MAX_TOKENS = 120
 QUESTION_MODEL_TEMPERATURE = 0.1
+QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v1"
 QUESTION_COMPOSER_VERIFIER_CHAIN = ("question_schema", "single_question", "no_authority_fields")
 QUESTION_COMPOSER_TOOL_PERMISSIONS = frozenset({Capability.READ_STATE})
 QUESTION_COMPOSER_FAILURE_POLICY = FailurePolicy()
@@ -516,6 +517,7 @@ def _runtime_contract_failure(
         run_spec.state_version != selection.input_state_version
         or run_spec.agent_spec_version != agent_spec.version
         or run_spec.prompt_version != QUESTION_COMPOSER_PROMPT_VERSION
+        or run_spec.policy_version != QUESTION_COMPOSER_POLICY_VERSION
         or prompt_version != QUESTION_COMPOSER_PROMPT_VERSION
         or agent_spec.name != QUESTION_COMPOSER_AGENT_NAME
         or agent_spec.version != QUESTION_COMPOSER_AGENT_VERSION

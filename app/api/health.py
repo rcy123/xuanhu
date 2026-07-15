@@ -8,12 +8,13 @@
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response
 
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient
 from app.services.health import HealthService
+from app.services.outbox_metrics import PROMETHEUS_CONTENT_TYPE, render_outbox_prometheus
 
 router = APIRouter(prefix="/api/v1", tags=["health"])
 
@@ -61,7 +62,7 @@ async def health_llm() -> JSONResponse:
 
 
 @router.get("/health/ready")
-async def health_ready() -> JSONResponse:
+async def health_ready(request: Request) -> JSONResponse:
     """就绪检查（含中间件连通性）。
 
     检查 database、redis、milvus、llm_gateway、embedding_gateway。
@@ -71,9 +72,13 @@ async def health_ready() -> JSONResponse:
     Returns:
         JSONResponse: 扁平 JSON，含 status、version、checks、timestamp。
     """
-    service = HealthService()
+    runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
+    service = HealthService(langgraph_runtime_state=runtime_state)
     result = await service.ready_check()
-    return JSONResponse(content=result)
+    return JSONResponse(
+        status_code=200 if result.get("status") == "ready" else 503,
+        content=result,
+    )
 
 
 @router.get("/health/rag")
@@ -97,3 +102,26 @@ async def health_outbox() -> JSONResponse:
     """Outbox backlog/DLQ health with aggregate, privacy-safe metrics only."""
     service = HealthService()
     return JSONResponse(content=await service.outbox_check())
+
+
+@router.get("/metrics/outbox", include_in_schema=False)
+async def metrics_outbox() -> Response:
+    """Expose fixed-name, aggregate-only Outbox gauges for Prometheus."""
+
+    settings = get_settings()
+    health_result = await HealthService().outbox_check()
+    document = render_outbox_prometheus(
+        health_result,
+        publisher_enabled=settings.outbox_publisher_enabled,
+        ready_max_oldest_age_seconds=settings.outbox_ready_max_oldest_age_seconds,
+        ready_max_dead_letters=settings.outbox_ready_max_dead_letters,
+    )
+    return Response(
+        content=document,
+        status_code=200,
+        headers={
+            "Content-Type": PROMETHEUS_CONTENT_TYPE,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

@@ -27,6 +27,9 @@ dependencies = [
     "numpy>=2.4,<2.5",
 ]
 
+[project.scripts]
+xuanhu-api = "app.server:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3,<10.0",
@@ -101,8 +104,10 @@ addopts = [
     "-m",
     "not integration",
 ]
+
 markers = [
     "integration: tests requiring real PostgreSQL, Redis, Milvus, network, or process-level infrastructure",
+    "performance: production-shaped orchestration baselines that must run without xdist contention",
 ]
 
 [dependency-groups]

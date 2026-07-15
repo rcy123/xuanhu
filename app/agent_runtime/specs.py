@@ -75,6 +75,7 @@ class RunSpec(BaseModel):
     stage: str = Field(min_length=1, max_length=100)
     agent_spec_version: str = Field(min_length=1, max_length=100)
     prompt_version: str = Field(min_length=1, max_length=100)
+    policy_version: str = Field(min_length=1, max_length=100)
     deadline_at: datetime
     total_attempt_budget: int = Field(ge=1, le=1000)
     idempotency_key: str = Field(min_length=1, max_length=200)
@@ -129,6 +130,34 @@ def model_output_digest(output: BaseModel) -> str:
     except (TypeError, ValueError, OverflowError):
         payload = f"{type(output).__module__}.{type(output).__qualname__}"
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def model_input_digest(
+    input_payload: BaseModel,
+    messages: list[dict[str, object]],
+) -> str:
+    """Return a stable, domain-separated digest of a validated model input.
+
+    The caller must pass the exact canonical input-schema instance and ordered
+    model messages used for the run.  Only the SHA-256 digest crosses the
+    recorder boundary; structured input, prompts, and clinical text never do.
+    """
+
+    try:
+        payload = json.dumps(
+            {
+                "type": f"{type(input_payload).__module__}.{type(input_payload).__qualname__}",
+                "input": input_payload.model_dump(mode="json"),
+                "messages": messages,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("model input is not canonically serializable") from exc
+    return hashlib.sha256(f"xuanhu:model-input:v2:{payload}".encode()).hexdigest()
 
 
 def run_artifact_subject_digest(artifact: RunArtifact) -> str:

@@ -27,6 +27,8 @@ class ModelRunAudit(Base):
     stage: Mapped[str] = mapped_column(String(100), nullable=False)
     agent_spec_version: Mapped[str] = mapped_column(String(100), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     output_schema_id: Mapped[str] = mapped_column(String(255), nullable=False)
     model_requested: Mapped[str] = mapped_column(String(200), nullable=False)
     model_actual: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -56,6 +58,10 @@ class ModelRunAudit(Base):
         CheckConstraint(
             "prompt_tokens >= 0 AND completion_tokens >= 0 AND total_tokens >= 0",
             name="chk_model_run_audits_token_usage",
+        ),
+        CheckConstraint(
+            "input_digest ~ '^[0-9a-f]{64}$'",
+            name="chk_model_run_audits_input_digest",
         ),
         CheckConstraint(
             "output_digest IS NULL OR output_digest ~ '^[0-9a-f]{64}$'",

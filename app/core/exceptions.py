@@ -58,6 +58,26 @@ class LangGraphPublicDisabledError(XuanhuError):
     retryable = False
 
 
+class RuntimeSwitchAuditMismatchError(XuanhuError):
+    """The configured default runtime lacks a matching durable switch audit."""
+
+    code = "RUNTIME_SWITCH_AUDIT_MISMATCH"
+    message = "默认 Agent 运行时尚未通过发布审计授权"
+    status_code = 503
+    retryable = True
+
+
+class ModelRunAuditIntegrityError(RuntimeError):
+    """Base class for fail-closed model-run audit integrity violations."""
+
+
+class ModelRunAuditUnavailableError(ModelRunAuditIntegrityError):
+    """Required durable model-run auditing did not complete."""
+
+    def __init__(self) -> None:
+        super().__init__("model-run audit unavailable")
+
+
 class SessionNotFoundError(XuanhuError):
     """会话不存在或已终止。"""
 

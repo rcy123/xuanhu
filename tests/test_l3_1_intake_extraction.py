@@ -15,6 +15,7 @@ from app.agent_runtime.context import PromptLayer
 from app.agent_runtime.intake_verifier import (
     INTAKE_AGENT_NAME,
     INTAKE_AGENT_VERSION,
+    INTAKE_POLICY_VERSION,
     INTAKE_PROMPT_VERSION,
     INTAKE_VERIFIER_CHAIN,
     IntakeVerificationFailureCode,
@@ -99,6 +100,7 @@ def make_run(
     run_id: UUID | None = None,
     stage: str = "inquiry",
     prompt_version: str = INTAKE_PROMPT_VERSION,
+    policy_version: str = INTAKE_POLICY_VERSION,
     agent_version: str = INTAKE_AGENT_VERSION,
     budget: int = 1,
     timeout: float = 2,
@@ -110,6 +112,7 @@ def make_run(
         stage=stage,
         agent_spec_version=agent_version,
         prompt_version=prompt_version,
+        policy_version=policy_version,
         deadline_at=datetime.now(UTC) + timedelta(seconds=timeout),
         total_attempt_budget=budget,
         idempotency_key="l3-1-command",
@@ -168,7 +171,7 @@ async def execute(
 ) -> tuple[Any, FakeGateway]:
     actual_gateway = gateway or FakeGateway([output])
     result = await execute_intake_extraction(
-        runtime=AgentRuntime(actual_gateway),
+        runtime=AgentRuntime(actual_gateway, recorder=None),
         run_spec=run or make_run(),
         input_payload=input_payload,
         agent_spec=build_intake_agent_spec(model="fake-model"),
@@ -337,9 +340,9 @@ async def test_constructed_string_decision_conflict_is_rebuilt_then_rejected() -
 @pytest.mark.asyncio
 async def test_model_copy_hidden_top_level_route_is_rejected() -> None:
     payload = make_input()
-    hidden_route = IntakeExtractionOutput(
-        decision=IntakeExtractionDecision.ABSTAINED
-    ).model_copy(update={"route": "reasoning"})
+    hidden_route = IntakeExtractionOutput(decision=IntakeExtractionDecision.ABSTAINED).model_copy(
+        update={"route": "reasoning"}
+    )
     gateway = FakeGateway([hidden_route])
     result, gateway = await execute(payload, hidden_route, gateway=gateway)
     assert result.failure_code is IntakeVerificationFailureCode.AUTHORITY_FIELD_FORBIDDEN
@@ -356,9 +359,7 @@ async def test_model_copy_hidden_top_level_route_is_rejected() -> None:
         ("contact.mobile_number", "138-0013-8000"),
     ),
 )
-async def test_identity_alias_nested_key_and_separated_number_are_rejected(
-    fact_key: str, value: Any
-) -> None:
+async def test_identity_alias_nested_key_and_separated_number_are_rejected(fact_key: str, value: Any) -> None:
     payload = make_input()
     source = payload.current_messages[0].message_id
     candidate = extracted(source, observation(source, fact_key, value))
@@ -921,9 +922,7 @@ async def test_timeout_and_gateway_unavailable_return_sanitized_fixed_failures()
     timeout_result, _ = await execute(payload, slow.outcomes[0], run=make_run(timeout=0.01), gateway=slow)
     assert timeout_result.failure_code is RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT
 
-    unavailable = FakeGateway(
-        [ModelGatewayUnavailableError("Alice api-key=secret full prompt", retryable=True)]
-    )
+    unavailable = FakeGateway([ModelGatewayUnavailableError("Alice api-key=secret full prompt", retryable=True)])
     unavailable_result, unavailable = await execute(
         payload,
         unavailable.outcomes[0],
@@ -952,6 +951,7 @@ async def test_invalid_stage_prompt_version_or_attempt_budget_is_rejected_before
     for run in (
         make_run(stage="sufficiency"),
         make_run(prompt_version="unregistered-v2"),
+        make_run(policy_version="unregistered-policy-v2"),
         make_run(budget=2),
     ):
         gateway = FakeGateway([extracted(payload.current_messages[0].message_id)])
@@ -1046,7 +1046,7 @@ def test_prompt_contract_mismatch_returns_fixed_code_without_patient_text() -> N
 
     async def invoke() -> Any:
         return await execute_intake_extraction(
-            runtime=AgentRuntime(gateway),
+            runtime=AgentRuntime(gateway, recorder=None),
             run_spec=run,
             input_payload=payload,
             agent_spec=build_intake_agent_spec(model="fake-model"),

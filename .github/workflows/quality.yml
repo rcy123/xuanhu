@@ -104,8 +104,14 @@ jobs:
       - run: uv sync --locked --group dev
       - name: Run real-service tests in isolated xdist databases
         run: >-
-          uv run pytest -o addopts="" -m integration -n 4 --dist=loadscope
+          uv run pytest -o addopts="" -m "integration and not performance"
+          -n 4 --dist=loadscope
           --strict-markers tests
+      - name: Run production-shaped orchestration baselines without xdist contention
+        run: >-
+          uv run pytest -o addopts="" -m "integration and performance"
+          --strict-markers tests/golden/test_legacy_performance_baseline.py
+          tests/golden/test_langgraph_performance_baseline.py
       - name: Prove workers cannot collide on identical PG and Redis keys
         run: >-
           uv run pytest -o addopts="" -m integration -n 2 --dist=each
@@ -148,6 +154,14 @@ jobs:
             git /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 \
             dir /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
+      - name: Validate Prometheus Outbox alerting rules
+        run: |
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 check rules \
+            deploy/prometheus/rules/xuanhu-outbox-alerts.yml
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 test rules \
+            deploy/prometheus/tests/xuanhu-outbox-alerts.test.yml
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:

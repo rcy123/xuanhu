@@ -22,7 +22,7 @@ from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.runtime import AgentRuntime
 from app.agent_runtime.state import XuanhuGraphState, default_state, validate_state_json_safe
-from app.api.advance import _run_langgraph_advance
+from app.api.advance import _run_langgraph_advance as _production_run_langgraph_advance
 from app.core.exceptions import InsufficientInquiryError
 from app.db.session import _build_async_pg_url
 from app.main import app
@@ -46,10 +46,27 @@ from app.schemas.intake import (
 from app.schemas.message import MessageCreateRequest, MessageCreateResponse
 from app.schemas.question import QuestionComposerModelOutput
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
-from app.services.langgraph_intake import LangGraphIntakeMessageRunner, _payload_digest
+from app.services.langgraph_intake import (
+    LangGraphIntakeMessageRunner as _ProductionLangGraphIntakeMessageRunner,
+)
+from app.services.langgraph_intake import _payload_digest
 from tests._database_safety import destructive_database_environment
 
 pytestmark = pytest.mark.integration
+
+
+class LangGraphIntakeMessageRunner(_ProductionLangGraphIntakeMessageRunner):
+    """Test subclass explicitly opting direct calls into request-local runtime."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        super().__init__(db, allow_request_local_runtime=True)
+
+
+async def _run_langgraph_advance(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Explicitly opt direct integration calls into request-local runtime."""
+
+    kwargs["allow_request_local_runtime"] = True
+    return await _production_run_langgraph_advance(*args, **kwargs)
 
 
 def _state() -> XuanhuGraphState:
@@ -182,9 +199,7 @@ def _intake_output(mode: str, source: uuid.UUID, text: str) -> IntakeExtractionO
     if mode == "privacy":
         return IntakeExtractionOutput(
             decision=IntakeExtractionDecision.EXTRACTED,
-            observations=(
-                _observation(source, "chief_complaint.symptom", "privacy_fact_value_778899"),
-            ),
+            observations=(_observation(source, "chief_complaint.symptom", "privacy_fact_value_778899"),),
         )
     return IntakeExtractionOutput(
         decision=IntakeExtractionDecision.EXTRACTED,
@@ -193,7 +208,11 @@ def _intake_output(mode: str, source: uuid.UUID, text: str) -> IntakeExtractionO
 
 
 def _install_fake_runtime(monkeypatch: pytest.MonkeyPatch, gateway: _E2EFakeGateway) -> None:
-    monkeypatch.setattr(langgraph_intake_module, "AgentRuntime", lambda: AgentRuntime(gateway))
+    monkeypatch.setattr(
+        langgraph_intake_module,
+        "AgentRuntime",
+        lambda: AgentRuntime(gateway, recorder=None),
+    )
 
 
 def _install_fake_advance_graph(
@@ -487,7 +506,9 @@ async def test_langgraph_messages_same_command_concurrent_replays_single_intake_
 
     async with db_factory() as db:
         claim_count = await db.scalar(select(func.count()).select_from(IntakeCommandClaim))
-        message_count = await db.scalar(text("SELECT count(*) FROM consult_messages WHERE session_id = :sid"), {"sid": session_id})
+        message_count = await db.scalar(
+            text("SELECT count(*) FROM consult_messages WHERE session_id = :sid"), {"sid": session_id}
+        )
 
     assert first.model_dump(mode="json") == second.model_dump(mode="json")
     assert gateway.intake_calls == 1
@@ -537,10 +558,7 @@ async def test_langgraph_messages_recovers_when_claim_completion_is_interrupted_
         claim = await db.scalar(select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id))
         commit = await db.scalar(select(DomainCommandCommit).where(DomainCommandCommit.session_id == session_id))
         agent_message_count = await db.scalar(
-            text(
-                "SELECT count(*) FROM consult_messages "
-                "WHERE session_id = :sid AND role = 'agent'"
-            ),
+            text("SELECT count(*) FROM consult_messages WHERE session_id = :sid AND role = 'agent'"),
             {"sid": session_id},
         )
 

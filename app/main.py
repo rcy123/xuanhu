@@ -13,6 +13,11 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.agent_runtime.lifecycle import (
+    LangGraphRuntimeState,
+    safe_runtime_error_code,
+    shared_langgraph_runtime,
+)
 from app.api.advance import advance_exception_handlers
 from app.api.advance import router as advance_router
 from app.api.health import router as health_router
@@ -38,48 +43,74 @@ logger = logging.getLogger("xuanhu")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
-    """应用生命周期 — 启动时输出脱敏配置，确保不泄露敏感信息。"""
+    """Own process-scoped runtime resources and close them reliably."""
     settings = get_settings()
     logger.info("应用启动，当前配置（已脱敏）: %s", settings.safe_dump())
+    runtime_cm = shared_langgraph_runtime(settings.database_url)
+    runtime_entered = False
+    app.state.langgraph_runtime_state = LangGraphRuntimeState(status="starting")
+    try:
+        runtime = await runtime_cm.__aenter__()
+        runtime_entered = True
+        app.state.langgraph_runtime_state = LangGraphRuntimeState.ready(runtime)
+    except Exception as exc:
+        error_code = safe_runtime_error_code(exc)
+        app.state.langgraph_runtime_state = LangGraphRuntimeState.unavailable(
+            error_code=error_code
+        )
+        logger.error(
+            "LangGraph 共享运行时启动失败，readiness 将保持 degraded: code=%s",
+            error_code,
+        )
+
     stop: asyncio.Event | None = None
     publisher_task: asyncio.Task[None] | None = None
-    if settings.outbox_publisher_enabled:
-        from app.agent_runtime.repository import PostgresDomainRepository
-        from app.db.session import get_session_factory
-        from app.services.events import EventService
-        from app.services.outbox_publisher import OutboxPublisher
-
-        stop = asyncio.Event()
-        publisher = OutboxPublisher(
-            PostgresDomainRepository(get_session_factory()),
-            EventService(dedupe_ttl_seconds=settings.event_dedupe_ttl_seconds),
-            worker_id=f"api-{uuid.uuid4().hex}",
-            batch_size=settings.outbox_publisher_batch_size,
-            lease_seconds=settings.outbox_publisher_lease_seconds,
-            max_attempts=settings.outbox_publisher_max_attempts,
-            base_retry_seconds=settings.outbox_publisher_base_retry_seconds,
-            max_retry_seconds=settings.outbox_publisher_max_retry_seconds,
-            poll_interval_seconds=settings.outbox_publisher_poll_interval_seconds,
-        )
-        app.state.outbox_publisher = publisher
-        publisher_task = asyncio.create_task(
-            publisher.run_forever(stop),
-            name="xuanhu-outbox-publisher",
-        )
     try:
+        if settings.outbox_publisher_enabled:
+            from app.agent_runtime.repository import PostgresDomainRepository
+            from app.db.session import get_session_factory
+            from app.services.events import EventService
+            from app.services.outbox_publisher import OutboxPublisher
+
+            stop = asyncio.Event()
+            publisher = OutboxPublisher(
+                PostgresDomainRepository(get_session_factory()),
+                EventService(dedupe_ttl_seconds=settings.event_dedupe_ttl_seconds),
+                worker_id=f"api-{uuid.uuid4().hex}",
+                batch_size=settings.outbox_publisher_batch_size,
+                lease_seconds=settings.outbox_publisher_lease_seconds,
+                max_attempts=settings.outbox_publisher_max_attempts,
+                base_retry_seconds=settings.outbox_publisher_base_retry_seconds,
+                max_retry_seconds=settings.outbox_publisher_max_retry_seconds,
+                poll_interval_seconds=settings.outbox_publisher_poll_interval_seconds,
+            )
+            app.state.outbox_publisher = publisher
+            publisher_task = asyncio.create_task(
+                publisher.run_forever(stop),
+                name="xuanhu-outbox-publisher",
+            )
         yield
     finally:
-        if stop is not None and publisher_task is not None:
-            stop.set()
+        try:
+            if stop is not None and publisher_task is not None:
+                stop.set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(publisher_task),
+                        timeout=settings.outbox_publisher_shutdown_grace_seconds,
+                    )
+                except TimeoutError:
+                    publisher_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await publisher_task
+        finally:
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(publisher_task),
-                    timeout=settings.outbox_publisher_shutdown_grace_seconds,
+                if runtime_entered:
+                    await runtime_cm.__aexit__(None, None, None)
+            finally:
+                app.state.langgraph_runtime_state = LangGraphRuntimeState(
+                    status="closed"
                 )
-            except TimeoutError:
-                publisher_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await publisher_task
 
 
 app = FastAPI(

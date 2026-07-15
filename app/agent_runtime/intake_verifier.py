@@ -30,6 +30,7 @@ from app.schemas.intake import (
 INTAKE_AGENT_NAME = "intake_extraction"
 INTAKE_AGENT_VERSION = "intake-extraction-agent.v2"
 INTAKE_PROMPT_VERSION = "intake_extraction_v2.jinja2"
+INTAKE_POLICY_VERSION = "intake-extraction-policy.v1"
 INTAKE_ALLOWED_STAGES = frozenset({"inquiry"})
 INTAKE_VERIFIER_CHAIN = (
     "schema",
@@ -176,6 +177,7 @@ def validate_intake_preflight(agent_spec: AgentSpec, run_spec: RunSpec) -> Intak
     if (
         run_spec.agent_spec_version != agent_spec.version
         or run_spec.prompt_version != INTAKE_PROMPT_VERSION
+        or run_spec.policy_version != INTAKE_POLICY_VERSION
         or run_spec.total_attempt_budget != 1
     ):
         return IntakeVerificationFailureCode.RUN_PROVENANCE_MISMATCH
@@ -215,6 +217,7 @@ def _verify_run(
     if (
         run_spec.agent_spec_version != agent_spec.version
         or run_spec.prompt_version != INTAKE_PROMPT_VERSION
+        or run_spec.policy_version != INTAKE_POLICY_VERSION
         or run_spec.total_attempt_budget != 1
         or artifact.run_id != run_spec.run_id
         or artifact.trace_id != run_spec.trace_id

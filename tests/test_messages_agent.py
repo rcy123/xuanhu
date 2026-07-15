@@ -368,8 +368,9 @@ async def test_agent_failure_does_not_forge_reply(client: AsyncClient, db: Async
 
         _orig_init = msg_module.MessageService.__init__
 
-        def patched_init(self, db, *, registry=None, event_service=None):
-            _orig_init(self, db, registry=reg, event_service=event_service)
+        def patched_init(self: object, db: object, **kwargs: Any) -> None:
+            kwargs["registry"] = reg
+            _orig_init(self, db, **kwargs)
 
         msg_module.MessageService.__init__ = patched_init  # type: ignore[method-assign]
 

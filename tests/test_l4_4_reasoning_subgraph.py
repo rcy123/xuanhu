@@ -38,7 +38,7 @@ from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelP
 from app.agent_runtime.state import default_state, validate_state_json_safe
 from app.agent_runtime.syndrome_verifier import SyndromeCheckResult, SyndromeCheckStatus, SyndromeVerificationReport
 from app.agent_runtime.verifiers import VerificationContext
-from app.api.advance import _run_langgraph_advance
+from app.api.advance import _run_langgraph_advance as _production_run_langgraph_advance
 from app.core.exceptions import InvalidStateVersionError
 from app.core.gateway import ModelTokenUsage, StructuredChatResponse
 from app.db.session import _build_async_pg_url, reset_session_factory
@@ -75,6 +75,13 @@ from app.services.langgraph_reasoning import run_reasoning_draft_syndrome_node
 from tests._database_safety import destructive_database_environment
 
 pytestmark = pytest.mark.integration
+
+
+async def _run_langgraph_advance(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Explicitly opt direct integration calls into request-local runtime."""
+
+    kwargs["allow_request_local_runtime"] = True
+    return await _production_run_langgraph_advance(*args, **kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -151,7 +158,11 @@ class _ReasoningFakeGateway:
 
 
 def _install_gateway(monkeypatch: pytest.MonkeyPatch, gateway: _ReasoningFakeGateway) -> None:
-    monkeypatch.setattr(reasoning_module, "AgentRuntime", lambda: AgentRuntime(gateway))
+    monkeypatch.setattr(
+        reasoning_module,
+        "AgentRuntime",
+        lambda: AgentRuntime(gateway, recorder=None),
+    )
 
 
 def _graph_state(session_id: uuid.UUID, command_key: str, run_id: uuid.UUID) -> dict[str, Any]:
@@ -415,6 +426,7 @@ def _context(
         stage="reasoning_reduce",
         agent_spec_version=agent_spec.version,
         prompt_version="l4-4-test",
+        policy_version="l4-4-test-policy.v1",
         deadline_at=datetime.now(UTC) + timedelta(seconds=10),
         total_attempt_budget=1,
         idempotency_key=idempotency_key,
@@ -892,7 +904,16 @@ async def test_syndrome_recovery_rejects_any_run_artifact_provenance_tamper(
     assert record is not None
     original_payload = copy.deepcopy(record.payload)
 
-    for field in ("model_actual", "attempts", "latency_ms", "trace_id", "run_id", "agent_spec_version", "prompt_version", "output"):
+    for field in (
+        "model_actual",
+        "attempts",
+        "latency_ms",
+        "trace_id",
+        "run_id",
+        "agent_spec_version",
+        "prompt_version",
+        "output",
+    ):
         tampered = copy.deepcopy(original_payload)
         run_artifact = tampered["run_artifact"]
         assert isinstance(run_artifact, dict)
@@ -961,7 +982,16 @@ async def test_formula_route_rejects_any_run_artifact_provenance_tamper(
     assert record is not None
     original_payload = copy.deepcopy(record.payload)
 
-    for field in ("model_actual", "attempts", "latency_ms", "trace_id", "run_id", "agent_spec_version", "prompt_version", "output"):
+    for field in (
+        "model_actual",
+        "attempts",
+        "latency_ms",
+        "trace_id",
+        "run_id",
+        "agent_spec_version",
+        "prompt_version",
+        "output",
+    ):
         tampered = copy.deepcopy(original_payload)
         run_artifact = tampered["run_artifact"]
         assert isinstance(run_artifact, dict)
@@ -1025,7 +1055,9 @@ async def test_syndrome_consumer_failure_does_not_write_artifact_payload(
     async with factory() as db:
         assert (
             await db.scalar(
-                select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "syndrome_draft")
+                select(func.count())
+                .select_from(ArtifactRevision)
+                .where(ArtifactRevision.artifact_type == "syndrome_draft")
             )
             == 0
         )

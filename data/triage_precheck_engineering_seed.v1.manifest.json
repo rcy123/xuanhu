@@ -1,0 +1,9 @@
+{
+  "schema_version": "triage-precheck-evaluation-manifest.v1",
+  "dataset_name": "triage-precheck-engineering-seed",
+  "dataset_version": "1.0.0",
+  "label_status": "engineering_seed_not_clinically_adjudicated",
+  "provenance": "synthetic_deidentified_engineering_seed",
+  "case_count": 29,
+  "canonical_sha256": "0343df40cc5f5165443514a345768e01c6f97d5b965b84d401ed5d04cc3e2bbe"
+}

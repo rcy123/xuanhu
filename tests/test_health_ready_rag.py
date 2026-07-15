@@ -183,9 +183,7 @@ async def test_ready_no_api_key_leaked(monkeypatch: pytest.MonkeyPatch) -> None:
         "secret",
     ]
     for keyword in forbidden:
-        assert keyword.lower() not in body_str.lower(), (
-            f"ready 响应泄露敏感信息: 发现 '{keyword}'"
-        )
+        assert keyword.lower() not in body_str.lower(), f"ready 响应泄露敏感信息: 发现 '{keyword}'"
 
     # 连接串中的密码不应出现
     if "database_url" in body_str or "redis_url" in body_str:
@@ -248,8 +246,7 @@ async def test_rag_response_flat_json_no_envelope(monkeypatch: pytest.MonkeyPatc
 async def test_rag_response_does_not_leak_sensitive_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RAG health 响应不泄露敏感信息。
-    """
+    """RAG health 响应不泄露敏感信息。"""
     _mock_rag_ok(monkeypatch)
 
     transport = ASGITransport(app=app)
@@ -273,9 +270,7 @@ async def test_rag_response_does_not_leak_sensitive_info(
         "raw_response",
     ]
     for keyword in forbidden:
-        assert keyword.lower() not in body_str.lower(), (
-            f"RAG health 响应泄露敏感信息: 发现 '{keyword}'"
-        )
+        assert keyword.lower() not in body_str.lower(), f"RAG health 响应泄露敏感信息: 发现 '{keyword}'"
 
 
 # ---------------------------------------------------------------------------
@@ -298,15 +293,17 @@ async def test_rag_health_never_500(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["status"] == "degraded"
 
 
-async def test_ready_health_never_500(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ready 检查始终返回 200（即使部分组件不可用）。"""
+async def test_ready_health_returns_503_when_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ready 降级时返回 503，让编排器停止分发流量。"""
     _mock_ready_degraded(monkeypatch)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/api/v1/health/ready")
 
-    assert response.status_code == 200
+    assert response.status_code == 503
     body = response.json()
     assert body["status"] == "degraded"
 
@@ -452,9 +449,7 @@ class TestHealthServiceNoSensitiveLeak:
 
         forbidden = ["api_key", "apiKey", "Bearer ", "password", "secret", "token"]
         for keyword in forbidden:
-            assert keyword.lower() not in result_str.lower(), (
-                f"ready_check 泄露: '{keyword}'"
-            )
+            assert keyword.lower() not in result_str.lower(), f"ready_check 泄露: '{keyword}'"
 
     async def test_rag_check_no_sensitive_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """rag_check() 返回字典不含敏感字段名。"""
@@ -468,6 +463,4 @@ class TestHealthServiceNoSensitiveLeak:
 
         forbidden = ["api_key", "apiKey", "Bearer ", "password", "secret", "token"]
         for keyword in forbidden:
-            assert keyword.lower() not in result_str.lower(), (
-                f"rag_check 泄露: '{keyword}'"
-            )
+            assert keyword.lower() not in result_str.lower(), f"rag_check 泄露: '{keyword}'"

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import Any
 
@@ -14,7 +15,9 @@ import pytest
 from httpx import AsyncClient
 
 from app.agents.registry import AgentRegistry
+from app.db.session import reset_session_factory
 from app.schemas.types import Stage
+from tests._database_safety import validate_test_database_url
 from tests.e2e.conftest import (
     FakeInquiryAgent,
     FakeSufficiencyAgent,
@@ -23,7 +26,11 @@ from tests.e2e.conftest import (
     create_session,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.performance,
+    pytest.mark.asyncio(loop_scope="module"),
+]
 logger = logging.getLogger(__name__)
 
 
@@ -49,8 +56,9 @@ def _percentile_nearest_rank(samples: list[float], percentile: float) -> float:
 
 async def test_legacy_message_round_performance_baseline(
     client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """20 个 fake-model 问诊回合应保持 2 次模型调用且无失败。"""
+    """20 个独立新会话的首轮消息应保持 2 次模型调用且无失败。"""
     import app.services.message as message_module
 
     inquiry = _CountingAgent(FakeInquiryAgent())
@@ -61,21 +69,33 @@ async def test_legacy_message_round_performance_baseline(
 
     original = message_module._default_inquiry_registry
     message_module._default_inquiry_registry = lambda: registry  # type: ignore[assignment]
-    session_data = await create_session(client)
-    session_id = session_data["session_id"]
+    session_ids: list[str] = []
     durations_ms: list[float] = []
     failures = 0
 
+    # Match the LangGraph benchmark and production by using SQLAlchemy's real
+    # connection pool.  The fixture has already provisioned an isolated *_test
+    # database; dispose the loop-bound pool before integration-fixture teardown.
+    validate_test_database_url(os.environ["DB_URL"])
+    await reset_session_factory()
+    monkeypatch.delenv("XUANHU_ALLOW_DESTRUCTIVE_TESTS")
     try:
         for index in range(20):
+            session_data = await create_session(client)
+            session_id = session_data["session_id"]
+            session_ids.append(session_id)
             started = time.perf_counter()
             response = await client.post(
                 f"/api/v1/consult/sessions/{session_id}/messages",
                 json={
-                    "content": f"第 {index + 1} 轮性能基线消息，无真实患者信息。",
-                    "role": "doctor",
+                    "content": f"headache baseline round {index + 1}",
+                    "role": "patient_proxy",
                 },
-                headers={"X-Doctor-Id": "doctor_l0_perf"},
+                headers={
+                    "X-Doctor-Id": "doctor_l0_perf",
+                    "X-State-Version": "1",
+                    "X-Idempotency-Key": f"l0-legacy-message-{index}",
+                },
             )
             durations_ms.append((time.perf_counter() - started) * 1000)
             if response.status_code != 200:
@@ -83,7 +103,11 @@ async def test_legacy_message_round_performance_baseline(
 
         p50 = _percentile_nearest_rank(durations_ms, 0.50)
         p95 = _percentile_nearest_rank(durations_ms, 0.95)
+        maximum = max(durations_ms)
         total_calls = inquiry.calls + sufficiency.calls
+        print(  # noqa: T201 - explicit performance runs must emit their measurements
+            f"legacy_message_baseline p50_ms={p50:.2f} p95_ms={p95:.2f} max_ms={maximum:.2f}"
+        )
         logger.info(
             "legacy_message_baseline rounds=20 calls=%d p50_ms=%.2f "
             "p95_ms=%.2f failures=%d token_usage=unavailable",
@@ -97,8 +121,10 @@ async def test_legacy_message_round_performance_baseline(
         assert inquiry.calls == 20
         assert sufficiency.calls == 20
         assert total_calls == 40
-        assert p95 < 5000
+        assert p95 < 5000, f"p50_ms={p50:.2f} p95_ms={p95:.2f} max_ms={maximum:.2f}"
     finally:
         message_module._default_inquiry_registry = original  # type: ignore[assignment]
-        await cleanup_stream(session_id)
-        await cleanup_session_lock(session_id)
+        for session_id in session_ids:
+            await cleanup_stream(session_id)
+            await cleanup_session_lock(session_id)
+        await reset_session_factory()

@@ -40,6 +40,9 @@ def _request(*headers: tuple[bytes, bytes]) -> Request:
 
 
 def _install_passthrough_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def preflight(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
     async def execute(self: object, **kwargs: Any) -> HttpCommandResult:
         del self
         data = await kwargs["handler"]()
@@ -51,6 +54,10 @@ def _install_passthrough_executor(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr("app.services.http_idempotency.HttpCommandExecutor.execute", execute)
+    monkeypatch.setattr(
+        "app.api.messages.MessageService.ensure_submission_runtime_available",
+        preflight,
+    )
 
 
 @pytest.mark.parametrize(

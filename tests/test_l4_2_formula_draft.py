@@ -76,6 +76,7 @@ from app.schemas.domain import (
 from app.schemas.formula import (
     FORMULA_EVIDENCE_MODE,
     FORMULA_NO_RAG_CONFIDENCE_MAX,
+    FORMULA_POLICY_VERSION,
     FORMULA_READY_STAGE,
     FormulaComposition,
     FormulaDraft,
@@ -88,6 +89,7 @@ from app.schemas.formula import (
 )
 from app.schemas.syndrome import (
     SYNDROME_EVIDENCE_MODE,
+    SYNDROME_POLICY_VERSION,
     SYNDROME_READY_STAGE,
     SyndromeDraft,
     SyndromeDraftDecision,
@@ -112,7 +114,9 @@ class FakeGateway:
         self.calls: list[dict[str, Any]] = []
         self.actual_request_count = 0
 
-    async def chat_structured(self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any) -> Any:
+    async def chat_structured(
+        self, messages: list[dict[str, Any]], output_schema: type[BaseModel], **kwargs: Any
+    ) -> Any:
         self.calls.append({"messages": messages, "output_schema": output_schema, **kwargs})
         self.actual_request_count += kwargs.get("max_requests", 1)
         outcome = self.outcomes.pop(0)
@@ -182,6 +186,7 @@ def _run(
     stage: str = FORMULA_READY_STAGE,
     agent_version: str = FORMULA_AGENT_VERSION,
     prompt_version: str = FORMULA_PROMPT_VERSION,
+    policy_version: str = FORMULA_POLICY_VERSION,
     budget: int = 1,
     session_id: uuid.UUID | None = None,
 ) -> RunSpec:
@@ -192,6 +197,7 @@ def _run(
         stage=stage,
         agent_spec_version=agent_version,
         prompt_version=prompt_version,
+        policy_version=policy_version,
         deadline_at=datetime.now(UTC) + timedelta(seconds=2),
         total_attempt_budget=budget,
         idempotency_key="l4-2-command",
@@ -222,7 +228,9 @@ def _observation(
     )
 
 
-def _gate(name: str, version: str, state_version: int, decision: GateDecision, details: dict[str, Any]) -> GateResultSchema:
+def _gate(
+    name: str, version: str, state_version: int, decision: GateDecision, details: dict[str, Any]
+) -> GateResultSchema:
     return GateResultSchema(
         gate_name=name,
         policy_version=version,
@@ -479,6 +487,7 @@ def _syndrome_run_spec(
     stage: str = SYNDROME_READY_STAGE,
     agent_version: str = SYNDROME_AGENT_VERSION_L4,
     prompt_version: str = SYNDROME_PROMPT_VERSION_L4,
+    policy_version: str = SYNDROME_POLICY_VERSION,
     budget: int = 1,
 ) -> RunSpec:
     return RunSpec(
@@ -488,6 +497,7 @@ def _syndrome_run_spec(
         stage=stage,
         agent_spec_version=agent_version,
         prompt_version=prompt_version,
+        policy_version=policy_version,
         deadline_at=datetime.now(UTC) + timedelta(seconds=2),
         total_attempt_budget=budget,
         idempotency_key="l4-1-command",
@@ -558,7 +568,7 @@ async def _execute(
             context_observations=trusted_context,
         )
         syndrome_result = await execute_syndrome_draft(
-            runtime=AgentRuntime(FakeGateway([input_payload.syndrome_draft])),
+            runtime=AgentRuntime(FakeGateway([input_payload.syndrome_draft]), recorder=None),
             repository=trusted_repository,
             run_spec=trusted_run,
             input_payload=syndrome_input,
@@ -567,7 +577,7 @@ async def _execute(
         )
         formula_kwargs["syndrome_result"] = syndrome_result
     result = await execute_formula_draft(
-        runtime=AgentRuntime(actual_gateway),
+        runtime=AgentRuntime(actual_gateway, recorder=None),
         repository=actual_repository,
         run_spec=actual_run,
         input_payload=input_payload,
@@ -769,9 +779,7 @@ async def test_repository_domain_state_overrides_forged_payload_domain_and_conte
     # authoritative repository still has the original observations.
     forged_draft = payload.syndrome_draft.model_copy(
         update={
-            "syndrome_basis": (
-                SyndromeFactClaim(claim="forged", fact_ids=(forged_observation.observation_id,)),
-            ),
+            "syndrome_basis": (SyndromeFactClaim(claim="forged", fact_ids=(forged_observation.observation_id,)),),
         }
     )
     forged_payload = FormulaDraftInput(
@@ -816,7 +824,9 @@ async def test_cross_session_and_stale_state_version_are_zero_call() -> None:
     # Stale state version
     stale_run = _run(session_id=payload.session_id, state_version=payload.state_version + 1)
     stale_gateway = FakeGateway([_completed_formula(payload)])
-    stale_result, stale_gateway = await _execute(payload, stale_gateway.outcomes[0], run=stale_run, gateway=stale_gateway)
+    stale_result, stale_gateway = await _execute(
+        payload, stale_gateway.outcomes[0], run=stale_run, gateway=stale_gateway
+    )
     assert stale_result.failure_code is FormulaVerificationFailureCode.RUN_PROVENANCE_MISMATCH
     assert stale_gateway.actual_request_count == 0
 
@@ -858,7 +868,8 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
     # Unknown fact ID in formula basis
     unknown = _completed_formula(payload).model_copy(
         update={
-            "base_formula": payload.syndrome_draft and _completed_formula(payload).base_formula.model_copy(
+            "base_formula": payload.syndrome_draft
+            and _completed_formula(payload).base_formula.model_copy(
                 update={
                     "basis": (FormulaFactClaim(claim="unknown", fact_ids=(uuid.uuid4(),)),),
                 }
@@ -879,7 +890,9 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
     # Superseded fact ID
     sid = uuid.uuid4()
     old = _observation(sid, "symptom.old", "old")
-    corrected = _observation(sid, "symptom.old", "new", status=ObservationStatus.CORRECTED, supersedes=old.observation_id)
+    corrected = _observation(
+        sid, "symptom.old", "new", status=ObservationStatus.CORRECTED, supersedes=old.observation_id
+    )
     superseded_payload = _input(session_id=sid, observations=(*_ready_observations(sid), old, corrected))
     superseded_run = _run(session_id=superseded_payload.session_id, state_version=superseded_payload.state_version)
     sup_syn_run = _syndrome_run_spec(superseded_payload.session_id, superseded_payload.state_version)
@@ -905,7 +918,9 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
     assert stale_report.failure_code is FormulaVerificationFailureCode.FACT_LINK_INVALID
 
     # Inactive (retracted) fact ID
-    retracted = _observation(sid, "symptom.inactive", "inactive", status=ObservationStatus.RETRACTED, supersedes=old.observation_id)
+    retracted = _observation(
+        sid, "symptom.inactive", "inactive", status=ObservationStatus.RETRACTED, supersedes=old.observation_id
+    )
     inactive_payload = _input(session_id=sid, observations=(*_ready_observations(sid), old, retracted))
     inactive_run = _run(session_id=inactive_payload.session_id, state_version=inactive_payload.state_version)
     inact_syn_run = _syndrome_run_spec(inactive_payload.session_id, inactive_payload.state_version)
@@ -992,6 +1007,7 @@ async def test_run_spec_agent_spec_and_policy_mismatch_are_zero_call() -> None:
         _run(session_id=payload.session_id, state_version=payload.state_version + 1),
         _run(session_id=payload.session_id, state_version=payload.state_version, agent_version="wrong"),
         _run(session_id=payload.session_id, state_version=payload.state_version, prompt_version="wrong.jinja2"),
+        _run(session_id=payload.session_id, state_version=payload.state_version, policy_version="wrong-policy.v2"),
         _run(session_id=payload.session_id, state_version=payload.state_version, budget=2),
     ):
         gateway = FakeGateway([_completed_formula(payload)])
@@ -1011,7 +1027,7 @@ async def test_run_spec_agent_spec_and_policy_mismatch_are_zero_call() -> None:
     syn_run = _syndrome_run_spec(payload.session_id, payload.state_version)
     syn_artifact = _syndrome_artifact(payload.syndrome_draft, syn_run)
     result = await execute_formula_draft(
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         repository=FakeGateRepository((payload.triage_gate, payload.completeness_gate), payload.domain_state),
         run_spec=_run(session_id=payload.session_id, state_version=payload.state_version),
         input_payload=payload,
@@ -1057,11 +1073,7 @@ async def test_non_empty_evidence_links_and_citation_fields_are_rejected() -> No
 
     # Non-empty claim_evidence_links
     with_links = _completed_formula(payload).model_copy(
-        update={
-            "claim_evidence_links": (
-                FormulaClaimEvidenceLink(claim="x", evidence_id="ev-1"),
-            )
-        }
+        update={"claim_evidence_links": (FormulaClaimEvidenceLink(claim="x", evidence_id="ev-1"),)}
     )
     result, _ = await _execute(payload, with_links)
     assert result.failure_code is FormulaVerificationFailureCode.NO_RAG_CONTRACT_VIOLATED
@@ -1176,7 +1188,9 @@ async def test_graph_state_checkpoint_contains_only_formula_artifact_reference()
         "graph_version": DEFAULT_GRAPH_VERSION,
         "run_id": str(uuid.uuid4()),
         "artifact_refs": [{"kind": "formula_draft", "artifact_id": str(uuid.uuid4()), "revision": 1}],
-        "gate_results": [{"gate_name": "formula_verifier", "decision": "passed", "policy_version": "formula-draft-policy.no-rag.v1"}],
+        "gate_results": [
+            {"gate_name": "formula_verifier", "decision": "passed", "policy_version": "formula-draft-policy.no-rag.v1"}
+        ],
     }
     config = make_run_config(state["session_id"], graph_version=DEFAULT_GRAPH_VERSION)
 
@@ -1299,7 +1313,9 @@ async def test_forged_blocked_triage_with_forged_continue_gate_is_zero_call() ->
 @pytest.mark.asyncio
 async def test_context_privacy_rejects_pii_before_gateway() -> None:
     sid = uuid.uuid4()
-    payload = _input(session_id=sid, observations=(*_ready_observations(sid), _observation(sid, "clinical.note", "13800138000")))
+    payload = _input(
+        session_id=sid, observations=(*_ready_observations(sid), _observation(sid, "clinical.note", "13800138000"))
+    )
     gateway = FakeGateway([_completed_formula(payload)])
     result, gateway = await _execute(payload, gateway.outcomes[0], gateway=gateway)
     assert result.failure_code is FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID
@@ -1309,7 +1325,9 @@ async def test_context_privacy_rejects_pii_before_gateway() -> None:
 @pytest.mark.asyncio
 async def test_confidence_exceeds_no_rag_limit_is_rejected() -> None:
     payload = _input()
-    high_confidence, _ = await _execute(payload, _completed_formula(payload, confidence=FORMULA_NO_RAG_CONFIDENCE_MAX + 0.01))
+    high_confidence, _ = await _execute(
+        payload, _completed_formula(payload, confidence=FORMULA_NO_RAG_CONFIDENCE_MAX + 0.01)
+    )
     assert high_confidence.failure_code is FormulaVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
 
 
@@ -1486,7 +1504,7 @@ async def test_handcrafted_privateattr_bundle_with_passed_report_is_zero_call() 
     forged_payload = payload.model_copy(update={"syndrome_draft": forged_draft})
     gateway = FakeGateway([_completed_formula(payload)])
     result = await execute_formula_draft(
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         repository=FakeGateRepository(
             (payload.triage_gate, payload.completeness_gate),
             payload.domain_state,
@@ -1519,7 +1537,7 @@ async def test_copy_of_real_syndrome_execution_result_is_zero_call() -> None:
         payload.domain_state,
     )
     real_result = await execute_syndrome_draft(
-        runtime=AgentRuntime(FakeGateway([payload.syndrome_draft])),
+        runtime=AgentRuntime(FakeGateway([payload.syndrome_draft]), recorder=None),
         repository=repository,
         run_spec=_syndrome_run_spec(payload.session_id, payload.state_version),
         input_payload=syndrome_input,
@@ -1537,7 +1555,7 @@ async def test_copy_of_real_syndrome_execution_result_is_zero_call() -> None:
     )
     success_gateway = FakeGateway([_completed_formula(payload)])
     success = await execute_formula_draft(
-        runtime=AgentRuntime(success_gateway),
+        runtime=AgentRuntime(success_gateway, recorder=None),
         repository=repository,
         run_spec=_run(session_id=payload.session_id, state_version=payload.state_version),
         input_payload=payload,
@@ -1550,7 +1568,7 @@ async def test_copy_of_real_syndrome_execution_result_is_zero_call() -> None:
 
     gateway = FakeGateway([_completed_formula(payload)])
     result = await execute_formula_draft(
-        runtime=AgentRuntime(gateway),
+        runtime=AgentRuntime(gateway, recorder=None),
         repository=repository,
         run_spec=_run(session_id=payload.session_id, state_version=payload.state_version),
         input_payload=payload,

@@ -42,6 +42,19 @@
 - `rag_eval_queries.json`
 - `import_commands.md`
 
+## 后端启动入口
+
+配置 `.env` 后使用仓库提供的受控入口启动 API：
+
+```bash
+uv run xuanhu-api
+```
+
+该入口在 Uvicorn 创建事件循环前选择 psycopg 兼容的 loop factory；Windows
+环境不要直接使用 `uvicorn app.main:app`，否则默认 Proactor loop 会使共享
+LangGraph PostgreSQL checkpointer 启动失败。存活探针使用 `/api/v1/health`；
+就绪探针使用 `/api/v1/health/ready`，任一必要依赖降级时后者返回 HTTP 503。
+
 ## 研发进入条件
 
 进入前后端并行开发前，应确认：

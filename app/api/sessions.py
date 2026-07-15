@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.core.exceptions import (
     InvalidStageTransitionError,
     LangGraphPublicDisabledError,
+    RuntimeSwitchAuditMismatchError,
     SessionNotFoundError,
 )
 from app.core.exceptions import (
@@ -261,10 +262,30 @@ async def langgraph_public_disabled_handler(
     )
 
 
+async def runtime_switch_audit_mismatch_handler(
+    request: Request, exc: RuntimeSwitchAuditMismatchError
+) -> JSONResponse:
+    """Render a sanitized fail-closed deployment-audit mismatch."""
+
+    trace_id = _get_trace_id(request)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
+
+
 # 导出路由级异常处理映射，供 main.py 注册
 session_exception_handlers: dict[Any, Any] = {
     SessionNotFoundError: session_not_found_handler,
     InvalidStageTransitionError: invalid_stage_transition_handler,
     LangGraphPublicDisabledError: langgraph_public_disabled_handler,
+    RuntimeSwitchAuditMismatchError: runtime_switch_audit_mismatch_handler,
     XuanhuValidationError: validation_error_handler,
 }

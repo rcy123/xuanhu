@@ -147,6 +147,7 @@ def make_context(
         stage="intake",
         agent_spec_version=spec.version,
         prompt_version="prompt-v1",
+        policy_version="test-verifier-policy.v1",
         deadline_at=datetime.now(UTC) + timedelta(minutes=1),
         total_attempt_budget=1,
         idempotency_key="idempotency-key",
