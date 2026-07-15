@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "verify_l0_l4_reacceptance.ps1"
@@ -138,6 +139,36 @@ def test_integration_preflight_requires_all_three_explicit_safety_inputs() -> No
     preflight_index = script.index("Assert-IntegrationEnvironment -RepoRoot $RepoRoot")
     integration_index = script.index('Write-Host "==> Isolated PostgreSQL and Redis integration gate"')
     assert preflight_index < integration_index
+
+
+def test_embedded_python_literals_survive_windows_powershell_native_argument_passing() -> None:
+    script = _script()
+    for fragment in (
+        "print('integration targets validated')",
+        "os.environ['TEST_DATABASE_URL']",
+        "os.environ['TEST_REDIS_URL']",
+        "redis.info(section='server')['redis_version']",
+        "{'postgres_server_version_num': postgres_version, 'redis_version': redis_version}",
+    ):
+        assert fragment in script
+
+    executable = _powershell()
+    escaped_python = sys.executable.replace("'", "''")
+    smoke_command = (
+        "$code = \"import json`nprint(json.dumps({'status': 'ok'}))\"; "
+        f"$output = @(& '{escaped_python}' -c $code); "
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
+        "$result = ($output -join [Environment]::NewLine) | ConvertFrom-Json; "
+        "if ($result.status -ne 'ok') { exit 1 }"
+    )
+    smoke = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-Command", smoke_command],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert smoke.returncode == 0, smoke.stdout + smoke.stderr
 
 
 def test_gate_script_has_exact_dependency_sbom_workflow_and_secret_scan_commands() -> None:

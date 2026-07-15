@@ -97,7 +97,7 @@ function Assert-IntegrationEnvironment {
 from tests._database_safety import require_destructive_test_database, require_destructive_test_redis
 require_destructive_test_database()
 require_destructive_test_redis()
-print("integration targets validated")
+print('integration targets validated')
 "@
     Invoke-NativeGate -Command "uv" -Arguments @(
         "run", "--isolated", "--python", "3.12", "--locked", "python", "-c", $guardCode
@@ -212,14 +212,14 @@ $infrastructureVersionCode = @"
 import json, os
 import psycopg
 from redis import Redis
-with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+with psycopg.connect(os.environ['TEST_DATABASE_URL']) as connection:
     postgres_version = connection.info.server_version
-redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=True)
+redis = Redis.from_url(os.environ['TEST_REDIS_URL'], decode_responses=True)
 try:
-    redis_version = redis.info(section="server")["redis_version"]
+    redis_version = redis.info(section='server')['redis_version']
 finally:
     redis.close()
-print(json.dumps({"postgres_server_version_num": postgres_version, "redis_version": redis_version}, sort_keys=True))
+print(json.dumps({'postgres_server_version_num': postgres_version, 'redis_version': redis_version}, sort_keys=True))
 "@
 $infrastructureVersions = (
     Invoke-NativeCapture -Command "uv" -Arguments @(
