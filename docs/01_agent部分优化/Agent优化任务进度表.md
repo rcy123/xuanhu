@@ -348,6 +348,7 @@
 | 2026-07-14 | Codex | L0～L4 工程重新验收通过；L4.5-02 仍等待具名临床专业人员按 `临床红旗规则人工审定签署单-2026-07-14.md` 签署。签署前两个 LangGraph 公共开关保持默认关闭，不得进入真实临床或患者试点。 |
 | 2026-07-15 | Codex | 终审重新打开 L0/L1/L2/L4.5-07/L4.5-10，关闭 runtime 切换台账、进程级 LangGraph 生命周期、required 模型审计、Outbox 可部署告警和 exact-HEAD 复验的证据缺口；技术实现提交 `c9148c2`，唯一 Alembic head 为 `20260715_0012`。 |
 | 2026-07-15 | Codex | 当前门禁证据：Python 3.11/3.12 各 `1547 passed, 362 deselected`；真实服务（排除串行性能）`359 passed, 1 xfailed`；碰撞 `2 passed`；串行双基线连续两次 `2 passed`；前端 `23 files / 171 tests`；Ruff、mypy（154 source files）、lock、pip/npm audit、双 SBOM、promtool、actionlint 和 Gitleaks 全绿。工程种子 `29/29` 只记为 `not_for_clinical_signoff`。 |
+| 2026-07-15 | Codex | 首次 exact-HEAD 一键执行发现 Windows PowerShell 5.1 会剥离多行 Python `-c` 中的双引号，环境探针在测试开始前 fail-closed；提交 `f37e758` 改为 Windows-safe 单引号字面量并增加真实 PowerShell native argument smoke test，安全目标与 PG/Redis 版本探针复测通过。 |
 
 ## 8. 下一步
 
