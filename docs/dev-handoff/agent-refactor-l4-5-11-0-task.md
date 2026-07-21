@@ -1,169 +1,264 @@
-# L4.5-11-0 回退后基线重置与方案校准任务
+# L4.5-11-0 回退后基线重置与方案校准任务（v2 重新发布）
 
-## 发布信息
+## 1. 发布信息
 
 | 项目 | 内容 |
 |---|---|
 | 任务编号 | `L4.5-11-0` |
+| 合同版本 | v2.0（重新发布） |
 | 发布日期 | 2026-07-21 |
-| 发布人 | Codex（工程项目经理） |
+| 发布人 | Codex（工程项目经理，依据项目 owner 指令） |
+| 执行负责人 | 领取本任务的开发测试执行者 |
 | 状态 | 已发布 / 待交付 |
-| 审核 | 待验收 |
+| 审核 | 待项目经理验收 |
 | 实施分支 | `codex/l4-5-11-context-privacy-hardening` |
-| 事实基线 | `b97c9f9` |
+| 事实核对基线 | `a0790c6` |
+| 生产代码基线 | `b97c9f9`（截至事实核对基线，其后两个提交仅修改受控文档） |
+| 原发布合同 | `6a7b8c4` 中的 v1 任务合同；由本合同替代，不视为交付或验收失败 |
 | 关联阻塞 | `AR-B-031`（P1，处理中） |
-| 交付文件 | `docs/dev-handoff/agent-refactor-l4-5-11-0.md` |
+| 唯一方案交付 | `docs/01_agent部分优化/L4.5-11模型输入隐私收敛方案-v2-2026-07-21.md` |
+| 交付与验收载体 | `docs/dev-handoff/agent-refactor-l4-5-11-0.md` |
 
-## 任务背景
+执行者开始工作时必须记录包含本任务合同的 clean exact HEAD，作为本轮“执行起点”；事实核对仍以 `a0790c6` 为准。若代码事实已经变化，按停止条件处理，不得静默套用本合同。
 
-用户已回退 B133 打地鼠式隐私返工。回退后的当前代码与旧 v1 重写方案存在结构性失配：
+## 2. 重新发布原因与权威关系
 
-- `app/agent_runtime/context.py` 当前为 210 行，不是 v1 假定的 10,000+ 行；
-- 当前不存在 `UserMessageProjection`；
-- `tests/test_l2_3_context_builder.py` 当前收集 9 项，不是 v1 声称的约 180 项；
-- `build_intake_context()` 把 `current_messages` 原文 JSON 直接放入 USER 层；
-- `AgentRuntime` 在最终 Gateway 调用前没有独立隐私门禁；
-- v1 重写方案、原范围批准单和 L5 预审报告此前只存在于被忽略的 `docs/` 工作树，没有进入受控 Git 历史。
+用户已回退 B1～B133 打地鼠式 Context 返工。原任务在 `6a7b8c4` 发布后尚未形成交付或验收结果，项目 owner 现要求重新发布。为避免旧合同、旧 v1 方案与当前管理台账形成多个事实源，本合同作如下限定：
 
-隐私缺口真实存在，但旧 A～F 的文件、类型、规模和测试前提已经失效。继续按旧批次开发会重新引入回退前复杂度。
+1. 本文件是 `L4.5-11-0` 唯一有效任务合同；
+2. `项目管理/00-当前状态.md` 是当前动作的唯一事实源；
+3. `项目管理/01-任务台账.md` 是任务状态的唯一事实源；
+4. `L4.5-11收敛性架构重写方案-2026-07-21.md`、`AR-B-031-scope-change-request-2026-07-21.md` 和 `项目管理/历史/ADR-006-pii-redaction-at-intake-entry-B133草案.md` 只提供回退前历史与失败模式，**不授权实施其中 A～F、Domain 假名化、临床白名单或文件拆分**；
+5. 只有本任务验收通过后，项目经理才可以发布一个 v2 实现任务。
 
-## 本任务目标
+本次重新发布不抹除 `ACC-20260721-002` 的第一次发布记录，也不把“重新发布”伪装成新的工程验收。
 
-建立一个与当前 HEAD 一致、可以有限验证且可以逐步实施的新基线。本任务只发布后续工程工作的可信输入，不修复生产代码，也不关闭 AR-B-031。
+## 3. 已核对的当前事实
 
-必须交付：
+截至事实基线 `a0790c6`：
 
-1. 一份 v2 实施方案，逐项引用当前真实模块、类型和调用链；
-2. 一份有限威胁模型，明确保护对象、允许数据、拒绝数据、规范化边界和停止条件；
-3. 明确区分持久化原始患者消息、Domain State、模型输入投影、模型审计摘要和 Gateway 最终请求；
-4. 明确 EvidenceSpan 的原文 quote/offset 如何在模型输入脱敏后保持可验证；
-5. 将实现拆成 2～4 个小任务，每个任务可独立先红后绿、验收和回退；
-6. 为每个后续任务写明允许文件、禁止文件、专项测试、全量门禁和失败停止条件；
-7. 在交付文件记录核对命令、事实结果、未决风险和建议发布的下一任务。
+- `app/agent_runtime/context.py` 为 210 行；
+- 仓库不存在 `UserMessageProjection`；
+- `tests/test_l2_3_context_builder.py` 收集 9 项测试；
+- `app/services/langgraph_intake.py::_build_intake_input()` 将 `ConsultMessage.content` 写入 `IntakeExtractionInput.current_messages`；
+- `app/agents/intake_extraction.py::build_intake_context()` 把 `current_messages` 的 `content` 原文 JSON 序列化到 USER 层；
+- `app/agents/intake_extraction.py::execute_intake_extraction()` 将 `ContextPacket.messages` 转为字典后调用 `AgentRuntime.run()`；
+- `app/agent_runtime/runtime.py::AgentRuntime._call_gateway()` 将 messages 直接交给 `ModelGatewayClient.chat_structured_observed()` 或 `chat_structured()`，当前没有独立的最终模型输入隐私门禁；
+- `ContextBuilder` 对 Mapping/string 投影中的自由文本应用两个简单裸号码模式，但 `build_intake_context()` 的 USER 参数不经过 Mapping 投影，因此当前 Intake USER 原文缺口成立；
+- 原始患者消息还承担 grounding 与 `EvidenceSpan` quote/offset 验证职责，不能把“修改 Domain 原文”当成无影响的默认方案。
 
-## 强制架构约束
+当前真实调用链为：
 
-- 原始患者消息及 `IntakeExtractionInput` 不得在本任务中修改。
-- v2 不得以“Domain State 只存假名”为默认结论；若未来要改变持久化语义，必须另行发布数据迁移、审计、grounding 和回滚任务。
-- 模型输入脱敏必须被描述为独立投影，不得伪装成原始事实。
-- 必须说明 `EvidenceSpan` 使用原始消息坐标时的映射或等长替换策略，不能用“现有 E2E 应继续通过”代替设计。
-- Gateway 兜底必须位于不可绕过的实际调用路径，并使用固定、脱敏、可测试的失败码。
-- 威胁模型必须是有限集合；不得继续使用 B1～B133 无限追加样例作为完成定义。
-- `context.py` 当前足够小，不得预先发布“拆分单文件”任务；只有 v2 证明新职责导致模块边界确有必要时才能提出。
-- 不得把项目经理工程验收、自动化测试或 AI Code Review 写成临床、隐私、法务或机构签署。
+```text
+ConsultMessage.content
+  -> app.services.langgraph_intake._build_intake_input
+  -> IntakeExtractionInput.current_messages
+  -> app.agents.intake_extraction.build_intake_context
+  -> ContextPacket.messages（USER 为 current_messages JSON）
+  -> app.agents.intake_extraction.execute_intake_extraction
+  -> AgentRuntime.run
+  -> AgentRuntime._call_gateway
+  -> ModelGatewayClient.chat_structured_observed / chat_structured
+```
 
-## 允许修改范围
+交付方案必须重新核对这条链路，不得引用回退前的类型、10,000+ 行文件或约 180 项测试。
 
-- `docs/01_agent部分优化/项目管理/00-当前状态.md`
-- `docs/01_agent部分优化/项目管理/01-任务台账.md`
-- `docs/01_agent部分优化/项目管理/02-阻塞与风险.md`
-- `docs/01_agent部分优化/项目管理/03-验收记录.md`
-- `docs/01_agent部分优化/项目管理/04-决策记录.md`
-- `docs/01_agent部分优化/项目管理/05-文档索引.md`
-- `docs/01_agent部分优化/Agent优化任务进度表.md`（仅修正兼容入口）
-- `docs/01_agent部分优化/L4.5-11收敛性架构重写方案-2026-07-21.md`（仅标记历史/废止状态）
-- 新的 L4.5-11 v2 实施方案文档
+## 4. 任务目标
+
+在不修改生产代码和测试代码的前提下，形成一个与当前小基线一致、有限、可验证、可分步回退的 L4.5-11 v2 工程方案。
+
+必须同时完成：
+
+1. 画出从原始消息到最终 Gateway 请求的当前数据流和所有权边界；
+2. 定义有限威胁模型、明确支持集合、非目标和停止条件；
+3. 比较并选定模型输入独立投影策略，不得预设 Domain State 改存假名；
+4. 给出 EvidenceSpan quote/offset 在脱敏投影下仍可验证的具体机制；
+5. 定义 Runtime/Gateway 最终不可绕过门禁的位置、失败码、审计内容和零请求失败语义；
+6. 把后续工程拆成 2～4 个互斥小任务，每个都能先红后绿、独立验收和回退；
+7. 只推荐其中一个作为验收后的下一发布任务；其余保持候选，不能提前实施。
+
+## 5. 非目标
+
+本任务不执行任何产品实现，不关闭 AR-B-031，也不恢复或批准旧 v1 A～F。
+
+明确不做：
+
+- 不编写或修改生产代码、测试代码、数据库迁移、依赖、CI 或部署配置；
+- 不改变持久化消息、Domain State、审计存储或前端显示语义；
+- 不设计或修改临床红旗规则、临床阈值、诊疗逻辑或 L5～L9；
+- 不改变 Legacy 默认路径、RAG、两个 LangGraph 公共开关或切流策略；
+- 不宣称解决“所有 PII”“所有 Unicode 变体”或无限攻击面；
+- 不把 AI 工程审查写成隐私、法务、临床、伦理或机构签署。
+
+## 6. 允许修改范围
+
+执行者只允许新增或修改以下两个交付文件：
+
+- `docs/01_agent部分优化/L4.5-11模型输入隐私收敛方案-v2-2026-07-21.md`
 - `docs/dev-handoff/agent-refactor-l4-5-11-0.md`
-- 本任务文件中的事实性勘误
 
-## 禁止修改范围
+本任务书若存在事实性错误，只在 handoff 登记并停止，由项目经理修订合同。执行者不得自行修改项目经理台账或任务合同。
+
+## 7. 禁止修改范围
 
 - `app/**`
 - `tests/**`
 - `frontend/**`
 - `scripts/**`
-- 数据库迁移、依赖、锁文件、CI、部署文件
-- L5～L9 状态和实现
-- Legacy 行为、默认运行时和两个 LangGraph 公共开关
-- `triage_precheck.py`、红旗规则、临床阈值和专业签署内容
+- `.github/**`
+- `pyproject.toml`、`uv.lock`、前端依赖和锁文件
+- 数据库迁移、运行配置、部署文件和环境文件
+- `docs/01_agent部分优化/项目管理/**`
+- `docs/01_agent部分优化/Agent优化任务进度表.md`
+- 回退前历史方案、历史批准单和历史 ADR 草案
+- 任何既有交付、验收和专业签署记录
 
-如果发现必须修改上述范围，立即停止并在交付文档登记阻塞，由项目经理决定是否发布新的限定任务。
+发现必须修改禁区时立即停止，在 handoff 写明触发原因、所需新权限和建议的新任务边界。
 
-## v2 方案最低内容
+## 8. v2 方案强制内容
 
-### 1. 当前数据流
+### 8.1 当前事实与数据所有权
 
-必须从实际代码画出并逐项说明：
+逐项列出并引用当前代码：
 
-```text
-ConsultMessage.content
-  -> IntakeExtractionInput.current_messages
-  -> build_intake_context
-  -> ContextPacket.messages
-  -> AgentRuntime.run
-  -> ModelGatewayClient
+| 数据层 | 必须回答的问题 |
+|---|---|
+| 原始持久消息 | 谁创建、谁读取、审计和 grounding 为何需要原文 |
+| Domain State | 哪些结构化事实来自原文，是否允许被投影结果反向覆盖 |
+| `IntakeExtractionInput` | 当前包含哪些原始或结构化字段，权威来源是什么 |
+| 模型输入投影 | 生命周期、可丢弃性、密钥依赖和与原文的映射关系 |
+| `ContextPacket.messages` | 每层允许和禁止的数据类别 |
+| 模型审计记录 | 允许保存的摘要、digest、计数和失败码；禁止记录的原始 PII |
+| 最终 Gateway 请求 | 最后一处不可绕过检查及失败时的零网络请求保证 |
+
+模型输入投影必须是派生数据，不得成为 Domain 或持久化原文的新事实源。
+
+### 8.2 有限威胁模型
+
+用有限矩阵定义完成条件，至少包含：
+
+- 保护对象：结构化身份字段、连续手机号、连续身份证号；
+- 明确支持的变换：原始 ASCII、NFKC 可归一化全角形式、方案明确列出的常见分隔形式、JSON 序列化、同一最终请求内的消息边界；
+- 保持对象：体温、血压、心率、血糖、日期、剂量等非身份临床数字，不得用“所有长数字都删除”代替分类策略；
+- 失败状态：密钥不可用、投影失败、映射失败、最终门禁命中时 fail-closed，并证明 Gateway 零请求；
+- 明确非目标：未列入支持集合的同形字、任意编码层数、任意跨请求拼接等进入风险台账，不通过无限追加正则暗示已解决。
+
+每个威胁族必须绑定一个不变量和一组参数化测试维度。B1～B133 的单个样例可以作为回归输入，但不能成为完成定义。
+
+### 8.3 EvidenceSpan 与 grounding
+
+必须比较至少两种策略：
+
+1. 等长替换，使模型可返回与原文坐标一致的 offset；
+2. 每条消息维护显式 projection-to-source offset map，在 verifier 中映射后核对原始 quote。
+
+方案必须选定一种，说明：
+
+- 映射对象的稳定标识；
+- NFKC、分隔符和替换长度变化如何处理；
+- 模型返回 span 时在哪一层完成映射和拒绝；
+- 无映射、越界、quote 不一致或跨消息 span 的固定失败行为；
+- 如何防止模型看到的假名/占位符反向写成患者事实。
+
+“保持现有 E2E 通过”或“后续再处理 offset”不能满足此项。
+
+### 8.4 最终不可绕过门禁
+
+方案必须以当前真实调用路径为依据，明确：
+
+- 门禁位于所有 Intake 模型请求必经的哪一层；
+- structured-output fallback 或重试是否仍经过同一门禁；
+- 门禁扫描的是最终序列化请求还是上游中间对象；
+- 命中时使用哪个固定、脱敏、可测试的失败码；
+- recorder、日志和异常不得包含命中的原始值；
+- 测试如何证明 Gateway 调用次数为 0；
+- 其他 Agent 是否复用该边界，若不复用必须明确非目标和后续任务。
+
+### 8.5 后续任务拆分
+
+拆为 2～4 个任务。每个候选任务必须包含：
+
+- 稳定候选编号和单一结果；
+- 依赖与前置验收；
+- 先红证据和期望失败原因；
+- 允许文件、禁止文件和公共 API 影响；
+- 专项测试与比例适当的回归门禁；
+- 回退方式；
+- 停止条件；
+- 交付文件路径；
+- 是否需要独立 reviewer 或外部专业批准。
+
+任务范围必须互斥。不得先发布“拆分 `context.py`”；当前文件仅 210 行，只有未来职责和依赖证明需要新模块时，才能在对应实现任务中提出最小模块边界。
+
+## 9. 交付文件要求
+
+`docs/dev-handoff/agent-refactor-l4-5-11-0.md` 必须包含：
+
+1. 执行起点 exact HEAD、分支和开始/结束工作树状态；
+2. 本任务第 3 节每项事实的代码路径、命令和结果；
+3. 新增/修改文件清单；
+4. 与原 v1 方案逐项比较：保留、拒绝、待决；
+5. v2 方案各不变量与对应测试维度；
+6. 2～4 个候选任务及依赖图；
+7. P0/P1/P2/P3 风险、owner、缓解和触发条件；
+8. 明确声明是否修改生产代码、测试、依赖、配置和项目经理台账；
+9. 只推荐一个下一任务，并说明其先红边界；
+10. 未决问题和停止条件触发情况。
+
+开发交付只能把任务状态声明为“已交付、申请验收”，不能自行写成“已完成”或“已验收”。
+
+## 10. 最低核对命令与证据
+
+执行者至少记录以下只读或文档门禁；可以按操作系统等价改写，但必须保留完整命令、退出码和摘要：
+
+```powershell
+git rev-parse HEAD
+git status --short --branch
+
+uv run python -c "from pathlib import Path; print(len(Path('app/agent_runtime/context.py').read_text(encoding='utf-8').splitlines()))"
+git grep -n "UserMessageProjection" -- app tests
+uv run pytest --override-ini addopts= --collect-only -q tests/test_l2_3_context_builder.py
+
+rg -n "def _build_intake_input|def build_intake_context|def execute_intake_extraction|async def run\(|def _call_gateway|chat_structured" app
+uv run pytest --override-ini addopts= -q tests/test_l0_1_contract.py
+git diff --check
+git status --short
 ```
 
-不得引用当前不存在的类型或回退前行号。
+`git grep` 无命中时退出码 1 是预期事实，不得伪写为测试失败。禁止为了让核对命令“变绿”而修改生产或测试文件。
 
-### 2. 数据所有权
+## 11. 验收标准
 
-至少定义：
+项目经理仅在以下条件全部满足时接受 `L4.5-11-0`：
 
-- 原始持久消息：审计、grounding 和患者记录的来源；
-- 模型输入投影：可丢弃、不可反向成为 Domain 真源；
-- 结构化身份字段：不得进入模型投影；
-- 自由文本直接标识符：进入 Gateway 前按已声明策略处理；
-- 临床数字：不得因宽泛数字规则被无理由删除。
+- 交付只包含本合同允许的两份文档；
+- 所有代码路径、类型、测试数量和调用链与交付 exact HEAD 一致；
+- v1 仅作为历史输入，没有被恢复为当前授权；
+- 原始消息、Domain State、模型输入投影、审计摘要和最终请求的所有权互不混淆；
+- 有限威胁模型具有明确边界、不变量、参数维度、非目标和停止条件；
+- EvidenceSpan 选择了可执行的等长或 offset-map 策略，并定义 fail-closed 行为；
+- 最终门禁绑定实际调用路径，覆盖 fallback/retry，且命中时零 Gateway 请求；
+- 2～4 个候选任务范围互斥、可独立先红后绿、验收和回退；
+- 只推荐一个下一任务，没有提前实现任何候选任务；
+- 没有把工程验收写成专业签署；
+- L0 文档契约通过，`git diff --check` 通过，交付文件显式纳入 Git；
+- 项目经理完成独立事实核对并在 handoff 写入验收结论。
 
-### 3. 有限威胁模型
+验收通过只表示可以发布一个 v2 实现任务。它不关闭 AR-B-031，不恢复 L4.5 总验收，不满足 L5 准入，也不替代具名隐私、法务、临床、伦理或机构批准。
 
-至少覆盖：
+## 12. 停止条件
 
-- 连续手机号和身份证号；
-- NFKC 可归一化的全角形式；
-- 已明确支持的常见分隔形式；
-- JSON 序列化后的最终消息；
-- 同一请求内消息边界拼接；
-- 缺少密钥或投影失败时 fail-closed；
-- 非 PII 临床数值保持。
+出现任一情况，执行者立即停止扩写方案，在 handoff 记录证据并申请项目经理决策：
 
-超出集合的模式进入风险台账，不允许通过无限扩展正则宣称“全部 PII 已解决”。
+- 执行起点的生产代码、调用链、测试数量与本合同基线不一致；
+- 需要修改本合同禁区才能证明设计成立；
+- 方案要求改变原始消息、Domain State、Legacy、UI、临床规则或专业审批边界；
+- EvidenceSpan 无法在所选投影方案下确定性映射和校验；
+- 威胁模型再次依赖无限 Unicode/转义/跨分片样例追加；
+- 候选任务超过 4 个、范围重叠或无法得到单一验收结论；
+- 发现新的 P0/P1，而现有 AR-B-031 无法准确承载；
+- 工作区包含无法归属的改动，或正式交付文件仍被 Git 忽略。
 
-### 4. 后续任务拆分
+## 13. 发布后的唯一下一动作
 
-建议目标顺序为：
-
-1. 当前 HEAD 上的失败契约测试；
-2. Intake 模型输入独立投影；
-3. AgentRuntime/Gateway 最终不可绕过门禁；
-4. 专项、全量、独立复审与 exact-HEAD 验收。
-
-具体编号和合并边界由 v2 方案论证，项目经理验收后逐项发布。未发布任务不得提前实现。
-
-## 交付要求
-
-交付文件 `docs/dev-handoff/agent-refactor-l4-5-11-0.md` 必须包含：
-
-1. 基线 HEAD、分支和工作树状态；
-2. 每个事实的代码路径与验证命令；
-3. 新增/修改文档清单；
-4. v2 中每个实现任务的输入、输出和停止条件；
-5. 与 v1 的逐项差异；
-6. P0/P1/P2/P3 风险表；
-7. 明确声明生产代码和测试代码均未修改；
-8. 建议项目经理下一步只发布一个任务。
-
-## 验收标准
-
-项目经理仅在以下条件全部满足时通过 L4.5-11-0：
-
-- 所有引用的类型、路径、测试数和数据流与交付 HEAD 一致；
-- v1 已明确标记为历史参考，不能再被误作实施授权；
-- v2 明确保留原始消息与模型输入投影的边界；
-- EvidenceSpan/grounding 没有被忽略或用模糊承诺替代；
-- 后续任务数量有限、范围互斥、每次只发布一个；
-- 文档没有把 AI 工程验收写成专业签署；
-- `uv run pytest --override-ini addopts= -q tests/test_l0_1_contract.py` 通过；
-- `git diff --check` 通过；
-- 新任务、v2 和交付文档使用显式 pathspec 纳入版本控制，不得只留在被忽略的工作树。
-
-验收通过只代表可以发布第一个 v2 实现任务，不代表 AR-B-031 关闭，也不代表 L5 可以开始。
-
-## 项目经理记录规则
-
-- 发布：更新当前状态、任务台账，必要时追加决策记录，并创建任务文件。
-- 交付：开发结果写入对应 handoff，任务台账改为“已交付”。
-- 验收通过：在 handoff 增加 PM 验收结论，追加验收记录，更新任务/阻塞/当前状态并只发布下一任务。
-- 验收失败：在阻塞与风险台账登记或更新 AR-B，任务改为“返工中”，只发布限定返工范围。
-- 外部阻塞：登记责任角色和所需证据，不由 Codex 代签或推定完成。
+开发测试执行者领取本合同，创建 v2 方案和 handoff，完成只读核对后提交“已交付、申请验收”。在项目经理验收前，不得开始任何生产代码或测试实现。
