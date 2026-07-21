@@ -3,10 +3,10 @@
 纯文件契约测试：验证 ADR、兼容矩阵、迁移边界文档的内容完整性、
 章节覆盖率、端点覆盖、事件覆盖和不可变约束。不调用数据库、Redis 或真实模型。
 
-通过 ``pyproject.toml`` 的默认 ``testpaths`` 不包含 ``test_agent/``，
-因此本测试必须显式执行：
+本测试位于默认 ``testpaths`` 的 ``tests/`` 目录，可随完整测试套件运行，
+也可以单独执行：
 
-    uv run pytest test_agent/test_l0_1_contract.py -q -rs
+    uv run pytest tests/test_l0_1_contract.py -q -rs
 """
 
 from __future__ import annotations

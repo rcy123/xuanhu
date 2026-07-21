@@ -79,7 +79,6 @@ def test_gate_script_has_exact_unit_static_integration_and_frontend_commands() -
     assert "…" not in script
 
     for fragment in (
-        '"run", "--isolated", "--python", "3.11", "--locked", "pytest"',
         '"run", "--isolated", "--python", "3.12", "--locked", "pytest"',
         '"run", "--isolated", "--python", "3.12", "--locked", "ruff", "check", "."',
         '"run", "--isolated", "--python", "3.12", "--locked", "mypy", "app", "scripts"',
@@ -116,6 +115,8 @@ def test_gate_script_has_exact_unit_static_integration_and_frontend_commands() -
     ):
         _assert_compact_fragment(script, fragment)
 
+    assert '"--python", "3.11"' not in script
+    assert "python_3_11" not in script
     assert "expected major version 24" in script
     assert "expected major version 11" in script
     assert "expected the validated 0.9 through 0.11 line" in script
@@ -271,6 +272,8 @@ def test_gate_script_has_exact_dependency_sbom_workflow_and_secret_scan_commands
     assert "Final reacceptance result manifest did not satisfy the exact-HEAD success contract" in script
 
     workflow = _compact(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    assert 'python-version: "3.12"' in workflow
+    assert "3.11" not in workflow
     assert 'docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro"' in workflow
     assert "prom/prometheus:v3.5.0 check rules" in workflow
     assert "deploy/prometheus/rules/xuanhu-outbox-alerts.yml" in workflow

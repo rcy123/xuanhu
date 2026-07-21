@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-T = TypeVar("T")
 
-
-class ApiResponse(BaseModel, Generic[T]):
+class ApiResponse[T](BaseModel):
     """标准成功响应 envelope。
 
     与接口设计文档 §1.4 保持一致：code / message / data / trace_id。
@@ -36,7 +34,7 @@ class ApiError(BaseModel):
     trace_id: str = Field(..., description="请求链路 ID")
 
 
-class PaginationResponse(BaseModel, Generic[T]):
+class PaginationResponse[T](BaseModel):
     """标准分页数据容器。
 
     与接口设计文档 §1.4 分页响应中的 data 对象保持一致。

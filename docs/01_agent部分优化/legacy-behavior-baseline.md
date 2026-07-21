@@ -48,8 +48,8 @@ Agent，不调用真实模型；确定性安全规则使用真实实现。基线
 | 验证旧错误行为、应删除 | LLM Sufficiency、InquiryAgent 生成下一问、`force=true` 绕过充分性、同会话 Legacy 阶段名细节 | 目标实现上线后删除，不作为兼容要求 |
 | 已知缺口 | 确定性 red-flag gate | L3 修复；当前以 strict xfail 记录 |
 
-当前默认测试发现数为 946（包含新增 10 个 Golden case）。L0-1 的
-`test_agent/test_l0_1_contract.py` 因项目约定不在默认 `testpaths`，必须单独运行。
+L0-1 文档契约测试现位于 `tests/test_l0_1_contract.py`，由默认
+`testpaths` 自动发现，也可在核对架构文档时单独运行。
 
 ## 5. 变更规则
 

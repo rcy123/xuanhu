@@ -97,7 +97,7 @@
 
 ## 验证方式
 
-- L0-1 契约测试（`test_agent/test_l0_1_contract.py`）验证本文档章节完整性
+- L0-1 契约测试（`tests/test_l0_1_contract.py`）验证本文档章节完整性
 - L0-2 Golden E2E 基线测试覆盖 Legacy 所有端点和 SSE 事件
 - L1 LangGraph 骨架测试验证空图 + checkpointer + interrupt + astream 链路
 - L2 Domain State 测试验证 Domain State 与 Graph State 的边界隔离

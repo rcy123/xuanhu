@@ -319,9 +319,6 @@ $evidenceManifest = [ordered]@{
     git_head = $ExpectedGitHead
     powershell = $PSVersionTable.PSVersion.ToString()
     uv = $uvVersion
-    python_3_11 = Invoke-NativeCapture -Command "uv" -Arguments @(
-        "run", "--isolated", "--python", "3.11", "--locked", "python", "--version"
-    ) -WorkingDirectory $RepoRoot
     python_3_12 = Invoke-NativeCapture -Command "uv" -Arguments @(
         "run", "--isolated", "--python", "3.12", "--locked", "python", "--version"
     ) -WorkingDirectory $RepoRoot
@@ -342,11 +339,6 @@ $EvidenceManifestPath = Join-Path $ArtifactDirectory "environment-evidence.json"
     ($evidenceManifest | ConvertTo-Json -Depth 4) + [Environment]::NewLine,
     [Text.UTF8Encoding]::new($false)
 )
-
-Write-Host "==> Python 3.11 unit and L0 contract gate"
-Invoke-NativeGate -Command "uv" -Arguments @(
-    "run", "--isolated", "--python", "3.11", "--locked", "pytest"
-) -WorkingDirectory $RepoRoot
 
 Write-Host "==> Python 3.12 unit and L0 contract gate"
 Invoke-NativeGate -Command "uv" -Arguments @(

@@ -2,7 +2,7 @@
 name = "xuanhu"
 version = "0.1.0"
 description = "悬壶（Xuanhu）— 中医 AI 辅助诊疗 MVP"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 readme = "README.md"
 license = { text = "UNLICENSED" }
 
@@ -21,10 +21,6 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.0,<4.0",
     "psycopg>=3.3.4,<4.0",
     "psycopg-pool>=3.3.1,<4.0",
-    # 约束 numpy 版本：numpy >=2.5 的 stub 文件使用 PEP 695 type 语句
-    #（Python 3.12+），与 mypy python_version="3.11" 不兼容。
-    # 本项目不直接依赖 numpy，此约束仅锁定传递依赖版本以保证 mypy 可运行。
-    "numpy>=2.4,<2.5",
 ]
 
 [project.scripts]
@@ -42,7 +38,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 exclude = [
     ".git",
@@ -77,7 +73,7 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -94,7 +90,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "test_agent"]
+testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = [

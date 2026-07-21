@@ -6,19 +6,15 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
-from typing import Generic, TypeVar
-
-K = TypeVar("K")
-V = TypeVar("V")
 
 
 @dataclass(frozen=True)
-class _Entry(Generic[V]):
+class _Entry[V]:
     value: V
     expires_at: float
 
 
-class BoundedTTLCache(MutableMapping[K, V], Generic[K, V]):
+class BoundedTTLCache[K, V](MutableMapping[K, V]):
     """A mapping-compatible LRU cache with a hard size and lifetime bound.
 
     Values in this cache are never authoritative.  Callers must be able to
