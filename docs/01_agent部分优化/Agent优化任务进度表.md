@@ -18,9 +18,9 @@
 
 ## 当前任务
 
-`L4.5-11-0：回退后基线重置与方案校准` v2 任务合同已重新发布、待交付。
+`L4.5-11-0：回退后基线重置与方案校准` 第 1 轮验收未通过；`L4.5-11-0-R1` 文档限定返工已发布、待交付。
 
-任务书：[agent-refactor-l4-5-11-0-task.md](../dev-handoff/agent-refactor-l4-5-11-0-task.md)
+当前任务书：[agent-refactor-l4-5-11-0-rework-1-task.md](../dev-handoff/agent-refactor-l4-5-11-0-rework-1-task.md)
 
 ## 历史流水
 
