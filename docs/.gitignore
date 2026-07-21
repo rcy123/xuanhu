@@ -1,0 +1,9 @@
+# Ad-hoc/generated documents remain ignored. The Agent refactor's
+# architecture, governance, task, and handoff evidence is versioned.
+*
+!.gitignore
+!01_agent部分优化/
+!01_agent部分优化/**
+!dev-handoff/
+dev-handoff/*
+!dev-handoff/agent-refactor-*.md

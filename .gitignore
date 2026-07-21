@@ -54,4 +54,14 @@ node_modules/
 
 # data
 data/
-docs/
+
+# Documentation
+# Most ad-hoc/generated documents remain ignored. Agent architecture,
+# governance, task, handoff, and acceptance evidence are source-controlled.
+docs/*
+!docs/.gitignore
+!docs/01_agent部分优化/
+!docs/01_agent部分优化/**
+!docs/dev-handoff/
+docs/dev-handoff/*
+!docs/dev-handoff/agent-refactor-*.md

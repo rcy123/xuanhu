@@ -1,5 +1,7 @@
 # L4.5 Integration & Safety Hardening 交接
 
+> 当前状态入口：`docs/01_agent部分优化/项目管理/README.md`。本文保留 L4.5 工程交接细节，不再承担实时任务台账。
+
 ## 任务状态与事实口径
 
 - 任务范围：重新打开 L0～L4 的工程验收，关闭中期审查列出的 2 个 P0 与 10 个 P1，不扩展 L5 Safety/HITL 业务语义。
