@@ -466,3 +466,65 @@ L4.5-11-1（Intake 入口投影层）
 
 *返工日期：2026-07-22*
 *返工人：开发测试执行者*
+
+## 14. PM 重新验收与接管修订（R1-A）
+
+> 核验日期：2026-07-22
+> R1 交付提交：`30f919e94eb4e1da4599d790699efe003736cab3`
+> R1 执行起点：`a76168d886ddca9b2f64868015d65eb58ec851b5`
+> 接管人：Codex（工程项目经理）
+> 状态：**R1 原交付仍未通过；依据用户授权由 PM 直接接管修订，修订结果待重新验收**
+
+### 14.1 R1 提交与范围核验
+
+| 检查项 | 结果 |
+|---|---|
+| R1 父提交 | 与返工执行起点 `a76168d...` 一致 |
+| R1 修改范围 | 仅本 handoff 与 v2 方案两份允许文档 |
+| 生产代码/测试/依赖/配置 | 未修改 |
+| `git diff --check a76168d..30f919e` | 通过 |
+| R1 提交后工作区 | 干净 |
+
+### 14.2 重新验收仍未闭合的事实
+
+| 级别 | 未闭合项 | 代码/文档证据 | 处置 |
+|---|---|---|---|
+| P1 | 最终门禁位置与真实请求次数仍写反 | `AgentRuntime._call_gateway()` 对真实 Gateway 传 `max_requests=1`；`_chat_structured_impl()` 在该参数存在时于 fallback 前 `break`；`_request_with_retry()` 的传输重试复用同一 payload | 改为 Intake-only Runtime 发送前门禁，并逐条证明目标路径只可能有一次请求 |
+| P1 | Gateway 方案无法同时满足“共享 Gateway”与“只影响 Intake” | R1 将门禁放在共享 `ModelGatewayClient`，但没有定义可靠启用谓词；还要求 core 使用 `RuntimeErrorCode`，会造成 core → agent_runtime 反向依赖 | 门禁留在持有 `AgentSpec` 的 Runtime；Gateway API 和依赖方向不变 |
+| P1 | 有限威胁模型没有可执行的跨 message 坐标规则 | 文档一处称支持，一处称不覆盖；“拼接 content”既无边界 token 也无原始坐标 | 定义 ASCII/全角 digit/X、三个精确分隔符、虚拟 `B` 和 `(message_index, raw_char_index)` token 流 |
+| P1 | 仍残留宽泛数字 + 临床白名单策略 | v2.1 第 4.3 节仍写“其余连续数字 token 一律脱敏” | 删除该路径；只匹配有限身份 grammar，临床六类作为负向不变量 |
+| P1 | 候选任务仍争用同一测试所有权 | L4.5-11-1 已要求临床数字测试，L4.5-11-3 又追加同一测试文件；依赖图还残留“临床数字白名单” | 合并临床负向回归到 L4.5-11-1，删除候选任务 3，只保留两个互斥任务 |
+
+上述问题仍属于原 `AR-B-031` 范围，没有发现新的范围外 P0/P1。根据用户“若还不通过，直接接手完成”的授权，本轮不再发布 R2 返工任务。
+
+### 14.3 PM 直接修订结果
+
+方案文档升级为 v2.2，并完成以下收敛：
+
+1. **有限 grammar**：只覆盖 ASCII/全角 digit/X、连续手机号/身份证号和三种精确手机号分隔形式；其他字符是硬边界；不宣称“所有 PII/Unicode”。
+2. **确定性坐标**：shadow token 必须携带原始 message/字符坐标；跨 message 的 `B` 为零宽；逐 message 回写 `█`，每条 Python 字符长度不变。
+3. **Grounding 所有权**：EvidenceSpan 始终属于原始 `source_message_id.content`；先投影再 JSON 序列化，验证器继续使用原文。
+4. **真实最终边界**：Runtime 在调用 Gateway 方法前对 Intake-only messages 扫描；命中/扫描异常均固定失败，Gateway 方法调用 0 次。
+5. **fallback/retry 证明**：目标 Runtime 路径传 `max_requests=1`，不会进入 JSON fallback，传输尝试也不会扩张；Legacy/其他 Agent/直接 Gateway 明确为非目标。
+6. **两任务拆分**：L4.5-11-1 独占 projector/scanner、入口集成和临床负向测试；L4.5-11-2 独占 Runtime/specs、零调用与审计测试。
+
+### 14.4 修改范围
+
+本接管修订阶段只修改：
+
+- `docs/01_agent部分优化/L4.5-11模型输入隐私收敛方案-v2-2026-07-21.md`
+- `docs/dev-handoff/agent-refactor-l4-5-11-0.md`
+
+未修改生产代码、测试、依赖、配置和项目经理台账。修订提交完成后，由 PM 对该提交执行 L0 文档契约、diff、范围、Git 跟踪和 clean exact-HEAD 复验，再单独写入最终验收事务。
+
+### 14.5 接管修订预提交验证
+
+| 检查项 | 结果 |
+|---|---|
+| L4.5-11-1 当前真实 red | 以手机号构造 `IntakeExtractionInput` 并调用 `build_intake_context()`；确认 USER 层仍含原值 |
+| L4.5-11-2 当前真实 red | 直接调用 `_call_gateway()` 传入不安全 Intake messages；确认 fake Gateway 调用 1 次 |
+| 方案结构断言 | v2.2、有限 grammar、原始坐标、`max_requests=1`、两个候选任务均存在；旧 L4.5-11-3/Gateway Payload 方案不存在 |
+| 字符长度复验 | `len('[REDACTED:11]') == 13`；`len('█' * 11) == 11` |
+| L0 文档契约 | `131 passed` |
+| `git diff --check` | 通过 |
+| 修改文件 | 仅 v2 方案与本 handoff 两份文档 |
