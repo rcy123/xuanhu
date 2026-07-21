@@ -5,7 +5,7 @@
 - 任务范围：重新打开 L0～L4 的工程验收，关闭中期审查列出的 2 个 P0 与 10 个 P1，不扩展 L5 Safety/HITL 业务语义。
 - 实施分支：`codex/l4-5-integration-safety-hardening`。
 - 初次技术提交：`3a92faa`；终审加固技术提交：`c9148c2`；PowerShell exact-HEAD 门禁参数修复：`f37e758`；原生命令退出码与最终成功回执加固位于本交接对应的最终 HEAD。
-- 工程状态：L4.5-01～L4.5-10 已通过技术验收；L4.5-02 的自动化与工程验收通过，但临床红旗规则人工审定尚未完成。
+- 工程状态：L4.5-01～L4.5-10 的历史技术验收已通过；2026-07-21 因 AR-B-031 模型输入隐私边界重新打开 L4.5，当前先执行文档限定的 L4.5-11-0 基线校准；L4.5-02 的临床红旗规则人工审定仍未完成。
 - 阶段状态：L0～L4 可表述为“工程重新验收通过”，L4.5 不能表述为临床关闭、临床发布完成或真实患者试点获准。
 - 临床门禁：`docs/01_agent部分优化/临床红旗规则人工审定签署单-2026-07-14.md` 当前明确为待具名临床专业人员审定；本交接不填写、不推定也不替代该签署。
 
@@ -23,6 +23,8 @@
 | L4.5-08 | 模型运行审计与有界临床临时缓存 | P1-08、P1-09 |
 | L4.5-09 | 默认关闭的 LangGraph WebUI 灰度闭环 | P1-10 |
 | L4.5-10 | CI、供应链、全量回归和 L0～L4 重新验收门禁 | P1-06 与重新验收清单 |
+| L4.5-11 | 回退后重新收敛模型输入隐私边界 | AR-B-031 |
+| L4.5-11-0 | 以当前 HEAD 校准事实、威胁模型和 v2 实施计划；禁止修改生产代码 | AR-B-031 基线失配 |
 
 ## L4.5-01 测试数据库安全隔离与破坏性夹具治理
 
@@ -114,6 +116,15 @@
 - 直接测试：`tests/test_reacceptance_gate_script.py`、`tests/test_database_safety.py`、`tests/test_infrastructure_isolation.py`，以及脚本调用的全量 suites。
 - 技术验收状态：通过。当前证据为 Python 3.11/3.12 各 `1549 passed, 362 deselected`；真实服务 `359 passed, 1 xfailed`；碰撞 `2 passed`；双性能基线连续两轮 `2 passed`；前端 `23 files / 171 tests`；静态、安全、SBOM、promtool 和 Gitleaks 均通过。完整证据见重新验收报告。
 - 明确边界：可复跑脚本要求 clean HEAD 和显式 `TEST_DATABASE_URL`、`TEST_REDIS_URL`、`XUANHU_ALLOW_DESTRUCTIVE_TESTS=1`；它不会自动启动、猜测或清空开发基础设施，也不会把临床签署变成自动化检查。
+
+## L4.5-11 模型输入隐私边界收敛
+
+- 重新打开原因：当前 `build_intake_context()` 把患者 `current_messages` 原文 JSON 放入 USER 层，`AgentRuntime` 在 Gateway 前没有最终隐私门禁；既有 Context 投影只覆盖 CONTEXT 层，不能证明模型输入边界成立。
+- 回退事实：用户已回退 B133 打地鼠式复杂修改；这些未提交实现不得恢复或作为当前代码事实。
+- 当前基线：exact HEAD `b97c9f9`；`app/agent_runtime/context.py` 为 210 行，`UserMessageProjection` 不存在，`tests/test_l2_3_context_builder.py` 收集 9 项。
+- v1 状态：`L4.5-11收敛性架构重写方案-2026-07-21.md` 的 10,000+ 行、旧类型和约 180 项测试前提与当前 HEAD 不符，只保留为回退前历史参考，不得直接执行 A～F。
+- 当前发布：`L4.5-11-0` 只允许文档与测试设计，任务文件为 `docs/dev-handoff/agent-refactor-l4-5-11-0-task.md`；交付文件为 `docs/dev-handoff/agent-refactor-l4-5-11-0.md`。
+- 关闭边界：L4.5-11-0 验收只允许发布后续实现任务，不能关闭 AR-B-031；AR-B-031 只能在后续实现、专项/全量门禁、独立复审、提交和 clean exact-HEAD 复验全部通过后关闭。
 
 ## 精确复跑入口
 

@@ -1,7 +1,7 @@
 # 悬壶 Agent 整体大修任务进度表
 
-> 版本：v1.3
-> 日期：2026-07-15
+> 版本：v1.4
+> 日期：2026-07-21
 > 目标架构：Harness + LangGraph
 > 总计划：`docs/01_agent部分优化/Agent整体大修实施计划-LangGraph版.md`
 > 状态说明：本文档是任务发布、验收、返工和阶段关闭的唯一进度看板
@@ -30,9 +30,9 @@
 
 | 项目 | 当前状态 |
 |---|---|
-| 当前阶段 | L0～L4 工程重新验收通过；L4.5 红旗规则人工审定待外部签署 |
-| 当前任务 | L4.5-01～L4.5-10 技术闭环完成；等待具名临床专业人员审定 `triage-raw-text-precheck.v1` |
-| LangGraph 新链路 | L0～L4 工程完成度为 100%；后端与 WebUI 灰度开关默认关闭，保持非默认、非临床验证 |
+| 当前阶段 | L4.5 因 AR-B-031 模型输入隐私边界重新打开；红旗规则人工审定仍待外部签署；L5 NO-GO |
+| 当前任务 | `L4.5-11-0` 回退后基线重置与方案校准已发布，等待文档交付和项目经理验收 |
+| LangGraph 新链路 | L0～L4 功能历史验收已完成；当前 exact HEAD `b97c9f9` 的模型输入隐私边界重新验收中；后端与 WebUI 灰度开关继续默认关闭 |
 | Legacy 生产链路 | 保持现状，只允许阻断性修复 |
 | 无 RAG 新版问诊里程碑 | 已完成，L3 关闭 |
 | 无 RAG 全链路里程碑 | 未完成，目标 L6 |
@@ -48,7 +48,7 @@
 | L2 | Harness 核心与领域 State | 工程已完成 | 100% | L1 核心底座可用 | AgentRuntime、Context、Verifier、Reducer、publisher 与审计闭环通过 |
 | L3 | Intake 问诊子图 | 工程已完成 | 100% | L2 核心数据边界可用 | 原文 Triage、初始数据、幂等、SSE、UI 和安全集成测试通过 |
 | L4 | 临床推理与方药子图 | 工程已完成 | 100% | L3 核心流程可用 | Read Model、恢复隔离、审计、UI 和全量真实 PG 验收通过 |
-| L4.5 | Integration & Safety Hardening | 技术已完成 / 规则审定待签 | 100%（工程） | 中期审查完成 | P0/P1 技术关闭；规则人工审定完成后方可进入后续受控非临床阶段 |
+| L4.5 | Integration & Safety Hardening | 重新打开 / L4.5-11-0 已发布 | 90%（10/11 技术任务） | 中期审查完成 | AR-B-031 工程关闭、exact-HEAD 复验通过且规则人工审定完成后方可进入后续受控非临床阶段 |
 | L5 | Safety 与医师 HITL | 未开始 | 0% | L4.5 关闭且后续范围获批 | Safety Gate、interrupt、review resume 和二次安全审核通过 |
 | L6 | 病历子图 | 未开始 | 0% | L5 关闭 | RecordAssembler、Narration 限权、落库和无 RAG E2E 通过 |
 | L7 | Evidence/RAG 增强 | 未开始 | 0% | L6 关闭 | Evidence policy、claim links、trace 和 RAG 评估通过 |
@@ -119,6 +119,8 @@
 | L4.5-08 | 模型运行审计与临床缓存治理 | L4.5-03 | 已完成 | 验收通过 | required PostgreSQL recorder 在模型调用前/后 fail-closed；policy、canonical DTO + 有序消息 digest、actual model/attempt/latency/usage/输出摘要可审计；冲突重放拒绝；10k key 证明缓存有界并清理 |
 | L4.5-09 | WebUI LangGraph 灰度入口与 L3/L4 结果闭环 | L4.5-04/L4.5-06/L4.5-07 | 已完成 | 验收通过 | 双 feature flag 默认关闭；启用后可创建/推进并显示 runtime/revision/unresolved，刷新后恢复 |
 | L4.5-10 | CI、全量回归、故障注入与 L0～L4 重新验收 | L4.5-01～L4.5-09 | 已完成 | 技术验收通过 | 单命令 locked-dependency 门禁覆盖 Python 3.11/3.12、真实 PG/Redis、串行性能、worker 碰撞、前端、静态、安全、SBOM、promtool 行为、actionlint、Gitleaks 与 detached clean tree；仅在全门禁完成后发布绑定 exact HEAD 的 `reacceptance-result.json`；证据见重新验收报告 |
+| L4.5-11 | 模型输入隐私边界收敛 | L4.5-03/L4.5-08/L4.5-10 | 返工中 | 验收未通过 | B133 打地鼠式修改已由用户回退；当前 HEAD 仍允许 Intake USER 原文直接到达 Gateway，必须按当前小基线重新设计，不得恢复 B133 复杂实现 |
+| L4.5-11-0 | 回退后基线重置与方案校准 | L4.5-11 | 已发布 | 待验收 | 只允许文档与测试设计；冻结 `b97c9f9` 事实基线、废止不适配当前 HEAD 的 v1 A～F、发布可收敛 v2；不得修改生产代码 |
 
 #### 2026-07-15 终审加固
 
@@ -210,6 +212,7 @@
 | AR-B-028 | P1 | L4-3 药名控制字符可绕过：`_normalize_text()` 先用 `\s+` 折叠空白，再检查 Unicode `Cc/Cf/Cs`，导致换行、回车、制表等控制字符在检查前消失。`herb="甘\n草"` 被规范为 `"甘 草"` 并得到 `passed=True`；同一药味可通过插入控制字符逃逸 alias/duplicate-herb 检测，污染后续候选方与 Safety 输入。现有 41 项专项未覆盖控制字符、format/surrogate 与规范化后重复组合 | L4-3 | 已关闭 | `_normalize_text()` 在任何空白折叠前依次检查原始字符串与 NFKC 结果，统一拒绝 `Cc/Cf/Cs`；药名、单位、name/note/rationale/basis 等 canonical 文本共享该顺序。新增换行、回车、制表、零宽字符、surrogate、单位与 `甘草 + 甘\n草` 碰撞回归，67 项专项及全门禁通过 |
 | AR-B-029 | P1 | L4-4 跨进程恢复可信边界曾可铸造：第 0 轮原始 DTO restore 可直接登记 trusted；第 1 轮调用方可注入伪 `PostgresDomainRepository` 子类返回手工 record/authority | L4-4 | 已关闭 | 恢复入口现只接受 session/artifact/revision/expected digest，并在闭包创建时捕获项目 session-factory 函数；Repository 与当前 authority 均由入口内部从 PostgreSQL 构造/加载。旧原始 restore 不存在，传入 Repository/record/Gate 固定 TypeError；原始 DTO、复制对象、伪 Repository 路径不命中 trusted consumer，真实 PostgreSQL restart 恢复保持通过 |
 | AR-B-030 | P1 | L4-4 曾丢弃真实 RunArtifact provenance，对 Syndrome/Formula payload 固定写 `model_actual="fake-model"`、`attempts=1`、`latency_ms=0`，恢复再以伪 provenance 自洽重验 | L4-4 | 已关闭 | Syndrome/Formula commit 现只消费各自 closure trusted execution 的 canonical RunArtifact，完整持久化 output、model、attempts、latency、usage、evidence、trace/run/spec/prompt；消费失败不写临床 artifact。Syndrome 恢复和 Formula replay 均绑定完整 subject digest/canonical payload，任一 provenance 字段篡改固定拒绝；26 项专项及全门禁通过 |
+| AR-B-031 | P1 | 当前 `build_intake_context()` 将 `current_messages` 原文 JSON 直接放入 USER 层，`AgentRuntime` 在 Gateway 前没有最终隐私门禁；B133 未提交复杂返工已回退。现有 v1 重写方案仍假定 `context.py` 为 10,000+ 行、存在 `UserMessageProjection` 和约 180 项 Context 测试，但当前 HEAD 分别为 210 行、类型不存在和 9 项测试，且方案文件未纳入 Git，不能作为可执行基线 | L4.5-11 | 处理中 | 先执行文档限定的 L4.5-11-0：以 `b97c9f9` 重建受控事实、明确原始消息与模型输入投影边界、形成有限威胁模型和 v2 实施批次；验收通过前禁止修改生产代码或发布 L5 |
 
 新增阻塞编号使用 `AR-B-001` 递增。
 
@@ -270,6 +273,7 @@
 | 2026-07-12 | L4-4 | 1 | 验收未通过 | 旧原始 DTO restore 已删除，分支/恢复/并发回归扩充至 PostgreSQL 专项 `18 passed, 3 warnings`；Ruff、mypy（118 files）、lock、diff check 通过。但独立对抗以无数据库的 `ForgedRepository(PostgresDomainRepository)` 覆写三个读取方法，`isinstance` 校验仍通过，手工 record/authority 再次得到 `restored=True`、`trusted_capability_granted=True`。AR-B-029 保持打开；一次并行测试批次因 120 秒超时无可靠汇总，确认 P1 后未运行组合、Safety/Legacy 和全量门禁 |
 | 2026-07-12 | L4-4 | 2 | 验收未通过 | AR-B-029 历史原始 DTO 与伪 Repository 注入攻击已固定拒绝，PostgreSQL 专项增至 `21 passed, 3 warnings`，Ruff、mypy（118 files）、lock、diff check 通过，可关闭 AR-B-029。但源码和独立诊断确认持久化 helper 对实际 `mimo-v2.5` 运行统一写入 `model_actual=fake-model`，attempts/latency 亦为固定值，恢复重验使用伪 provenance 自洽通过；登记 AR-B-030。确认 P1 后未运行组合、Safety/Legacy 和全量门禁 |
 | 2026-07-12 | L4-4 | 3 | 验收通过 | 独立重放原始 DTO 与伪 Repository 注入均固定拒绝；Syndrome/Formula payload 精确来自 closure trusted RunArtifact，非默认模型及 model/attempts/latency/usage/evidence/trace/run/spec/prompt/output 篡改回归成立。PostgreSQL 专项 `26 passed, 3 warnings`，L1～L4/Repository/Advance 组合 `316 passed, 11 warnings`，Safety/Legacy `176 passed`，全量后端 `1500 passed, 1 xfailed, 17 warnings`；Ruff、mypy（118 files）、lock、diff check 全部通过。关闭 AR-B-030，L4-4 完成并关闭 L4 |
+| 2026-07-21 | L4.5-11-0 | 发布 | 待验收 | 项目经理核对当前 exact HEAD `b97c9f9`：`context.py` 210 行，`UserMessageProjection` 不存在，Context 专项 9 项；确认 Intake USER 原文可直接到达 Gateway，确认 v1 A～F 与回退后代码不一致。发布文档限定基线校准任务，生产代码保持不变 |
 
 ## 7. 最近更新
 
@@ -350,12 +354,14 @@
 | 2026-07-15 | Codex | 当前门禁证据：Python 3.11/3.12 各 `1549 passed, 362 deselected`；真实服务（排除串行性能）`359 passed, 1 xfailed`；碰撞 `2 passed`；串行双基线连续两次 `2 passed`；前端 `23 files / 171 tests`；Ruff、mypy（154 source files）、lock、pip/npm audit、双 SBOM、promtool、actionlint 和 Gitleaks 全绿。工程种子 `29/29` 只记为 `not_for_clinical_signoff`。 |
 | 2026-07-15 | Codex | 首次 exact-HEAD 一键执行发现 Windows PowerShell 5.1 会剥离多行 Python `-c` 中的双引号，环境探针在测试开始前 fail-closed；提交 `f37e758` 改为 Windows-safe 单引号字面量并增加真实 PowerShell native argument smoke test，安全目标与 PG/Redis 版本探针复测通过。 |
 | 2026-07-15 | Codex | 后续一键执行发现 PowerShell 5.1 函数局部 `$LASTEXITCODE` 会遮蔽原生命令写入的全局退出码，导致 export/audit/SBOM 失败被延迟暴露；现已改为读取真实全局退出码，增加真实 `exit 23` 回归测试、非空/格式校验、临时发布和最终成功回执，禁止将半成品 manifest 误作整轮通过证据。 |
+| 2026-07-21 | Codex（项目经理） | 接管工程任务发布与验收；以用户回退 B133 后的 `b97c9f9` 为当前事实基线，登记 AR-B-031，重新打开 L4.5，发布 `L4.5-11-0`。旧 v1 A～F 只保留为回退前历史参考，未经新任务验收不得实施；临床、隐私、法务和机构签署仍由具名责任人完成。 |
 
 ## 8. 下一步
 
-1. 由具名临床专业人员审定 `triage-raw-text-precheck.v1` 的规则、同义词、否定/时态、数值阈值和去标识化召回评估集，填写并签署 `临床红旗规则人工审定签署单-2026-07-14.md`。
-2. 签署完成且规则摘要与技术实现提交 `c9148c2` 一致后，只关闭 L4.5-02 红旗规则人工审定门禁；任何规则变更都必须重新审定。该签署不是临床上线许可，真实患者服务或临床试点仍须完成 L5～L9 和机构正式审批。在此之前保持 Legacy 默认和两个 LangGraph 公共开关关闭。
-3. L5 只能在产品/医疗安全负责人明确确认临床门禁与后续范围后重新发布；不得把本次 501 Recovery 隔离、健康端点或 L0～L4 工程完成误写成 L5～L9 已完成。
+1. 交付并验收 `L4.5-11-0`：只校准回退后事实、威胁模型、数据边界和 v2 任务拆分，不修改生产代码；交付文件为 `docs/dev-handoff/agent-refactor-l4-5-11-0.md`。
+2. `L4.5-11-0` 验收通过后，由项目经理逐个发布 v2 实施任务；任何任务未通过验收，只发布限定返工，不得顺手扩展 L5、Legacy、RAG、UI、临床规则或 Domain 事实语义。
+3. 由具名临床专业人员并行审定 `triage-raw-text-precheck.v1` 并签署；该签署不能关闭 AR-B-031，也不是临床上线许可。
+4. AR-B-031、L4.5-02 人工审定及 L5 专业准入门禁全部关闭前，保持 Legacy 默认和两个 LangGraph 公共开关关闭，L5 维持 NO-GO。
 
 ## 9. 维护要求
 
@@ -366,3 +372,4 @@
 - 不因对话摘要或交接声明覆盖本地代码事实。
 - 正式验收引用的 `docs/dev-handoff/*` 必须显式纳入对应交付提交，不能只留在被忽略的工作树。
 - `docs/` 默认被 `.gitignore` 忽略；正式进度/交接证据须使用显式 pathspec 纳入版本控制。
+- Codex 项目经理可以发布任务、验收工程代码和自动化证据，但不得代签临床、隐私、法务、伦理或机构审批；要求独立复审时，项目经理自身复核不计作独立意见。
