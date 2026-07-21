@@ -307,3 +307,162 @@ L4.5-11-1（Intake 入口投影层）
 - 仅发布 `L4.5-11-0-R1` 文档限定返工，允许修订本轮两份交付文档，不允许修改代码、测试或项目经理台账。
 
 限定返工任务：`docs/dev-handoff/agent-refactor-l4-5-11-0-rework-1-task.md`。
+
+---
+
+## 13. 限定返工交付（R1）
+
+> 返工任务编号：L4.5-11-0-R1
+> 执行起点：`a76168d886ddca9b2f64868015d65eb58ec851b5`
+> 返工日期：2026-07-22
+> 状态：**返工已交付，申请重新验收**
+
+### 13.1 执行起点
+
+| 项目 | 值 |
+|---|---|
+| 执行起点 exact HEAD | `a76168d886ddca9b2f64868015d65eb58ec851b5` |
+| 分支 | `codex/l4-5-11-context-privacy-hardening` |
+| 开始工作树状态 | 干净（`git status --short` 无输出） |
+
+### 13.2 修正内容逐项记录
+
+#### P1-1：EvidenceSpan 等长替换修正
+
+| 修正项 | 位置 | 修正前 | 修正后 |
+|---|---|---|---|
+| 占位符形式 | 4.3 决策 3 | `[REDACTED:N]` | `█` 重复 N 次（U+2588） |
+| 长度复验 | 5.2 等长替换规则 | 声称 `[REDACTED:11]` = 11 字符 | 复验：`[REDACTED:11]` = 13 字符；`█` × 11 = 11 字符 |
+| NFKC 处理 | 5.1 策略比较 | "投影前对原文做 NFKC" | **替换在原始文本上进行**；NFKC 仅用于匹配辅助 |
+| 坐标不变量 | 5.2 关键不变量 | 未明确 | 新增：替换在原始文本上进行，不经过 NFKC；每个匹配字符替换为一个 `█` |
+
+**复验命令与结果：**
+
+```powershell
+$env:PYTHONUTF8='1'
+uv run python -c "print(len('[REDACTED:11]'), len('█' * 11))"
+# 输出: 13 11
+
+uv run python -c "
+import unicodedata
+raw = '体温㍑后疼痛'
+nfkc = unicodedata.normalize('NFKC', raw)
+print(f'原文: {len(raw)} chars, NFKC: {len(nfkc)} chars')
+"
+# 输出: 原文: 6 chars, NFKC: 9 chars
+```
+
+**结论**：`[REDACTED:N]` 标签形式不等长；`█`（U+2588）经 NFKC 后长度不变；替换必须在原始文本上进行。
+
+#### P1-2：最终门禁位置与覆盖修正
+
+| 修正项 | 位置 | 修正前 | 修正后 |
+|---|---|---|---|
+| 门禁位置 | 6.1 | `AgentRuntime._call_gateway()` | `ModelGatewayClient._chat_structured_impl()` 入口 |
+| 扫描对象 | 6.2 | 初始 `messages` 列表 | 最终 HTTP payload `payload["messages"]` |
+| fallback 覆盖 | 6.2 | 声称 fallback 经过 `_call_gateway()` | 修正：fallback 在 Gateway 内部追加 system message，不回到 Runtime；Gateway 门禁覆盖 fallback |
+| retry 覆盖 | 6.2 | 声称 retry 经过 `_call_gateway()` | 修正：retry 在 Gateway 内部；Gateway 门禁每次 retry 重新扫描 |
+| 跨 message 重组 | 6.2 | 声称逐条扫描覆盖 | 修正：Gateway 门禁拼接所有 content 后扫描，覆盖跨 message 重组 |
+| 共享影响 | 6.5 | "其他 Agent 不复用" | 明确：Gateway 被所有 Agent 使用；门禁需限制为 Intake-only 或明确非目标 |
+
+**代码事实复验：**
+
+- `_chat_structured_json_fallback()`（`app/core/gateway.py:514`）追加 system message 后直接调用 `_request_with_retry()`，不回到 `_call_gateway()`
+- `_chat_structured_impl()`（`app/core/gateway.py:338`）内每次 retry 重新构造 payload
+- 结论：Gateway Payload 门禁比 Runtime 门禁覆盖更完整
+
+#### P1-3：候选任务修正
+
+| 修正项 | 修正前 | 修正后 |
+|---|---|---|
+| L4.5-11-3 性质 | 独立实施任务"临床数字白名单" | 改为 L4.5-11-1 的**负向回归测试** |
+| L4.5-11-3 先红 | 虚假先红：声称当前误脱敏体温 | 修正：当前 `_PII_PATTERNS` 精确匹配 11/18 位，不误伤临床数字；先红为验证投影后临床数字仍保留 |
+| L4.5-11-3 范围 | 修改 `app/agent_runtime/context.py` | 只新增测试，不修改生产代码 |
+| 任务重叠 | L4.5-11-1 和 L4.5-11-3 都修改 `context.py` | 修正：L4.5-11-3 只追加测试，无重叠生产职责 |
+
+**复验命令与结果：**
+
+```powershell
+uv run python -c "
+import re
+_PII_PATTERNS = (re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)'), re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)'))
+def _redact_free_text(value):
+    for pattern in _PII_PATTERNS:
+        value = pattern.sub('[REDACTED]', value)
+    return value
+
+tests = ['体温 38.5℃', '血压 120/80 mmHg', '心率 72 次/分', '血糖 5.6 mmol/L', '500 mg']
+for t in tests:
+    result = _redact_free_text(t)
+    print(f'{t!r:30} -> {result!r}')
+"
+# 输出: 所有临床数字都保留，未被脱敏
+```
+
+#### P2-1：数据所有权修正
+
+| 修正项 | 位置 | 修正前 | 修正后 |
+|---|---|---|---|
+| `ActiveObservationContext` | 1.2 数据所有权矩阵 | "结构化事实，不涉及原文" | "`value`/`normalized_value: Any` 可能含患者派生数据；权威来源是 Intake 抽取结果" |
+| 审计 digest | 1.2 数据所有权矩阵 | "不记录原始 PII" | "digest 计算输入含 canonical input 和 messages，但 digest 本身不可逆" |
+| 姓名保护 | 3.1 保护对象 | 将姓名列为结构化身份字段 | 修正：当前 IntakeMessage 不含结构化姓名字段；自由文本姓名列为残余风险 |
+| 非目标 | 3.5 | 未列姓名 | 新增："自由文本中的姓名"为非目标 |
+
+### 13.3 修订后的候选任务
+
+| 编号 | 名称 | 结果 | 依赖 | 先红证据 | 允许文件 |
+|---|---|---|---|---|---|
+| L4.5-11-1 | Intake 入口投影层 | USER 层不含裸 PII | L4.5-11-0-R1 | 手机号在 USER 层未被脱敏（原文 JSON） | `app/agents/intake_extraction.py`、`app/agent_runtime/context.py` |
+| L4.5-11-2 | Gateway 最终隐私门禁 | 命中时零 Gateway 请求 | L4.5-11-1 | `_chat_structured_impl()` 直接发送，无隐私检查 | `app/core/gateway.py`、`app/agent_runtime/specs.py` |
+| L4.5-11-3 | 临床数字保留回归测试 | 确认临床数字不被误脱敏 | L4.5-11-1 | 当前无入口投影；实施后验证临床数字保留 | `tests/test_l4_5_11_1_intake_privacy_projection.py`（追加测试） |
+
+**依赖图：**
+
+```
+L4.5-11-0-R1（本返工：方案修订）
+   │
+   ▼
+L4.5-11-1（Intake 入口投影层）
+   │
+   ├──→ L4.5-11-3（临床数字保留回归测试）
+   │
+   └──→ L4.5-11-2（Gateway 最终门禁）
+            │
+            ▼
+      AR-B-031 关闭评估
+```
+
+**推荐下一任务：L4.5-11-1 Intake 入口投影层**
+
+### 13.4 核对证据
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| HEAD | `git rev-parse HEAD` | `a76168d886ddca9b2f64868015d65eb58ec851b5` |
+| 工作区 | `git status --short` | 干净 |
+| L0 文档契约 | `uv run pytest --override-ini addopts= -q tests/test_l0_1_contract.py` | 131 passed |
+| diff 检查 | `git diff --check` | 通过 |
+
+### 13.5 修改范围声明
+
+| 范围 | 是否修改 | 说明 |
+|---|---|---|
+| 生产代码 | ❌ 否 | 未修改 |
+| 测试代码 | ❌ 否 | 未修改 |
+| 方案文档 | ✅ 是 | 修订 v2 方案 |
+| Handoff 文档 | ✅ 是 | 追加 R1 返工交付 |
+
+### 13.6 交付声明
+
+本返工状态：**返工已交付，申请重新验收**。
+
+交付内容：
+1. `docs/01_agent部分优化/L4.5-11模型输入隐私收敛方案-v2-2026-07-21.md`（v2.1 修订版）
+2. `docs/dev-handoff/agent-refactor-l4-5-11-0.md`（追加 R1 返工交付）
+
+未修改生产代码、测试、依赖、配置或项目经理台账。
+
+---
+
+*返工日期：2026-07-22*
+*返工人：开发测试执行者*
