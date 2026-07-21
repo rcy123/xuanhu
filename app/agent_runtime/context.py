@@ -9,7 +9,7 @@ import hmac
 import json
 import re
 import string
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -79,6 +79,294 @@ class ContextPacket(BaseModel):
 
 _PII_KEYS = frozenset({"name", "patient_name", "phone", "mobile", "id_card", "identity_card", "outpatient_no", "medical_record_no"})
 _PII_PATTERNS = (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"))
+
+# ---------------------------------------------------------------------------
+# L4.5-11-1 有限身份 scanner / projector
+# ---------------------------------------------------------------------------
+
+# 全角到ASCII的映射
+_FULLWIDTH_DIGITS = {
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+}
+_FULLWIDTH_X = {"Ｘ": "X", "ｘ": "x"}
+
+
+def _normalize_char(ch: str) -> str | None:
+    """将单个字符归一化为允许token或None(HARD)。"""
+    if ch in _FULLWIDTH_DIGITS:
+        return _FULLWIDTH_DIGITS[ch]
+    if "0" <= ch <= "9":
+        return ch
+    if ch in _FULLWIDTH_X:
+        return _FULLWIDTH_X[ch]
+    if ch in "Xx":
+        return ch
+    if ch in " -.":
+        return ch  # 保留具体分隔符种类
+    return None  # HARD
+
+
+def _tokenize(contents: Sequence[str]) -> tuple[list[tuple[str | None, int, int]], list[int]]:
+    """将contents序列化为token流。
+
+    返回:
+        tokens: 列表，每个元素为(normalized_char_or_None, message_index, raw_char_index)
+                None表示HARD或B边界
+        message_ends: 每个message在token流中的结束索引（exclusive）
+    """
+    tokens: list[tuple[str | None, int, int]] = []
+    message_ends: list[int] = []
+    for msg_idx, content in enumerate(contents):
+        if not isinstance(content, str):
+            raise ContextBuilderError("invalid input: expected string sequence")
+        for char_idx, ch in enumerate(content):
+            norm = _normalize_char(ch)
+            tokens.append((norm, msg_idx, char_idx))
+        message_ends.append(len(tokens))
+        # 在message之间插入虚拟边界B（最后一个message后不加）
+        if msg_idx < len(contents) - 1:
+            tokens.append((None, msg_idx, -1))  # None表示B边界
+    return tokens, message_ends
+
+
+def _find_matches(tokens: list[tuple[str | None, int, int]]) -> list[tuple[int, int]]:
+    """在token流中查找所有匹配的身份序列。
+
+    Grammar:
+    - 连续手机号: 1[3-9]D{9}
+    - 分隔手机号: 1[3-9]D S D{4} S D{4}，两个S必须是同一种具体字符
+    - 身份证号: D{17}(D|X)
+    - B可位于上述grammar任意两个字符token之间
+    - 匹配前后的最近非B token若为D或X，该候选必须拒绝
+
+    返回: 列表，每个元素为(start_idx, end_idx)，表示token流中的匹配范围（exclusive）
+    """
+    n = len(tokens)
+    candidates: list[tuple[int, int, str]] = []  # (start, end, type)
+
+    def _is_digit_token(i: int) -> bool:
+        if i >= n:
+            return False
+        ch = tokens[i][0]
+        return ch is not None and ch in "0123456789"
+
+    def _is_x_token(i: int) -> bool:
+        if i >= n:
+            return False
+        ch = tokens[i][0]
+        return ch is not None and ch in "Xx"
+
+    def _is_separator_token(i: int) -> bool:
+        if i >= n:
+            return False
+        ch = tokens[i][0]
+        return ch is not None and ch in " -."
+
+    def _is_boundary_token(i: int) -> bool:
+        return i < n and tokens[i][0] is None and tokens[i][2] == -1
+
+    def _is_hard_token(i: int) -> bool:
+        return i < n and tokens[i][0] is None and tokens[i][2] != -1
+
+    def _is_digit_or_x_token(i: int) -> bool:
+        return _is_digit_token(i) or _is_x_token(i)
+
+    def _next_non_boundary(i: int) -> int:
+        """返回从i开始的下一个非B token的索引，或n。"""
+        while i < n and _is_boundary_token(i):
+            i += 1
+        return i
+
+    def _prev_non_boundary(i: int) -> int:
+        """返回从i-1往前的上一个非B token的索引，或-1。"""
+        j = i - 1
+        while j >= 0 and _is_boundary_token(j):
+            j -= 1
+        return j
+
+    def _collect_digits_with_boundaries(start: int, count: int) -> tuple[list[int], int]:
+        """从start开始收集count个digit token（跳过B边界）。
+        返回: (digit_indices, next_pos)
+        """
+        digits: list[int] = []
+        pos = start
+        while len(digits) < count and pos < n:
+            if _is_digit_token(pos):
+                digits.append(pos)
+                pos += 1
+            elif _is_boundary_token(pos):
+                pos += 1
+            else:
+                break
+        if len(digits) == count:
+            return digits, pos
+        return [], start
+
+    def _collect_exact_digits(start: int, count: int) -> tuple[list[int], int]:
+        """从start开始收集count个digit token（允许跳过B边界）。"""
+        digits: list[int] = []
+        pos = start
+        while len(digits) < count and pos < n:
+            if _is_digit_token(pos):
+                digits.append(pos)
+                pos += 1
+            elif _is_boundary_token(pos):
+                pos += 1
+            else:
+                break
+        if len(digits) == count:
+            return digits, pos
+        return [], start
+
+    def _check_boundary(start: int, end: int) -> bool:
+        """检查前后边界。返回True表示通过检查。"""
+        prev_idx = _prev_non_boundary(start)
+        next_idx = _next_non_boundary(end)
+        return not (
+            (prev_idx >= 0 and _is_digit_or_x_token(prev_idx))
+            or (next_idx < n and _is_digit_or_x_token(next_idx))
+        )
+
+    i = 0
+    while i < n:
+        # 跳过HARD和B
+        if _is_hard_token(i) or _is_boundary_token(i):
+            i += 1
+            continue
+
+        # 尝试匹配连续手机号: 1[3-9]D{9}
+        # 需要11个连续digit token
+        if _is_digit_token(i):
+            # 检查第一个字符是否是'1'
+            if tokens[i][0] == "1":
+                # 检查第二个字符是否是3-9
+                j = _next_non_boundary(i + 1)
+                if j < n and _is_digit_token(j):
+                    ch_j = tokens[j][0]
+                    assert ch_j is not None
+                    if ch_j in "3456789":
+                        # 收集后续9个digit
+                        remaining_digits, after = _collect_exact_digits(j + 1, 9)
+                        if len(remaining_digits) == 9:
+                            end = remaining_digits[-1] + 1
+                            if _check_boundary(i, end):
+                                candidates.append((i, end, "phone"))
+                            i = end
+                            continue
+
+            # 尝试匹配分隔手机号: 1[3-9]D S D{4} S D{4}
+            if tokens[i][0] == "1":
+                j = _next_non_boundary(i + 1)
+                if j < n and _is_digit_token(j):
+                    ch_j = tokens[j][0]
+                    assert ch_j is not None
+                    if ch_j in "3456789":
+                        # 需要一个digit
+                        k = _next_non_boundary(j + 1)
+                        if k < n and _is_digit_token(k):
+                            # 需要一个separator
+                            l_pos = _next_non_boundary(k + 1)
+                            if l_pos < n and _is_separator_token(l_pos):
+                                sep_char = tokens[l_pos][0]
+                                # 需要4个digit
+                                m_digits, after_m = _collect_digits_with_boundaries(l_pos + 1, 4)
+                                if len(m_digits) == 4:
+                                    # 需要相同的separator
+                                    n_pos = _next_non_boundary(after_m)
+                                    if n_pos < n and _is_separator_token(n_pos) and tokens[n_pos][0] == sep_char:
+                                        # 需要4个digit
+                                        o_digits, after_o = _collect_digits_with_boundaries(n_pos + 1, 4)
+                                        if len(o_digits) == 4:
+                                            end = after_o
+                                            if _check_boundary(i, end):
+                                                candidates.append((i, end, "phone_sep"))
+                                            i = end
+                                            continue
+
+            # 尝试匹配身份证号: D{17}(D|X)
+            # 需要17个连续digit + 1个digit或X
+            if _is_digit_token(i):
+                digits_17, after_17 = _collect_exact_digits(i, 17)
+                if len(digits_17) == 17:
+                    # 第18个必须是D或X
+                    j = after_17
+                    if j < n and (_is_digit_token(j) or _is_x_token(j)):
+                        end = j + 1
+                        if _check_boundary(i, end):
+                            candidates.append((i, end, "id_card"))
+                        i = end
+                        continue
+
+        i += 1
+
+    # 去重和冲突解决
+    # 按起点从左到右、同起点最长优先、仍相同时身份证优先
+    # 首先按起点排序，然后贪心选择不重叠的匹配
+    candidates.sort(key=lambda c: (c[0], -(c[1] - c[0]), 0 if c[2] == "id_card" else 1))
+
+    selected: list[tuple[int, int]] = []
+    last_end = -1
+    for start, end, _ in candidates:
+        if start >= last_end:
+            selected.append((start, end))
+            last_end = end
+
+    return selected
+
+
+def _apply_mask(contents: Sequence[str], tokens: list[tuple[str | None, int, int]], matches: list[tuple[int, int]]) -> tuple[str, ...]:
+    """将匹配结果回写到原始message，生成投影副本。
+
+    对每个命中的token位置写入'█'，B边界不写入任何字符。
+    返回新的tuple[str, ...]。
+    """
+    # 为每个message创建字符列表
+    result_chars: list[list[str]] = []
+    for content in contents:
+        result_chars.append(list(content))
+
+    for start, end in matches:
+        for idx in range(start, end):
+            token = tokens[idx]
+            norm, msg_idx, char_idx = token
+            if norm is None and char_idx == -1:
+                # B边界，不写入
+                continue
+            if msg_idx >= 0 and char_idx >= 0:
+                result_chars[msg_idx][char_idx] = "█"
+
+    return tuple("".join(chars) for chars in result_chars)
+
+
+def contains_model_input_identity_sequence(contents: Sequence[str]) -> bool:
+    """检查contents中是否包含有限身份序列。"""
+    try:
+        tokens, _ = _tokenize(contents)
+    except ContextBuilderError:
+        raise
+    except Exception as exc:
+        raise ContextBuilderError("scanner internal error") from exc
+    matches = _find_matches(tokens)
+    return len(matches) > 0
+
+
+def project_model_input_identity_sequences(contents: Sequence[str]) -> tuple[str, ...]:
+    """对contents中的身份序列进行等长投影遮罩。
+
+    使用'█'（U+2588）作为唯一遮罩字符。
+    返回新的tuple[str, ...]，每条message长度与原文相同。
+    """
+    try:
+        tokens, _ = _tokenize(contents)
+    except ContextBuilderError:
+        raise
+    except Exception as exc:
+        raise ContextBuilderError("projector internal error") from exc
+    matches = _find_matches(tokens)
+    return _apply_mask(contents, tokens, matches)
+
+
 
 
 def pseudonym(value: Any, *, key: bytes | None = None) -> str:

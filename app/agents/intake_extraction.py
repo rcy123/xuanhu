@@ -7,7 +7,12 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
+from app.agent_runtime.context import (
+    ContextBuilder,
+    ContextBuilderError,
+    ContextPacket,
+    project_model_input_identity_sequences,
+)
 from app.agent_runtime.intake_verifier import (
     INTAKE_AGENT_NAME,
     INTAKE_AGENT_VERSION,
@@ -100,9 +105,12 @@ def build_intake_context(
         raise PromptManifestError("intake prompt version mismatch")
 
     history = [item.model_dump(mode="json") for item in input_payload.historical_active_facts]
+    # L4.5-11-1: 按原始顺序投影current_messages[*].content
+    raw_contents = [item.content for item in input_payload.current_messages]
+    projected_contents = project_model_input_identity_sequences(raw_contents)
     current_messages = [
-        {"message_id": str(item.message_id), "content": item.content}
-        for item in input_payload.current_messages
+        {"message_id": str(item.message_id), "content": projected_contents[i]}
+        for i, item in enumerate(input_payload.current_messages)
     ]
     builder = ContextBuilder(
         allowed_fields={"historical_active_facts"},
