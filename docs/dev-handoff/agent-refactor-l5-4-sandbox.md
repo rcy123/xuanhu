@@ -140,3 +140,54 @@ $env:UV_OFFLINE='1'
 - P2-1：combined restore 没有逐 revision 验证 namespace/session/thread/review schema 的继承和 challenge 关联；在重派生相关 refs 后，terminal blocked schema 或三 revision 链中间 namespace 可漂移并被接受。
 - P2-2：review source/challenge setup 异常被捕获后，revision render digest 路径在保护范围外再次调用 source build；source build failure 会返回动态异常且不提交已接受 modification 的 invalidation。
 - PM 结论：**未接受 / 发布 L5-4-R1 限定返工**（`ACC-20260722-032`、`DEC-20260722-025`）。保留本 delivery、RED/GREEN、CI 与 findings；L5 仍为 3/4，L6 未开始。
+
+## 10. L5-4-R1 revision authority 与 review-setup 原子性返工
+
+### 10.1 状态与起点
+
+- 状态：**L5-4-R1 已交付，申请验收**；不声明 accepted、clinical approved 或 production ready。
+- clean management release / exact parent：`9382fc7e411d90530cb4abb93479272d8655b7dd`；其中保留失败 delivery `d5b8f0e`、`ACC-20260722-032`、`DEC-20260722-025` 与 R1 任务书，没有 reset、amend、覆盖或删除失败证据。
+- R1 只修改原三个 L5-4 文件；未修改任务书、PM 台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime 或外部边界。
+
+### 10.2 真实 R1 RED
+
+production 保持 `d5b8f0e` 行为、工作区唯一修改为两组 R1 回归时，使用完整 fake env 与 `UV_OFFLINE=1` 运行两个测试节点（两个 authority 参数子例 + 一个 source-build 子例），结果为退出码 `1`、`3 failed in 2.24s`：
+
+1. terminal BLOCK revision 的 `review_schema_version` 改为 `forged-review-schema.v9`，同步重算 revision/run/invalidation/receipt refs 与 current pointer 后，restore 错误接受；
+2. 三 revision 链中间 revision namespace 改为其他值，完整重算后续 command digest、revision/run/invalidation/receipt refs 与 current pointer 后，restore 错误接受；
+3. `SandboxReviewSourceV1.build` 抛出含动态文本的 `RuntimeError` 时，异常保护范围外的第二次 build 原样抛错，snapshot 没有新增 revision/invalidation。
+
+没有先改 production、skip、xfail、浅层旧-ref 特判或弱化原 32 项。
+
+### 10.3 finding 关闭
+
+- 新 `_challenge_matches_revision(...)` 把 exact challenge 与 revision 的 schema、namespace/session/thread、checkpoint/interrupt、state/formula、adapter/graph、subject/result/rule/dataset/render digests 全部绑定；
+- 每个 child revision 额外验证 record/subject test session 对齐，以及 namespace/test-session/thread 从 parent 精确继承；terminal no-challenge 状态只能继承 parent review schema；
+- historical `review_required` revision 必须仍能在完整 private review snapshot 定位 exact source/challenge，且其后继存在时唯一 event 必须是 applied `modify_fixture`；删除 review history 与 invalidation 两侧后重算不能恢复；
+- ALLOW 路径只构建一次 `SandboxReviewSourceV1`，成功时缓存其 render digest；source/store/coordinator/challenge 任一步失败均不重复调用，统一进入 `review_setup_failed`；
+- source build 尚未成功时 revision 保存完整新 safety result、`review_render_digest=None`、`challenge_ref=None`，仍原子追加 revision/run/invalidation/receipt、切换 current、阻断 completion；restart 与 exact retry 保持固定、幂等且无动态异常文本。
+
+两组 R1 回归最终 `3 passed in 1.89s`；完整专项扩展为 `35 passed in 2.70s`，原 32 项全部保持。
+
+### 10.4 R1 最终门禁
+
+| 门禁 | R1 结果 |
+|---|---|
+| L5-4/R1 专项 | `35 passed in 2.70s` |
+| accepted L5-3 + L5-2 + L5-1 合并回归 | `91 passed in 19.27s`（59 + 18 + 14） |
+| Safety 回归 | `71 passed, 3 deselected in 1.78s` |
+| L4.5-11 privacy 回归 | `76 passed in 4.60s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.35s` |
+| AST 离线边界 | `1 passed in 1.90s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1750 passed, 362 deselected in 147.83s`；唯一为既有 `test_load_with_defaults` 默认值差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1751 passed, 362 deselected in 148.32s` |
+
+### 10.5 提交、限制与回退
+
+- 单一 R1 开发提交消息为 `fix: close L5-4 revision authority gaps`；exact parent 必须为 `9382fc7e411d90530cb4abb93479272d8655b7dd`；只含本 handoff 第 8 节三个文件。
+- Git SHA 无法在包含本文的同一提交中自引用；冻结后以 `git rev-parse HEAD`、提交消息和本节约定共同报告，由独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、临床或公开生产能力。
+- 若 R1 验收失败，以单一 R1 delivery 执行 `git revert <r1-delivery-commit>` 并保留全部历史，不 reset 或覆盖。

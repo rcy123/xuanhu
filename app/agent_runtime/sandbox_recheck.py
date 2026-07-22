@@ -16,6 +16,7 @@ from app.agent_runtime.sandbox_review import (
     SandboxResumeCommandV1,
     SandboxResumeSubmissionV1,
     SandboxReviewAction,
+    SandboxReviewChallengeV1,
     SandboxReviewCoordinator,
     SandboxReviewSourceV1,
     SandboxReviewStoreSnapshotV1,
@@ -313,6 +314,34 @@ def _authority_refs(
     return challenge_refs, event_refs
 
 
+def _challenge_matches_revision(
+    challenge: SandboxReviewChallengeV1,
+    revision: SandboxRevisionRecordV1,
+) -> bool:
+    result = revision.result
+    return (
+        result is not None
+        and revision.review_render_digest is not None
+        and challenge.challenge_ref == revision.challenge_ref
+        and challenge.sandbox_schema_version == revision.review_schema_version
+        and challenge.namespace == revision.namespace
+        and challenge.test_session_id == revision.test_session_id
+        and challenge.thread_id == revision.thread_id
+        and challenge.checkpoint_id == revision.checkpoint_id
+        and challenge.interrupt_id == revision.interrupt_id
+        and challenge.domain_state_version == revision.subject.domain_state_version
+        and challenge.formula_revision == revision.subject.formula_revision
+        and challenge.adapter_version == revision.subject.adapter_version
+        and challenge.graph_version == revision.subject.graph_version
+        and challenge.input_digest == _digest(revision.subject)
+        and challenge.result_digest == result.result_digest
+        and challenge.rule_bundle_digest == revision.subject.rule_bundle_digest
+        and challenge.synthetic_dataset_digest
+        == revision.subject.synthetic_dataset_digest
+        and challenge.review_render_digest == revision.review_render_digest
+    )
+
+
 def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
     revisions = snapshot.revisions
     runs = snapshot.runs
@@ -344,6 +373,11 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         return False
     first = revisions[0]
     first_challenges, first_events = _authority_refs(snapshot.review_snapshot, first)
+    first_exact_challenges = tuple(
+        challenge
+        for challenge in snapshot.review_snapshot.challenges
+        if challenge.challenge_ref == first.challenge_ref
+    )
     if (
         first.parent_revision_ref is not None
         or first.status != "modify_applied"
@@ -351,11 +385,9 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         or first.result is None
         or first.result.decision is not SandboxSafetyDecision.ALLOW
         or first.challenge_ref not in first_challenges
-        or not any(
-            challenge.challenge_ref == first.challenge_ref
-            and challenge.sandbox_schema_version == first.review_schema_version
-            for challenge in snapshot.review_snapshot.challenges
-        )
+        or first.test_session_id != first.subject.test_session_id
+        or len(first_exact_challenges) != 1
+        or not _challenge_matches_revision(first_exact_challenges[0], first)
         or len(first_events) != 1
         or not any(
             event.event_ref == first_events[0]
@@ -409,6 +441,10 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             return False
         if (
             revision.subject.test_session_id != prior.subject.test_session_id
+            or revision.test_session_id != revision.subject.test_session_id
+            or revision.namespace != prior.namespace
+            or revision.test_session_id != prior.test_session_id
+            or revision.thread_id != prior.thread_id
             or revision.subject.formula_artifact_id
             != prior.subject.formula_artifact_id
             or revision.subject.profile_artifact_id
@@ -425,12 +461,35 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             or revision.result.adapter_version != revision.subject.adapter_version
         ):
             return False
+        revision_challenge_refs, revision_event_refs = _authority_refs(
+            snapshot.review_snapshot, revision
+        )
+        exact_challenges = tuple(
+            challenge
+            for challenge in snapshot.review_snapshot.challenges
+            if challenge.challenge_ref == revision.challenge_ref
+        )
         if revision.status == "review_required" and (
             revision.result is None
             or revision.result.decision is not SandboxSafetyDecision.ALLOW
             or revision.challenge_ref is None
+            or revision.challenge_ref not in revision_challenge_refs
+            or len(exact_challenges) != 1
+            or not _challenge_matches_revision(exact_challenges[0], revision)
         ):
             return False
+        if revision.status == "review_required" and index < len(revisions) - 1:
+            exact_events = tuple(
+                event
+                for event in snapshot.review_snapshot.events
+                if event.event_ref in revision_event_refs
+                and event.challenge_ref == revision.challenge_ref
+            )
+            if (
+                len(exact_events) != 1
+                or exact_events[0].action is not SandboxReviewAction.MODIFY_FIXTURE
+            ):
+                return False
         if revision.status == "blocked" and (
             revision.result is None
             or revision.result.decision is not SandboxSafetyDecision.BLOCK
@@ -445,6 +504,10 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             revision.result is None
             or revision.result.decision is not SandboxSafetyDecision.ALLOW
             or revision.challenge_ref is not None
+        ):
+            return False
+        if revision.status != "review_required" and (
+            revision.review_schema_version != prior.review_schema_version
         ):
             return False
         old_challenges, old_events = _authority_refs(snapshot.review_snapshot, prior)
@@ -705,6 +768,7 @@ class SandboxRecheckCoordinator:
             ]
             delivery: SandboxChallengeDeliveryV1 | None = None
             candidate_store: SandboxInMemoryReviewStore | None = None
+            review_render_digest: str | None = None
             evaluation_failed = False
             prewrite_rejection = False
             try:
@@ -742,6 +806,7 @@ class SandboxRecheckCoordinator:
                         safety_result=result,
                         explanation_result=None,
                     )
+                    review_render_digest = source.review_render_digest
                     candidate_store = SandboxInMemoryReviewStore(
                         snapshot=self._review_store.snapshot()
                     )
@@ -782,15 +847,7 @@ class SandboxRecheckCoordinator:
                 rule_bundle=command.rule_bundle,
                 result=result,
                 explanation_digest=None,
-                review_render_digest=(
-                    None
-                    if result is None
-                    else SandboxReviewSourceV1.build(
-                        safety_subject=command.candidate_subject,
-                        safety_result=result,
-                        explanation_result=None,
-                    ).review_render_digest
-                ),
+                review_render_digest=review_render_digest,
                 review_schema_version=(
                     current.review_schema_version
                     if delivery is None

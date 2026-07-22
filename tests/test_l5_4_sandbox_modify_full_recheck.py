@@ -307,6 +307,14 @@ def _derived_mapping_ref(prefix: str, value: dict[str, object], field: str) -> s
     return prefix + hashlib.sha256(canonical_json_bytes(body)).hexdigest()
 
 
+def _refresh_mapping_ref(
+    value: dict[str, object], *, prefix: str, field: str
+) -> str:
+    refreshed = _derived_mapping_ref(prefix, value, field)
+    value[field] = refreshed
+    return refreshed
+
+
 def test_l5_4_normal_modify_runs_full_recheck_and_requires_new_review() -> None:
     coordinator, review_snapshot, *_ = _coordinator()
     command = _revision_command(coordinator)
@@ -842,6 +850,180 @@ def test_l5_4_combined_snapshot_rejects_each_outer_integrity_mismatch(
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("drift", ("terminal_schema", "middle_namespace"))
+def test_l5_4_restart_rejects_rederived_revision_authority_drift(
+    drift: str,
+) -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    if drift == "terminal_schema":
+        candidate, bundle = _subject_and_bundle(
+            domain_state_version=8,
+            formula_revision=4,
+            amount_milliunits=2,
+            dataset_version="authority.2",
+            decision=SandboxSafetyDecision.BLOCK,
+            issue_count=1,
+        )
+        coordinator.apply_revision(
+            _revision_command(
+                coordinator, candidate=candidate, bundle=bundle, suffix="authority-008"
+            )
+        )
+        bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+        bad["revisions"][1]["review_schema_version"] = "forged-review-schema.v9"
+        new_revision_ref = _refresh_mapping_ref(
+            bad["revisions"][1],
+            prefix="sandbox-recheck-revision-",
+            field="revision_ref",
+        )
+        bad["current_revision_ref"] = new_revision_ref
+        for key, prefix, field in (
+            ("runs", "sandbox-recheck-run-", "run_ref"),
+            ("invalidations", "sandbox-recheck-invalidation-", "invalidation_ref"),
+            ("receipts", "sandbox-recheck-receipt-", "receipt_ref"),
+        ):
+            bad[key][0]["new_revision_ref"] = new_revision_ref
+            _refresh_mapping_ref(bad[key][0], prefix=prefix, field=field)
+    else:
+        first = coordinator.apply_revision(_revision_command(coordinator))
+        assert first.delivery is not None
+        staged = coordinator.stage_current_review(
+            _submission(first.delivery, SandboxReviewAction.MODIFY_FIXTURE)
+        )
+        assert staged.resume_attempt_ref is not None
+        assert coordinator.resume_current_review(
+            SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+        ).status == "applied"
+        candidate, bundle = _subject_and_bundle(
+            domain_state_version=9,
+            formula_revision=5,
+            amount_milliunits=3,
+            dataset_version="authority.3",
+            decision=SandboxSafetyDecision.BLOCK,
+            issue_count=1,
+        )
+        coordinator.apply_revision(
+            _revision_command(
+                coordinator, candidate=candidate, bundle=bundle, suffix="authority-009"
+            )
+        )
+        snapshot = coordinator.snapshot()
+        bad = copy.deepcopy(snapshot.model_dump(mode="python"))
+        bad["revisions"][1]["namespace"] = "sandbox.recheck.forged"
+        middle_ref = _refresh_mapping_ref(
+            bad["revisions"][1],
+            prefix="sandbox-recheck-revision-",
+            field="revision_ref",
+        )
+        for key, prefix, field in (
+            ("runs", "sandbox-recheck-run-", "run_ref"),
+            ("invalidations", "sandbox-recheck-invalidation-", "invalidation_ref"),
+            ("receipts", "sandbox-recheck-receipt-", "receipt_ref"),
+        ):
+            bad[key][0]["new_revision_ref"] = middle_ref
+            _refresh_mapping_ref(bad[key][0], prefix=prefix, field=field)
+
+        final_revision = bad["revisions"][2]
+        final_run = bad["runs"][1]
+        final_bundle = snapshot.revisions[2].rule_bundle
+        assert final_bundle is not None
+        reconstructed = SandboxRevisionCommandV1(
+            expected_current_revision_ref=middle_ref,
+            command_id=final_run["command_id"],
+            run_id=final_run["run_id"],
+            trace_id=final_run["trace_id"],
+            candidate_subject=snapshot.revisions[2].subject,
+            rule_bundle=final_bundle,
+            checkpoint_id=final_revision["checkpoint_id"],
+            interrupt_id=final_revision["interrupt_id"],
+        )
+        command_digest = hashlib.sha256(canonical_json_bytes(reconstructed)).hexdigest()
+        final_revision["parent_revision_ref"] = middle_ref
+        final_revision["accepted_command_digest"] = command_digest
+        final_ref = _refresh_mapping_ref(
+            final_revision,
+            prefix="sandbox-recheck-revision-",
+            field="revision_ref",
+        )
+        final_run["command_digest"] = command_digest
+        final_run["old_revision_ref"] = middle_ref
+        final_run["new_revision_ref"] = final_ref
+        _refresh_mapping_ref(
+            final_run, prefix="sandbox-recheck-run-", field="run_ref"
+        )
+        bad["invalidations"][1]["old_revision_ref"] = middle_ref
+        bad["invalidations"][1]["new_revision_ref"] = final_ref
+        _refresh_mapping_ref(
+            bad["invalidations"][1],
+            prefix="sandbox-recheck-invalidation-",
+            field="invalidation_ref",
+        )
+        bad["receipts"][1]["command_digest"] = command_digest
+        bad["receipts"][1]["old_revision_ref"] = middle_ref
+        bad["receipts"][1]["new_revision_ref"] = final_ref
+        _refresh_mapping_ref(
+            bad["receipts"][1],
+            prefix="sandbox-recheck-receipt-",
+            field="receipt_ref",
+        )
+        bad["current_revision_ref"] = final_ref
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_source_build_failure_commits_fixed_review_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, review_snapshot, clock, nonce_factory, verifier = _coordinator()
+    command = _revision_command(coordinator, suffix="source-build-failure")
+
+    def fail_source_build(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("dynamic-review-build-detail")
+
+    monkeypatch.setattr(SandboxReviewSourceV1, "build", fail_source_build)
+    outcome = coordinator.apply_revision(command)
+    snapshot = coordinator.snapshot()
+
+    assert outcome.status == "review_setup_failed"
+    assert outcome.delivery is None
+    assert len(snapshot.revisions) == 2
+    assert len(snapshot.runs) == len(snapshot.invalidations) == len(snapshot.receipts) == 1
+    assert snapshot.revisions[-1].result is not None
+    assert snapshot.revisions[-1].review_render_digest is None
+    assert snapshot.revisions[-1].challenge_ref is None
+    assert snapshot.invalidations[-1].old_challenge_refs == (
+        review_snapshot.challenges[-1].challenge_ref,
+    )
+    assert snapshot.invalidations[-1].old_event_refs == (
+        review_snapshot.events[-1].event_ref,
+    )
+    assert b"dynamic-review-build-detail" not in canonical_json_bytes(snapshot)
+    assert coordinator.completion_eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=_SESSION,
+        thread_id=_THREAD,
+        checkpoint_id=_NEW_CHECKPOINT,
+    ).status == "blocked"
+
+    restarted = SandboxRecheckCoordinator(
+        snapshot=snapshot,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    assert restarted.snapshot() == snapshot
+    assert restarted.apply_revision(command).status == "replayed_or_conflict"
+    assert restarted.snapshot() == snapshot
 
 
 def test_l5_4_snapshot_and_inputs_are_isolated_immutable_copies() -> None:
