@@ -428,3 +428,12 @@ production 保持 `c71832b` 行为时，先新增三项关系矩阵回归，真�
 - Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
 - 若 R5 验收失败，以单一 R5 delivery 执行 `git revert <r5-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+## 19. L5-4-R5 独立验收（通过）
+
+- 冻结 R5 delivery：`847076e86275edc6a92470dbb749a695d9177757`；exact parent `fca217b8311b206b5229c1ebbbd13b7cbf743706`；只修改三个允许文件；Review/CI 前后 clean。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0；finite authority qualification matrix、helper ownership、other-scope/same-revision terminal、R4 completion、R3 projection/current 与 R2/R1 历史 finding 全部通过。
+- 独立 CI：矩阵 `3`、L5-4 `47`、L5-3 `59`、L5-2 `18`、L5-1 `14`、Safety `71/3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/AST/diff/scope/tracked/clean 全通过；forced full `1 failed, 1762 passed, 362 deselected` 且仅既有 defaults 差异；calibrated full `1763 passed, 362 deselected`。
+- PM 六项矩阵/组合复验 `6 passed in 2.39s`；exact HEAD 不变且 clean。
+- PM 结论：**L5-4 与 R5 accepted**（`ACC-20260722-037`、`DEC-20260722-030`），关闭 `R-L5-RECHECK-001`。初始～R4 失败历史全部保留。
+- 本节只完成 L5-4 单项验收；L5-1～L5-4 现为 4/4 individually accepted，但 L5 整体仍须在包含 acceptance management 事务的 clean exact HEAD 执行最终组合 Review/CI/PM 后另行关闭；L6 未开始。
