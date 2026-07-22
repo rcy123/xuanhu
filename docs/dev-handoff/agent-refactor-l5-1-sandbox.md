@@ -145,3 +145,14 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 ---
 
 **已交付，申请验收。**
+
+## 10. 项目经理第 1 轮独立验收（2026-07-22）
+
+- 冻结交付：`d3eb7b90611b477eb837c395215473f80fe9726f`；exact parent `4a2e1392aea660d08c2440113059a94103c2df3d`；范围为本 handoff 第 8 节三个文件；Review/CI 前后 worktree clean。
+- 独立 CI：专项、Safety、L4.5-11 隐私、Ruff、mypy、L0、lock、diff/scope/tracked 均通过；校准全量 `1635 passed, 362 deselected`。强制 `APP_ENV=sandbox-test` 的原命令保留唯一既有 defaults 冲突，不以合同外配置修改掩盖。
+- 独立 Reviewer：P0=0、P1=1、P2=2、P3=0，结论 `rework required`。
+- P1：连续两次相等采样不能证明 evaluator 纯度；pair-wise state drift 可令相同 exact 输入跨请求从 `block` 变成 `allow`。
+- P2：fixture 缺准入包 §5.3/§8 完整 manifest；资源门禁只测 1 issue，未固化最大合法 256 issues。Reviewer 的 64 items + 256 issues 探针通过，因此性能本身未观察到失败。
+- PM 结论：**未接受 / 发布 L5-1-R1 限定返工**。保留本提交和全部失败证据；L5-2 不得发布。
+
+R1 合同见 [agent-refactor-l5-1-sandbox-rework-1-task.md](agent-refactor-l5-1-sandbox-rework-1-task.md)。
