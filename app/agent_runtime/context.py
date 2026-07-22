@@ -228,77 +228,48 @@ def _find_matches(tokens: list[tuple[str | None, int, int]]) -> list[tuple[int, 
             or (next_idx < n and _is_digit_or_x_token(next_idx))
         )
 
-    i = 0
-    while i < n:
-        # 跳过HARD和B
-        if _is_hard_token(i) or _is_boundary_token(i):
-            i += 1
+    for i in range(n):
+        # 每个原始起点独立收集全部合同内候选；候选失败不能推进扫描游标。
+        if not _is_digit_token(i):
             continue
 
-        # 尝试匹配连续手机号: 1[3-9]D{9}
-        # 需要11个连续digit token
-        if _is_digit_token(i):
-            # 检查第一个字符是否是'1'
-            if tokens[i][0] == "1":
-                # 检查第二个字符是否是3-9
-                j = _next_non_boundary(i + 1)
-                if j < n and _is_digit_token(j):
-                    ch_j = tokens[j][0]
-                    assert ch_j is not None
-                    if ch_j in "3456789":
-                        # 收集后续9个digit
-                        remaining_digits, after = _collect_exact_digits(j + 1, 9)
-                        if len(remaining_digits) == 9:
-                            end = remaining_digits[-1] + 1
-                            if _check_boundary(i, end):
-                                candidates.append((i, end, "phone"))
-                            i = end
-                            continue
+        if tokens[i][0] == "1":
+            j = _next_non_boundary(i + 1)
+            second_digit = tokens[j][0] if j < n and _is_digit_token(j) else None
+            if second_digit is not None and second_digit in "3456789":
+                # 连续手机号: 1[3-9]D{9}
+                remaining_digits, _ = _collect_exact_digits(j + 1, 9)
+                if len(remaining_digits) == 9:
+                    end = remaining_digits[-1] + 1
+                    if _check_boundary(i, end):
+                        candidates.append((i, end, "phone"))
 
-            # 尝试匹配分隔手机号: 1[3-9]D S D{4} S D{4}
-            if tokens[i][0] == "1":
-                j = _next_non_boundary(i + 1)
-                if j < n and _is_digit_token(j):
-                    ch_j = tokens[j][0]
-                    assert ch_j is not None
-                    if ch_j in "3456789":
-                        # 需要一个digit
-                        k = _next_non_boundary(j + 1)
-                        if k < n and _is_digit_token(k):
-                            # 需要一个separator
-                            l_pos = _next_non_boundary(k + 1)
-                            if l_pos < n and _is_separator_token(l_pos):
-                                sep_char = tokens[l_pos][0]
-                                # 需要4个digit
-                                m_digits, after_m = _collect_digits_with_boundaries(l_pos + 1, 4)
-                                if len(m_digits) == 4:
-                                    # 需要相同的separator
-                                    n_pos = _next_non_boundary(after_m)
-                                    if n_pos < n and _is_separator_token(n_pos) and tokens[n_pos][0] == sep_char:
-                                        # 需要4个digit
-                                        o_digits, after_o = _collect_digits_with_boundaries(n_pos + 1, 4)
-                                        if len(o_digits) == 4:
-                                            end = after_o
-                                            if _check_boundary(i, end):
-                                                candidates.append((i, end, "phone_sep"))
-                                            i = end
-                                            continue
+                # 分隔手机号: 1[3-9]D S D{4} S D{4}
+                k = _next_non_boundary(j + 1)
+                if k < n and _is_digit_token(k):
+                    first_separator = _next_non_boundary(k + 1)
+                    if first_separator < n and _is_separator_token(first_separator):
+                        separator = tokens[first_separator][0]
+                        middle_digits, after_middle = _collect_digits_with_boundaries(first_separator + 1, 4)
+                        second_separator = _next_non_boundary(after_middle)
+                        if (
+                            len(middle_digits) == 4
+                            and second_separator < n
+                            and _is_separator_token(second_separator)
+                            and tokens[second_separator][0] == separator
+                        ):
+                            final_digits, after_final = _collect_digits_with_boundaries(second_separator + 1, 4)
+                            if len(final_digits) == 4 and _check_boundary(i, after_final):
+                                candidates.append((i, after_final, "phone_sep"))
 
-            # 尝试匹配身份证号: D{17}(D|X)
-            # 需要17个连续digit + 1个digit或X
-            if _is_digit_token(i):
-                digits_17, after_17 = _collect_exact_digits(i, 17)
-                if len(digits_17) == 17:
-                    # 第18个必须是D或X
-                    j = after_17
-                    if j < n and (_is_digit_token(j) or _is_x_token(j)):
-                        end = j + 1
-                        if _check_boundary(i, end):
-                            candidates.append((i, end, "id_card"))
-                        i = end
-                        continue
-
-        i += 1
+        # 身份证号: D{17}(D|X)。第18位之前也允许跨越一个或多个B。
+        digits_17, after_17 = _collect_exact_digits(i, 17)
+        if len(digits_17) == 17:
+            final_token = _next_non_boundary(after_17)
+            if final_token < n and (_is_digit_token(final_token) or _is_x_token(final_token)):
+                end = final_token + 1
+                if _check_boundary(i, end):
+                    candidates.append((i, end, "id_card"))
 
     # 去重和冲突解决
     # 按起点从左到右、同起点最长优先、仍相同时身份证优先
@@ -343,12 +314,10 @@ def contains_model_input_identity_sequence(contents: Sequence[str]) -> bool:
     """检查contents中是否包含有限身份序列。"""
     try:
         tokens, _ = _tokenize(contents)
-    except ContextBuilderError:
-        raise
-    except Exception as exc:
-        raise ContextBuilderError("scanner internal error") from exc
-    matches = _find_matches(tokens)
-    return len(matches) > 0
+        return bool(_find_matches(tokens))
+    except Exception:
+        pass
+    raise ContextBuilderError("identity sequence processing failed") from None
 
 
 def project_model_input_identity_sequences(contents: Sequence[str]) -> tuple[str, ...]:
@@ -359,12 +328,11 @@ def project_model_input_identity_sequences(contents: Sequence[str]) -> tuple[str
     """
     try:
         tokens, _ = _tokenize(contents)
-    except ContextBuilderError:
-        raise
-    except Exception as exc:
-        raise ContextBuilderError("projector internal error") from exc
-    matches = _find_matches(tokens)
-    return _apply_mask(contents, tokens, matches)
+        matches = _find_matches(tokens)
+        return _apply_mask(contents, tokens, matches)
+    except Exception:
+        pass
+    raise ContextBuilderError("identity sequence processing failed") from None
 
 
 

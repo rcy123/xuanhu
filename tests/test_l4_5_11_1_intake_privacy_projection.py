@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 
+import app.agent_runtime.context as context_module
 from app.agent_runtime.context import (
     ContextBuilderError,
     contains_model_input_identity_sequence,
@@ -124,23 +125,26 @@ def test_cross_message_continuous_phone_split_at_each_position() -> None:
         assert result[0].count("█") + result[1].count("█") == 11
 
 
-def test_cross_message_id_card_split_at_each_position() -> None:
+@pytest.mark.parametrize(
+    "id_card",
+    [
+        "11010519491231002X",
+        "11010519491231002x",
+        "１１０１０５１９４９１２３１００２Ｘ",
+        "１１０１０５１９４９１２３１００２ｘ",
+    ],
+)
+def test_cross_message_id_card_split_at_each_position(id_card: str) -> None:
     """身份证号的每一个单一跨message切分位置。"""
-    id_card = "11010519491231002X"
     for i in range(1, len(id_card)):
         first, second = id_card[:i], id_card[i:]
         result = project_model_input_identity_sequences((first, second))
         assert len(result) == 2
         assert len(result[0]) == len(first)
         assert len(result[1]) == len(second)
-        # 跨message后应能重组并命中
-        # 注意：如果切分位置导致前后边界检查失败，可能无法命中
-        combined = "".join(result)
-        # 只要有一个message被遮罩，就说明命中了
+        assert contains_model_input_identity_sequence((first, second)) is True
         total_masked = sum(r.count("█") for r in result)
-        if total_masked > 0:
-            assert "11010519491231002X" not in combined
-            assert total_masked == 18
+        assert total_masked == 18
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +197,23 @@ def test_adjacent_candidates_and_deterministic_selection() -> None:
     result = project_model_input_identity_sequences((content,))
     # 边界检查导致没有匹配
     assert result[0] == content
+
+
+@pytest.mark.parametrize(
+    "id_card",
+    [
+        "13812345678901234X",
+        "13812345678901234x",
+        "１３８１２３４５６７８９０１２３４Ｘ",
+        "１３８１２３４５６７８９０１２３４ｘ",
+    ],
+)
+def test_phone_shaped_prefix_does_not_hide_same_start_id_card(id_card: str) -> None:
+    """被边界拒绝的手机号样式前缀不得遮蔽同起点身份证候选。"""
+    assert contains_model_input_identity_sequence((id_card,)) is True
+    projected = project_model_input_identity_sequences((id_card,))
+    assert len(projected[0]) == len(id_card)
+    assert projected[0] == "█" * 18
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +350,52 @@ def test_error_does_not_leak_original_values() -> None:
     exc_str = str(exc_info.value)
     assert "138" not in exc_str
     assert "110105" not in exc_str
+
+
+@pytest.mark.parametrize(
+    "public_helper",
+    [
+        contains_model_input_identity_sequence,
+        project_model_input_identity_sequences,
+    ],
+)
+def test_matcher_failure_is_fixed_redacted_and_chainless(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    public_helper: object,
+) -> None:
+    leaked_value = "13900000000"
+
+    def _raise_matcher_error(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"matcher failed for {leaked_value}")
+
+    monkeypatch.setattr(context_module, "_find_matches", _raise_matcher_error)
+    with pytest.raises(ContextBuilderError) as exc_info:
+        public_helper((leaked_value,))  # type: ignore[operator]
+
+    assert str(exc_info.value) == "identity sequence processing failed"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert leaked_value not in caplog.text
+
+
+def test_mask_failure_is_fixed_redacted_and_chainless(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    leaked_value = "13900000000"
+
+    def _raise_mask_error(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"mask failed for {leaked_value}")
+
+    monkeypatch.setattr(context_module, "_apply_mask", _raise_mask_error)
+    with pytest.raises(ContextBuilderError) as exc_info:
+        project_model_input_identity_sequences((leaked_value,))
+
+    assert str(exc_info.value) == "identity sequence processing failed"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert leaked_value not in caplog.text
 
 
 # ---------------------------------------------------------------------------

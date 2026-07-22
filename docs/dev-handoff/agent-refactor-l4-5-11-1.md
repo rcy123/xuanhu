@@ -153,7 +153,7 @@ git status --short --branch
 
 ## 10. 交付提交
 
-- **交付提交 exact HEAD**: （提交后填写）
+- **交付提交 exact HEAD**: `ca1c34b0bafbb22b3ba68d92ef4122717b400818`
 - **git diff --check**: 通过
 - **tracked 文件**: `app/agent_runtime/context.py`, `app/agents/intake_extraction.py`, `tests/test_l4_5_11_1_intake_privacy_projection.py`, `docs/dev-handoff/agent-refactor-l4-5-11-1.md`
 - **clean worktree**: 是
@@ -220,3 +220,78 @@ git status --short --branch
 - `L4.5-11-1-R1`：未开始 → **已发布 / 待交付**；
 - `AR-B-031` 保持 P1 打开；
 - 下一步只允许执行 [L4.5-11-1-R1 限定返工任务书](agent-refactor-l4-5-11-1-rework-1-task.md)。
+
+## 12. L4.5-11-1-R1 返工交付
+
+### 12.1 执行起点与范围
+
+- 分支：`codex/l4-5-11-context-privacy-hardening`；
+- 包含 R1 合同的执行起点 clean exact HEAD：`508980d9e9d8f6073811a689d85694fb91d49390`；
+- 开始时 `git status --short` 无输出；
+- 相对执行起点只修改 R1 合同允许的 3 个文件：`app/agent_runtime/context.py`、`tests/test_l4_5_11_1_intake_privacy_projection.py`、本文；
+- 未修改 `app/agents/intake_extraction.py`、PM 台账、Runtime、Gateway、schema、verifier、Domain、Legacy、RAG、前端、依赖或配置。
+
+### 12.2 R1 先红证据
+
+先只修改专项测试，在生产代码仍为执行起点行为时运行：
+
+```powershell
+uv run pytest --override-ini addopts= -q -m "not integration" tests/test_l4_5_11_1_intake_privacy_projection.py
+```
+
+结果：退出码 `1`，`11 failed, 42 passed in 2.16s`。三类真实 RED 为：
+
+1. `test_phone_shaped_prefix_does_not_hide_same_start_id_card` 的 ASCII/全角及 `X/x` 4 个变体失败：较短手机号样式候选被后边界拒绝后仍推进游标，遮蔽同起点 18 位身份证候选；
+2. `test_cross_message_id_card_split_at_each_position` 的 ASCII/全角及 `X/x` 4 个变体失败：循环在第 17 位之后切分时 scanner 为 `False`，证明 matcher 未跨 `B` 读取末位；
+3. `test_matcher_failure_is_fixed_redacted_and_chainless` 的 scanner/projector 2 项和 `test_mask_failure_is_fixed_redacted_and_chainless` 1 项失败：内部异常未归一化为 `ContextBuilderError`，固定虚构值出现在异常输出中。
+
+本记录只使用测试中的固定虚构值，不含真实患者数据。
+
+### 12.3 实现修复
+
+- `_find_matches()` 对每个原始起点分别收集连续手机号、分隔手机号和身份证候选；任何较短候选通过或被边界拒绝都不再改变外层扫描推进；
+- 所有候选进入同一集合后，继续按“起点从左到右、同起点最长 token span 优先、仍相同时身份证优先”排序与选择；
+- 身份证收集 17 个 digit 后用 `_next_non_boundary()` 跳过一个或多个 `B`，再读取末位 `D/X/x`；grammar、字符类和坐标模型未扩大；
+- `contains_model_input_identity_sequence()` 将 token 化和 matcher 全部纳入异常边界；`project_model_input_identity_sequences()` 将 token 化、matcher 与 `_apply_mask()` 坐标回写全部纳入同一异常边界；
+- 任意内部 `Exception` 只向外抛消息固定为 `identity sequence processing failed` 的 `ContextBuilderError`；在 `except` 结束后 `from None` 抛出，使 `__cause__`、`__context__` 和日志均不携带原异常或输入值。
+
+### 12.4 新增与强化测试
+
+- 同起点手机号样式前缀身份证：覆盖 ASCII/全角数字及 `X/x/Ｘ/ｘ`，无条件断言 scanner 为 `True`、逐消息长度不变、18 个字符全部遮罩；
+- 身份证跨 message：覆盖 ASCII/全角数字及 `X/x/Ｘ/ｘ` 的全部 17 个单一切分位置，每次无条件断言 scanner 为 `True`、总遮罩数为 18、两条 message 各自长度不变；已删除允许零命中通过的条件断言；
+- fail-closed：monkeypatch `_find_matches()` 分别覆盖 scanner/projector，monkeypatch `_apply_mask()` 覆盖 projector；无条件断言固定异常类型与消息、`__cause__ is None`、`__context__ is None`，并通过 `caplog` 断言固定虚构值未写入日志；
+- 专项从第 1 轮的 43 项增加到 53 项。
+
+### 12.5 最终 GREEN 与门禁
+
+所有结果均在最终 R1 生产代码与专项测试上重新运行：
+
+| 门禁 | 结果 |
+|---|---|
+| R1 专项 | `53 passed in 1.89s` |
+| Context Builder / Intake 相关回归 | `65 passed, 22 deselected in 2.15s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 2 source files` |
+| L0 文档契约 | `131 passed in 2.53s` |
+| 全量非集成 | `1602 passed, 362 deselected in 111.92s` |
+| `git diff --check` | 通过，无输出 |
+
+实现过程首次运行 mypy 时发现候选第二位的 `str | None` 类型未显式收窄（1 项）；完成合同内显式收窄后，Ruff、mypy、专项、相关回归、L0 和全量最终结果均如上通过。
+
+### 12.6 不变量与残余风险
+
+- 两个 helper 仍共享唯一 `_find_matches()`；scanner/projector 对新增候选的一致性由专项覆盖；
+- 遮罩仍为逐原始字符等长写回，`B` 不生成字符；原始 DTO、持久化消息和 grounding 坐标所有权未变；
+- 本返工没有实现 Runtime 最终门禁，也没有扩大自由文本姓名、15 位身份证、其他证件、任意编码、任意 Unicode 同形字或跨请求拼接等明确非目标；
+- `AR-B-031` 保持打开，`L4.5-11-2` 未发布、未实施；是否接受本返工由项目经理的独立 Review、CI 与黑盒探针决定。
+
+### 12.7 R1 交付提交
+
+- 第 1 轮交付 exact commit 已在本文 §10 补齐为 `ca1c34b0bafbb22b3ba68d92ef4122717b400818`，第 1 轮失败历史完整保留；
+- R1 使用单一开发交付提交，提交消息为 `fix: complete L4.5-11-1-R1 privacy projection rework`；
+- R1 exact commit 由提交冻结后的 `git rev-parse HEAD` 外部证据锚定并随交付报告提供。Git commit 的最终 SHA 取决于包含本文的 tree，不能在同一个提交内自引用其尚未生成的 SHA；
+- 3 个交付文件均为 Git tracked 文件，提交后工作区 clean。
+
+---
+
+**已返工交付，申请重新验收。**
