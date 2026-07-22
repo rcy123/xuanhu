@@ -501,3 +501,15 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由新的独立 Reviewer/CI/PM 锚定。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。L5 当前仍为 3/4，L6 未开始。
 - 若 R6 验收失败，以单一 R6 delivery 执行 `git revert <r6-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+## 22. L5-4-R6 独立验收（通过）
+
+- 冻结 delivery：`f6b790d48cb4198bd9786fa94bcdc235a67c3de2`；parent `6fe77cd008d83e3ad34e32509cefe63a802a27ab`；仅本 handoff 第 21 节约定的 3 个 tracked 文件，前后 exact HEAD/clean 与 diff check 通过。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0；确认重派生 RED 真实，共享 schema inheritance guard 位于所有 child status 分支之前，失败 restore 固定、chainless、零 mutation，R5 不变量未放宽。
+- 独立 CI：R6 定向 `3`、L5-4 `50`、L5-3/2/1 `59/18/14`、Safety `71/3 deselected`、privacy `76`、纯离线 Runtime/Legacy/public `57`、public flag `10`、AST `6`、L0 `131`、Ruff/mypy/lock 全通过。
+- CI 口径纠正：一次误把 integration-marked golden 与 unit 混跑，被仓库隔离夹具在任何资源启动前固定拒绝；改用纯离线 57 项集合后全绿。该记录不属于产品失败，无外部副作用。
+- 双全量：forced `1 failed, 1765 passed, 362 deselected`，唯一仍为 `test_load_with_defaults` 的 local vs sandbox-test 既有差异；calibrated 仅移除 `APP_ENV`，为 `1766 passed, 362 deselected`。
+- PM 独立探针：R6 三项 `3 passed`；不一致 child 固定拒绝且输入不变，合法 review/terminal 多状态链可 restart，共享 guard 位于状态分支之前；HEAD 未变、工作区 clean。
+- 结论：**通过 / accepted**（`ACC-20260722-039`、`DEC-20260722-032`）；再次关闭 `R-L5-RECHECK-001`，L5-1～L5-4 恢复 4/4 individually accepted。
+- 后续：本节不关闭 L5 整体。必须从包含本 acceptance 事务的新 clean exact HEAD 调用新的最终组合 Reviewer、独立 CI 与 PM 探针，不得复用 `ACC-20260722-038` 失败轮结果；L6 未发布、未开始。
+- 边界：固定虚构/合成、offline unit/in-memory reference composition 不变；不授权 Runtime、HTTP、DB、Gateway、真实 clinical/patient/public production。
