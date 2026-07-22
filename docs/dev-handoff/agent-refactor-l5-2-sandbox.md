@@ -242,3 +242,19 @@ true-max committed test 继续使用 64 个 unique issues/rules 与 64 个 exact
 ---
 
 **R1 已交付，申请验收。**
+
+## 12. 项目经理 R1 最终验收（2026-07-22）
+
+- 冻结交付：`1957ad311b3997499e4f9a0e3f2dd95aa652fa9e`；exact parent `b09c94ce7da4edefea1e90b7c2f7963c02903c03`；分支正确；提交只含原合同三个文件；Review、CI 与 PM 前后 worktree/index clean。
+- 真实先红与最终 GREEN：原 `335f7ad` 行为下三个 R1 回归为 `3 failed, 15 passed`；最终专项 `18 passed`。第 1 次失败交付、P1 和 R1 修复历史均保留。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0，结论 `no findings`；原共享 nested entry P1 **resolved**。Reviewer 独立确认 pre-call primitive/canonical snapshot、逐字段新 request DTO、只读 snapshot verifier、port 返回后及 attach 前重验成立。
+- 独立 CI：L5-2 `18 passed`、true-max `1 passed`、L5-1 `14 passed`、Safety `71 passed, 3 deselected`、privacy `76 passed`、L0 `131 passed`；Ruff、mypy、lock、diff、scope、tracked、clean 全通过。
+- 全量校准：强制 `APP_ENV=sandbox-test` 为 `1 failed, 1656 passed, 362 deselected`，唯一是既有 defaults 测试期望 `local`；只移除该变量且保持全部 fake endpoints 后为 `1657 passed, 362 deselected`。没有修改范围外 config/test 制造通过。
+- 资源：Reviewer 对 64 issues/64 statements、7,926-byte candidate、8,176-byte result、1,000 samples 测得 p95 `8.891 ms`、p99 `9.964 ms`、RSS `+86,016 B`，满足原阈值。
+- PM 定向探针：三个 R1 回归、valid attach、source byte identity、true-max 合计 `6 passed`；p95 `7.469 ms`、p99 `8.202 ms`、RSS `+303,104 B`。
+- PM 结论：**通过 / accepted**（`ACC-20260722-023`）；关闭 `R-L5-EXPL-001`。允许项目经理从 clean accepted 基线另行发布 L5-3，但本验收事务不发布或实施 L5-3。
+- 边界：仅个人学习、非临床、固定虚构 synthetic、离线单元级 sandbox；不构成临床、法律、隐私、伦理、监管或生产批准。应用 Runtime、HTTP/E2E、容器、DB、Gateway、Legacy、真实患者/机构/公开服务继续 NO-GO；G1～G6、EXT-001、EXT-002 保持原状态。
+
+---
+
+**L5-2 已完成 / accepted；下一动作仅为项目经理另行发布 L5-3。**
