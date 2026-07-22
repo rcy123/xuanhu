@@ -576,6 +576,8 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             checkpoint_id=revision.checkpoint_id,
             interrupt_id=revision.interrupt_id,
         )
+        if revision.review_schema_version != prior.review_schema_version:
+            return False
         if (
             revision.parent_revision_ref != prior.revision_ref
             or revision.accepted_command_digest != run.command_digest
@@ -664,8 +666,7 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
                 _same_revision_authority_refs(snapshot.review_snapshot, revision)
             )
             if (
-                revision.review_schema_version != prior.review_schema_version
-                or bool(same_sources)
+                bool(same_sources)
                 or bool(same_challenges)
                 or bool(same_events)
             ):

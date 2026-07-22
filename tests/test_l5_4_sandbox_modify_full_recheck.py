@@ -361,6 +361,59 @@ def _rederive_single_child_command_chain(bad: dict[str, object]) -> None:
     bad["current_revision_ref"] = child_ref
 
 
+def _rederive_current_child_review_schema(
+    bad: dict[str, object], *, schema_version: str
+) -> None:
+    review_snapshot = bad["review_snapshot"]
+    child = bad["revisions"][1]
+    old_challenge_ref = child["challenge_ref"]
+    exact_challenges = [
+        challenge
+        for challenge in review_snapshot["challenges"]
+        if challenge["challenge_ref"] == old_challenge_ref
+    ]
+    assert len(exact_challenges) == 1
+    challenge = exact_challenges[0]
+    assert challenge["state"] == "issued"
+    challenge["sandbox_schema_version"] = schema_version
+    challenge_authority = dict(challenge)
+    challenge_authority.pop("challenge_ref")
+    challenge_authority.pop("state")
+    new_challenge_ref = (
+        "sandbox-challenge-"
+        + hashlib.sha256(canonical_json_bytes(challenge_authority)).hexdigest()
+    )
+    challenge["challenge_ref"] = new_challenge_ref
+
+    for checkpoint in review_snapshot["checkpoints"]:
+        if checkpoint["challenge_ref"] == old_challenge_ref:
+            checkpoint["challenge_ref"] = new_challenge_ref
+    for transition in review_snapshot["transitions"]:
+        if transition["challenge_ref"] == old_challenge_ref:
+            transition["challenge_ref"] = new_challenge_ref
+            _refresh_mapping_ref(
+                transition,
+                prefix="sandbox-transition-",
+                field="transition_ref",
+            )
+    for marker in review_snapshot["current_authorities"]:
+        if marker["challenge_ref"] == old_challenge_ref:
+            marker["challenge_ref"] = new_challenge_ref
+
+    assert not any(
+        attempt["challenge_ref"] == old_challenge_ref
+        for attempt in review_snapshot["attempts"]
+    )
+    assert not any(
+        event["challenge_ref"] == old_challenge_ref
+        for event in review_snapshot["events"]
+    )
+    child["review_schema_version"] = schema_version
+    child["challenge_ref"] = new_challenge_ref
+    bad["runs"][0]["challenge_ref"] = new_challenge_ref
+    _rederive_single_child_command_chain(bad)
+
+
 def test_l5_4_normal_modify_runs_full_recheck_and_requires_new_review() -> None:
     coordinator, review_snapshot, *_ = _coordinator()
     command = _revision_command(coordinator)
@@ -1025,6 +1078,141 @@ def test_l5_4_restart_rejects_rederived_revision_authority_drift(
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_l5_4_restart_rejects_self_consistent_current_child_schema_drift() -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    outcome = coordinator.apply_revision(
+        _revision_command(coordinator, suffix="schema-child-008")
+    )
+    assert outcome.status == "review_required"
+    bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+    parent_schema = bad["revisions"][0]["review_schema_version"]
+    child_schema = bad["revisions"][1]["review_schema_version"]
+    assert parent_schema == child_schema == "sandbox-review-challenge.v1"
+
+    _rederive_current_child_review_schema(
+        bad, schema_version="sandbox-review-challenge.v2"
+    )
+    assert SandboxInMemoryReviewStore(snapshot=bad["review_snapshot"]).snapshot()
+    assert bad["revisions"][0]["review_schema_version"] == parent_schema
+    assert bad["revisions"][1]["review_schema_version"] != parent_schema
+    before_restore = copy.deepcopy(bad)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert bad == before_restore
+
+
+def test_l5_4_restart_preserves_one_schema_across_review_and_terminal_children() -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    review_required = coordinator.apply_revision(
+        _revision_command(coordinator, suffix="schema-chain-008")
+    )
+    assert review_required.status == "review_required"
+    assert review_required.delivery is not None
+    restarted = SandboxRecheckCoordinator(
+        snapshot=coordinator.snapshot(),
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    staged = restarted.stage_current_review(
+        _submission(review_required.delivery, SandboxReviewAction.MODIFY_FIXTURE)
+    )
+    assert staged.resume_attempt_ref is not None
+    assert restarted.resume_current_review(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    ).status == "applied"
+
+    candidate, bundle = _subject_and_bundle(
+        domain_state_version=9,
+        formula_revision=5,
+        amount_milliunits=3,
+        dataset_version="schema-chain.3",
+        decision=SandboxSafetyDecision.BLOCK,
+        issue_count=1,
+    )
+    terminal = restarted.apply_revision(
+        _revision_command(
+            restarted,
+            candidate=candidate,
+            bundle=bundle,
+            suffix="schema-chain-009",
+        )
+    )
+    assert terminal.status == "blocked"
+    snapshot = restarted.snapshot()
+    assert tuple(revision.status for revision in snapshot.revisions) == (
+        "modify_applied",
+        "review_required",
+        "blocked",
+    )
+    assert {revision.review_schema_version for revision in snapshot.revisions} == {
+        snapshot.revisions[0].review_schema_version
+    }
+    assert SandboxRecheckCoordinator(
+        snapshot=snapshot,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    ).snapshot() == snapshot
+
+
+def test_l5_4_child_schema_inheritance_is_a_shared_restore_guard() -> None:
+    tree = ast.parse(
+        Path("app/agent_runtime/sandbox_recheck.py").read_text(encoding="utf-8")
+    )
+    snapshot_function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_snapshot_is_integral"
+    )
+    child_loop = next(
+        node
+        for node in snapshot_function.body
+        if isinstance(node, ast.For)
+        and ast.unparse(node.iter) == "enumerate(revisions[1:], start=1)"
+    )
+
+    def is_schema_inheritance(node: ast.AST) -> bool:
+        return any(
+            isinstance(candidate, ast.Compare)
+            and ast.unparse(candidate.left) == "revision.review_schema_version"
+            and [ast.unparse(item) for item in candidate.comparators]
+            == ["prior.review_schema_version"]
+            for candidate in ast.walk(node)
+        )
+
+    def reads_child_status(node: ast.AST) -> bool:
+        return any(
+            isinstance(candidate, ast.Attribute)
+            and ast.unparse(candidate) == "revision.status"
+            for candidate in ast.walk(node)
+        )
+
+    shared_guards = tuple(
+        statement
+        for statement in child_loop.body
+        if isinstance(statement, ast.If)
+        and is_schema_inheritance(statement.test)
+        and not reads_child_status(statement.test)
+    )
+    assert len(shared_guards) == 1
+    first_status_branch = next(
+        index
+        for index, statement in enumerate(child_loop.body)
+        if isinstance(statement, ast.If) and reads_child_status(statement.test)
+    )
+    assert child_loop.body.index(shared_guards[0]) < first_status_branch
 
 
 def test_l5_4_source_build_failure_commits_fixed_review_setup_failure(

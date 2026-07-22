@@ -445,3 +445,59 @@ production 保持 `c71832b` 行为时，先新增三项关系矩阵回归，真�
 - 最终 Reviewer：P0=0、P1=0、P2=1、P3=0；唯一 P2 为 current `review_required` child 没有继承 parent review schema authority，同步改变 child/private schema 并重派生完整 refs 后 restore 仍接受。
 - PM 跨层 `13 passed`，并独立复现 parent v1 / child v2 的 `review_required` snapshot `restore=accepted`。
 - 结论：最终组合 **未通过**（`ACC-20260722-038`、`DEC-20260722-031`）；保留第 19 节和 `ACC-037` 的历史单项结论，但 L5-4 与 `R-L5-RECHECK-001` 重新打开，发布 R6；L5 当前 3/4，L6 未开始。
+
+## 21. L5-4-R6 review schema authority inheritance 闭合
+
+### 21.1 状态与精确起点
+
+- 状态：**L5-4-R6 已交付，申请验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`6fe77cd008d83e3ad34e32509cefe63a802a27ab`；其中保留 R5 delivery、历史单项 acceptance、最终组合第 1 轮失败证据、`ACC-20260722-038`、`DEC-20260722-031` 与 R6 任务书。
+- R6 只修改原三个 L5-4 文件；未修改 R6 任务书、PM 六台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime、Legacy 或外部边界。
+
+### 21.2 真实 RED 与 GREEN
+
+exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production diff 为空、工作区唯一变更为三项 R6 回归时，完整 fake env 与 `UV_OFFLINE=1` 下定向运行，真实 RED 为退出码 `1`、`2 failed, 1 passed in 2.43s`：
+
+1. 创建正常 current `review_required` child，把 child 与 exact private challenge 的 schema 从 `sandbox-review-challenge.v1` 同步改为 `sandbox-review-challenge.v2`；按 canonical authority 重算 challenge ref、对应 transition ref、checkpoint/current marker，再重算 outer revision/run/invalidation/receipt/current refs。private snapshot 可单独通过 strict store restore，parent 仍为 v1，旧 combined restore 错误接受；测试期望固定、chainless 拒绝且输入零 mutation。
+2. AST 结构断言找不到 status 分支之前的统一相邻 child schema inheritance guard，证明旧条件只属于 non-`review_required` 分支。
+3. 正常 `initial -> review_required -> blocked` 多 revision 链保持同一 initial schema并可连续 restart，RED 阶段已通过。
+
+没有依赖 stale ref、单侧 schema 变化、删除 private history、skip、xfail 或弱化 R5 的 47 项。PM 最终组合第 1 轮的同类复现继续保留在第 20 节；本次回归将其转化为可重复的完整重派生证据。
+
+最小实现后，三项定向为 `3 passed in 1.89s`；完整 L5-4 专项为 `50 passed in 3.31s`，R5 的 47 项全部保留。
+
+### 21.3 单一 schema chain authority
+
+- `_snapshot_is_integral(...)` 在每个 child 的 reconstructed command 建立后、任何 status-specific 分支之前，无条件要求 `revision.review_schema_version == prior.review_schema_version`；因此整条 outer revision chain 等价继承 initial schema。
+- `review_required` 的 exact challenge 仍由 `_challenge_matches_revision(...)` 要求 `sandbox_schema_version == revision.review_schema_version`；current source/challenge/current marker、historical applied review、terminal absence、R5 finite authority qualification matrix 均未放宽。
+- live 创建路径未改：仍消费 accepted L5-3 固定 schema；没有新增 schema migration、版本协商、registry 或第二套 authority。
+- 任一 restore 不一致仍归一化为固定 `SANDBOX_RECHECK_REJECTED`，无动态 payload、无异常 cause/context、无部分 mutation。
+- 新结构测试定位 child loop 的唯一 shared inheritance guard，并要求它不读取 `revision.status` 且位于第一个 status branch 之前；功能正例证明 review-required 与 terminal child 共享同一 initial schema并可 restart。
+
+### 21.4 R6 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部使用第 7 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R6 结果 |
+|---|---|
+| R6 三项定向 / L5-4 完整专项 | `3 passed in 1.89s`；`50 passed in 3.31s` |
+| accepted L5-3 | `59 passed in 3.13s` |
+| accepted L5-2 | `18 passed in 8.54s` |
+| accepted L5-1 | `14 passed in 19.33s` |
+| Safety / privacy | `71 passed, 3 deselected in 2.61s`；`76 passed in 5.80s` |
+| Runtime/Legacy / public flag | `57 passed in 2.48s`；`10 passed in 1.95s` |
+| AST 离线与结构边界 | `6 passed in 1.98s` |
+| Ruff / mypy | `All checks passed!`；production 1 source / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 | 最终 handoff 内容复跑 `131 passed` |
+| `uv lock --check` | `Resolved 84 packages in 5ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1765 passed, 362 deselected in 148.47s`；唯一为既有 `tests/test_config.py::test_load_with_defaults` 的 `local` / `sandbox-test` defaults 差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1766 passed, 362 deselected in 153.44s` |
+
+全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；未读取 `.env`、ignored `data/` 或 `.codex_tmp`，未启动网络、应用、容器、数据库或外部服务。本轮没有新的偶发结果。
+
+### 21.5 范围、提交、限制与回退
+
+- 提交前 `git diff --check`、exact 三文件 scope 与 tracked 检查必须通过；单一 R6 开发提交消息为 `fix: enforce L5-4 review schema inheritance`，exact parent 为 `6fe77cd008d83e3ad34e32509cefe63a802a27ab`，提交后工作区必须 clean。
+- Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由新的独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。L5 当前仍为 3/4，L6 未开始。
+- 若 R6 验收失败，以单一 R6 delivery 执行 `git revert <r6-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
