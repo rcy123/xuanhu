@@ -1523,6 +1523,171 @@ def test_l5_4_completion_uses_exact_current_source_with_other_scope_history() ->
     )
 
 
+def _review_setup_failed_terminal_snapshot(monkeypatch: pytest.MonkeyPatch):
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    command = _revision_command(coordinator, suffix="r5-terminal-source")
+
+    def fail_source_build(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("synthetic-r5-source-build-failure")
+
+    with monkeypatch.context() as controlled:
+        controlled.setattr(SandboxReviewSourceV1, "build", fail_source_build)
+        outcome = coordinator.apply_revision(command)
+    assert outcome.status == "review_setup_failed"
+    snapshot = coordinator.snapshot()
+    terminal = snapshot.revisions[-1]
+    assert terminal.status == "review_setup_failed"
+    assert terminal.result is not None
+    source = SandboxReviewSourceV1.build(
+        safety_subject=terminal.subject,
+        safety_result=terminal.result,
+        explanation_result=None,
+    )
+    return snapshot, terminal, source, clock, nonce_factory, verifier
+
+
+def test_l5_4_terminal_ignores_other_scope_same_subject_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline, terminal, source, clock, nonce_factory, verifier = (
+        _review_setup_failed_terminal_snapshot(monkeypatch)
+    )
+    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    other_scope = review.create_single_use_challenge(
+        source,
+        namespace="sandbox.recheck.r5-terminal-other-scope",
+        thread_id="sandbox-recheck-thread-r5-terminal-other-scope",
+        checkpoint_id="sandbox-recheck-checkpoint-r5-terminal-other-scope",
+        interrupt_id="sandbox-recheck-interrupt-r5-terminal-other-scope",
+    )
+    private_snapshot = store.snapshot()
+    assert other_scope.challenge.test_session_id == terminal.test_session_id
+    assert other_scope.challenge.namespace != terminal.namespace
+    assert other_scope.challenge.thread_id != terminal.thread_id
+    assert len(private_snapshot.current_authorities) == 2
+
+    expanded = copy.deepcopy(baseline.model_dump(mode="python"))
+    expanded["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    restarted = SandboxRecheckCoordinator(
+        snapshot=expanded,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    round_trip = restarted.snapshot()
+    assert round_trip.review_snapshot == private_snapshot
+    assert round_trip.revisions == baseline.revisions
+    assert SandboxRecheckCoordinator(
+        snapshot=round_trip,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    ).snapshot() == round_trip
+
+
+def test_l5_4_terminal_rejects_same_revision_source_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline, terminal, source, clock, nonce_factory, verifier = (
+        _review_setup_failed_terminal_snapshot(monkeypatch)
+    )
+    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    same_revision = review.create_single_use_challenge(
+        source,
+        namespace=terminal.namespace,
+        thread_id=terminal.thread_id,
+        checkpoint_id=terminal.checkpoint_id,
+        interrupt_id=terminal.interrupt_id,
+    )
+    private_snapshot = store.snapshot()
+    assert same_revision.challenge.test_session_id == terminal.test_session_id
+    assert same_revision.challenge.namespace == terminal.namespace
+    assert same_revision.challenge.thread_id == terminal.thread_id
+    assert same_revision.challenge.checkpoint_id == terminal.checkpoint_id
+    assert same_revision.challenge.interrupt_id == terminal.interrupt_id
+
+    expanded = copy.deepcopy(baseline.model_dump(mode="python"))
+    expanded["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=expanded,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_authority_qualification_helpers_have_bounded_ownership() -> None:
+    tree = ast.parse(
+        Path("app/agent_runtime/sandbox_recheck.py").read_text(encoding="utf-8")
+    )
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not {
+        "_authority_refs",
+        "_source_refs",
+        "_subject_source_refs",
+    }.intersection(functions)
+
+    historical_name = "_historical_invalidation_authority_refs"
+    same_revision_name = "_source_matches_same_revision"
+    exact_current_name = "_source_matches_revision_exactly"
+    same_revision_authority_name = "_same_revision_authority_refs"
+    assert {
+        historical_name,
+        same_revision_name,
+        exact_current_name,
+        same_revision_authority_name,
+    }.issubset(functions)
+
+    historical_calls = tuple(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == historical_name
+    )
+    assert len(historical_calls) == 2
+    assert {ast.unparse(call.args[1]) for call in historical_calls} == {
+        "current",
+        "prior",
+    }
+
+    exact_current_calls = tuple(
+        node
+        for node in ast.walk(functions[exact_current_name])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == same_revision_name
+    )
+    same_revision_authority_calls = tuple(
+        node
+        for node in ast.walk(functions[same_revision_authority_name])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == same_revision_name
+    )
+    assert len(exact_current_calls) == len(same_revision_authority_calls) == 1
+
+
 def test_l5_4_snapshot_and_inputs_are_isolated_immutable_copies() -> None:
     coordinator, *_ = _coordinator()
     command = _revision_command(coordinator)

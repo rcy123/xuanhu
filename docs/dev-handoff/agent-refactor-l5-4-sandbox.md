@@ -374,3 +374,57 @@ production 保持 `b7cbbff` 行为时，先新增一个独立端到端回归：�
 - 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R4 exact-current completion 主 finding 与 R3～R1 历史 findings 均关闭/保持关闭。
 - 剩余 P2：terminal absence 仍调用全 store subject/authority 查询；`review_setup_failed` terminal 添加合法 other-scope 同内容 source/challenge 后，same-scope parent marker 与 outer chain 不变，restore 仍错误拒绝。PM 独立复现 `terminal=review_setup_failed; restore=rejected`。
 - PM 结论：**未接受 / 发布 L5-4-R5 authority qualification matrix 架构收敛**（`ACC-20260722-036`、`DEC-20260722-029`）。同根因连续两轮，停止症状补丁；初始～R4 失败历史全部保留；L5 仍为 3/4，L6 未开始。
+
+## 18. L5-4-R5 authority qualification matrix 架构收敛
+
+### 18.1 状态与起点
+
+- 状态：**L5-4-R5 已交付，申请验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`fca217b8311b206b5229c1ebbbd13b7cbf743706`；其中 append-only 保留初始～R4 失败 deliveries、全部独立验收证据、`ACC-20260722-036`、`DEC-20260722-029` 与 R5 收敛任务书。
+- R5 只修改原三个 L5-4 文件；未修改 R5 任务书、PM 台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime 或外部边界。
+
+### 18.2 关系矩阵真实 RED 与 GREEN
+
+production 保持 `c71832b` 行为时，先新增三项关系矩阵回归，真实 RED 为退出码 `1`、`2 failed, 1 passed in 2.44s`：
+
+1. 由真实 source-build failure 产生 `review_setup_failed` terminal，再为相同 terminal subject/result 在其他 namespace/thread/checkpoint/interrupt 建立合法 source/challenge/current；private snapshot 合法、outer chain 与 same-scope parent marker 不变，但旧 restore 错误 fixed reject；
+2. 在 terminal 自己的 namespace/session/thread/checkpoint/interrupt 建立同 revision source/challenge，旧实现与期望均 fixed chainless reject，因此该矩阵负例在 RED 阶段已通过；
+3. AST/source ownership 发现旧 `_authority_refs/_source_refs/_subject_source_refs` 仍同时服务 historical、current 与 terminal，结构断言失败。
+
+收敛实现后，三项矩阵为 `3 passed in 1.85s`；最终完整专项为 `47 passed in 3.16s`，R4 的 44 项（包括 exact-current confirm→eligible 与 R3 cross-scope projection）全部保持。other-scope terminal restart 连续 round-trip 保留全部 private 记录；same-revision terminal 继续返回固定、无 cause/context 的拒绝。
+
+### 18.3 有限 authority qualification matrix
+
+- `_source_matches_same_revision(...)` 是唯一 same-revision identity predicate，仅比较 namespace、test session、thread、checkpoint、interrupt 与 subject；
+- `_source_matches_revision_exactly(...)` 组合 same-revision predicate，再比较 result 与 explanation absence；restore current source 与 completion consumer 继续共同复用它；
+- `_same_revision_authority_refs(...)` 只从 same-revision source refs 派生对应 challenge/event refs，terminal presence/absence 精确使用该投影；other scope 不计入，同 revision scope 精确计入；
+- 宽 collection 明确更名为 `_historical_invalidation_authority_refs(...)`，accepted subject/result collection 语义保持不变；生产 AST ownership 精确只有两个调用：live invalidation 使用 `current`，restore old-ref 核对使用 `prior`；
+- initial 与 historical review challenge/event ownership 改为直接 exact challenge ref 查询，不借 historical invalidation helper；R3 `_issue_projection_and_current_are_integral(...)` 的 namespace/session/thread scope 及 expected-current 规则未改。
+
+结构回归还证明旧三个含混 helper 已不存在、exact-current 与 same-revision authority helper 各自只组合一次 same-revision predicate。每种关系现在只有一个具名 authority helper，停止继续堆叠调用点字段补丁。
+
+### 18.4 R5 最终门禁
+
+| 门禁 | R5 结果 |
+|---|---|
+| L5-4/R5 专项 | `47 passed in 3.16s` |
+| accepted L5-3 | `59 passed in 2.38s` |
+| accepted L5-2 | `18 passed in 6.68s` |
+| accepted L5-1 | `14 passed in 13.59s` |
+| Safety 回归 | `71 passed, 3 deselected in 1.81s` |
+| L4.5-11 两项 privacy 回归 | `76 passed in 4.55s` |
+| Ruff / mypy | `All checks passed!`；production 1 source / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.25s` |
+| AST 离线边界 | `1 passed in 1.95s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1762 passed, 362 deselected in 147.41s`；唯一为既有 `tests/test_config.py::test_load_with_defaults` 的 `local` / `sandbox-test` defaults 差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1763 passed, 362 deselected in 147.28s` |
+
+首次分层静态检查发现一个等价嵌套条件的 Ruff `SIM102`，手工合并为单一条件后，专项、全部分层门禁与双全量均对最终内容重新执行；没有复用修正前结果。本轮双全量没有新的偶发结果。全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；未读取 `.env`、ignored `data/` 或 `.codex_tmp`，未启动网络、应用或外部服务。
+
+### 18.5 范围、提交、限制与回退
+
+- 提交前 `git diff --check`、exact 三文件 scope 与 tracked 检查必须通过；单一 R5 开发提交消息为 `refactor: converge L5-4 authority qualification`，exact parent 为 `fca217b8311b206b5229c1ebbbd13b7cbf743706`，提交后工作区必须 clean。
+- Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
+- 若 R5 验收失败，以单一 R5 delivery 执行 `git revert <r5-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。

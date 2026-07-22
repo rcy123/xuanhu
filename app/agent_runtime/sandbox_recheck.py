@@ -314,12 +314,17 @@ def _receipt_record(**values: object) -> _CommandReceiptV1:
     )
 
 
-def _authority_refs(
+def _historical_invalidation_authority_refs(
     snapshot: SandboxReviewStoreSnapshotV1,
     revision: SandboxRevisionRecordV1,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     subject = revision.subject
-    source_refs = set(_source_refs(snapshot, revision))
+    source_refs = {
+        source.source_ref
+        for source in snapshot.sources
+        if source.source.safety_subject == revision.subject
+        and source.source.safety_result == revision.result
+    }
     challenge_refs = tuple(
         challenge.challenge_ref
         for challenge in snapshot.challenges
@@ -341,30 +346,7 @@ def _authority_refs(
     return challenge_refs, event_refs
 
 
-def _source_refs(
-    snapshot: SandboxReviewStoreSnapshotV1,
-    revision: SandboxRevisionRecordV1,
-) -> tuple[str, ...]:
-    return tuple(
-        source.source_ref
-        for source in snapshot.sources
-        if source.source.safety_subject == revision.subject
-        and source.source.safety_result == revision.result
-    )
-
-
-def _subject_source_refs(
-    snapshot: SandboxReviewStoreSnapshotV1,
-    revision: SandboxRevisionRecordV1,
-) -> tuple[str, ...]:
-    return tuple(
-        source.source_ref
-        for source in snapshot.sources
-        if source.source.safety_subject == revision.subject
-    )
-
-
-def _source_matches_revision_exactly(
+def _source_matches_same_revision(
     source: _ReviewSourceRecord,
     revision: SandboxRevisionRecordV1,
 ) -> bool:
@@ -375,9 +357,46 @@ def _source_matches_revision_exactly(
         and source.checkpoint_id == revision.checkpoint_id
         and source.interrupt_id == revision.interrupt_id
         and source.source.safety_subject == revision.subject
+    )
+
+
+def _source_matches_revision_exactly(
+    source: _ReviewSourceRecord,
+    revision: SandboxRevisionRecordV1,
+) -> bool:
+    return (
+        _source_matches_same_revision(source, revision)
         and source.source.safety_result == revision.result
         and source.source.explanation_result is None
     )
+
+
+def _same_revision_authority_refs(
+    snapshot: SandboxReviewStoreSnapshotV1,
+    revision: SandboxRevisionRecordV1,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    source_refs = tuple(
+        source.source_ref
+        for source in snapshot.sources
+        if _source_matches_same_revision(source, revision)
+    )
+    source_set = set(source_refs)
+    challenge_refs = tuple(
+        challenge.challenge_ref
+        for challenge in snapshot.challenges
+        if any(
+            checkpoint.challenge_ref == challenge.challenge_ref
+            and checkpoint.source_ref in source_set
+            for checkpoint in snapshot.checkpoints
+        )
+    )
+    challenge_set = set(challenge_refs)
+    event_refs = tuple(
+        event.event_ref
+        for event in snapshot.events
+        if event.challenge_ref in challenge_set
+    )
+    return source_refs, challenge_refs, event_refs
 
 
 def _challenge_matches_revision(
@@ -516,7 +535,6 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
     ):
         return False
     first = revisions[0]
-    first_challenges, first_events = _authority_refs(snapshot.review_snapshot, first)
     first_exact_challenges = tuple(
         challenge
         for challenge in snapshot.review_snapshot.challenges
@@ -533,13 +551,11 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         or first.rule_bundle is not None
         or first.result is None
         or first.result.decision is not SandboxSafetyDecision.ALLOW
-        or first.challenge_ref not in first_challenges
         or first.test_session_id != first.subject.test_session_id
         or len(first_exact_challenges) != 1
         or not _challenge_matches_revision(first_exact_challenges[0], first)
         or first_exact_challenges[0].state != "applied"
         or len(first_exact_events) != 1
-        or first_exact_events[0].event_ref not in first_events
         or first_exact_events[0].action is not SandboxReviewAction.MODIFY_FIXTURE
     ):
         return False
@@ -599,36 +615,34 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             or revision.result.adapter_version != revision.subject.adapter_version
         ):
             return False
-        revision_challenge_refs, revision_event_refs = _authority_refs(
-            snapshot.review_snapshot, revision
-        )
         exact_challenges = tuple(
             challenge
             for challenge in snapshot.review_snapshot.challenges
             if challenge.challenge_ref == revision.challenge_ref
         )
+        exact_events = tuple(
+            event
+            for event in snapshot.review_snapshot.events
+            if event.challenge_ref == revision.challenge_ref
+        )
         if revision.status == "review_required" and (
             revision.result is None
             or revision.result.decision is not SandboxSafetyDecision.ALLOW
             or revision.challenge_ref is None
-            or revision.challenge_ref not in revision_challenge_refs
             or len(exact_challenges) != 1
             or not _challenge_matches_revision(exact_challenges[0], revision)
         ):
             return False
-        if revision.status == "review_required" and index < len(revisions) - 1:
-            exact_events = tuple(
-                event
-                for event in snapshot.review_snapshot.events
-                if event.event_ref in revision_event_refs
-                and event.challenge_ref == revision.challenge_ref
-            )
-            if (
+        if (
+            revision.status == "review_required"
+            and index < len(revisions) - 1
+            and (
                 len(exact_events) != 1
                 or exact_challenges[0].state != "applied"
                 or exact_events[0].action is not SandboxReviewAction.MODIFY_FIXTURE
-            ):
-                return False
+            )
+        ):
+            return False
         if revision.status == "blocked" and (
             revision.result is None
             or revision.result.decision is not SandboxSafetyDecision.BLOCK
@@ -645,13 +659,20 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             or revision.challenge_ref is not None
         ):
             return False
-        if revision.status != "review_required" and (
-            revision.review_schema_version != prior.review_schema_version
-            or bool(_subject_source_refs(snapshot.review_snapshot, revision))
-            or bool(revision_challenge_refs)
-        ):
-            return False
-        old_challenges, old_events = _authority_refs(snapshot.review_snapshot, prior)
+        if revision.status != "review_required":
+            same_sources, same_challenges, same_events = (
+                _same_revision_authority_refs(snapshot.review_snapshot, revision)
+            )
+            if (
+                revision.review_schema_version != prior.review_schema_version
+                or bool(same_sources)
+                or bool(same_challenges)
+                or bool(same_events)
+            ):
+                return False
+        old_challenges, old_events = _historical_invalidation_authority_refs(
+            snapshot.review_snapshot, prior
+        )
         if (
             invalidation.old_challenge_refs != old_challenges
             or invalidation.old_event_refs != old_events
@@ -999,7 +1020,9 @@ class SandboxRecheckCoordinator:
                 challenge_ref=challenge_ref,
                 status=status,
             )
-            old_challenges, old_events = _authority_refs(published_review, current)
+            old_challenges, old_events = _historical_invalidation_authority_refs(
+                published_review, current
+            )
             invalidation = _invalidation_record(
                 sequence=len(self._invalidations),
                 old_revision_ref=current.revision_ref,
