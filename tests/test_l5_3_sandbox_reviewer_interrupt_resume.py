@@ -332,6 +332,16 @@ def _submission(delivery, action: SandboxReviewAction) -> SandboxResumeSubmissio
     )
 
 
+def _derived_record_ref(
+    prefix: str,
+    record: dict[str, object],
+    *,
+    ref_field: str,
+) -> str:
+    body = {key: value for key, value in record.items() if key != ref_field}
+    return prefix + hashlib.sha256(canonical_review_bytes(body)).hexdigest()
+
+
 def _stage_and_resume(
     coordinator: SandboxReviewCoordinator,
     delivery,
@@ -744,6 +754,107 @@ def test_l5_3_restart_snapshot_rejects_changed_event_action_and_derived_refs(
     assert raised.value.__context__ is None
 
 
+def test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_change() -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, delivery, SandboxReviewAction.REJECT)
+    snapshot = store.snapshot().model_dump(mode="python")
+    snapshot["attempts"][0]["action"] = SandboxReviewAction.CONFIRM
+    snapshot["events"][0]["action"] = SandboxReviewAction.CONFIRM
+    snapshot["events"][0]["event_ref"] = _derived_record_ref(
+        "sandbox-review-event-",
+        snapshot["events"][0],
+        ref_field="event_ref",
+    )
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=snapshot)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_3_restart_snapshot_rejects_two_applied_attempts_for_one_challenge() -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    sealed = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.CONFIRM)
+    )
+    applied = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.REJECT)
+    )
+    assert sealed.resume_attempt_ref is not None
+    assert applied.resume_attempt_ref is not None
+    assert coordinator.resume(
+        SandboxResumeCommandV1(resume_attempt_ref=applied.resume_attempt_ref)
+    ).status == "applied"
+    snapshot = store.snapshot().model_dump(mode="python")
+    sealed_attempt = next(
+        attempt
+        for attempt in snapshot["attempts"]
+        if attempt["resume_attempt_ref"] == sealed.resume_attempt_ref
+    )
+    sealed_attempt["state"] = "applied"
+    existing_event = snapshot["events"][0]
+    second_event = dict(existing_event)
+    second_event.update(
+        {
+            "sequence": len(snapshot["events"]),
+            "resume_attempt_ref": sealed_attempt["resume_attempt_ref"],
+            "action": sealed_attempt["action"],
+            "sandbox_test_reviewer_id": sealed_attempt[
+                "sandbox_test_reviewer_id"
+            ],
+            "sandbox_test_role": sealed_attempt["sandbox_test_role"],
+            "sandbox_test_organization_label": sealed_attempt[
+                "sandbox_test_organization_label"
+            ],
+            "sandbox_test_qualification_label": sealed_attempt[
+                "sandbox_test_qualification_label"
+            ],
+            "sandbox_test_signature_scheme": sealed_attempt[
+                "sandbox_test_signature_scheme"
+            ],
+            "sandbox_test_key_id": sealed_attempt["sandbox_test_key_id"],
+            "sandbox_test_signed_payload_digest": sealed_attempt[
+                "sandbox_test_signed_payload_digest"
+            ],
+        }
+    )
+    second_event["event_ref"] = _derived_record_ref(
+        "sandbox-review-event-",
+        second_event,
+        ref_field="event_ref",
+    )
+    snapshot["events"] = snapshot["events"] + (second_event,)
+    for from_state, to_state in (
+        ("issued", "claimed"),
+        ("claimed", "applied"),
+        ("review_pending", "review_applied"),
+    ):
+        transition: dict[str, object] = {
+            "transition_ref": "pending",
+            "sequence": len(snapshot["transitions"]),
+            "challenge_ref": delivery.challenge.challenge_ref,
+            "resume_attempt_ref": sealed_attempt["resume_attempt_ref"],
+            "from_state": from_state,
+            "to_state": to_state,
+            "observed_at": second_event["applied_at"],
+        }
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+        snapshot["transitions"] = snapshot["transitions"] + (transition,)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=snapshot)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility() -> None:
     coordinator, store, clock, nonce_factory, _ = _coordinator()
     first_delivery = _issue(coordinator)
@@ -798,6 +909,106 @@ def test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility() -> Non
         thread_id=_THREAD_ID,
         checkpoint_id="sandbox-checkpoint-002",
     ).status == "blocked"
+
+
+def test_l5_3_reused_checkpoint_id_resolves_current_interrupt_eligibility() -> None:
+    coordinator, store, clock, nonce_factory, _ = _coordinator()
+    first_delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, first_delivery, SandboxReviewAction.CONFIRM)
+    second_source = _accepted_source(domain_state_version=8)
+    second_delivery = coordinator.create_single_use_challenge(
+        second_source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+        interrupt_id="sandbox-interrupt-002",
+    )
+    _stage_and_resume(coordinator, second_delivery, SandboxReviewAction.CONFIRM)
+    live_status = coordinator.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=second_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status
+
+    restarted_store = SandboxInMemoryReviewStore(
+        snapshot=store.snapshot().model_dump(mode="python")
+    )
+    restarted = SandboxReviewCoordinator(
+        store=restarted_store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=_FakeSignatureVerifier(),
+    )
+    restart_status = restarted.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=second_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status
+    assert (live_status, restart_status) == ("eligible", "eligible")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "staged_before_issued",
+        "staged_at_expiry",
+        "applied_before_staged",
+        "applied_at_expiry",
+    ),
+)
+def test_l5_3_restart_snapshot_rejects_noncausal_stage_and_apply_times(
+    tamper: str,
+) -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, delivery, SandboxReviewAction.CONFIRM)
+    snapshot = store.snapshot().model_dump(mode="python")
+    issued_at = delivery.challenge.issued_at
+    expires_at = delivery.challenge.expires_at
+    staged_transition = next(
+        transition
+        for transition in snapshot["transitions"]
+        if transition["to_state"] == "attempt_staged"
+    )
+    applied_transitions = tuple(
+        transition
+        for transition in snapshot["transitions"]
+        if transition["to_state"] in {"claimed", "applied", "review_applied"}
+    )
+
+    if tamper == "staged_before_issued":
+        staged_transition["observed_at"] = issued_at - 1
+    elif tamper == "staged_at_expiry":
+        staged_transition["observed_at"] = expires_at
+    elif tamper == "applied_before_staged":
+        staged_transition["observed_at"] = issued_at + 10
+        snapshot["events"][0]["applied_at"] = issued_at + 9
+        for transition in applied_transitions:
+            transition["observed_at"] = issued_at + 9
+    elif tamper == "applied_at_expiry":
+        snapshot["events"][0]["applied_at"] = expires_at
+        for transition in applied_transitions:
+            transition["observed_at"] = expires_at
+
+    snapshot["events"][0]["event_ref"] = _derived_record_ref(
+        "sandbox-review-event-",
+        snapshot["events"][0],
+        ref_field="event_ref",
+    )
+    for transition in snapshot["transitions"]:
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=snapshot)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction() -> None:

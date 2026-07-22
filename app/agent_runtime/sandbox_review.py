@@ -388,9 +388,7 @@ class _SealedAttemptV1(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def attempt_ref_is_derived(self) -> _SealedAttemptV1:
-        if self.resume_attempt_ref != _attempt_ref(
-            self.challenge_ref, self.sandbox_test_signed_payload_digest
-        ):
+        if self.resume_attempt_ref != _attempt_ref(self):
             raise ValueError("resume attempt reference mismatch")
         return self
 
@@ -517,8 +515,12 @@ def _stored_source_ref(source: _StoredSourceV1) -> str:
     return f"sandbox-source-{_sha256(body)}"
 
 
-def _attempt_ref(challenge_ref: str, signed_payload_digest: str) -> str:
-    return f"sandbox-attempt-{_sha256({'challenge_ref': challenge_ref, 'signed_payload_digest': signed_payload_digest})}"
+def _attempt_ref(attempt: _SealedAttemptV1) -> str:
+    body = attempt.model_dump(
+        mode="python",
+        exclude={"resume_attempt_ref", "state"},
+    )
+    return f"sandbox-attempt-{_sha256(body)}"
 
 
 def _event_ref(event: SandboxTestReviewEventV1) -> str:
@@ -725,6 +727,26 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
 
     for challenge in challenges:
         bound = transitions_by_challenge.get(challenge.challenge_ref, [])
+        challenge_attempts = tuple(
+            attempt
+            for attempt in attempts
+            if attempt.challenge_ref == challenge.challenge_ref
+        )
+        applied_attempts = tuple(
+            attempt for attempt in challenge_attempts if attempt.state == "applied"
+        )
+        challenge_events = tuple(
+            event
+            for event in events
+            if event.challenge_ref == challenge.challenge_ref
+        )
+        if len(applied_attempts) > 1:
+            return False
+        if challenge.state == "applied":
+            if len(applied_attempts) != 1 or len(challenge_events) != 1:
+                return False
+        elif applied_attempts or challenge_events:
+            return False
         initial = tuple(
             transition
             for transition in bound
@@ -735,9 +757,7 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
         )
         if len(initial) != 1:
             return False
-        for attempt in (
-            item for item in attempts if item.challenge_ref == challenge.challenge_ref
-        ):
+        for attempt in challenge_attempts:
             staged = tuple(
                 transition
                 for transition in bound
@@ -745,7 +765,15 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
                 and transition.from_state == "attempt_unstaged"
                 and transition.to_state == "attempt_staged"
             )
-            if len(staged) != 1 or staged[0].sequence <= initial[0].sequence:
+            if (
+                len(staged) != 1
+                or staged[0].sequence <= initial[0].sequence
+                or not (
+                    challenge.issued_at
+                    <= staged[0].observed_at
+                    < challenge.expires_at
+                )
+            ):
                 return False
             applied_transitions = tuple(
                 transition
@@ -773,14 +801,17 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
                 if any(
                     transition.observed_at != event.applied_at
                     for transition in applied_transitions
+                ) or not (
+                    staged[0].observed_at
+                    <= event.applied_at
+                    < challenge.expires_at
                 ):
                     return False
             elif applied_transitions:
                 return False
         allowed_count = 1 + sum(
             1 + (3 if attempt.state == "applied" else 0)
-            for attempt in attempts
-            if attempt.challenge_ref == challenge.challenge_ref
+            for attempt in challenge_attempts
         )
         if len(bound) != allowed_count:
             return False
@@ -1119,17 +1150,6 @@ class SandboxInMemoryReviewStore:
         checkpoint_id: str,
     ) -> bool:
         with self._lock:
-            checkpoints = tuple(
-                checkpoint
-                for checkpoint in self._checkpoints
-                if checkpoint.namespace == namespace
-                and checkpoint.test_session_id == test_session_id
-                and checkpoint.thread_id == thread_id
-                and checkpoint.checkpoint_id == checkpoint_id
-            )
-            if len(checkpoints) != 1 or checkpoints[0].state != "review_applied":
-                return False
-            checkpoint = checkpoints[0]
             current = tuple(
                 marker
                 for marker in self._current_authorities
@@ -1139,11 +1159,23 @@ class SandboxInMemoryReviewStore:
             )
             if (
                 len(current) != 1
-                or current[0].issue_sequence != checkpoint.issue_sequence
-                or current[0].checkpoint_id != checkpoint.checkpoint_id
-                or current[0].challenge_ref != checkpoint.challenge_ref
+                or current[0].checkpoint_id != checkpoint_id
             ):
                 return False
+            marker = current[0]
+            checkpoints = tuple(
+                checkpoint
+                for checkpoint in self._checkpoints
+                if checkpoint.issue_sequence == marker.issue_sequence
+                and checkpoint.namespace == namespace
+                and checkpoint.test_session_id == test_session_id
+                and checkpoint.thread_id == thread_id
+                and checkpoint.checkpoint_id == marker.checkpoint_id
+                and checkpoint.challenge_ref == marker.challenge_ref
+            )
+            if len(checkpoints) != 1 or checkpoints[0].state != "review_applied":
+                return False
+            checkpoint = checkpoints[0]
             challenge = self._challenge(checkpoint.challenge_ref)
             source = self._source(checkpoint.source_ref)
             if (
@@ -1527,10 +1559,6 @@ class SandboxReviewCoordinator:
                 )
             ):
                 return _fixed_stage_rejection()
-            attempt_ref = _attempt_ref(
-                challenge.challenge_ref,
-                signed_payload_digest,
-            )
             snapshot = self._store.snapshot()
             matching = tuple(
                 source
@@ -1544,8 +1572,28 @@ class SandboxReviewCoordinator:
             if len(matching) != 1:
                 return _fixed_stage_rejection()
             source_ref = matching[0].source_ref
+            provisional_attempt = _SealedAttemptV1.model_construct(
+                resume_attempt_ref="sandbox-attempt-" + "0" * 64,
+                challenge_ref=challenge.challenge_ref,
+                source_ref=source_ref,
+                namespace=submission.namespace,
+                test_session_id=submission.test_session_id,
+                action=submission.action,
+                sandbox_test_reviewer_id=proof.sandbox_test_reviewer_id,
+                sandbox_test_role=proof.sandbox_test_role,
+                sandbox_test_organization_label=(
+                    proof.sandbox_test_organization_label
+                ),
+                sandbox_test_qualification_label=(
+                    proof.sandbox_test_qualification_label
+                ),
+                sandbox_test_signature_scheme=proof.sandbox_test_signature_scheme,
+                sandbox_test_key_id=proof.sandbox_test_key_id,
+                sandbox_test_signed_payload_digest=signed_payload_digest,
+                state="sealed",
+            )
             attempt = _SealedAttemptV1(
-                resume_attempt_ref=attempt_ref,
+                resume_attempt_ref=_attempt_ref(provisional_attempt),
                 challenge_ref=challenge.challenge_ref,
                 source_ref=source_ref,
                 namespace=submission.namespace,

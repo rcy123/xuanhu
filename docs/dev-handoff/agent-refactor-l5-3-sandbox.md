@@ -261,3 +261,90 @@ Canonical JSON 保持完整诚实：没有通过隐藏 action、identity、sourc
 - PM 结论：**R1 未接受 / 发布 L5-3-R2**（`ACC-20260722-026`、`DEC-20260722-019`）。保留第 1 次与 R1 全部失败/CI/Review 证据；L5-4 不得发布。
 
 R2 合同见 [agent-refactor-l5-3-sandbox-rework-2-task.md](agent-refactor-l5-3-sandbox-rework-2-task.md)。
+
+## 13. L5-3-R2 开发交付（2026-07-22）
+
+### 13.1 状态、基线与限定范围
+
+- 状态：**R2 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R2 clean release / exact parent：`aa9661200ec3d55c230ef32ec8c242c050990cf9`；其 parent 为失败 R1 delivery `f5b7211a51418f2cd09348fc60c993576568a5b2`。原 delivery、R1、两轮 finding、`ACC-20260722-025/026`、`DEC-20260722-018/019` 与 R1/R2 任务书全部保留，没有 reset、覆盖或删除失败历史。
+- R2 只修改原三个文件：`app/agent_runtime/sandbox_review.py`、`tests/test_l5_3_sandbox_reviewer_interrupt_resume.py` 与本文；没有修改 R2 任务书、PM 台账、accepted L5-1/L5-2、配置、依赖、Runtime、Legacy、HTTP/DB/Gateway 或 L5-4。
+
+### 13.2 四项先行回归与真实 RED
+
+在 production 仍为 `f5b7211` 行为、worktree 唯一修改为四项指定 regression（causal restore 使用四个明确参数子例）时，以第 8 节完整 fake env 与 `UV_OFFLINE=1` 运行专项。exact HEAD 仍为 `aa9661200ec3d55c230ef32ec8c242c050990cf9`；结果为退出码 `1`，`7 failed, 48 passed in 2.84s`，55 项全部收集：
+
+1. `test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_change`：同时把 applied reject attempt/event action 改为 confirm 并重算 event ref 后，restore `DID NOT RAISE`；
+2. `test_l5_3_restart_snapshot_rejects_two_applied_attempts_for_one_challenge`：同 challenge 两个不同 action attempt 被构造成各自 derived event/transition 的双 applied history 后，restore `DID NOT RAISE`；
+3. `test_l5_3_reused_checkpoint_id_resolves_current_interrupt_eligibility`：同 scope 复用 checkpoint ID、以不同 interrupt 发布并 applied v8 后，live/restart eligibility 实际均为 `blocked`；
+4. `test_l5_3_restart_snapshot_rejects_noncausal_stage_and_apply_times`：`staged < issued`、`staged >= expires`、`applied < staged`、`applied >= expires` 四个 tamper 在同步重算 event/transition refs 后全部 `DID NOT RAISE`。
+
+RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfail、条件绕过、只测 stale ref 或弱化原 48 项。实现后的首次专项即为 `55 passed in 2.33s`。
+
+### 13.3 Full sealed-attempt authority binding
+
+- `resume_attempt_ref` 现在覆盖 `_SealedAttemptV1` 除 `resume_attempt_ref/state` 外的完整 canonical body：challenge/source ref、namespace/session、action、reviewer ID、固定 test role/organization/qualification、signature scheme/key ID 与 signed payload digest；
+- coordinator 先从 authoritative store snapshot 定位 exact source ref，构造内部 provisional sealed body，再派生 ref 并 strict 构造最终 attempt；caller 不参与 ref authority；
+- sealed 到 applied 只改变 state，因此 ref 保持稳定；除 ref/state 外任一 authority 字段改变而不重算 ref会在 DTO validator 拒绝。即使同时改 attempt/event action并重算 event ref，旧 attempt ref也不再匹配；
+- attempt/event 跨记录 action、全部 test identity 与 signed payload digest 一致性继续验证；store 仍不保存 plaintext nonce 或 signature。
+
+### 13.4 Single-use cardinality 与 exact applied history
+
+snapshot integrity 现在对每个 challenge 直接计数：
+
+- 最多一个 applied attempt；applied challenge/checkpoint 必须精确一个 applied attempt与一个 event；issued/expired challenge 必须为零 applied attempt/event；
+- 每个 attempt 精确一条 staged transition；applied attempt 精确一条 `issued->claimed`、一条 `claimed->applied` 与一条 `review_pending->review_applied`，且绑定唯一 event；
+- applied 前允许多个合法 sealed attempts；一个成功后其余保持 sealed，live resume 继续返回 replay/conflict，restore 不能表示第二个 applied；
+- 原 32-thread 回归继续证明精确 `1 applied + 31 replayed_or_conflict`、一个 event 与一个 review_applied transition。R1 的 ref uniqueness、cross-record、append sequence 与 current marker integrity 全部保留。
+
+### 13.5 Current-marker-first eligibility
+
+eligibility 在 lock 内先按 `(namespace, test_session_id, thread_id)` 取得唯一 current marker：
+
+1. caller checkpoint ID 必须等于 marker checkpoint ID；
+2. 再以 marker 的 `issue_sequence + challenge_ref + scope + checkpoint_id` 定位精确 current checkpoint row；
+3. 最后验证 current challenge/source/event exact applied-confirm authority。
+
+因此相同 checkpoint ID、不同 interrupt 的 append-only history 合法；旧 interrupt 即使 checkpoint ID 相同也不会被先选中或造成全历史 uniqueness 误拒。R2 regression 同时证明 live store 与 fake restart 对 current v8 applied confirm 都返回 eligible；current pending/reject/modify 与旧 authority仍 blocked。
+
+### 13.6 Restore temporal causality
+
+- initial transition 继续精确等于 challenge `issued_at`；
+- 每个 staged transition 现在必须满足 `issued_at <= staged_at < expires_at`，且 append sequence 晚于 initial；
+- applied event 与三条 applied transition 必须时间逐字一致，并满足 `staged_at <= applied_at < expires_at`；
+- integrity 校验在 ref validator 之后独立执行，因此攻击者同步重算 event/transition refs 也不能绕过因果；只验证每个 challenge/attempt 内因果，不要求全局 fake clock 单调；
+- live stage/apply 的 R1 exclusive `now >= expires_at` atomic tombstone、clock 回拨不可复活、900 秒 TTL 与 fixed chainless boundary不变。
+
+本修复不改变 ALLOW-only/BLOCK zero mutation、32-byte nonce only-once、challenge 全绑定、ref-only command、65,536-byte limit、secret-free、fake restart 不重发、current marker atomic issue/restore、non-confirm blocked 或 complete/record/export absent。
+
+### 13.7 R2 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部命令使用第 8 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R2 结果 |
+|---|---|
+| L5-3/R2 专项 | 最终交付树 `55 passed in 2.59s`；前次 `55 passed in 2.33s` |
+| accepted L5-2 回归 | `18 passed in 8.46s` |
+| accepted L5-1 回归 | `14 passed in 15.69s` |
+| Safety 回归 | `71 passed, 3 deselected in 2.44s` |
+| L4.5-11 privacy 回归 | `76 passed in 6.14s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.34s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms` |
+| diff/scope/tracked | working/cached diff check 均无错误；name-status 精确为三个原允许文件且均为 `M`；`git ls-files --error-unmatch` 对三者全部成功 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1711 passed, 362 deselected in 130.97s`；唯一失败为既有 `test_load_with_defaults` 预期 `local`、实际为强制值 `sandbox-test` |
+| 只移除 `APP_ENV` 的校准全量 | `1712 passed, 362 deselected in 133.08s` |
+
+全部执行没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway、网络或外部服务。
+
+### 13.8 R2 提交、限制与回退
+
+- 单一 R2 开发提交消息为 `fix: close L5-3 restored history gaps`，exact parent 必须为 `aa9661200ec3d55c230ef32ec8c242c050990cf9`，提交只含 13.1 节三个原允许文件。
+- Git SHA 不能在包含本文的同一提交中自引用；delivery exact HEAD 由提交后外部报告的 `git rev-parse HEAD`、上述 parent/message、三文件 scope 与 clean worktree 共同冻结，后续由独立 Reviewer/CI/PM 锚定验收。
+- in-memory snapshot integrity 仍是本地 reference-store structural/causal integrity，不是外部持久化、加密签名、数据库 transaction 或生产 durability；真实 Runtime/identity/DB/HTTP 与 L5-4 full recheck 仍未实现、未发布。
+- 若 R2 独立验收失败，使用 `git revert <r2-delivery-exact-head>` 保留历史，不 reset 或覆盖前两轮失败交付与 accepted L5-1/L5-2。
+
+---
+
+**R2 已交付，申请验收。**
