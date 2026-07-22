@@ -124,3 +124,61 @@ uv run pytest --override-ini addopts= -q -m "not integration" `
 ---
 
 **已交付，申请独立验收。**
+
+## 9. 项目经理验收结论
+
+| 项目 | 结果 |
+|---|---|
+| 验收日期 | 2026-07-22 |
+| 发布提交 | `b8c553af9361c97683dac94c2d5a34dc5aca5dd2` |
+| 交付提交 | `ada23c77cedd4a3e98db5d4e4a5c11328ee4c0e4` |
+| 父提交核对 | `ada23c77^ == b8c553a`，通过 |
+| 范围与工作区 | 精确 3 个合同允许文件；新 handoff tracked；diff check、exact HEAD、初末 clean 全部通过 |
+| 独立 Code Review | **No findings**（P0/P1/P2/P3 均无） |
+| 独立 CI | 全部通过 |
+| 结论 | **通过 / accepted** |
+
+### 9.1 性能 finding 关闭证据
+
+未参与实现的 R2 Reviewer 在 Python 3.12.12 上以 10 次预热、25 次采样独立复测：
+
+| 输入与函数 | 独立 GREEN 中位数 | 阈值 |
+|---|---:|---:|
+| 单条 4,000 位 / scanner | `4.127 ms` | `<10 ms` |
+| 单条 4,000 位 / projector | `3.954 ms` | `<10 ms` |
+| 8 条 × 4,000 位 / scanner | `32.639 ms` | `<80 ms` |
+| 8 条 × 4,000 位 / projector | `35.650 ms` | `<80 ms` |
+
+Reviewer 直接加载 parent 复现真实 RED：单条 `27.226/26.329 ms`，batch `214.342/236.760 ms`，四项只因性能越线失败。它确认新 matcher 是三次有界 O(n) 遍历，无回溯正则、截断、跳过扫描、跨请求缓存或 grammar 缩减；40,000 组公共 API、2,168 组定向样本和 20,000 组 raw-range 差分均与 parent 等价。
+
+最初报告 R-PERF-001 的最终组合 Reviewer 随后在同一冻结提交复审，得到单条 `4.127/3.627 ms`、batch `33.672/32.479 ms`，明确裁决原 P2 已 resolved，P0～P3 均无新 finding。
+
+### 9.2 独立 CI 与项目经理探针
+
+独立 CI 在 `ada23c77` 上只读运行：
+
+| 门禁 | 结果 |
+|---|---|
+| L4.5-11-1 专项（含 R2） | `57 passed` |
+| L4.5-11-2 专项 | `19 passed` |
+| 现存相关路径超集 | `313 passed, 48 deselected` |
+| Ruff / mypy | 通过 |
+| L0 文档契约 | `131 passed` |
+| 全量非 integration | `1625 passed, 362 deselected` |
+| parent-source RED | `23.065/23.479 ms`；batch `200.383/217.482 ms`，四项按预期失败 |
+| diff / scope / tracked / exact / clean | 全部通过 |
+
+任务书 §8 中五个旧测试路径在仓库不存在；开发者按项目经理授权使用九个现存语义对应文件的覆盖超集，handoff 保留实际命令。该校准不改变生产范围、测试所有权或验收门槛，不构成 finding。
+
+项目经理以相同协议复测得到单条 `4.118/3.825 ms`、batch `33.136/31.304 ms`；跨层假网关探针证明原始 DTO 不变、跨 message 等长、clinical offset 不变、安全 Intake 请求 1 且 `max_requests=1`、直接 unsafe Intake 请求 0、非 Intake 请求 1。
+
+### 9.3 组合最终裁决
+
+- `L4.5-11-1-R2`：已交付 → **accepted / 已关闭**；
+- `L4.5-11-1`：性能验收重新打开 → **accepted / 已完成**；
+- `L4.5-11-2`：继续 **accepted / 已完成**；
+- `R-PERF-001`、`R-GROUND-001`：关闭；
+- `L4.5-11`：组合验收第 1 轮未通过 → **accepted / 已完成**；
+- `AR-B-031`：以 `140262d`、`5ada262`、`ada23c77`、两轮组合 Review、独立 CI 与项目经理探针作为完整证据，**关闭**；
+- 自由文本姓名、15 位身份证、其他证件/编码/Unicode 同形字符、跨请求重组、非 Intake/Legacy/direct Gateway 和完整隐私/法律/临床合规仍是明确非目标；
+- L4.5-11 完成不代表 L4.5/L5 可进入，EXT-001、EXT-002 继续保持 NO-GO。
