@@ -252,3 +252,11 @@ production 保持 `8b345b9` 行为、工作区唯一修改为四类 R2 回归时
 - Git SHA 由冻结后的 `git rev-parse HEAD`、提交消息和本节共同报告，由独立 Reviewer/CI/PM 锚定。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、临床或公开生产能力。
 - 若 R2 验收失败，以单一 R2 delivery 执行 `git revert <r2-delivery-commit>` 并保留全部历史，不 reset 或覆盖。
+
+## 13. L5-4-R2 独立验收（未通过）
+
+- 冻结 R2 delivery：`23a561a5c972cd9fb0103fb7d39ebbe7ad841cbb`；exact parent `84c8f6459ac086457dfb9218575ac2360c4068af`；只修改三个允许文件；Review/CI 前后 clean。
+- 独立 CI：专项 `39`、L5-3 `59`、L5-2 `18`、L5-1 `14`、Safety `71/3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/AST/diff/scope/tracked/clean 全通过；校准全量 `1755 passed, 362 deselected`；强制环境为 `1 failed, 1754 passed, 362 deselected` 且仅既有 defaults 差异。
+- 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R1 的 shared command predicate 与 terminal retained-authority 两项均 resolved。
+- 剩余 P2：only-initial combined snapshot 可继续引用 historical applied-modify challenge，即使 private L5-3 snapshot 已有新的 same-scope pending challenge 且 current marker 已改变；outer chain 尚未闭合到完整 issue projection/current marker。
+- PM 结论：**未接受 / 发布 L5-4-R3 限定返工**（`ACC-20260722-034`、`DEC-20260722-027`）。保留初始/R1/R2 deliveries 与全部证据；L5 仍为 3/4，L6 未开始。
