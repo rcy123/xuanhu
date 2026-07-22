@@ -319,3 +319,50 @@ production 保持 `23a561a` 行为、工作区唯一 production 变化尚未开�
 - 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R3 same-scope projection/current 三项目标与 R2/R1 历史 findings 均 resolved/保持关闭。
 - 剩余 P2：restore current-source 查询已限定 exact scope，但 completion consumer 仍按全 store subject/result 计数；other-scope 同内容 source 存在时，exact current review 已 applied confirm 后 completion 仍错误 blocked。
 - PM 六项定向 `6 passed`，随后独立复现 `applied=applied; completion=blocked; matching_sources=2`。PM 结论：**未接受 / 发布 L5-4-R4 限定返工**（`ACC-20260722-035`、`DEC-20260722-028`）。L5 仍为 3/4，L6 未开始。
+
+## 16. L5-4-R4 completion exact-current source 闭合
+
+### 16.1 状态与起点
+
+- 状态：**L5-4-R4 已交付，申请验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`d27ee992f691f65fa62e23b645f3b1f2112e9d2a`；其中 append-only 保留初始～R3 失败 deliveries、全部独立验收证据、`ACC-20260722-035`、`DEC-20260722-028` 与 R4 任务书。
+- R4 只修改原三个 L5-4 文件；未修改 R4 任务书、PM 台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime 或外部边界。
+
+### 16.2 真实 RED 与 GREEN
+
+production 保持 `b7cbbff` 行为时，先新增一个独立端到端回归：构造合法 private issue 顺序 `initial -> other-scope -> exact-current-child` 并 restart，使用 exact current delivery 完成 stage 与 confirm resume。stage 返回 `staged`、resume 返回 `applied`，但 exact completion 仍实际返回 `blocked`；测试期望 `eligible`，真实 RED 为退出码 `1`、`1 failed in 2.32s`，失败断言精确为 `blocked != eligible`。
+
+该回归同时覆盖错误 namespace、thread、checkpoint 均保持 `blocked`，并检查 other-scope source/challenge/current marker 在 confirm 后 append-only 保留。修复后定向为 `1 passed in 1.83s`，最终完整专项为 `44 passed in 3.10s`，R3 的 43 项全部保留。
+
+### 16.3 shared exact-source predicate
+
+- 新增纯 `_source_matches_revision_exactly(source, revision)`，通过只读结构协议接收 private source record，完整比较 namespace、test session、thread、checkpoint、interrupt、`safety_subject`、`safety_result`，并要求 `explanation_result is None`；
+- combined restore 对 current `review_required` 的 exact source 基数检查与 `completion_eligibility()` 每次重读均调用该同一 predicate，不再维护两套字段子集；
+- completion 对 exact marker/checkpoint/challenge/event 的各自唯一性、accepted L5-3 eligibility 调用、错误查询 fixed blocked 语义均未放宽；other-scope 记录既不计入 exact source，也未被删除；
+- R3 `_issue_projection_and_current_are_integral(...)` 未改；R2 shared command predicate、R1 exact event/source-build 原子性及原状态机不变量继续保持。
+
+### 16.4 R4 最终门禁
+
+| 门禁 | R4 结果 |
+|---|---|
+| L5-4/R4 专项 | `44 passed in 3.10s` |
+| accepted L5-3 | `59 passed in 2.64s` |
+| accepted L5-2 | `18 passed in 7.02s` |
+| accepted L5-1 | `14 passed in 13.90s` |
+| Safety 回归 | `71 passed, 3 deselected in 1.80s` |
+| L4.5-11 两项 privacy 回归 | `76 passed in 4.53s` |
+| Ruff / mypy | `All checks passed!`；production 1 source / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.23s` |
+| AST 离线边界 | `1 passed in 1.80s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1759 passed, 362 deselected in 148.74s`；唯一为既有 `tests/test_config.py::test_load_with_defaults` 的 `local` / `sandbox-test` defaults 差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1760 passed, 362 deselected in 146.52s` |
+
+本轮强制与 calibrated 全量均未出现新的偶发结果。全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；未读取 `.env`、ignored `data/` 或 `.codex_tmp`，未启动网络、应用或外部服务。
+
+### 16.5 范围、提交、限制与回退
+
+- 提交前 `git diff --check`、exact 三文件 scope 与 tracked 检查必须通过；单一 R4 开发提交消息为 `fix: bind L5-4 completion to exact source`，exact parent 为 `d27ee992f691f65fa62e23b645f3b1f2112e9d2a`，提交后工作区必须 clean。
+- Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
+- 若 R4 验收失败，以单一 R4 delivery 执行 `git revert <r4-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。

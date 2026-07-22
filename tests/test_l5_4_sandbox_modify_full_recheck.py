@@ -1433,6 +1433,96 @@ def test_l5_4_issue_projection_ignores_other_scope_interleaving() -> None:
     assert restarted.snapshot().review_snapshot == private_snapshot
 
 
+def test_l5_4_completion_uses_exact_current_source_with_other_scope_history() -> None:
+    coordinator, initial_review_snapshot, clock, nonce_factory, verifier = _coordinator()
+    outcome = coordinator.apply_revision(
+        _revision_command(coordinator, suffix="other-scope-completion")
+    )
+    assert outcome.status == "review_required"
+    baseline = coordinator.snapshot()
+    current = baseline.revisions[-1]
+    current_source = next(
+        source.source
+        for source in baseline.review_snapshot.sources
+        if source.source.safety_subject == current.subject
+        and source.source.safety_result == current.result
+    )
+
+    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    other_scope = review.create_single_use_challenge(
+        current_source,
+        namespace="sandbox.recheck.completion-other-scope",
+        thread_id="sandbox-recheck-thread-completion-other-scope",
+        checkpoint_id="sandbox-recheck-checkpoint-completion-other-scope",
+        interrupt_id="sandbox-recheck-interrupt-completion-other-scope",
+    )
+    exact_current = review.create_single_use_challenge(
+        current_source,
+        namespace=current.namespace,
+        thread_id=current.thread_id,
+        checkpoint_id=current.checkpoint_id,
+        interrupt_id=current.interrupt_id,
+    )
+    private_snapshot = store.snapshot()
+    assert exact_current.challenge.challenge_ref == current.challenge_ref
+    assert tuple(
+        checkpoint.challenge_ref for checkpoint in private_snapshot.checkpoints
+    ) == (
+        initial_review_snapshot.challenges[0].challenge_ref,
+        other_scope.challenge.challenge_ref,
+        current.challenge_ref,
+    )
+
+    expanded = copy.deepcopy(baseline.model_dump(mode="python"))
+    expanded["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    restarted = SandboxRecheckCoordinator(
+        snapshot=expanded,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    staged = restarted.stage_current_review(
+        _submission(exact_current, SandboxReviewAction.CONFIRM)
+    )
+    assert staged.status == "staged"
+    assert staged.resume_attempt_ref is not None
+    assert restarted.resume_current_review(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    ).status == "applied"
+
+    exact_query = {
+        "namespace": current.namespace,
+        "test_session_id": current.test_session_id,
+        "thread_id": current.thread_id,
+        "checkpoint_id": current.checkpoint_id,
+    }
+    assert restarted.completion_eligibility(**exact_query).status == "eligible"
+    for field, wrong_value in (
+        ("namespace", "sandbox.recheck.wrong-completion-scope"),
+        ("thread_id", "sandbox-recheck-thread-wrong-completion-scope"),
+        ("checkpoint_id", "sandbox-recheck-checkpoint-wrong-completion-scope"),
+    ):
+        wrong_query = {**exact_query, field: wrong_value}
+        assert restarted.completion_eligibility(**wrong_query).status == "blocked"
+
+    after = restarted.snapshot().review_snapshot
+    assert after.sources[1] == private_snapshot.sources[1]
+    assert after.challenges[1] == private_snapshot.challenges[1]
+    assert any(
+        marker.namespace == other_scope.challenge.namespace
+        and marker.test_session_id == other_scope.challenge.test_session_id
+        and marker.thread_id == other_scope.challenge.thread_id
+        and marker.challenge_ref == other_scope.challenge.challenge_ref
+        for marker in after.current_authorities
+    )
+
+
 def test_l5_4_snapshot_and_inputs_are_isolated_immutable_copies() -> None:
     coordinator, *_ = _coordinator()
     command = _revision_command(coordinator)

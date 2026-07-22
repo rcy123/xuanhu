@@ -6,7 +6,7 @@ import hashlib
 import threading
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -40,6 +40,15 @@ _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 
 class _StrictFrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+class _ReviewSourceRecord(Protocol):
+    namespace: str
+    test_session_id: str
+    thread_id: str
+    checkpoint_id: str
+    interrupt_id: str
+    source: SandboxReviewSourceV1
 
 
 class SandboxRecheckError(ValueError):
@@ -355,6 +364,22 @@ def _subject_source_refs(
     )
 
 
+def _source_matches_revision_exactly(
+    source: _ReviewSourceRecord,
+    revision: SandboxRevisionRecordV1,
+) -> bool:
+    return (
+        source.namespace == revision.namespace
+        and source.test_session_id == revision.test_session_id
+        and source.thread_id == revision.thread_id
+        and source.checkpoint_id == revision.checkpoint_id
+        and source.interrupt_id == revision.interrupt_id
+        and source.source.safety_subject == revision.subject
+        and source.source.safety_result == revision.result
+        and source.source.explanation_result is None
+    )
+
+
 def _challenge_matches_revision(
     challenge: SandboxReviewChallengeV1,
     revision: SandboxRevisionRecordV1,
@@ -652,14 +677,7 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         sources = tuple(
             source
             for source in snapshot.review_snapshot.sources
-            if source.namespace == current.namespace
-            and source.test_session_id == current.test_session_id
-            and source.thread_id == current.thread_id
-            and source.checkpoint_id == current.checkpoint_id
-            and source.interrupt_id == current.interrupt_id
-            and source.source.safety_subject == current.subject
-            and source.source.safety_result == current.result
-            and source.source.explanation_result is None
+            if _source_matches_revision_exactly(source, current)
         )
         challenges = tuple(
             challenge
@@ -1152,9 +1170,7 @@ class SandboxRecheckCoordinator:
                 sources = tuple(
                     source
                     for source in snapshot.sources
-                    if source.source.safety_subject == current.subject
-                    and source.source.safety_result == current.result
-                    and source.source.explanation_result is None
+                    if _source_matches_revision_exactly(source, current)
                 )
                 events = tuple(
                     event
