@@ -168,3 +168,77 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 - PM 结论：**未接受 / 发布 L5-2-R1 限定返工**。保留本提交与全部证据；L5-3 不得发布。
 
 R1 合同见 [agent-refactor-l5-2-sandbox-rework-1-task.md](agent-refactor-l5-2-sandbox-rework-1-task.md)。
+
+## 11. L5-2-R1 开发交付（2026-07-22）
+
+### 11.1 状态、基线与限定范围
+
+- 状态：**R1 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R1 clean release / 执行起点 exact HEAD：`b09c94ce7da4edefea1e90b7c2f7963c02903c03`。
+- exact parent 保留失败交付 `335f7ad1f8b07535edec3420f39dea5fcef02e4c`、`ACC-20260722-022`、`DEC-20260722-016`、原任务与 R1 合同；没有 reset、覆盖或删除第 1 轮失败证据。
+- 开始时分支为 `codex/l4-5-11-context-privacy-hardening`，worktree/index clean；仓库及其父目录没有 `AGENTS.md`，全部任务/决策/handoff/accepted L5-1 authority 均 tracked。
+- R1 只修改 `app/agent_runtime/sandbox_explanation.py`、`tests/test_l5_2_sandbox_safety_explanation.py` 和本文；没有修改 R1 任务书、L5-1、PM 台账、配置、依赖、公共开关、Runtime、HTTP、DB、Gateway、Legacy、review、record/export 或 L5-3。
+
+### 11.2 三项真实 RED
+
+生产代码仍为 `335f7ad` 行为、工作区唯一变更为专项测试时，在第 8 节完整 fake 环境运行：
+
+```powershell
+uv run pytest tests/test_l5_2_sandbox_safety_explanation.py -q -rs
+```
+
+结果为退出码 `1`，`3 failed, 15 passed in 6.29s`。三个合同指定测试全部收集并按共享引用根因失败：
+
+1. `test_l5_2_port_request_nested_changes_cannot_change_allowlist_authority`：port 通过 `object.__setattr__` 改写 request nested allowlist text 后，旧 verifier 错误 attach 非 snapshot text；
+2. `test_l5_2_port_request_entries_are_identity_isolated_from_verifier_snapshot`：port 只改 request-local entry、返回原 canonical candidate 时，旧 verifier 因共享 entry 被污染而错误 unavailable；
+3. `test_l5_2_post_port_allowlist_and_source_snapshots_are_revalidated`：port 返回前改写原调用方 allowlist 时，旧实现没有 post-call allowlist revalidation，错误 attach。
+
+RED 时 HEAD 仍为 `b09c94c...`，生产模块未修改；没有 skip、xfail、条件跳过、弱化断言或先改生产代码。
+
+### 11.3 copy isolation、snapshot 与 revalidation
+
+R1 在 port 调用前建立单一 verifier authority：
+
+- source 保存完整 `canonical_result_bytes`，并把 schema/adapter version、decision、逐 issue 的 ID/rule/severity/order、decision subject digest、run envelope digest 和 result digest 冻结为 primitive invariant tuple；
+- allowlist 保存完整 canonical bytes、原 allowlist digest 和逐 entry 的 `rule_id/text` primitive invariant tuple；独立构造 `rule_id→text` verifier mapping；
+- source issue authority 独立投影为 pre-call `issue_id→rule_id` 和 source order mapping；port 返回后不从 request 或共享 nested model 重建任何 verifier authority；
+- port request 的每个 issue ref 与每个 allowlist entry 都逐字段创建为新 DTO；request nested entries 不复用 verifier allowlist entry，request-local mutation 最多改变 port 自己的临时对象；
+- port 返回后立即 strict 重解析原 source input 与原 allowlist input，并比较 canonical bytes、digest 和全部 invariants；candidate 验证和 final size gate 后、attach 前再次执行同一重验；任何差异只返回 fixed `explanation_unavailable`。
+
+专项同时证明：request-local issue ID/allowlist text 被绕过 frozen 标志改写后，原 candidate 仍按 pre-call snapshot attach；把 request-local 非 snapshot text 回显为 candidate 时 fixed unavailable；caller source/allowlist canonical bytes 不因 request alias 改变。fixed unavailable 继续无 candidate/异常 payload、cause/context 或日志，L5-1 source bytes/digest 不变。原 exact reference、intervention、64 issues、8 KiB、immutability、zero import/call 和资源边界全部保留。
+
+实现后的首次专项即为 `18 passed in 6.63s`，没有 first-GREEN 故障；增加 request-local issue-ref 断言后为 `18 passed in 6.75s`，最终交付树复跑为 `18 passed in 6.38s`。
+
+### 11.4 R1 GREEN、回归与资源证据
+
+除 calibrated full suite 只移除 `APP_ENV` 外，下列命令均使用第 8 节完整 fake 环境：
+
+| 门禁 | R1 结果 |
+|---|---|
+| L5-2/R1 专项 | 最终交付树 `18 passed in 6.38s` |
+| true-max 独立资源输出 | `1 passed in 6.48s`；指标如下 |
+| accepted L5-1 回归 | `14 passed in 13.54s` |
+| Safety 回归 | `71 passed, 3 deselected in 2.09s` |
+| L4.5-11 privacy 回归 | `76 passed in 4.67s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；仅有既有 `pymilvus.*` unused-section note |
+| L0 | 最终交付树 `131 passed in 2.09s`；前次 `131 passed in 1.97s` |
+| `uv lock --check` / `git diff --check` | lock `Resolved 84 packages in 4ms`；diff check 无错误 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1656 passed, 362 deselected in 131.32s`；唯一为既有 `test_load_with_defaults` 预期 `local`、实际 `sandbox-test` |
+| 只移除 `APP_ENV`、保留全部 fake endpoints 的校准全量 | `1657 passed, 362 deselected in 138.70s` |
+
+true-max committed test 继续使用 64 个 unique issues/rules 与 64 个 exact statements：candidate `7,926` bytes、final result `8,176` bytes；预热 20 次、正式 1,000 次，Python `3.12.12`，CPU `Intel64 Family 6 Model 142 Stepping 12, GenuineIntel`。`perf_counter_ns` p95/p99 为 `4.947 ms` / `6.397 ms`，Windows process working-set RSS 增长 `61,440 bytes`，满足 `<50 ms`、`<100 ms`、`<64 MiB`，没有放宽 64/8 KiB/资源门槛。
+
+### 11.5 受控边界、提交与回退
+
+- 全部执行仅使用 inline fixed-fictitious synthetic fixture 和第 8 节 loopback unavailable fake 值；没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、网络、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway 或外部服务。
+- 强制 `APP_ENV=sandbox-test` 与既有 defaults 测试的冲突原样保留；校准全量只移除 `APP_ENV`，不能替代精确命令事实，也没有修改合同外配置/测试制造通过。
+- 本 R1 不改变 L5-1 decision authority，不实现真实 generator/LLM、wall-clock timeout runner、Runtime、review/challenge、record/export 或 L5-3；真实临床、患者服务、商业/公开生产和人体研究继续 NO-GO。
+- 冻结前 `git diff --name-only` 精确列出三个允许文件，`git ls-files --error-unmatch` 对三者全部成功，`git diff --check` 无错误；冻结后以外部报告的 exact HEAD 和空 `git status --short` 完成 tracked/clean 证明，本文不伪造自引用 SHA。
+- 单一 R1 开发提交消息为 `fix: isolate L5-2 explanation port authority`，exact parent 必须为 `b09c94ce7da4edefea1e90b7c2f7963c02903c03`，提交只含 11.1 节三个文件。
+- Git SHA 不能在包含本文的同一提交中自引用；冻结后以 `git rev-parse HEAD`、exact parent、唯一提交消息、三文件 scope 和 clean worktree 共同报告 delivery exact HEAD，由独立 Reviewer/CI/PM 后续锚定。
+- 若 R1 独立验收失败，使用 `git revert <r1-delivery-exact-head>` 保留全部历史，不 reset 或覆盖原失败交付。
+
+---
+
+**R1 已交付，申请验收。**

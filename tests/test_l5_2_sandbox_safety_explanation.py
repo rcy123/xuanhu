@@ -486,6 +486,121 @@ def test_l5_2_result_and_nested_statements_are_immutable() -> None:
     assert isinstance(request.allowlist_entries, tuple)
 
 
+def test_l5_2_port_request_nested_changes_cannot_change_allowlist_authority() -> None:
+    source = _source_result(issue_count=1)
+    allowlist = _allowlist(source)
+    source_before = canonical_result_bytes(source)
+    allowlist_before = canonical_explanation_bytes(allowlist)
+    non_authoritative_text = "port-local text must never become verifier authority"
+
+    def mutate_request_and_echo(
+        request: SandboxExplanationPortInputV1,
+    ) -> object:
+        entry = request.allowlist_entries[0]
+        object.__setattr__(entry, "text", non_authoritative_text)
+        return {
+            "statements": (
+                {
+                    "issue_id": request.issue_refs[0].issue_id,
+                    "rule_id": request.issue_refs[0].rule_id,
+                    "text": non_authoritative_text,
+                },
+            )
+        }
+
+    result, port = _explain(source, allowlist, mutate_request_and_echo)
+
+    _assert_unavailable(result, source.result_digest)
+    assert port.calls == 1
+    assert canonical_result_bytes(source) == source_before
+    assert canonical_explanation_bytes(allowlist) == allowlist_before
+
+
+def test_l5_2_port_request_entries_are_identity_isolated_from_verifier_snapshot() -> None:
+    source = _source_result(issue_count=1)
+    allowlist = _allowlist(source)
+    candidate = _candidate(source, allowlist)
+    authoritative_text = allowlist.entries[0].text
+    source_before = canonical_result_bytes(source)
+    allowlist_before = canonical_explanation_bytes(allowlist)
+    port_local_text = "mutated request copy with no authority"
+    port_local_issue_id = "port.local.issue"
+
+    def mutate_request_but_return_snapshot_candidate(
+        request: SandboxExplanationPortInputV1,
+    ) -> object:
+        object.__setattr__(request.issue_refs[0], "issue_id", port_local_issue_id)
+        object.__setattr__(request.allowlist_entries[0], "text", port_local_text)
+        return candidate
+
+    result, port = _explain(
+        source,
+        allowlist,
+        mutate_request_but_return_snapshot_candidate,
+    )
+
+    assert result.status is SandboxExplanationStatus.ATTACHED
+    assert tuple(statement.text for statement in result.statements) == (
+        authoritative_text,
+    )
+    assert port.inputs[0].issue_refs[0].issue_id == port_local_issue_id
+    assert port.inputs[0].allowlist_entries[0].text == port_local_text
+    assert port.inputs[0].issue_refs[0] is not source.issues[0]
+    assert port.inputs[0].allowlist_entries[0] is not allowlist.entries[0]
+    assert canonical_result_bytes(source) == source_before
+    assert canonical_explanation_bytes(allowlist) == allowlist_before
+
+
+def test_l5_2_post_port_allowlist_and_source_snapshots_are_revalidated() -> None:
+    source = _source_result(issue_count=1)
+    allowlist = _allowlist(source)
+    candidate = _candidate(source, allowlist)
+    source_before = canonical_result_bytes(source)
+
+    def mutate_original_allowlist(
+        request: SandboxExplanationPortInputV1,
+    ) -> object:
+        del request
+        object.__setattr__(
+            allowlist.entries[0],
+            "text",
+            "post-call caller allowlist mutation",
+        )
+        return candidate
+
+    allowlist_changed, allowlist_port = _explain(
+        source,
+        allowlist,
+        mutate_original_allowlist,
+    )
+
+    _assert_unavailable(allowlist_changed, source.result_digest)
+    assert allowlist_port.calls == 1
+    assert canonical_result_bytes(source) == source_before
+
+    source = _source_result(issue_count=1)
+    allowlist = _allowlist(source)
+    candidate = _candidate(source, allowlist)
+    allowlist_before = canonical_explanation_bytes(allowlist)
+
+    def mutate_original_source(
+        request: SandboxExplanationPortInputV1,
+    ) -> object:
+        del request
+        object.__setattr__(source, "decision", SandboxSafetyDecision.ALLOW)
+        return candidate
+
+    source_changed, source_port = _explain(
+        source,
+        allowlist,
+        mutate_original_source,
+    )
+
+    _assert_unavailable(source_changed, source.result_digest)
+    assert source_port.calls == 1
+    assert canonical_explanation_bytes(allowlist) == allowlist_before
+
+
 def test_l5_2_source_result_and_digest_are_byte_identical_across_all_paths() -> None:
     source = _source_result(issue_count=2)
     allowlist = _allowlist(source)

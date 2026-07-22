@@ -247,12 +247,80 @@ def _parse_model[ModelT: BaseModel](
         return None
 
 
-def _source_is_unchanged(source_input: object, expected_bytes: bytes) -> bool:
+type _SourceInvariants = tuple[
+    str,
+    str,
+    SandboxSafetyDecision,
+    tuple[tuple[str, str, SandboxSafetySeverity, int], ...],
+    str,
+    str,
+    str,
+]
+type _AllowlistInvariants = tuple[str, tuple[tuple[str, str], ...]]
+
+
+def _source_invariants(source: SandboxSafetyResultV1) -> _SourceInvariants:
+    return (
+        source.sandbox_schema_version,
+        source.adapter_version,
+        source.decision,
+        tuple(
+            (
+                issue.issue_id,
+                issue.rule_id,
+                issue.severity,
+                issue.execution_order,
+            )
+            for issue in source.issues
+        ),
+        source.decision_subject_digest,
+        source.run_envelope_digest,
+        source.result_digest,
+    )
+
+
+def _allowlist_invariants(
+    allowlist: SandboxExplanationAllowlistBundleV1,
+) -> _AllowlistInvariants:
+    return (
+        allowlist.allowlist_digest,
+        tuple((entry.rule_id, entry.text) for entry in allowlist.entries),
+    )
+
+
+def _source_is_unchanged(
+    source_input: object,
+    expected_bytes: bytes,
+    expected_invariants: _SourceInvariants,
+) -> bool:
     reparsed = _parse_model(SandboxSafetyResultV1, source_input)
     if reparsed is None:
         return False
     try:
-        return canonical_result_bytes(reparsed) == expected_bytes
+        return (
+            canonical_result_bytes(reparsed) == expected_bytes
+            and _source_invariants(reparsed) == expected_invariants
+        )
+    except Exception:
+        return False
+
+
+def _allowlist_is_unchanged(
+    allowlist_input: object,
+    expected_bytes: bytes,
+    expected_invariants: _AllowlistInvariants,
+) -> bool:
+    reparsed = _parse_model(
+        SandboxExplanationAllowlistBundleV1,
+        allowlist_input,
+    )
+    if reparsed is None:
+        return False
+    try:
+        return (
+            canonical_explanation_bytes(reparsed) == expected_bytes
+            and _allowlist_invariants(reparsed) == expected_invariants
+        )
     except Exception:
         return False
 
@@ -291,23 +359,27 @@ class SandboxSafetyExplanationAdapter:
             return _unavailable(source_digest)
 
         source_bytes = canonical_result_bytes(source)
-        source_invariants = (
-            source.decision,
-            source.issues,
-            source.decision_subject_digest,
-            source.result_digest,
-        )
+        source_invariants = _source_invariants(source)
         if len(source.issues) > MAX_EXPLANATION_ISSUES or not source.issues:
             return _unavailable(source_digest)
 
         allowlist = _parse_model(SandboxExplanationAllowlistBundleV1, allowlist_input)
         if allowlist is None:
             return _unavailable(source_digest)
+        allowlist_bytes = canonical_explanation_bytes(allowlist)
+        allowlist_invariants = _allowlist_invariants(allowlist)
+        verifier_text_by_rule = dict(allowlist_invariants[1])
         expected_rule_ids = frozenset(issue.rule_id for issue in source.issues)
-        actual_rule_ids = frozenset(entry.rule_id for entry in allowlist.entries)
+        actual_rule_ids = frozenset(verifier_text_by_rule)
         if expected_rule_ids != actual_rule_ids:
             return _unavailable(source_digest)
 
+        issue_rule_by_id = {
+            issue.issue_id: issue.rule_id for issue in source.issues
+        }
+        source_order = {
+            issue.issue_id: position for position, issue in enumerate(source.issues)
+        }
         request = SandboxExplanationPortInputV1(
             result_digest=source.result_digest,
             decision=source.decision,
@@ -319,21 +391,28 @@ class SandboxSafetyExplanationAdapter:
                 )
                 for issue in source.issues
             ),
-            allowlist_entries=allowlist.entries,
+            allowlist_entries=tuple(
+                SandboxExplanationAllowlistEntryV1(
+                    rule_id=rule_id,
+                    text=text,
+                )
+                for rule_id, text in allowlist_invariants[1]
+            ),
         )
         try:
             candidate_input = self._port.generate(request)
         except Exception:
             return _unavailable(source_digest)
 
-        if not _source_is_unchanged(source_input, source_bytes):
-            return _unavailable(source_digest)
-        if (
-            source.decision,
-            source.issues,
-            source.decision_subject_digest,
-            source.result_digest,
-        ) != source_invariants:
+        if not _source_is_unchanged(
+            source_input,
+            source_bytes,
+            source_invariants,
+        ) or not _allowlist_is_unchanged(
+            allowlist_input,
+            allowlist_bytes,
+            allowlist_invariants,
+        ):
             return _unavailable(source_digest)
 
         candidate = _parse_model(SandboxExplanationCandidateV1, candidate_input)
@@ -344,22 +423,17 @@ class SandboxSafetyExplanationAdapter:
         if len(candidate.statements) > len(source.issues):
             return _unavailable(source_digest)
 
-        issue_by_id = {issue.issue_id: issue for issue in source.issues}
-        source_order = {
-            issue.issue_id: position for position, issue in enumerate(source.issues)
-        }
-        text_by_rule = {entry.rule_id: entry.text for entry in allowlist.entries}
         statement_issue_ids = tuple(
             statement.issue_id for statement in candidate.statements
         )
         if len(statement_issue_ids) != len(set(statement_issue_ids)):
             return _unavailable(source_digest)
         for statement in candidate.statements:
-            source_issue = issue_by_id.get(statement.issue_id)
+            source_rule_id = issue_rule_by_id.get(statement.issue_id)
             if (
-                source_issue is None
-                or statement.rule_id != source_issue.rule_id
-                or text_by_rule.get(statement.rule_id) != statement.text
+                source_rule_id is None
+                or statement.rule_id != source_rule_id
+                or verifier_text_by_rule.get(statement.rule_id) != statement.text
             ):
                 return _unavailable(source_digest)
 
@@ -384,7 +458,15 @@ class SandboxSafetyExplanationAdapter:
         )
         if len(canonical_explanation_bytes(result)) > MAX_EXPLANATION_BYTES:
             return _unavailable(source_digest)
-        if not _source_is_unchanged(source_input, source_bytes):
+        if not _source_is_unchanged(
+            source_input,
+            source_bytes,
+            source_invariants,
+        ) or not _allowlist_is_unchanged(
+            allowlist_input,
+            allowlist_bytes,
+            allowlist_invariants,
+        ):
             return _unavailable(source_digest)
         return result
 
