@@ -161,3 +161,15 @@ $env:UV_OFFLINE='1'
 ---
 
 **已交付，申请验收。**
+
+## 10. 项目经理第 1 轮独立验收（2026-07-22）
+
+- 冻结交付：`99a1fb822a3963a9f324232e3be465c6835694b9`；exact parent `5c54b038dff9eefc060efbdbe8a5356279b4ea7f`；只含原合同三个文件；Review/CI 前后 clean。
+- 独立 CI：专项 `35 passed`；L5-2 `18`、L5-1 `14`、Safety `71 passed, 3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/scope/tracked/clean 通过；校准全量 `1692 passed, 362 deselected`；强制 fake env 仅既有 APP_ENV defaults 冲突。
+- 独立 Reviewer：P0=0、P1=3、P2=1、P3=0，结论 `rework required`。
+- P1：`now == expires_at` 仍可 staged/applied；restart snapshot 的 event action 可在旧 event ref 下从 reject 改 confirm；新 authority 发布后旧 checkpoint 仍 eligible。
+- P2：注入的 `SandboxReviewError` 可经 bare re-raise 保留 cause/context，不满足 fixed chainless contract。
+- PM 固定 synthetic 探针逐项复现；自动化全绿不能替代未覆盖的边界语义。
+- PM 结论：**未接受 / 发布 L5-3-R1 限定返工**（`ACC-20260722-025`、`DEC-20260722-018`）。保留本提交与全部证据；L5-4 不得发布。
+
+R1 合同见 [agent-refactor-l5-3-sandbox-rework-1-task.md](agent-refactor-l5-3-sandbox-rework-1-task.md)。
