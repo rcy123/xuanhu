@@ -311,3 +311,11 @@ production 保持 `23a561a` 行为、工作区唯一 production 变化尚未开�
 - Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
 - 若 R3 验收失败，以单一 R3 delivery 执行 `git revert <r3-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+## 15. L5-4-R3 独立验收（未通过）
+
+- 冻结 R3 delivery：`b7cbbffd76a11646ffe9209d1b5a8ec610720358`；exact parent `f35d58ca24f8f8f7d4e6e4ebd8a180915d69e81a`；只修改三个允许文件；Review/CI 前后 clean。
+- 独立 CI：专项 `43`、L5-3 `59`、L5-2 `18`、L5-1 `14`、Safety `71/3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/AST/diff/scope/tracked/clean 通过；calibrated full `1759 passed, 362 deselected`；forced full 首次除 defaults 外有一次 L3 deadline code 偏差，精确节点 5 次与完整 forced full 复验均未复现，复验为 `1 failed, 1758 passed, 362 deselected`，首次证据保留。
+- 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R3 same-scope projection/current 三项目标与 R2/R1 历史 findings 均 resolved/保持关闭。
+- 剩余 P2：restore current-source 查询已限定 exact scope，但 completion consumer 仍按全 store subject/result 计数；other-scope 同内容 source 存在时，exact current review 已 applied confirm 后 completion 仍错误 blocked。
+- PM 六项定向 `6 passed`，随后独立复现 `applied=applied; completion=blocked; matching_sources=2`。PM 结论：**未接受 / 发布 L5-4-R4 限定返工**（`ACC-20260722-035`、`DEC-20260722-028`）。L5 仍为 3/4，L6 未开始。
