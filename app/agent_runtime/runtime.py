@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -21,6 +22,8 @@ from app.core.exceptions import (
 )
 from app.core.gateway import ModelGatewayClient, StructuredChatResponse
 
+from .context import contains_model_input_identity_sequence
+from .intake_verifier import INTAKE_AGENT_NAME
 from .specs import (
     AgentSpec,
     RunArtifact,
@@ -354,6 +357,26 @@ class AgentRuntime:
             return None, None, RuntimeErrorBase(RuntimeErrorCode.OUTPUT_SCHEMA_INVALID, "output schema invalid")
 
     async def _call_gateway(self, agent_spec: AgentSpec, run_spec: RunSpec, messages: list[dict[str, Any]]) -> Any:
+        if agent_spec.name == INTAKE_AGENT_NAME:
+            rejected = False
+            contents: list[str] = []
+            try:
+                for message in messages:
+                    if not isinstance(message, Mapping):
+                        raise TypeError
+                    content = message["content"]
+                    if not isinstance(content, str):
+                        raise TypeError
+                    contents.append(content)
+                rejected = contains_model_input_identity_sequence(tuple(contents))
+            except Exception:
+                rejected = True
+            if rejected:
+                raise RuntimeErrorBase(
+                    RuntimeErrorCode.MODEL_INPUT_PRIVACY_VIOLATION,
+                    "model input privacy guard rejected request",
+                ) from None
+
         kwargs: dict[str, Any] = {
             "model": agent_spec.model_policy.model,
             "temperature": agent_spec.model_policy.temperature,
