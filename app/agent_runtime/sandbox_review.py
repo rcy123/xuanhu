@@ -843,6 +843,15 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
         if len(bound) != allowed_count:
             return False
 
+    if tuple(challenge.challenge_ref for challenge in challenges) != tuple(
+        transition.challenge_ref
+        for transition in transitions
+        if transition.resume_attempt_ref is None
+        and transition.from_state == "decided"
+        and transition.to_state == "review_pending"
+    ):
+        return False
+
     if tuple(event.resume_attempt_ref for event in events) != tuple(
         transition.resume_attempt_ref
         for transition in transitions

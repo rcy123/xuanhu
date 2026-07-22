@@ -502,3 +502,79 @@ RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfai
 - PM 结论：**R4 未接受 / 发布 L5-3-R5**（`ACC-20260722-029`、`DEC-20260722-022`）。R5 以全部显式 sequenced projections 为根因边界；不为无 sequence 的 keyed collections 发明顺序。保留前五次 delivery 和全部证据；L5-4 不得发布。
 
 R5 合同见 [agent-refactor-l5-3-sandbox-rework-5-task.md](agent-refactor-l5-3-sandbox-rework-5-task.md)。
+
+## 19. L5-3-R5 开发交付（2026-07-22）
+
+### 19.1 状态、基线与限定范围
+
+- 状态：**R5 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R5 clean release / exact parent：`ef8139dee1320860cf8c924ecf2c53de4e860925`；其 parent 为失败 R4 delivery `1f8503e0c28dd19dcc48b6e63b3e5103ce9adeda`。原 delivery、R1～R4、五轮 finding、`ACC-20260722-025/026/027/028/029`、`DEC-20260722-018/019/020/021/022` 与 R1～R5 任务书全部保留，没有 reset、覆盖或删除失败历史。
+- R5 只修改原三个文件：`app/agent_runtime/sandbox_review.py`、`tests/test_l5_3_sandbox_reviewer_interrupt_resume.py` 与本文；没有修改 R5 任务书、PM 台账、accepted L5-1/L5-2、配置、依赖、Runtime、Legacy、HTTP/DB/Gateway 或 L5-4。
+
+### 19.2 指定先行回归与真实 RED
+
+在 production 仍为 `1f8503e0c28dd19dcc48b6e63b3e5103ce9adeda` 行为、worktree 唯一修改为指定 regression 时，以第 8 节完整 fake env 与 `UV_OFFLINE=1` 运行专项。exact HEAD 仍为 `ef8139dee1320860cf8c924ecf2c53de4e860925`，production diff 为空；结果为退出码 `1`，`1 failed, 58 passed in 2.82s`，59 项全部收集：
+
+- `test_l5_3_restart_snapshot_rejects_initial_transition_order_opposite_issue_order` 在同一 store 依次 issue 两个 pending challenges A/B，保持 sources/challenges/checkpoints 原样，只反转两条 `decided -> review_pending` transitions、按新位置重编号 sequence 并重算两个 transition refs；R4 restore 实际 `DID NOT RAISE SandboxReviewError`。
+
+RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfail、条件绕过、依赖 stale ref 或弱化原 58 项。实现后的首次专项为 `59 passed in 2.46s`。
+
+### 19.3 Issue/initial-transition append projection P2 closure
+
+- snapshot 继续先要求 sources/checkpoints 的 `issue_sequence` 从零连续，并以 strict zip 验证 sources/challenges/checkpoints 同长度、同位置、同 scope、同 checkpoint/interrupt 与 source/challenge refs；
+- 每个 challenge 继续精确一条 `resume_attempt_ref is None`、`decided -> review_pending`、`observed_at == issued_at` 的 initial transition；transition sequence 连续、derived refs、uniqueness 与逐 challenge cardinality 全部先保持；
+- 上述逐记录和逐 challenge 校验完成后，restore 精确比较 challenge-order refs 与 transition log 中全部 initial-transition challenge refs 的 tuple；反转 initial transitions 后即使同步重编号 sequence 和重算 refs，仍 fixed chainless reject；
+- R4 的 event-order 到 `review_applied` transition-order attempt tuple 等式原样保留，失败继续由既有 create/restore fixed `SandboxReviewError` 边界归一化且无 cause/context。
+
+### 19.4 Explicit sequenced collection audit
+
+对 `SandboxReviewStoreSnapshotV1` 与 store lock 内全部 append/replace 路径的显式审计结论如下：
+
+| Collection | 顺序 authority | 跨 collection 投影 |
+|---|---|---|
+| `sources/challenges/checkpoints` | source/checkpoint 连续 `issue_sequence`，三者 strict zip/cross-reference 固定同一 issue order | R5 精确投影到 `decided -> review_pending` initial transitions 的 challenge-ref tuple |
+| `events` | 连续 `event.sequence`，live apply 在 store lock 内 append | R4 精确投影到 `review_applied` transitions 的 attempt-ref tuple |
+| `transitions` | 连续 `transition.sequence`，承担 issue/stage/apply 的 append-only master order | 接收上述 issue/apply 两项投影；逐 challenge 的 stage/apply 状态、连续三 transition 与 cardinality 仍独立验证 |
+| `attempts` | 无 `sequence`；按唯一 `resume_attempt_ref` 寻址并可原位更新 state | keyed unordered；不新增排序或位置 authority |
+| `current_authorities` | 按唯一 scope key 寻址并原位替换；其 `issue_sequence` 是指向 latest checkpoint 的 authority 值，不是 current collection 自身的 append sequence | keyed unordered；继续使用 scope uniqueness/latest-marker cross-reference，不新增排序 |
+
+因此全部有合同依据的跨 collection 显式序列映射恰为 issue projection 与 apply projection。R5 没有为 attempts/current-authorities 发明顺序，也没有按时间、ref 或对象内容排序任何 collection。
+
+### 19.5 非全局单调 fake clock 与既有不变量
+
+新 regression 的合法前置历史在较晚 fake time issue A，随后 clock 回拨 100 秒再 issue B；`B.issued_at < A.issued_at`，但正常 A/B live snapshot 仍可逐字 restore。issue 顺序只取自 store-lock append sequence，不比较跨 challenge/event/attempt 时间戳，也不要求 wall/fake clock 全局单调。
+
+R4 event projection、R3 live/restore causal predicate 与 cross-attempt stage/apply sequence、R2 full sealed-attempt binding/cardinality/current authority、R1/初始 findings，以及 32-thread 精确 `1 applied + 31 replayed_or_conflict` 全部保留。本修复不实现 L5-4 stale 写入、full safety recheck 或任何生产 Runtime/DB/HTTP 集成。
+
+### 19.6 R5 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部命令使用第 8 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R5 结果 |
+|---|---|
+| L5-3/R5 专项 | 最终交付树 `59 passed in 2.57s`；实现后前次 `59 passed in 2.46s` |
+| 独立 AST 边界 | `1 passed, 58 deselected in 2.51s` |
+| accepted L5-2 回归 | `18 passed in 9.56s` |
+| accepted L5-1 回归 | `14 passed in 16.76s` |
+| Safety 回归 | `71 passed, 3 deselected in 3.20s` |
+| L4.5-11 privacy 回归 | `76 passed in 7.05s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.95s` |
+| `uv lock --check` | `Resolved 84 packages in 5ms` |
+| diff/scope/tracked | 提交前最终审计精确限定为 19.1 节三个 tracked 文件，working/cached diff check 均须无错误 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1715 passed, 362 deselected in 130.67s`；唯一失败为既有 `test_load_with_defaults` 预期 `local`、实际为强制值 `sandbox-test` |
+| 只移除 `APP_ENV` 的校准全量 | `1716 passed, 362 deselected in 131.46s` |
+
+全部执行没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway、网络或外部服务。
+
+### 19.7 R5 提交、限制与回退
+
+- 单一 R5 开发提交消息为 `fix: align L5-3 issue append order`，exact parent 必须为 `ef8139dee1320860cf8c924ecf2c53de4e860925`，提交只含 19.1 节三个原允许文件。
+- Git SHA 不能在包含本文的同一提交中自引用；delivery exact HEAD 由提交后外部报告的 `git rev-parse HEAD`、上述 parent/message、三文件 scope 与 clean worktree 共同冻结，后续由独立 Reviewer/CI/PM 锚定验收。
+- in-memory snapshot integrity 仍是本地 reference-store structural/causal integrity，不是外部持久化、加密签名、数据库 transaction 或生产 durability；真实 Runtime/identity/DB/HTTP 与 L5-4 full recheck 仍未实现、未发布。
+- 若 R5 独立验收失败，使用 `git revert <r5-delivery-exact-head>` 保留历史，不 reset 或覆盖前五轮失败交付与 accepted L5-1/L5-2。
+
+---
+
+**R5 已交付，申请验收。**

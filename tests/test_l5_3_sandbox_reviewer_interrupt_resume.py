@@ -1157,6 +1157,54 @@ def test_l5_3_restart_snapshot_rejects_event_order_opposite_review_applied_order
     assert raised.value.__context__ is None
 
 
+def test_l5_3_restart_snapshot_rejects_initial_transition_order_opposite_issue_order() -> None:
+    clock = _FakeClock(value=2_000_000_100)
+    coordinator, store, *_ = _coordinator(clock=clock)
+    first_delivery = _issue(coordinator)
+
+    clock.value = first_delivery.challenge.issued_at - 100
+    second_delivery = coordinator.create_single_use_challenge(
+        _accepted_source(domain_state_version=8),
+        namespace=_NAMESPACE,
+        thread_id=_THREAD_ID,
+        checkpoint_id="sandbox-checkpoint-002",
+        interrupt_id="sandbox-interrupt-002",
+    )
+
+    live_snapshot = store.snapshot()
+    assert tuple(
+        challenge.challenge_ref for challenge in live_snapshot.challenges
+    ) == (
+        first_delivery.challenge.challenge_ref,
+        second_delivery.challenge.challenge_ref,
+    )
+    assert (
+        live_snapshot.challenges[1].issued_at
+        < live_snapshot.challenges[0].issued_at
+    )
+    assert (
+        SandboxInMemoryReviewStore(snapshot=live_snapshot).snapshot()
+        == live_snapshot
+    )
+
+    tampered = live_snapshot.model_dump(mode="python")
+    reversed_initial = tuple(reversed(tampered["transitions"]))
+    for sequence, transition in enumerate(reversed_initial):
+        transition["sequence"] = sequence
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+    tampered["transitions"] = reversed_initial
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=tampered)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction() -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)
