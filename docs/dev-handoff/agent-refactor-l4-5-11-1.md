@@ -295,3 +295,50 @@ uv run pytest --override-ini addopts= -q -m "not integration" tests/test_l4_5_11
 ---
 
 **已返工交付，申请重新验收。**
+
+## 13. 项目经理 R1 重新验收结论
+
+| 项目 | 结果 |
+|---|---|
+| 验收日期 | 2026-07-22 |
+| R1 合同提交 | `508980d9e9d8f6073811a689d85694fb91d49390` |
+| R1 交付提交 | `140262d944e16cc6043124d7537794bb46cd7960` |
+| 父提交核对 | `140262d^ == 508980d`，通过 |
+| 范围与工作区 | 相对 R1 合同只修改 3 个允许文件；全部 tracked；验收开始和结束均为 exact HEAD、clean worktree；`git diff --check` 通过 |
+| 独立 Code Review | **No findings**（P0/P1/P2/P3 均无） |
+| 独立 CI | 全部通过 |
+| 结论 | **通过 / accepted** |
+
+### 13.1 独立 Review 与项目经理探针
+
+未参与实现的 Reviewer 在冻结提交 `140262d` 上只读核对实际 diff 和合同，并独立复现：
+
+- ASCII/全角数字及 `X/x/Ｘ/ｘ` 的 68 个身份证单一切分组合全部命中且逐 message 等长遮罩；
+- 手机号样式前缀被边界拒绝时，同起点 18 位身份证仍按最长候选命中；多个不重叠候选保持确定性；
+- 身份证末位可跨零个、一个或多个连续 `B`；
+- tokenization、matcher 和 mask/坐标回写故障均收敛为固定 `ContextBuilderError`，`cause/context is None`，日志无固定虚构原值；
+- 原始 DTO、message ID、顺序、逐 message 长度和 grounding offset 所有权不变。
+
+Reviewer 结论为 no findings。项目经理另以 Unicode code point 构造固定虚构输入，复验 4 个同起点变体、68 个单一切分、连续多 `B` 和 3 个 matcher/mask 故障注入，全部通过。最初使用 PowerShell 管道直接传入 `█`/全角字面量的探针出现编码伪失败；改为 code point 构造后与专项测试、Reviewer 结果一致，该伪失败不属于产品缺陷。
+
+### 13.2 独立 CI 证据
+
+独立 CI 子 Agent 在同一冻结 exact commit 上只读运行：
+
+| 门禁 | 结果 |
+|---|---|
+| R1 专项 | `53 passed` |
+| Context Builder / Intake 相关回归 | `65 passed, 22 deselected` |
+| Ruff | 通过 |
+| mypy | 2 个生产文件通过 |
+| L0 文档契约 | `131 passed` |
+| 全量非集成 | `1602 passed, 362 deselected` |
+| diff / scope / tracked / exact HEAD / clean | 全部通过 |
+
+### 13.3 裁决与状态迁移
+
+- `L4.5-11-1-R1`：已交付 → **accepted / 已关闭**；
+- `L4.5-11-1`：返工中 → **accepted / 已完成**；
+- `R-MATCH-001`、`R-FAILCLOSED-001`：以 `140262d`、独立 Review、独立 CI 和项目经理探针作为关闭证据；
+- `AR-B-031` 继续保持 P1 打开：Runtime 最终发送前门禁尚未实现；
+- 下一动作仅为项目经理基于已验收 v2.2 方案和当前调用链发布 bounded `L4.5-11-2`；本结论本身不授权未发布合同的实现。
