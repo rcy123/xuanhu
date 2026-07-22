@@ -513,3 +513,12 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 结论：**通过 / accepted**（`ACC-20260722-039`、`DEC-20260722-032`）；再次关闭 `R-L5-RECHECK-001`，L5-1～L5-4 恢复 4/4 individually accepted。
 - 后续：本节不关闭 L5 整体。必须从包含本 acceptance 事务的新 clean exact HEAD 调用新的最终组合 Reviewer、独立 CI 与 PM 探针，不得复用 `ACC-20260722-038` 失败轮结果；L6 未发布、未开始。
 - 边界：固定虚构/合成、offline unit/in-memory reference composition 不变；不授权 Runtime、HTTP、DB、Gateway、真实 clinical/patient/public production。
+
+## 23. L5 最终组合第 2 轮（未通过，L5-3/L5-4 reopened）
+
+- 冻结 exact HEAD：`4ffbaff7374bd6a13b1a9d058e9c920709593119`；R6 delivery `f6b790d` 与单项 acceptance 全部保留；工作区前后 clean。
+- 最终独立 CI：L5-1/2/3/4 `14/18/59/50`、组合 `141`、calibrated full `1766 passed, 362 deselected`；forced full 只含既有 defaults 差异；35 个核心 required paths 全部 tracked。
+- PM 跨层：`13 passed`；常规 live composition、并发、完整重评估、失效/待确认、离线边界与默认关闭均保持。
+- 最终 Reviewer：P0=0、P1=0、P2=1、P3=0。把真实 initial applied review snapshot 的固定 v1 整体协调为 v2并重派生全部 L5-3 refs 后，L5-3 store 与 L5-4 initial-only coordinator 均接受；R6 child==parent guard 在无 child 时不会执行。
+- 结论：最终组合 **未通过**（`ACC-20260722-040`、`DEC-20260722-033`）；R5/R6 单项 acceptance 历史保留，但 L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
+- R7 所有权：修复必须位于 L5-3 shared snapshot restore；L5-4 production 不增加重复条件，只新增 composition 回归证明下层拒绝向上传递。L6 未发布、未开始。

@@ -587,3 +587,13 @@ R4 event projection、R3 live/restore causal predicate 与 cross-attempt stage/a
 - PM 定向复验：同 exact HEAD 六项 `6 passed in 1.96s`，覆盖两类顺序投影、live/restart 时间一致性、复用 checkpoint current 定位与 32 并发；运行后 HEAD 不变且 clean。
 - 结论：**L5-3 与 R5 accepted**（`ACC-20260722-030`、`DEC-20260722-023`）；`R-L5-RESUME-001` 关闭；L5 为 3/4 accepted。
 - 限制：只接受个人学习、固定虚构/合成数据、离线单元和 in-memory sandbox。L5-4 尚未发布；Runtime、HTTP、容器、部署、DB、Gateway、Legacy、真实临床/患者/公开生产继续 NO-GO，L6 未开始。
+
+## 21. L5 最终组合第 2 轮（未通过，L5-3 reopened）
+
+- 冻结 exact HEAD：`4ffbaff7374bd6a13b1a9d058e9c920709593119`；工作区前后 clean；`ACC-20260722-039` 与 R6 delivery 均为祖先。
+- 最终独立 CI：L5 四层组合 `141 passed`，calibrated full `1766 passed, 362 deselected`；forced full 仅既有 defaults 差异；全部相邻、静态、scope/tracked/exact/clean 门禁通过。
+- PM 跨层：`13 passed`，证明正常 live 路径和组合回归保持。
+- 最终 Reviewer：P0=0、P1=0、P2=1、P3=0。协调修改一个真实 initial applied review snapshot 的 schema v1→v2并重派生 challenge/attempt/event/transition refs、checkpoint/current 后，`SandboxInMemoryReviewStore` 仍接受；该状态不是当前 live issue 路径可产生。
+- 根因：live issue 使用模块固定 `_REVIEW_SCHEMA_VERSION`，但 shared snapshot restore 只校验记录彼此一致，没有校验 challenge 使用唯一受支持版本。
+- 结论：最终组合 **未通过**（`ACC-20260722-040`、`DEC-20260722-033`）；`ACC-030` 历史单项结论保留，但 L5-3 与 `R-L5-RESUME-001` 重新打开；shared R7 已发布。
+- 边界：R7 只在 L5-3 shared restore 持有 fixed schema authority，并以 L5-3/L5-4 两层回归证明；不增加迁移、多版本兼容、Runtime 或外部能力，L6 未开始。
