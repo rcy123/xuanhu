@@ -366,3 +366,11 @@ production 保持 `b7cbbff` 行为时，先新增一个独立端到端回归：�
 - Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
 - 若 R4 验收失败，以单一 R4 delivery 执行 `git revert <r4-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+## 17. L5-4-R4 独立验收（未通过）
+
+- 冻结 R4 delivery：`c71832b2e1f188c9acc5ebd3d4f76ca1a38a8e43`；exact parent `d27ee992f691f65fa62e23b645f3b1f2112e9d2a`；只修改三个允许文件；Review/CI 前后 clean。
+- 独立 CI：专项 `44`、L5-3 `59`、L5-2 `18`、L5-1 `14`、Safety `71/3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/AST/diff/scope/tracked/clean 通过；forced full `1 failed, 1759 passed, 362 deselected` 且仅 defaults 差异；calibrated full `1760 passed, 362 deselected`。
+- 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R4 exact-current completion 主 finding 与 R3～R1 历史 findings 均关闭/保持关闭。
+- 剩余 P2：terminal absence 仍调用全 store subject/authority 查询；`review_setup_failed` terminal 添加合法 other-scope 同内容 source/challenge 后，same-scope parent marker 与 outer chain 不变，restore 仍错误拒绝。PM 独立复现 `terminal=review_setup_failed; restore=rejected`。
+- PM 结论：**未接受 / 发布 L5-4-R5 authority qualification matrix 架构收敛**（`ACC-20260722-036`、`DEC-20260722-029`）。同根因连续两轮，停止症状补丁；初始～R4 失败历史全部保留；L5 仍为 3/4，L6 未开始。
