@@ -259,3 +259,13 @@ subject 现内嵌 frozen/strict `SandboxSyntheticManifestV1` 和 `SandboxIdentif
 ---
 
 **R1 已交付，申请验收。**
+
+## 12. 项目经理 R1 最终验收（2026-07-22）
+
+- 冻结交付：`461487e03d6529dfacbc7f3f1ff1fe919e8633d5`；exact parent/merge-base `53cbb9cad9bbd4630f4259409708966df4369e4d`；只修改本 handoff 第 8 节三个文件；Review/CI/PM 前后 clean。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0。原 pair-wise determinism、manifest、true-max 三项 findings 全部关闭；authority/digest/stale/no-case/size/manifest fail-closed 和 zero-call 边界独立复现。
+- 独立 CI：专项 `14 passed`，Safety `71 passed, 3 deselected`，L4.5-11 privacy `76 passed`，Ruff/mypy/L0/lock/diff/scope/tracked/clean 通过；校准全量 `1639 passed, 362 deselected`。
+- PM 定向探针：同一 exact HEAD 六项 `6 passed`；true-max 为 64 items + 256 issues，p95 `7.042 ms`、p99 `8.794 ms`、RSS `+790,528 B`。
+- 强制 `APP_ENV=sandbox-test` 的精确全量唯一 defaults 冲突原样保留；只移除 `APP_ENV`、保持全部 fake endpoints 的校准全量证明代码无回归，不修改合同外配置/测试。
+- 结论：**L5-1 与 L5-1-R1 accepted**；关闭 `R-L5-DET-001`、`R-L5-EVID-001`；允许项目经理另行发布 L5-2，当前事务不实施 L5-2。
+- 边界：这是个人学习、非临床、离线 synthetic sandbox 工程验收，不是临床、法律、隐私、伦理、监管或生产批准；G1～G6、EXT-001/EXT-002 和真实/公开用途 NO-GO 不变。
