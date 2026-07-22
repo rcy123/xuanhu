@@ -348,3 +348,12 @@ eligibility 在 lock 内先按 `(namespace, test_session_id, thread_id)` 取得�
 ---
 
 **R2 已交付，申请验收。**
+
+## 14. 项目经理 R2 独立验收（2026-07-22）
+
+- delivery `03ba9104a9d79924fb4d1241429161a8d80f989e` 的 exact parent、三个文件 scope、tracked 与 clean 均正确。
+- 独立 CI 通过合同校准：L5-3 `55 passed`；L5-2 `18`；L5-1 `14`；Safety `71/3 deselected`；privacy `76`；L0 `131`；Ruff/mypy/lock/AST/diff 全绿。强制全量 `1 failed, 1711 passed, 362 deselected` 且唯一为既有 `APP_ENV` defaults 冲突；校准全量 `1712 passed, 362 deselected`。
+- 独立 Reviewer 确认 R1 四项与原 expiry/event/current/chainless findings 均关闭，但发现 P1=1、P2=1：live stage/apply 缺 predecessor lower bound，可生成自身 restore 拒绝的历史；restore 仍接受 challenge applied 后才 stage loser attempt 的不可达 sequence。
+- PM 结论：**R2 未接受 / 发布 L5-3-R3**（`ACC-20260722-027`、`DEC-20260722-020`）。保留前三次 delivery、全部 RED/GREEN、CI 与 Review 证据；L5-4 不得发布。
+
+R3 合同见 [agent-refactor-l5-3-sandbox-rework-3-task.md](agent-refactor-l5-3-sandbox-rework-3-task.md)。
