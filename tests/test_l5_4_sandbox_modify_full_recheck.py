@@ -315,6 +315,52 @@ def _refresh_mapping_ref(
     return refreshed
 
 
+def _rederive_single_child_command_chain(bad: dict[str, object]) -> None:
+    revisions = bad["revisions"]
+    runs = bad["runs"]
+    invalidations = bad["invalidations"]
+    receipts = bad["receipts"]
+    parent = revisions[0]
+    child = revisions[1]
+    run = runs[0]
+    bundle = SandboxRuleBundleV1.model_validate(child["rule_bundle"], strict=True)
+    subject = SandboxSafetySubjectV1.model_validate(child["subject"], strict=True)
+    reconstructed = SandboxRevisionCommandV1(
+        expected_current_revision_ref=parent["revision_ref"],
+        command_id=run["command_id"],
+        run_id=run["run_id"],
+        trace_id=run["trace_id"],
+        candidate_subject=subject,
+        rule_bundle=bundle,
+        checkpoint_id=child["checkpoint_id"],
+        interrupt_id=child["interrupt_id"],
+    )
+    command_digest = hashlib.sha256(canonical_json_bytes(reconstructed)).hexdigest()
+    child["accepted_command_digest"] = command_digest
+    child_ref = _refresh_mapping_ref(
+        child,
+        prefix="sandbox-recheck-revision-",
+        field="revision_ref",
+    )
+    run["command_digest"] = command_digest
+    run["new_revision_ref"] = child_ref
+    _refresh_mapping_ref(run, prefix="sandbox-recheck-run-", field="run_ref")
+    invalidations[0]["new_revision_ref"] = child_ref
+    _refresh_mapping_ref(
+        invalidations[0],
+        prefix="sandbox-recheck-invalidation-",
+        field="invalidation_ref",
+    )
+    receipts[0]["command_digest"] = command_digest
+    receipts[0]["new_revision_ref"] = child_ref
+    _refresh_mapping_ref(
+        receipts[0],
+        prefix="sandbox-recheck-receipt-",
+        field="receipt_ref",
+    )
+    bad["current_revision_ref"] = child_ref
+
+
 def test_l5_4_normal_modify_runs_full_recheck_and_requires_new_review() -> None:
     coordinator, review_snapshot, *_ = _coordinator()
     command = _revision_command(coordinator)
@@ -1024,6 +1070,135 @@ def test_l5_4_source_build_failure_commits_fixed_review_setup_failure(
     assert restarted.snapshot() == snapshot
     assert restarted.apply_revision(command).status == "replayed_or_conflict"
     assert restarted.snapshot() == snapshot
+
+
+@pytest.mark.parametrize("drift", ("adapter_bundle", "checkpoint_interrupt"))
+def test_l5_4_restore_reuses_full_live_command_prevalidation(drift: str) -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    if drift == "adapter_bundle":
+        candidate, bundle = _subject_and_bundle(
+            domain_state_version=8,
+            formula_revision=4,
+            amount_milliunits=2,
+            dataset_version="shared-predicate.2",
+        )
+        candidate = candidate.model_copy(
+            update={"adapter_version": "sandbox-safety-adapter.v2"}
+        )
+        bundle = bundle.model_copy(
+            update={"adapter_version": "sandbox-safety-adapter.v2"}
+        )
+        coordinator.apply_revision(
+            _revision_command(
+                coordinator, candidate=candidate, bundle=bundle, suffix="predicate-adapter"
+            )
+        )
+        bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+        bad["revisions"][1]["rule_bundle"]["adapter_version"] = (
+            "sandbox-safety-adapter.v1"
+        )
+    else:
+        candidate, bundle = _subject_and_bundle(
+            domain_state_version=8,
+            formula_revision=4,
+            amount_milliunits=2,
+            dataset_version="shared-predicate.2",
+            decision=SandboxSafetyDecision.BLOCK,
+            issue_count=1,
+        )
+        coordinator.apply_revision(
+            _revision_command(
+                coordinator, candidate=candidate, bundle=bundle, suffix="predicate-binding"
+            )
+        )
+        bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+        bad["revisions"][1]["checkpoint_id"] = bad["revisions"][0][
+            "checkpoint_id"
+        ]
+        bad["revisions"][1]["interrupt_id"] = bad["revisions"][0][
+            "interrupt_id"
+        ]
+    _rederive_single_child_command_chain(bad)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_initial_modify_event_must_belong_to_exact_applied_challenge() -> None:
+    review_snapshot, clock, nonce_factory, verifier = _accepted_modify_snapshot()
+    baseline = SandboxRecheckCoordinator(
+        review_snapshot=review_snapshot,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    ).snapshot()
+    store = SandboxInMemoryReviewStore(snapshot=review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    pending = review.create_single_use_challenge(
+        review_snapshot.sources[0].source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD,
+        checkpoint_id=_NEW_CHECKPOINT,
+        interrupt_id=_NEW_INTERRUPT,
+    )
+    bad = copy.deepcopy(baseline.model_dump(mode="python"))
+    bad["review_snapshot"] = store.snapshot().model_dump(mode="python")
+    first = bad["revisions"][0]
+    first["checkpoint_id"] = pending.challenge.checkpoint_id
+    first["interrupt_id"] = pending.challenge.interrupt_id
+    first["review_schema_version"] = pending.challenge.sandbox_schema_version
+    first["challenge_ref"] = pending.challenge.challenge_ref
+    first_ref = _refresh_mapping_ref(
+        first,
+        prefix="sandbox-recheck-revision-",
+        field="revision_ref",
+    )
+    bad["current_revision_ref"] = first_ref
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_terminal_status_rejects_retained_private_review_authority() -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    coordinator.apply_revision(_revision_command(coordinator, suffix="retained-review"))
+    bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+    child = bad["revisions"][1]
+    child["status"] = "review_setup_failed"
+    child["challenge_ref"] = None
+    bad["runs"][0]["status"] = "review_setup_failed"
+    bad["runs"][0]["challenge_ref"] = None
+    bad["receipts"][0]["status"] = "review_setup_failed"
+    _rederive_single_child_command_chain(bad)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_l5_4_snapshot_and_inputs_are_isolated_immutable_copies() -> None:

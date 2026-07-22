@@ -200,3 +200,55 @@ production 保持 `d5b8f0e` 行为、工作区唯一修改为两组 R1 回归时
 - 新 P2-1：restore 没有复用 live 完整 command predicate；可接受 subject/bundle adapter mismatch 的 resultless terminal，或复用 parent checkpoint/interrupt 的 child。
 - 新 P2-2：initial event 未绑定 exact challenge/applied state；terminal outer record 可清空 challenge ref、改 status 后继续借用 private snapshot 中同 revision source/challenge/current marker。
 - PM 结论：**未接受 / 发布 L5-4-R2 限定返工**（`ACC-20260722-033`、`DEC-20260722-026`）。保留初始/R1 deliveries 与全部证据；L5 仍为 3/4，L6 未开始。
+
+## 12. L5-4-R2 live/restore 预验证与 review 状态族返工
+
+### 12.1 状态与起点
+
+- 状态：**L5-4-R2 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- clean management release / exact parent：`84c8f6459ac086457dfb9218575ac2360c4068af`；其中保留初始/R1 失败 deliveries、`ACC-20260722-032/033`、`DEC-20260722-025/026` 与两份返工任务书。
+- R2 只修改原三个 L5-4 文件；没有修改 R2 任务书、PM 台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime 或外部边界。
+
+### 12.2 真实 R2 RED
+
+production 保持 `8b345b9` 行为、工作区唯一修改为四类 R2 回归时，使用完整 fake env 与 `UV_OFFLINE=1` 运行三个测试节点（一个双参数），结果为退出码 `1`、`4 failed in 2.32s`：
+
+1. 合法 unknown-adapter `recheck_failed` snapshot 的 bundle adapter 改回 v1，重建 command digest 与全部 outer refs 后 restore 错误接受 subject/bundle mismatch；
+2. 合法 BLOCK child 的 checkpoint/interrupt 改为 parent 值并重派生完整链后，restore 错误接受 live 入口不可能产生的复用；
+3. 同 subject/result 先有 historical applied-modify、再有 current pending challenge 的合法 L5-3 snapshot 中，combined initial 指向 pending challenge并重派生 ref 后，restore 错误借用历史 modify event；
+4. 正常 `review_required` 外层记录改成 `review_setup_failed`、清空 outer challenge ref 并重派生全部 outer refs，但保留 private source/challenge/current marker，restore 错误接受。
+
+没有先改 production、skip、xfail、只保留 stale ref 或弱化原 35 项。
+
+### 12.3 根因族关闭
+
+- `_command_is_prevalidated(command, parent)` 已提取为 coordinator 外纯函数；live `apply_revision` 与 restore 重建的 canonical command 调用同一实现；
+- shared predicate 完整覆盖 session/artifact identity、state/formula `+1`、canonical authority change、subject↔bundle version/digest/evaluator/adapter 对齐，以及相对 parent 的新 checkpoint/interrupt；status/resultless 不跳过；
+- initial `modify_applied` 现在要求 exact challenge 存在、`state=applied`，且 exact challenge 自己精确一个 `modify_fixture` event；不再从同 subject 的其他 challenge 借 event；
+- historical `review_required` 有后继时要求 exact challenge applied 与 exact-owned single modify event；current `review_required` 继续由完整 private L5-3 snapshot 表达 pending/claimed/applied/expired；
+- blocked/recheck_failed/review_setup_failed 除 outer challenge ref 为空外，还必须不存在任何同 subject private source 及由 exact subject/result 派生的 challenge；因此保留 private review authority 后改 outer status 固定拒绝；
+- 任一 restore 失败继续在 private store 可用前归一化为固定 chainless `SandboxRecheckError`。
+
+四类 R2 回归最终 `4 passed in 1.94s`；完整专项扩展为 `39 passed in 2.79s`，R1 与原 32 项全部保持。
+
+### 12.4 R2 最终门禁
+
+| 门禁 | R2 结果 |
+|---|---|
+| L5-4/R2 专项 | `39 passed in 2.79s` |
+| accepted L5-3 + L5-2 + L5-1 合并回归 | `91 passed in 19.88s`（59 + 18 + 14） |
+| Safety 回归 | `71 passed, 3 deselected in 1.76s` |
+| L4.5-11 privacy 回归 | `76 passed in 4.37s` |
+| Ruff / mypy | `All checks passed!`；production 1 source / 0 issues；仅既有 `pymilvus.*` note |
+| L0 | `131 passed in 2.20s` |
+| AST 离线边界 | `1 passed in 1.73s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1754 passed, 362 deselected in 148.35s`；唯一为既有 defaults 差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1755 passed, 362 deselected in 146.89s` |
+
+### 12.5 提交、限制与回退
+
+- 单一 R2 开发提交消息为 `fix: unify L5-4 live and restored state checks`；exact parent 必须为 `84c8f6459ac086457dfb9218575ac2360c4068af`；只含本 handoff 第 8 节三个文件。
+- Git SHA 由冻结后的 `git rev-parse HEAD`、提交消息和本节共同报告，由独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、临床或公开生产能力。
+- 若 R2 验收失败，以单一 R2 delivery 执行 `git revert <r2-delivery-commit>` 并保留全部历史，不 reset 或覆盖。

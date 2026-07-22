@@ -227,6 +227,29 @@ def _authority_changed(
     )
 
 
+def _command_is_prevalidated(
+    command: SandboxRevisionCommandV1,
+    current: SandboxRevisionRecordV1,
+) -> bool:
+    candidate = command.candidate_subject
+    bundle = command.rule_bundle
+    return (
+        candidate.test_session_id == current.test_session_id
+        and candidate.formula_artifact_id == current.subject.formula_artifact_id
+        and candidate.profile_artifact_id == current.subject.profile_artifact_id
+        and candidate.domain_state_version == current.subject.domain_state_version + 1
+        and candidate.formula_revision == current.subject.formula_revision + 1
+        and _authority_changed(candidate, current.subject)
+        and candidate.rule_bundle_version == bundle.rule_bundle_version
+        and candidate.rule_bundle_digest == bundle.rule_bundle_digest
+        and candidate.evaluator_authority_digest
+        == bundle.evaluator_authority.authority_digest
+        and candidate.adapter_version == bundle.adapter_version
+        and command.checkpoint_id != current.checkpoint_id
+        and command.interrupt_id != current.interrupt_id
+    )
+
+
 def _derived_ref(prefix: str, value: BaseModel, ref_field: str) -> str:
     return prefix + _digest(value.model_dump(mode="python", exclude={ref_field}))
 
@@ -287,12 +310,7 @@ def _authority_refs(
     revision: SandboxRevisionRecordV1,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     subject = revision.subject
-    source_refs = {
-        source.source_ref
-        for source in snapshot.sources
-        if source.source.safety_subject == subject
-        and source.source.safety_result == revision.result
-    }
+    source_refs = set(_source_refs(snapshot, revision))
     challenge_refs = tuple(
         challenge.challenge_ref
         for challenge in snapshot.challenges
@@ -312,6 +330,29 @@ def _authority_refs(
         if event.challenge_ref in challenge_set
     )
     return challenge_refs, event_refs
+
+
+def _source_refs(
+    snapshot: SandboxReviewStoreSnapshotV1,
+    revision: SandboxRevisionRecordV1,
+) -> tuple[str, ...]:
+    return tuple(
+        source.source_ref
+        for source in snapshot.sources
+        if source.source.safety_subject == revision.subject
+        and source.source.safety_result == revision.result
+    )
+
+
+def _subject_source_refs(
+    snapshot: SandboxReviewStoreSnapshotV1,
+    revision: SandboxRevisionRecordV1,
+) -> tuple[str, ...]:
+    return tuple(
+        source.source_ref
+        for source in snapshot.sources
+        if source.source.safety_subject == revision.subject
+    )
 
 
 def _challenge_matches_revision(
@@ -378,6 +419,11 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         for challenge in snapshot.review_snapshot.challenges
         if challenge.challenge_ref == first.challenge_ref
     )
+    first_exact_events = tuple(
+        event
+        for event in snapshot.review_snapshot.events
+        if event.challenge_ref == first.challenge_ref
+    )
     if (
         first.parent_revision_ref is not None
         or first.status != "modify_applied"
@@ -388,12 +434,10 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         or first.test_session_id != first.subject.test_session_id
         or len(first_exact_challenges) != 1
         or not _challenge_matches_revision(first_exact_challenges[0], first)
-        or len(first_events) != 1
-        or not any(
-            event.event_ref == first_events[0]
-            and event.action is SandboxReviewAction.MODIFY_FIXTURE
-            for event in snapshot.review_snapshot.events
-        )
+        or first_exact_challenges[0].state != "applied"
+        or len(first_exact_events) != 1
+        or first_exact_events[0].event_ref not in first_events
+        or first_exact_events[0].action is not SandboxReviewAction.MODIFY_FIXTURE
     ):
         return False
     for index, revision in enumerate(revisions[1:], start=1):
@@ -437,23 +481,14 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             or receipt.new_revision_ref != revision.revision_ref
             or receipt.status != revision.status
             or run.command_digest != _digest(reconstructed_command)
+            or not _command_is_prevalidated(reconstructed_command, prior)
         ):
             return False
         if (
-            revision.subject.test_session_id != prior.subject.test_session_id
-            or revision.test_session_id != revision.subject.test_session_id
+            revision.test_session_id != revision.subject.test_session_id
             or revision.namespace != prior.namespace
             or revision.test_session_id != prior.test_session_id
             or revision.thread_id != prior.thread_id
-            or revision.subject.formula_artifact_id
-            != prior.subject.formula_artifact_id
-            or revision.subject.profile_artifact_id
-            != prior.subject.profile_artifact_id
-            or revision.subject.domain_state_version
-            != prior.subject.domain_state_version + 1
-            or revision.subject.formula_revision
-            != prior.subject.formula_revision + 1
-            or not _authority_changed(revision.subject, prior.subject)
         ):
             return False
         if revision.result is not None and (
@@ -487,6 +522,7 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             )
             if (
                 len(exact_events) != 1
+                or exact_challenges[0].state != "applied"
                 or exact_events[0].action is not SandboxReviewAction.MODIFY_FIXTURE
             ):
                 return False
@@ -508,6 +544,8 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             return False
         if revision.status != "review_required" and (
             revision.review_schema_version != prior.review_schema_version
+            or bool(_subject_source_refs(snapshot.review_snapshot, revision))
+            or bool(revision_challenge_refs)
         ):
             return False
         old_challenges, old_events = _authority_refs(snapshot.review_snapshot, prior)
@@ -757,7 +795,7 @@ class SandboxRecheckCoordinator:
                     status="replayed_or_conflict",
                     current_revision_ref=self._current_revision_ref,
                 )
-            if not self._current_modify_is_applied(current) or not self._command_is_prevalidated(
+            if not self._current_modify_is_applied(current) or not _command_is_prevalidated(
                 command, current
             ):
                 raise SandboxRecheckError()
@@ -1055,30 +1093,6 @@ class SandboxRecheckCoordinator:
                 return SandboxCompletionEligibilityV1(status=status)
             except Exception:
                 return SandboxCompletionEligibilityV1(status="blocked")
-
-    def _command_is_prevalidated(
-        self,
-        command: SandboxRevisionCommandV1,
-        current: SandboxRevisionRecordV1,
-    ) -> bool:
-        candidate = command.candidate_subject
-        bundle = command.rule_bundle
-        return (
-            candidate.test_session_id == current.test_session_id
-            and candidate.formula_artifact_id == current.subject.formula_artifact_id
-            and candidate.profile_artifact_id == current.subject.profile_artifact_id
-            and candidate.domain_state_version
-            == current.subject.domain_state_version + 1
-            and candidate.formula_revision == current.subject.formula_revision + 1
-            and _authority_changed(candidate, current.subject)
-            and candidate.rule_bundle_version == bundle.rule_bundle_version
-            and candidate.rule_bundle_digest == bundle.rule_bundle_digest
-            and candidate.evaluator_authority_digest
-            == bundle.evaluator_authority.authority_digest
-            and candidate.adapter_version == bundle.adapter_version
-            and command.checkpoint_id != current.checkpoint_id
-            and command.interrupt_id != current.interrupt_id
-        )
 
     def _current_modify_is_applied(
         self, current: SandboxRevisionRecordV1
