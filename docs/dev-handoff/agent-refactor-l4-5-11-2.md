@@ -133,3 +133,55 @@ Ruff 首次运行只发现新测试 import block 后多一个空行；按 Ruff d
 ---
 
 **已交付，申请验收。**
+
+## 9. 项目经理验收结论
+
+| 项目 | 结果 |
+|---|---|
+| 验收日期 | 2026-07-22 |
+| 发布提交 | `2da64ae64ddbd22cd9631e72ea37eaf9f257b36e` |
+| 交付提交 | `5ada2622255b3c9dc25649ec391f45b35123559a` |
+| 父提交核对 | `5ada262^ == 2da64ae`，通过 |
+| 范围与工作区 | 只含 4 个合同允许文件；新增测试和 handoff 均 tracked mode `100644`；验收前后 exact HEAD、clean worktree；`git diff --check` 通过 |
+| 独立 Code Review | **No findings**（P0/P1/P2/P3 均无） |
+| 独立 CI | 全部通过 |
+| 结论 | **通过 / accepted** |
+
+### 9.1 独立 Review 与项目经理探针
+
+未参与实现的 Reviewer 在冻结提交 `5ada262` 上核对实际 diff 和合同，确认：
+
+- guard 位于 Gateway observed/plain 方法 lookup、选择和调用之前；poison-property 探针证明拒绝时 Gateway 方法选择属性读取数也为 0；
+- 精确复用现有 `INTAKE_AGENT_NAME` 与 L4.5-11-1 accepted scanner，没有复制名称或 grammar；
+- scanner 只收到有序 content tuple，role 和 metadata 不进入扫描；
+- 命中、非 Mapping、content 缺失/非字符串/提取异常和 scanner 异常均固定、chainless fail closed；
+- 任何 retry policy 下均不重试；拒绝时 observed/plain/request 为 0；安全 Intake 为 1 次且 `max_requests=1`；
+- 非 Intake `_call_gateway()` 不读取 content，Gateway 行为不变；recorder/log 无原值；enum 只增加目标成员；
+- 新专项与 accepted scanner 专项合计 `72 passed`，无 skip、xfail 或 importorskip；parent-source 复核支持 `16 failed, 3 passed` 的真实 RED。
+
+Reviewer 结论为 no findings。项目经理另行复验跨 final message 零调用、scanner 故障零调用、固定错误、safe Intake 一次请求和非 Intake 不读 content，全部通过。首个非 Intake poison-Mapping 探针误从完整 `run()` 进入，在既有 guard 之前被 `model_input_digest()` 的非序列化输入检查拒绝；改为直接探测任务权威边界 `_call_gateway()` 后通过。该差异是探针层级校准，不是产品缺陷。
+
+### 9.2 独立 CI 证据
+
+独立 CI 子 Agent 在同一 exact commit 上只读运行：
+
+| 门禁 | 结果 |
+|---|---|
+| L4.5-11-2 专项 | `19 passed` |
+| L4.5-11-1 accepted scanner 专项 | `53 passed` |
+| 七文件相关回归 | `267 passed, 22 deselected` |
+| Ruff | 通过 |
+| mypy | 2 个生产文件通过 |
+| L0 文档契约 | `131 passed` |
+| 全量非集成 | `1621 passed, 362 deselected` |
+| diff / scope / tracked / exact HEAD / clean | 全部通过 |
+
+独立 CI 未调用真实外部 integration，未修改任何文件。
+
+### 9.3 裁决与状态迁移
+
+- `L4.5-11-2`：已交付 → **accepted / 已完成**；
+- `R-GATE-001`：以 `5ada262`、独立 Review/CI 和项目经理零调用探针作为关闭证据；
+- 原 writer 从 clean 发布提交开始、只留下同任务测试草稿后被中断；项目经理核对其唯一性与范围并显式转移给替代 writer，未混入用户或无关修改，不构成未归属工作区风险；
+- `AR-B-031` 继续保持 P1 打开，等待 L4.5-11 两任务组合关闭验收和最终未参与实现 Reviewer；
+- 下一动作仅为在包含本验收记录的 clean exact HEAD 上执行 L4.5-11 组合关闭验收，不进入 L5，不改变现有外部门禁。
