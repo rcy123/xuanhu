@@ -578,3 +578,12 @@ R4 event projection、R3 live/restore causal predicate 与 cross-attempt stage/a
 ---
 
 **R5 已交付，申请验收。**
+
+## 20. 项目经理 R5 最终验收（2026-07-22）
+
+- exact delivery：`95be09a1b766c36eb4da411162b33a2efb4a1346`；exact parent `ef8139dee1320860cf8c924ecf2c53de4e860925`；单一提交只含三个允许且 tracked 的文件，验收前后 worktree/index clean。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0；确认 issue/apply 两类显式 sequence 投影完整，attempts/current-authorities 保持 keyed-unordered，全部历史 findings 与恢复后 32 并发回归通过。
+- 独立 CI：L5-3 `59 passed`；L5-2 `18`；L5-1 `14`；Safety `71/3 deselected`；privacy `76`；L0 `131`；Ruff/mypy/lock/AST/diff 全绿。强制全量 `1 failed, 1715 passed, 362 deselected` 且唯一为既有 `APP_ENV` defaults 差异；只移除 `APP_ENV` 的校准全量 `1716 passed, 362 deselected`。
+- PM 定向复验：同 exact HEAD 六项 `6 passed in 1.96s`，覆盖两类顺序投影、live/restart 时间一致性、复用 checkpoint current 定位与 32 并发；运行后 HEAD 不变且 clean。
+- 结论：**L5-3 与 R5 accepted**（`ACC-20260722-030`、`DEC-20260722-023`）；`R-L5-RESUME-001` 关闭；L5 为 3/4 accepted。
+- 限制：只接受个人学习、固定虚构/合成数据、离线单元和 in-memory sandbox。L5-4 尚未发布；Runtime、HTTP、容器、部署、DB、Gateway、Legacy、真实临床/患者/公开生产继续 NO-GO，L6 未开始。
