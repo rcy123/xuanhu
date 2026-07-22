@@ -75,6 +75,34 @@ class _FakeNonceFactory:
         return self.value
 
 
+def _raise_nested_review_error(secret: str) -> None:
+    try:
+        raise RuntimeError(secret)
+    except RuntimeError as cause:
+        try:
+            raise ValueError(f"outer:{secret}") from cause
+        except ValueError:
+            raise SandboxReviewError() from None
+
+
+class _NestedReviewErrorNonceFactory:
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+        self.calls = 0
+
+    def __call__(self) -> bytes:
+        self.calls += 1
+        _raise_nested_review_error(self.secret)
+        raise AssertionError("unreachable")
+
+
+class _NestedReviewErrorStore(SandboxInMemoryReviewStore):
+    def recover_challenge(self, **kwargs: object) -> object:
+        del kwargs
+        _raise_nested_review_error("nested-store-secret")
+        raise AssertionError("unreachable")
+
+
 class _FakeSignatureVerifier:
     def __init__(self, *, raises: str | None = None) -> None:
         self.calls = 0
@@ -573,6 +601,47 @@ def test_l5_3_expired_nonce_does_not_revive_when_fake_clock_moves_back() -> None
     assert store.snapshot().events == ()
 
 
+def test_l5_3_exact_expiry_is_rejected_during_stage_and_resume() -> None:
+    stage_clock = _FakeClock()
+    stage_coordinator, stage_store, *_ = _coordinator(clock=stage_clock)
+    stage_delivery = _issue(stage_coordinator)
+    stage_submission = _submission(stage_delivery, SandboxReviewAction.CONFIRM)
+    stage_clock.value = stage_delivery.challenge.expires_at
+    stage_result = stage_coordinator.stage_verified_resume_attempt(stage_submission)
+    stage_snapshot = stage_store.snapshot()
+    stage_clock.value = stage_delivery.challenge.issued_at
+    stage_after_rollback = stage_coordinator.stage_verified_resume_attempt(
+        stage_submission
+    )
+
+    resume_clock = _FakeClock()
+    resume_coordinator, resume_store, *_ = _coordinator(clock=resume_clock)
+    resume_delivery = _issue(resume_coordinator)
+    staged = resume_coordinator.stage_verified_resume_attempt(
+        _submission(resume_delivery, SandboxReviewAction.CONFIRM)
+    )
+    assert staged.resume_attempt_ref is not None
+    resume_clock.value = resume_delivery.challenge.expires_at
+    resume_result = resume_coordinator.resume(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    )
+    resume_snapshot = resume_store.snapshot()
+
+    assert (stage_result.status, resume_result.status) == (
+        "resume_rejected",
+        "resume_rejected",
+    )
+    assert stage_after_rollback.status == "resume_rejected"
+    assert stage_snapshot.challenges[0].state == "expired"
+    assert stage_snapshot.checkpoints[0].state == "review_pending"
+    assert stage_snapshot.attempts == ()
+    assert stage_snapshot.events == ()
+    assert resume_snapshot.challenges[0].state == "expired"
+    assert resume_snapshot.checkpoints[0].state == "review_pending"
+    assert resume_snapshot.attempts[0].state == "sealed"
+    assert resume_snapshot.events == ()
+
+
 def test_l5_3_thirty_two_concurrent_resumes_have_exactly_one_success() -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)
@@ -620,6 +689,117 @@ def test_l5_3_fake_restart_recovers_exact_checkpoint_without_reissuing_challenge
     assert len(store.snapshot().events) == 1
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "event_action",
+        "event_ref",
+        "attempt_ref",
+        "transition_ref",
+        "source_ref",
+        "duplicate_event",
+        "reordered_transitions",
+        "missing_challenge",
+        "event_identity",
+        "missing_current_authority",
+    ),
+)
+def test_l5_3_restart_snapshot_rejects_changed_event_action_and_derived_refs(
+    tamper: str,
+) -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, delivery, SandboxReviewAction.REJECT)
+    snapshot = store.snapshot().model_dump(mode="python")
+
+    if tamper == "event_action":
+        snapshot["events"][0]["action"] = SandboxReviewAction.CONFIRM
+    elif tamper == "event_ref":
+        snapshot["events"][0]["event_ref"] = "sandbox-review-event-" + "f" * 64
+    elif tamper == "attempt_ref":
+        snapshot["attempts"][0]["resume_attempt_ref"] = (
+            "sandbox-attempt-" + "f" * 64
+        )
+    elif tamper == "transition_ref":
+        snapshot["transitions"][-1]["transition_ref"] = (
+            "sandbox-transition-" + "f" * 64
+        )
+    elif tamper == "source_ref":
+        snapshot["sources"][0]["source_ref"] = "sandbox-source-" + "f" * 64
+    elif tamper == "duplicate_event":
+        snapshot["events"] = snapshot["events"] + (dict(snapshot["events"][0]),)
+    elif tamper == "reordered_transitions":
+        snapshot["transitions"] = tuple(reversed(snapshot["transitions"]))
+    elif tamper == "missing_challenge":
+        snapshot["challenges"] = ()
+    elif tamper == "event_identity":
+        snapshot["events"][0]["sandbox_test_reviewer_id"] = "tampered-reviewer"
+    elif tamper == "missing_current_authority":
+        snapshot.pop("current_authorities", None)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=snapshot)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility() -> None:
+    coordinator, store, clock, nonce_factory, _ = _coordinator()
+    first_delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, first_delivery, SandboxReviewAction.CONFIRM)
+    assert coordinator.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=first_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status == "eligible"
+
+    second_source = _accepted_source(domain_state_version=8)
+    second_delivery = coordinator.create_single_use_challenge(
+        second_source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD_ID,
+        checkpoint_id="sandbox-checkpoint-002",
+        interrupt_id="sandbox-interrupt-002",
+    )
+    assert second_delivery.challenge.domain_state_version == 8
+    assert coordinator.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=first_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status == "blocked"
+    assert coordinator.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=second_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id="sandbox-checkpoint-002",
+    ).status == "blocked"
+
+    restarted_store = SandboxInMemoryReviewStore(
+        snapshot=store.snapshot().model_dump(mode="python")
+    )
+    restarted = SandboxReviewCoordinator(
+        store=restarted_store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=_FakeSignatureVerifier(),
+    )
+    assert restarted.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=first_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status == "blocked"
+    assert restarted.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=second_delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id="sandbox-checkpoint-002",
+    ).status == "blocked"
+
+
 def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction() -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)
@@ -628,26 +808,19 @@ def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction
 
     without_challenge = dict(snapshot)
     without_challenge["challenges"] = ()
-    missing_challenge_store = SandboxInMemoryReviewStore(snapshot=without_challenge)
-    missing_challenge, *_ = _coordinator(store=missing_challenge_store)
-    assert (
-        missing_challenge.stage_verified_resume_attempt(submission).status
-        == "resume_rejected"
-    )
-    assert missing_challenge_store.snapshot().challenges == ()
+    with pytest.raises(SandboxReviewError) as missing_challenge:
+        SandboxInMemoryReviewStore(snapshot=without_challenge)
+    assert missing_challenge.value.__cause__ is None
+    assert missing_challenge.value.__context__ is None
 
     staged = coordinator.stage_verified_resume_attempt(submission)
     assert staged.resume_attempt_ref is not None
     without_checkpoint = store.snapshot().model_dump(mode="python")
     without_checkpoint["checkpoints"] = ()
-    missing_checkpoint_store = SandboxInMemoryReviewStore(snapshot=without_checkpoint)
-    missing_checkpoint, *_ = _coordinator(store=missing_checkpoint_store)
-    result = missing_checkpoint.resume(
-        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
-    )
-    assert result.status == "resume_rejected"
-    assert missing_checkpoint_store.snapshot().checkpoints == ()
-    assert missing_checkpoint_store.snapshot().events == ()
+    with pytest.raises(SandboxReviewError) as missing_checkpoint:
+        SandboxInMemoryReviewStore(snapshot=without_checkpoint)
+    assert missing_checkpoint.value.__cause__ is None
+    assert missing_checkpoint.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -804,6 +977,37 @@ def test_l5_3_errors_are_fixed_chainless_and_payload_free() -> None:
     assert missing.status == "resume_rejected"
     assert "should-not-escape" not in repr(bad_schema)
     assert "missing-attempt-ref" not in repr(missing)
+
+
+def test_l5_3_injected_review_error_is_normalized_without_cause_or_context() -> None:
+    secret = "nested-nonce-secret"
+    nonce_factory = _NestedReviewErrorNonceFactory(secret)
+    nonce_coordinator, nonce_store, *_ = _coordinator(
+        nonce_factory=nonce_factory  # type: ignore[arg-type]
+    )
+    store_dependency = _NestedReviewErrorStore()
+    store_coordinator, _, _, store_nonce_factory, _ = _coordinator(
+        store=store_dependency
+    )
+    captured: list[SandboxReviewError] = []
+
+    for coordinator in (nonce_coordinator, store_coordinator):
+        try:
+            _issue(coordinator)
+        except SandboxReviewError as error:
+            captured.append(error)
+
+    assert len(captured) == 2
+    for error in captured:
+        assert str(error) == "SANDBOX_REVIEW_REJECTED"
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert secret not in repr(error)
+        assert "nested-store-secret" not in repr(error)
+    assert nonce_factory.calls == 1
+    assert store_nonce_factory.calls == 0
+    assert nonce_store.operation_count == 0
+    assert store_dependency.operation_count == 0
 
 
 def test_l5_3_no_settings_env_network_runtime_db_gateway_legacy_or_export_imports() -> None:

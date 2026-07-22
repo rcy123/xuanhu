@@ -173,3 +173,81 @@ $env:UV_OFFLINE='1'
 - PM 结论：**未接受 / 发布 L5-3-R1 限定返工**（`ACC-20260722-025`、`DEC-20260722-018`）。保留本提交与全部证据；L5-4 不得发布。
 
 R1 合同见 [agent-refactor-l5-3-sandbox-rework-1-task.md](agent-refactor-l5-3-sandbox-rework-1-task.md)。
+
+## 11. L5-3-R1 开发交付（2026-07-22）
+
+### 11.1 状态、基线与限定范围
+
+- 状态：**R1 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R1 clean release / exact parent：`e3f1472d2956aa9a1e350938d28adc00e6b8d41f`；其 parent 为失败 delivery `99a1fb822a3963a9f324232e3be465c6835694b9`。原交付、`ACC-20260722-025`、`DEC-20260722-018`、第 1 轮 finding 与 R1 任务书全部保留，没有 reset、覆盖或删除失败历史。
+- R1 只修改 `app/agent_runtime/sandbox_review.py`、`tests/test_l5_3_sandbox_reviewer_interrupt_resume.py` 与本文；没有修改 R1 任务书、PM 台账、accepted L5-1/L5-2、配置、依赖、Runtime、Legacy、HTTP/DB/Gateway 或 L5-4。
+
+### 11.2 四项先行回归与真实 RED
+
+在 production 仍为 `99a1fb8` 行为、worktree 唯一修改为四项指定 regression（restart integrity 使用 10 个明确参数子例）时，以第 8 节完整 fake env 与 `UV_OFFLINE=1` 运行专项。exact HEAD 仍为 `e3f1472d2956aa9a1e350938d28adc00e6b8d41f`；结果为退出码 `1`，`13 failed, 35 passed in 2.91s`，48 项全部收集：
+
+1. `test_l5_3_exact_expiry_is_rejected_during_stage_and_resume`：exact `expires_at` 的实际结果为 `staged/applied`，而非两次 fixed rejection；
+2. `test_l5_3_restart_snapshot_rejects_changed_event_action_and_derived_refs`：event action/ref、attempt ref、transition ref、source ref、duplicate event、transition reorder、missing challenge、event identity 与 missing current marker 共 10 个 tamper 全部 `DID NOT RAISE`；
+3. `test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility`：发布同 scope v8/checkpoint-2 后，旧 v7/checkpoint-1 实际仍为 `eligible`；
+4. `test_l5_3_injected_review_error_is_normalized_without_cause_or_context`：fake nonce/store dependency 抛出的 fixed error 保留 nested `ValueError` 作为 `__context__`。
+
+RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfail、条件分支或弱化原 35 项。实现后的首次专项为 `47 passed, 1 failed`；唯一失败是原 missing-record test 仍预期损坏 snapshot 可以先构造 store。R1 合同要求 restore 立即 fail closed，因此该原测试被加强为 constructor fixed chainless rejection；最终专项 `48 passed`。
+
+### 11.3 Exclusive expiry 与 atomic tombstone
+
+- stage/apply 均在 store lock 内使用 exclusive upper bound `now >= expires_at`；exact boundary 与 `+1` 都先替换为 `expired` tombstone，再 fixed reject；
+- exact-expiry stage 不创建 attempt/event、不推进 checkpoint；到期前 staged、exact-expiry resume 保持 attempt sealed、checkpoint pending、event 为空；
+- fake clock 回拨仍读取 persisted expired state，不能恢复 nonce；TTL 继续精确 900 秒，没有 wall-clock read 或 wait。
+
+### 11.4 Restart integrity 与 derived refs
+
+restore 先 canonical strict 深重建，再验证完整 snapshot；任一失败在离开 exception context 后创建新的 fixed `SandboxReviewError`，cause/context 均为空，不自动修补输入。R1 integrity 包括：
+
+- stored source ref 绑定 issue sequence、scope、checkpoint/interrupt 与完整 accepted source；attempt ref 绑定 challenge ref 与 signed payload digest；event/transition ref 绑定各自除 ref 外的完整 canonical body；
+- source/challenge/checkpoint 按连续 `issue_sequence` 一对一同序；event/transition 具有连续 append sequence，duplicate ref、missing/extra record、改序或断链均拒绝；
+- checkpoint/challenge/source/attempt/event/transition 引用必须存在；attempt scope/source/challenge 必须一致；
+- event 的 action、全部 test identity、signed payload digest 必须与 sealed attempt 一致；event 的全部 version/scope/state/formula/digest authority 必须与 challenge 一致；applied/sealed attempt、challenge/checkpoint/event/transition state 必须形成唯一一致历史；
+- 每个 staged attempt 追加 bound `attempt_unstaged -> attempt_staged` transition；每个 applied attempt 仍只有一组 issued/claimed/applied 与 review_applied transition、一个 event。原 32-thread CAS 继续为精确 `1 applied + 31 replayed_or_conflict`。
+
+Canonical JSON 保持完整诚实：没有通过隐藏 action、identity、source 或其他字段伪造 integrity。store 仍只排除 plaintext nonce/signature；event 继续额外排除 fixture/explanation 原文。
+
+### 11.5 Current authority 与 fixed chainless boundary
+
+- store 在 issue 的同一 lock/transaction 内维护 `(namespace, test_session_id, thread_id)` 唯一 `_CurrentAuthorityV1`，绑定 issue sequence、checkpoint 与 challenge；同 scope 新 issue 原子替换 current marker；
+- snapshot integrity 要求每个有 checkpoint 的 scope 恰有一个 marker，且必须指向该 scope 最大 issue sequence；missing、duplicate、旧 marker 或 cross-ref mismatch 不能 restore；
+- eligibility 除原 exact applied-confirm authority 外，还要求请求 checkpoint 与 current marker 精确一致；新 checkpoint pending 时新旧 checkpoint 都 blocked；fake restart 后 marker 语义不变；
+- coordinator create 与 store restore 均吞并 injected/internal exception，仅在 active exception context 退出后抛出新的 `SANDBOX_REVIEW_REJECTED`；测试对 nonce factory 与 store dependency 的 nested cause/context 同时证明最终 `__cause__ is None`、`__context__ is None`，无嵌套原文；stage/resume/eligibility 继续只返回 fixed DTO。
+
+本修复不改变 ALLOW-only admission、BLOCK zero mutation、32-byte nonce only-once、ref-only command、65,536-byte limit、secret-free、fake restart 不重发、non-confirm blocked 或 complete/record/export absent。
+
+### 11.6 R1 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部命令使用第 8 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R1 结果 |
+|---|---|
+| L5-3/R1 专项 | 最终交付树 `48 passed in 2.50s`；前次 `48 passed in 2.43s` |
+| accepted L5-2 回归 | `18 passed in 8.21s` |
+| accepted L5-1 回归 | `14 passed in 15.75s` |
+| Safety 回归 | `71 passed, 3 deselected in 2.29s` |
+| L4.5-11 privacy 回归 | `76 passed in 5.88s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.20s` |
+| `uv lock --check` | `Resolved 84 packages in 4ms` |
+| diff/scope/tracked | working/cached diff check 均无错误；name-status 精确为三个原允许文件且均为 `M`；`git ls-files --error-unmatch` 对三者全部成功 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1704 passed, 362 deselected in 132.36s`；唯一失败为既有 `test_load_with_defaults` 预期 `local`、实际为强制值 `sandbox-test` |
+| 只移除 `APP_ENV` 的校准全量 | `1705 passed, 362 deselected in 130.79s` |
+
+全部执行没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway、网络或外部服务。
+
+### 11.7 R1 提交、限制与回退
+
+- 单一 R1 开发提交消息为 `fix: close L5-3 review state invariants`，exact parent 必须为 `e3f1472d2956aa9a1e350938d28adc00e6b8d41f`，提交只含 11.1 节三个原允许文件。
+- Git SHA 不能在包含本文的同一提交中自引用；delivery exact HEAD 由提交后外部报告的 `git rev-parse HEAD`、上述 parent/message、三文件 scope 与 clean worktree 共同冻结，后续由独立 Reviewer/CI/PM 锚定验收。
+- in-memory snapshot integrity 是本地 reference-store structural integrity，不是外部持久化、加密签名、数据库 transaction 或生产 durability；真实 Runtime/identity/DB/HTTP 与 L5-4 full recheck 仍未实现、未发布。
+- 若 R1 独立验收失败，使用 `git revert <r1-delivery-exact-head>` 保留历史，不 reset 或覆盖失败交付与 accepted L5-1/L5-2。
+
+---
+
+**R1 已交付，申请验收。**

@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 from enum import StrEnum
 from typing import Literal, Protocol
 
@@ -342,6 +343,7 @@ def review_signed_payload_digest(
 
 class _StoredSourceV1(_StrictFrozenModel):
     source_ref: str = Field(pattern=r"^sandbox-source-[0-9a-f]{64}$")
+    issue_sequence: int = Field(ge=0)
     namespace: str
     test_session_id: str
     thread_id: str
@@ -349,8 +351,15 @@ class _StoredSourceV1(_StrictFrozenModel):
     interrupt_id: str
     source: SandboxReviewSourceV1
 
+    @model_validator(mode="after")
+    def source_ref_is_derived(self) -> _StoredSourceV1:
+        if self.source_ref != _stored_source_ref(self):
+            raise ValueError("stored source reference mismatch")
+        return self
+
 
 class _CheckpointV1(_StrictFrozenModel):
+    issue_sequence: int = Field(ge=0)
     namespace: str
     test_session_id: str
     thread_id: str
@@ -377,9 +386,18 @@ class _SealedAttemptV1(_StrictFrozenModel):
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     state: Literal["sealed", "applied"]
 
+    @model_validator(mode="after")
+    def attempt_ref_is_derived(self) -> _SealedAttemptV1:
+        if self.resume_attempt_ref != _attempt_ref(
+            self.challenge_ref, self.sandbox_test_signed_payload_digest
+        ):
+            raise ValueError("resume attempt reference mismatch")
+        return self
+
 
 class SandboxTestReviewEventV1(_StrictFrozenModel):
     event_ref: str
+    sequence: int = Field(ge=0)
     resume_attempt_ref: str
     challenge_ref: str
     sandbox_schema_version: str
@@ -407,14 +425,36 @@ class SandboxTestReviewEventV1(_StrictFrozenModel):
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     applied_at: int
 
+    @model_validator(mode="after")
+    def event_ref_is_derived(self) -> SandboxTestReviewEventV1:
+        if self.event_ref != _event_ref(self):
+            raise ValueError("review event reference mismatch")
+        return self
+
 
 class _TransitionV1(_StrictFrozenModel):
     transition_ref: str
+    sequence: int = Field(ge=0)
     challenge_ref: str
     resume_attempt_ref: str | None
     from_state: str
     to_state: str
     observed_at: int
+
+    @model_validator(mode="after")
+    def transition_ref_is_derived(self) -> _TransitionV1:
+        if self.transition_ref != _transition_ref(self):
+            raise ValueError("transition reference mismatch")
+        return self
+
+
+class _CurrentAuthorityV1(_StrictFrozenModel):
+    issue_sequence: int = Field(ge=0)
+    namespace: str
+    test_session_id: str
+    thread_id: str
+    checkpoint_id: str
+    challenge_ref: str
 
 
 class SandboxReviewStoreSnapshotV1(_StrictFrozenModel):
@@ -424,6 +464,13 @@ class SandboxReviewStoreSnapshotV1(_StrictFrozenModel):
     attempts: tuple[_SealedAttemptV1, ...] = ()
     events: tuple[SandboxTestReviewEventV1, ...] = ()
     transitions: tuple[_TransitionV1, ...] = ()
+    current_authorities: tuple[_CurrentAuthorityV1, ...] = ()
+
+    @model_validator(mode="after")
+    def records_are_complete_and_consistent(self) -> SandboxReviewStoreSnapshotV1:
+        if not _snapshot_is_integral(self):
+            raise ValueError("review store snapshot integrity mismatch")
+        return self
 
 
 class _StageResultV1(_StrictFrozenModel):
@@ -465,23 +512,334 @@ def _fixed_resume_rejection() -> _ResumeResultV1:
     return _ResumeResultV1(status="resume_rejected")
 
 
+def _stored_source_ref(source: _StoredSourceV1) -> str:
+    body = source.model_dump(mode="python", exclude={"source_ref"})
+    return f"sandbox-source-{_sha256(body)}"
+
+
+def _attempt_ref(challenge_ref: str, signed_payload_digest: str) -> str:
+    return f"sandbox-attempt-{_sha256({'challenge_ref': challenge_ref, 'signed_payload_digest': signed_payload_digest})}"
+
+
+def _event_ref(event: SandboxTestReviewEventV1) -> str:
+    body = event.model_dump(mode="python", exclude={"event_ref"})
+    return f"sandbox-review-event-{_sha256(body)}"
+
+
+def _transition_ref(transition: _TransitionV1) -> str:
+    body = transition.model_dump(mode="python", exclude={"transition_ref"})
+    return f"sandbox-transition-{_sha256(body)}"
+
+
+def _values_are_unique(values: tuple[str, ...]) -> bool:
+    return len(values) == len(set(values))
+
+
+def _scope_key(
+    value: _CheckpointV1 | _CurrentAuthorityV1,
+) -> tuple[str, str, str]:
+    return (value.namespace, value.test_session_id, value.thread_id)
+
+
+def _event_matches_authority(
+    event: SandboxTestReviewEventV1,
+    challenge: SandboxReviewChallengeV1,
+    attempt: _SealedAttemptV1,
+) -> bool:
+    return (
+        event.resume_attempt_ref == attempt.resume_attempt_ref
+        and event.challenge_ref == challenge.challenge_ref
+        and event.sandbox_schema_version == challenge.sandbox_schema_version
+        and event.adapter_version == challenge.adapter_version
+        and event.graph_version == challenge.graph_version
+        and event.namespace == challenge.namespace
+        and event.test_session_id == challenge.test_session_id
+        and event.thread_id == challenge.thread_id
+        and event.checkpoint_id == challenge.checkpoint_id
+        and event.interrupt_id == challenge.interrupt_id
+        and event.domain_state_version == challenge.domain_state_version
+        and event.formula_revision == challenge.formula_revision
+        and event.input_digest == challenge.input_digest
+        and event.result_digest == challenge.result_digest
+        and event.rule_bundle_digest == challenge.rule_bundle_digest
+        and event.synthetic_dataset_digest == challenge.synthetic_dataset_digest
+        and event.review_render_digest == challenge.review_render_digest
+        and event.action is attempt.action
+        and event.sandbox_test_reviewer_id == attempt.sandbox_test_reviewer_id
+        and event.sandbox_test_role == attempt.sandbox_test_role
+        and event.sandbox_test_organization_label
+        == attempt.sandbox_test_organization_label
+        and event.sandbox_test_qualification_label
+        == attempt.sandbox_test_qualification_label
+        and event.sandbox_test_signature_scheme
+        == attempt.sandbox_test_signature_scheme
+        and event.sandbox_test_key_id == attempt.sandbox_test_key_id
+        and event.sandbox_test_signed_payload_digest
+        == attempt.sandbox_test_signed_payload_digest
+    )
+
+
+def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
+    sources = snapshot.sources
+    challenges = snapshot.challenges
+    checkpoints = snapshot.checkpoints
+    attempts = snapshot.attempts
+    events = snapshot.events
+    transitions = snapshot.transitions
+    current = snapshot.current_authorities
+
+    if not (
+        len(sources) == len(challenges) == len(checkpoints)
+        and tuple(source.issue_sequence for source in sources)
+        == tuple(range(len(sources)))
+        and tuple(checkpoint.issue_sequence for checkpoint in checkpoints)
+        == tuple(range(len(checkpoints)))
+        and tuple(event.sequence for event in events) == tuple(range(len(events)))
+        and tuple(transition.sequence for transition in transitions)
+        == tuple(range(len(transitions)))
+        and _values_are_unique(tuple(source.source_ref for source in sources))
+        and _values_are_unique(
+            tuple(challenge.challenge_ref for challenge in challenges)
+        )
+        and _values_are_unique(
+            tuple(attempt.resume_attempt_ref for attempt in attempts)
+        )
+        and _values_are_unique(tuple(event.event_ref for event in events))
+        and _values_are_unique(
+            tuple(transition.transition_ref for transition in transitions)
+        )
+    ):
+        return False
+
+    checkpoint_keys = tuple(
+        (
+            checkpoint.namespace,
+            checkpoint.test_session_id,
+            checkpoint.thread_id,
+            checkpoint.checkpoint_id,
+            checkpoint.interrupt_id,
+        )
+        for checkpoint in checkpoints
+    )
+    if len(checkpoint_keys) != len(set(checkpoint_keys)):
+        return False
+
+    for sequence, (source, challenge, checkpoint) in enumerate(
+        zip(sources, challenges, checkpoints, strict=True)
+    ):
+        if (
+            source.issue_sequence != sequence
+            or checkpoint.issue_sequence != sequence
+            or checkpoint.challenge_ref != challenge.challenge_ref
+            or checkpoint.source_ref != source.source_ref
+            or not (
+                source.namespace == challenge.namespace == checkpoint.namespace
+            )
+            or not (
+                source.test_session_id
+                == challenge.test_session_id
+                == checkpoint.test_session_id
+            )
+            or not (
+                source.thread_id == challenge.thread_id == checkpoint.thread_id
+            )
+            or not (
+                source.checkpoint_id
+                == challenge.checkpoint_id
+                == checkpoint.checkpoint_id
+            )
+            or not (
+                source.interrupt_id
+                == challenge.interrupt_id
+                == checkpoint.interrupt_id
+            )
+            or not _challenge_matches_source(challenge, source.source)
+            or (challenge.state == "applied")
+            != (checkpoint.state == "review_applied")
+            or challenge.state == "claimed"
+        ):
+            return False
+
+    source_by_ref = {source.source_ref: source for source in sources}
+    challenge_by_ref = {
+        challenge.challenge_ref: challenge for challenge in challenges
+    }
+    checkpoint_by_challenge = {
+        checkpoint.challenge_ref: checkpoint for checkpoint in checkpoints
+    }
+    attempt_by_ref = {
+        attempt.resume_attempt_ref: attempt for attempt in attempts
+    }
+
+    for attempt in attempts:
+        attempt_challenge = challenge_by_ref.get(attempt.challenge_ref)
+        attempt_source = source_by_ref.get(attempt.source_ref)
+        attempt_checkpoint = checkpoint_by_challenge.get(attempt.challenge_ref)
+        if (
+            attempt_challenge is None
+            or attempt_source is None
+            or attempt_checkpoint is None
+            or attempt_checkpoint.source_ref != attempt.source_ref
+            or attempt.namespace != attempt_challenge.namespace
+            or attempt.test_session_id != attempt_challenge.test_session_id
+        ):
+            return False
+
+    events_by_attempt: dict[str, list[SandboxTestReviewEventV1]] = {}
+    for event in events:
+        event_attempt = attempt_by_ref.get(event.resume_attempt_ref)
+        event_challenge = challenge_by_ref.get(event.challenge_ref)
+        if (
+            event_attempt is None
+            or event_challenge is None
+            or event_attempt.challenge_ref != event.challenge_ref
+            or event_attempt.state != "applied"
+            or event_challenge.state != "applied"
+            or not _event_matches_authority(
+                event, event_challenge, event_attempt
+            )
+        ):
+            return False
+        events_by_attempt.setdefault(event.resume_attempt_ref, []).append(event)
+    if any(len(bound_events) != 1 for bound_events in events_by_attempt.values()):
+        return False
+    for attempt in attempts:
+        event_count = len(events_by_attempt.get(attempt.resume_attempt_ref, ()))
+        if (attempt.state == "applied" and event_count != 1) or (
+            attempt.state == "sealed" and event_count != 0
+        ):
+            return False
+
+    transitions_by_challenge: dict[str, list[_TransitionV1]] = {}
+    for transition in transitions:
+        if transition.challenge_ref not in challenge_by_ref:
+            return False
+        if (
+            transition.resume_attempt_ref is not None
+            and transition.resume_attempt_ref not in attempt_by_ref
+        ):
+            return False
+        transitions_by_challenge.setdefault(transition.challenge_ref, []).append(
+            transition
+        )
+
+    for challenge in challenges:
+        bound = transitions_by_challenge.get(challenge.challenge_ref, [])
+        initial = tuple(
+            transition
+            for transition in bound
+            if transition.resume_attempt_ref is None
+            and transition.from_state == "decided"
+            and transition.to_state == "review_pending"
+            and transition.observed_at == challenge.issued_at
+        )
+        if len(initial) != 1:
+            return False
+        for attempt in (
+            item for item in attempts if item.challenge_ref == challenge.challenge_ref
+        ):
+            staged = tuple(
+                transition
+                for transition in bound
+                if transition.resume_attempt_ref == attempt.resume_attempt_ref
+                and transition.from_state == "attempt_unstaged"
+                and transition.to_state == "attempt_staged"
+            )
+            if len(staged) != 1 or staged[0].sequence <= initial[0].sequence:
+                return False
+            applied_transitions = tuple(
+                transition
+                for transition in bound
+                if transition.resume_attempt_ref == attempt.resume_attempt_ref
+                and (transition.from_state, transition.to_state)
+                in {
+                    ("issued", "claimed"),
+                    ("claimed", "applied"),
+                    ("review_pending", "review_applied"),
+                }
+            )
+            if attempt.state == "applied":
+                expected_states = (
+                    ("issued", "claimed"),
+                    ("claimed", "applied"),
+                    ("review_pending", "review_applied"),
+                )
+                if tuple(
+                    (transition.from_state, transition.to_state)
+                    for transition in applied_transitions
+                ) != expected_states or applied_transitions[0].sequence <= staged[0].sequence:
+                    return False
+                event = events_by_attempt[attempt.resume_attempt_ref][0]
+                if any(
+                    transition.observed_at != event.applied_at
+                    for transition in applied_transitions
+                ):
+                    return False
+            elif applied_transitions:
+                return False
+        allowed_count = 1 + sum(
+            1 + (3 if attempt.state == "applied" else 0)
+            for attempt in attempts
+            if attempt.challenge_ref == challenge.challenge_ref
+        )
+        if len(bound) != allowed_count:
+            return False
+
+    applied_challenge_refs = {
+        attempt.challenge_ref for attempt in attempts if attempt.state == "applied"
+    }
+    if applied_challenge_refs != {
+        challenge.challenge_ref
+        for challenge in challenges
+        if challenge.state == "applied"
+    }:
+        return False
+
+    current_scopes = tuple(_scope_key(marker) for marker in current)
+    checkpoint_scopes = {_scope_key(checkpoint) for checkpoint in checkpoints}
+    if (
+        len(current_scopes) != len(set(current_scopes))
+        or set(current_scopes) != checkpoint_scopes
+    ):
+        return False
+    for marker in current:
+        scoped_checkpoints = tuple(
+            checkpoint
+            for checkpoint in checkpoints
+            if _scope_key(checkpoint) == _scope_key(marker)
+        )
+        latest = max(scoped_checkpoints, key=lambda checkpoint: checkpoint.issue_sequence)
+        if (
+            marker.issue_sequence != latest.issue_sequence
+            or marker.checkpoint_id != latest.checkpoint_id
+            or marker.challenge_ref != latest.challenge_ref
+        ):
+            return False
+    return True
+
+
 class SandboxInMemoryReviewStore:
     """Thread-safe, sandbox-only in-memory reference domain store."""
 
     def __init__(self, *, snapshot: object | None = None) -> None:
         self._lock = threading.RLock()
         self._operation_count = 0
-        initial = (
-            SandboxReviewStoreSnapshotV1()
-            if snapshot is None
-            else _deep_model(SandboxReviewStoreSnapshotV1, snapshot)
-        )
+        initial: SandboxReviewStoreSnapshotV1 | None = None
+        with suppress(Exception):
+            initial = (
+                SandboxReviewStoreSnapshotV1()
+                if snapshot is None
+                else _deep_model(SandboxReviewStoreSnapshotV1, snapshot)
+            )
+        if initial is None:
+            raise SandboxReviewError()
         self._sources = list(initial.sources)
         self._challenges = list(initial.challenges)
         self._checkpoints = list(initial.checkpoints)
         self._attempts = list(initial.attempts)
         self._events = list(initial.events)
         self._transitions = list(initial.transitions)
+        self._current_authorities = list(initial.current_authorities)
 
     @property
     def operation_count(self) -> int:
@@ -497,6 +855,7 @@ class SandboxInMemoryReviewStore:
                 attempts=tuple(self._attempts),
                 events=tuple(self._events),
                 transitions=tuple(self._transitions),
+                current_authorities=tuple(self._current_authorities),
             )
             return _deep_model(SandboxReviewStoreSnapshotV1, value)
 
@@ -542,21 +901,33 @@ class SandboxInMemoryReviewStore:
                 return False
             source_copy = _deep_model(SandboxReviewSourceV1, source)
             challenge_copy = _deep_model(SandboxReviewChallengeV1, challenge)
-            source_ref = f"sandbox-source-{_sha256(source_copy)}"
-            self._sources.append(
-                _StoredSourceV1(
-                    source_ref=source_ref,
-                    namespace=challenge.namespace,
-                    test_session_id=challenge.test_session_id,
-                    thread_id=challenge.thread_id,
-                    checkpoint_id=challenge.checkpoint_id,
-                    interrupt_id=challenge.interrupt_id,
-                    source=source_copy,
-                )
+            issue_sequence = len(self._checkpoints)
+            provisional_source = _StoredSourceV1.model_construct(
+                source_ref="sandbox-source-" + "0" * 64,
+                issue_sequence=issue_sequence,
+                namespace=challenge.namespace,
+                test_session_id=challenge.test_session_id,
+                thread_id=challenge.thread_id,
+                checkpoint_id=challenge.checkpoint_id,
+                interrupt_id=challenge.interrupt_id,
+                source=source_copy,
             )
+            stored_source = _StoredSourceV1(
+                source_ref=_stored_source_ref(provisional_source),
+                issue_sequence=issue_sequence,
+                namespace=challenge.namespace,
+                test_session_id=challenge.test_session_id,
+                thread_id=challenge.thread_id,
+                checkpoint_id=challenge.checkpoint_id,
+                interrupt_id=challenge.interrupt_id,
+                source=source_copy,
+            )
+            source_ref = stored_source.source_ref
+            self._sources.append(stored_source)
             self._challenges.append(challenge_copy)
             self._checkpoints.append(
                 _CheckpointV1(
+                    issue_sequence=issue_sequence,
                     namespace=challenge.namespace,
                     test_session_id=challenge.test_session_id,
                     thread_id=challenge.thread_id,
@@ -574,8 +945,30 @@ class SandboxInMemoryReviewStore:
                     from_state="decided",
                     to_state="review_pending",
                     observed_at=challenge.issued_at,
+                    sequence=len(self._transitions),
                 )
             )
+            current = _CurrentAuthorityV1(
+                issue_sequence=issue_sequence,
+                namespace=challenge.namespace,
+                test_session_id=challenge.test_session_id,
+                thread_id=challenge.thread_id,
+                checkpoint_id=challenge.checkpoint_id,
+                challenge_ref=challenge.challenge_ref,
+            )
+            existing_current = next(
+                (
+                    marker
+                    for marker in self._current_authorities
+                    if _scope_key(marker) == _scope_key(current)
+                ),
+                None,
+            )
+            if existing_current is None:
+                self._current_authorities.append(current)
+            else:
+                current_index = self._current_authorities.index(existing_current)
+                self._current_authorities[current_index] = current
             self._operation_count += 1
             return True
 
@@ -602,7 +995,7 @@ class SandboxInMemoryReviewStore:
                 return False
             if challenge.state == "expired":
                 return False
-            if now > challenge.expires_at:
+            if now >= challenge.expires_at:
                 self._replace_challenge(challenge, state="expired")
                 self._operation_count += 1
                 return False
@@ -616,7 +1009,18 @@ class SandboxInMemoryReviewStore:
                 return False
             existing = self._attempt(attempt.resume_attempt_ref)
             if existing is None:
-                self._attempts.append(_deep_model(_SealedAttemptV1, attempt))
+                attempt_copy = _deep_model(_SealedAttemptV1, attempt)
+                self._attempts.append(attempt_copy)
+                self._transitions.append(
+                    _transition(
+                        challenge_ref=challenge.challenge_ref,
+                        resume_attempt_ref=attempt.resume_attempt_ref,
+                        from_state="attempt_unstaged",
+                        to_state="attempt_staged",
+                        observed_at=now,
+                        sequence=len(self._transitions),
+                    )
+                )
                 self._operation_count += 1
             return True
 
@@ -648,7 +1052,7 @@ class SandboxInMemoryReviewStore:
                 return "replayed_or_conflict"
             if challenge.state == "expired":
                 return "resume_rejected"
-            if now > challenge.expires_at:
+            if now >= challenge.expires_at:
                 self._replace_challenge(challenge, state="expired")
                 self._operation_count += 1
                 return "resume_rejected"
@@ -669,6 +1073,7 @@ class SandboxInMemoryReviewStore:
                     from_state="issued",
                     to_state="claimed",
                     observed_at=now,
+                    sequence=len(self._transitions),
                 )
             )
             applied = self._replace_challenge(claimed, state="applied")
@@ -682,6 +1087,7 @@ class SandboxInMemoryReviewStore:
                         from_state="claimed",
                         to_state="applied",
                         observed_at=now,
+                        sequence=len(self._transitions),
                     ),
                     _transition(
                         challenge_ref=applied.challenge_ref,
@@ -689,10 +1095,18 @@ class SandboxInMemoryReviewStore:
                         from_state="review_pending",
                         to_state="review_applied",
                         observed_at=now,
+                        sequence=len(self._transitions) + 1,
                     ),
                 )
             )
-            self._events.append(_review_event(applied, attempt, now=now))
+            self._events.append(
+                _review_event(
+                    applied,
+                    attempt,
+                    now=now,
+                    sequence=len(self._events),
+                )
+            )
             self._operation_count += 1
             return "applied"
 
@@ -716,6 +1130,20 @@ class SandboxInMemoryReviewStore:
             if len(checkpoints) != 1 or checkpoints[0].state != "review_applied":
                 return False
             checkpoint = checkpoints[0]
+            current = tuple(
+                marker
+                for marker in self._current_authorities
+                if marker.namespace == namespace
+                and marker.test_session_id == test_session_id
+                and marker.thread_id == thread_id
+            )
+            if (
+                len(current) != 1
+                or current[0].issue_sequence != checkpoint.issue_sequence
+                or current[0].checkpoint_id != checkpoint.checkpoint_id
+                or current[0].challenge_ref != checkpoint.challenge_ref
+            ):
+                return False
             challenge = self._challenge(checkpoint.challenge_ref)
             source = self._source(checkpoint.source_ref)
             if (
@@ -820,16 +1248,19 @@ def _transition(
     from_state: str,
     to_state: str,
     observed_at: int,
+    sequence: int,
 ) -> _TransitionV1:
     body = {
         "challenge_ref": challenge_ref,
         "from_state": from_state,
         "observed_at": observed_at,
         "resume_attempt_ref": resume_attempt_ref,
+        "sequence": sequence,
         "to_state": to_state,
     }
     return _TransitionV1(
         transition_ref=f"sandbox-transition-{_sha256(body)}",
+        sequence=sequence,
         challenge_ref=challenge_ref,
         resume_attempt_ref=resume_attempt_ref,
         from_state=from_state,
@@ -843,6 +1274,7 @@ def _review_event(
     attempt: _SealedAttemptV1,
     *,
     now: int,
+    sequence: int,
 ) -> SandboxTestReviewEventV1:
     body: dict[str, object] = {
         "action": attempt.action,
@@ -861,6 +1293,7 @@ def _review_event(
         "review_render_digest": challenge.review_render_digest,
         "rule_bundle_digest": challenge.rule_bundle_digest,
         "sandbox_schema_version": challenge.sandbox_schema_version,
+        "sequence": sequence,
         "sandbox_test_key_id": attempt.sandbox_test_key_id,
         "sandbox_test_organization_label": attempt.sandbox_test_organization_label,
         "sandbox_test_qualification_label": attempt.sandbox_test_qualification_label,
@@ -876,6 +1309,7 @@ def _review_event(
     }
     return SandboxTestReviewEventV1(
         event_ref=f"sandbox-review-event-{_sha256(body)}",
+        sequence=sequence,
         resume_attempt_ref=attempt.resume_attempt_ref,
         challenge_ref=challenge.challenge_ref,
         sandbox_schema_version=challenge.sandbox_schema_version,
@@ -1037,10 +1471,9 @@ class SandboxReviewCoordinator:
                 challenge=challenge,
                 plaintext_nonce=plaintext_nonce,
             )
-        except SandboxReviewError:
-            raise
         except Exception:
-            raise SandboxReviewError() from None
+            pass
+        raise SandboxReviewError()
 
     def stage_verified_resume_attempt(
         self, submission_input: SandboxResumeSubmissionV1 | bytes
@@ -1094,7 +1527,10 @@ class SandboxReviewCoordinator:
                 )
             ):
                 return _fixed_stage_rejection()
-            attempt_ref = f"sandbox-attempt-{_sha256({'challenge_ref': challenge.challenge_ref, 'signed_payload_digest': signed_payload_digest})}"
+            attempt_ref = _attempt_ref(
+                challenge.challenge_ref,
+                signed_payload_digest,
+            )
             snapshot = self._store.snapshot()
             matching = tuple(
                 source
