@@ -422,3 +422,12 @@ R2 已关闭的 full sealed-attempt authority binding、single-use cardinality�
 ---
 
 **R3 已交付，申请验收。**
+
+## 16. 项目经理 R3 独立验收（2026-07-22）
+
+- delivery `605f32466b71c6f6a0f1a41ece5fd3eb3d0ac12b` 的 exact parent、三个文件 scope、tracked 与 clean 均正确。
+- 独立 CI 通过合同校准：L5-3 `57 passed`；L5-2 `18`；L5-1 `14`；Safety `71/3 deselected`；privacy `76`；L0 `131`；Ruff/mypy/lock/AST/diff 全绿。强制全量 `1 failed, 1713 passed, 362 deselected` 且唯一为既有 `APP_ENV` defaults 冲突；校准全量 `1714 passed, 362 deselected`。
+- 独立 Reviewer 确认 R2 两项、R1/初始 findings 与跨 attempt 非单调时间正例全部通过，但发现 P2=1：两个已应用 challenges 的 events 可被反转、重编号并重算 refs，而 `review_applied` transitions 保持原序，restore 仍接受该 live-unreachable 双日志历史。
+- PM 结论：**R3 未接受 / 发布 L5-3-R4**（`ACC-20260722-028`、`DEC-20260722-021`）。保留前四次 delivery、全部 RED/GREEN、CI 与 Review 证据；L5-4 不得发布。
+
+R4 合同见 [agent-refactor-l5-3-sandbox-rework-4-task.md](agent-refactor-l5-3-sandbox-rework-4-task.md)。
