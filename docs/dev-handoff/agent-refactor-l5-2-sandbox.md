@@ -158,3 +158,13 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 ---
 
 **已交付，申请验收。**
+
+## 10. 项目经理第 1 轮独立验收（2026-07-22）
+
+- 冻结交付：`335f7ad1f8b07535edec3420f39dea5fcef02e4c`；exact parent `fdc7b3e0275b7488384cda84763f77df0df6056d`；只含原合同三个文件；Review/CI 前后 clean。
+- 独立 CI：专项、L5-1、Safety、privacy、Ruff、mypy、L0、lock、scope/tracked/clean 通过；校准全量 `1654 passed, 362 deselected`；精确 fake env 仅既有 APP_ENV defaults 冲突。
+- 独立 Reviewer：P0=0、P1=1、P2=0、P3=0，结论 `rework required`。
+- P1：已校验 allowlist entries 与 port request 共享 nested 实例；返回后 verifier 从相同对象读取 text，因而 pre-call digest 不能约束 post-call authority。
+- PM 结论：**未接受 / 发布 L5-2-R1 限定返工**。保留本提交与全部证据；L5-3 不得发布。
+
+R1 合同见 [agent-refactor-l5-2-sandbox-rework-1-task.md](agent-refactor-l5-2-sandbox-rework-1-task.md)。
