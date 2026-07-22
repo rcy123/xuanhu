@@ -1093,6 +1093,70 @@ def test_l5_3_restart_snapshot_rejects_attempt_staged_after_challenge_applied() 
     assert raised.value.__context__ is None
 
 
+def test_l5_3_restart_snapshot_rejects_event_order_opposite_review_applied_order() -> None:
+    clock = _FakeClock(value=2_000_000_100)
+    coordinator, store, *_ = _coordinator(clock=clock)
+    first_delivery = _issue(coordinator)
+    first_staged, first_resumed = _stage_and_resume(
+        coordinator,
+        first_delivery,
+        SandboxReviewAction.CONFIRM,
+    )
+    assert first_resumed.status == "applied"
+    assert first_staged.resume_attempt_ref is not None
+
+    clock.value = first_delivery.challenge.issued_at - 100
+    second_delivery = coordinator.create_single_use_challenge(
+        _accepted_source(domain_state_version=8),
+        namespace=_NAMESPACE,
+        thread_id=_THREAD_ID,
+        checkpoint_id="sandbox-checkpoint-002",
+        interrupt_id="sandbox-interrupt-002",
+    )
+    second_staged, second_resumed = _stage_and_resume(
+        coordinator,
+        second_delivery,
+        SandboxReviewAction.CONFIRM,
+    )
+    assert second_resumed.status == "applied"
+    assert second_staged.resume_attempt_ref is not None
+
+    live_snapshot = store.snapshot()
+    review_applied_attempts = tuple(
+        transition.resume_attempt_ref
+        for transition in live_snapshot.transitions
+        if transition.to_state == "review_applied"
+    )
+    assert tuple(
+        event.resume_attempt_ref for event in live_snapshot.events
+    ) == review_applied_attempts == (
+        first_staged.resume_attempt_ref,
+        second_staged.resume_attempt_ref,
+    )
+    assert live_snapshot.events[0].applied_at > live_snapshot.events[1].applied_at
+    assert (
+        SandboxInMemoryReviewStore(snapshot=live_snapshot).snapshot()
+        == live_snapshot
+    )
+
+    tampered = live_snapshot.model_dump(mode="python")
+    reversed_events = tuple(reversed(tampered["events"]))
+    for sequence, event in enumerate(reversed_events):
+        event["sequence"] = sequence
+        event["event_ref"] = _derived_record_ref(
+            "sandbox-review-event-",
+            event,
+            ref_field="event_ref",
+        )
+    tampered["events"] = reversed_events
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=tampered)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction() -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)

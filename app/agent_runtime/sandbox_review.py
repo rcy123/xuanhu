@@ -843,6 +843,13 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
         if len(bound) != allowed_count:
             return False
 
+    if tuple(event.resume_attempt_ref for event in events) != tuple(
+        transition.resume_attempt_ref
+        for transition in transitions
+        if transition.to_state == "review_applied"
+    ):
+        return False
+
     applied_challenge_refs = {
         attempt.challenge_ref for attempt in attempts if attempt.state == "applied"
     }

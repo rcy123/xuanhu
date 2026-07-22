@@ -431,3 +431,65 @@ R2 已关闭的 full sealed-attempt authority binding、single-use cardinality�
 - PM 结论：**R3 未接受 / 发布 L5-3-R4**（`ACC-20260722-028`、`DEC-20260722-021`）。保留前四次 delivery、全部 RED/GREEN、CI 与 Review 证据；L5-4 不得发布。
 
 R4 合同见 [agent-refactor-l5-3-sandbox-rework-4-task.md](agent-refactor-l5-3-sandbox-rework-4-task.md)。
+
+## 17. L5-3-R4 开发交付（2026-07-22）
+
+### 17.1 状态、基线与限定范围
+
+- 状态：**R4 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R4 clean release / exact parent：`b557a36fbf130073aa63e14ba53e984e6dac5a0b`；其 parent 为失败 R3 delivery `605f32466b71c6f6a0f1a41ece5fd3eb3d0ac12b`。原 delivery、R1/R2/R3、四轮 finding、`ACC-20260722-025/026/027/028`、`DEC-20260722-018/019/020/021` 与 R1/R2/R3/R4 任务书全部保留，没有 reset、覆盖或删除失败历史。
+- R4 只修改原三个文件：`app/agent_runtime/sandbox_review.py`、`tests/test_l5_3_sandbox_reviewer_interrupt_resume.py` 与本文；没有修改 R4 任务书、PM 台账、accepted L5-1/L5-2、配置、依赖、Runtime、Legacy、HTTP/DB/Gateway 或 L5-4。
+
+### 17.2 指定先行回归与真实 RED
+
+在 production 仍为 `605f32466b71c6f6a0f1a41ece5fd3eb3d0ac12b` 行为、worktree 唯一修改为指定 regression 时，以第 8 节完整 fake env 与 `UV_OFFLINE=1` 运行专项。exact HEAD 仍为 `b557a36fbf130073aa63e14ba53e984e6dac5a0b`，production diff 为空；结果为退出码 `1`，`1 failed, 57 passed in 2.99s`，58 项全部收集：
+
+- `test_l5_3_restart_snapshot_rejects_event_order_opposite_review_applied_order` 先在同一 store 依次成功 apply 两个合法 challenges，再保持 transitions 原样、反转 events、按新位置重编号 sequence 并重算两个 event refs；R3 restore 实际 `DID NOT RAISE SandboxReviewError`。
+
+RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfail、条件绕过、依赖 stale event ref 或弱化原 57 项。实现后的首次专项为 `58 passed in 2.50s`。
+
+### 17.3 Event/transition append-order P2 closure
+
+- snapshot 继续先验证 event/transition sequence 分别从零连续、ref 唯一与 derived ref 完整，并逐 event 验证 attempt/challenge authority；每 challenge 精确一个 event、winner 精确连续三条 applied transitions、single-use cardinality、状态与时间因果不变量全部保留；
+- 上述逐记录和逐 challenge 校验完成后，restore 精确比较 `tuple(event.resume_attempt_ref for event in events)` 与全部 `to_state == "review_applied"` transitions 的 `resume_attempt_ref` tuple；两侧顺序或成员有任何差异都 fixed reject；
+- 因为 event 与 transition 都在同一 store lock 内 append，其连续 sequence 是唯一顺序 authority。同步反转 events、重编号 sequence 并重算 refs 仍无法把 live-unreachable 双日志历史恢复为合法 snapshot；
+- 失败继续由既有 create/restore fixed `SandboxReviewError` 边界归一化，`__cause__` 与 `__context__` 均为空，不泄漏动态对象、时间、nonce、签名或内部异常。
+
+### 17.4 非全局单调 fake clock 正例与既有不变量
+
+新 regression 的合法 live 前置历史同时覆盖两个不同 challenges/attempts：challenge A 在较晚 fake time issue/stage/apply，随后 clock 整体回拨 100 秒，再 issue/stage/apply challenge B。A event 的 `applied_at` 明确大于 B，但原始 live snapshot 仍可逐字 restore，且 event attempt tuple 与 review-applied transition attempt tuple 同序。
+
+因此 R4 不比较不同 events、challenges 或 attempts 的时间戳，不引入全局 wall/fake-clock 单调假设；顺序 authority 仅来自 append-only sequence。R3 的 live/restore shared causal predicate、cross-attempt stage/apply sequence，R2 的 full sealed-attempt binding/cardinality/current authority，R1 与初始 expiry/event/chainless findings，以及 32-thread 精确 `1 applied + 31 replayed_or_conflict` 全部保留。本修复不实现 L5-4 stale 写入、full safety recheck 或任何生产 Runtime/DB/HTTP 集成。
+
+### 17.5 R4 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部命令使用第 8 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R4 结果 |
+|---|---|
+| L5-3/R4 专项 | 最终交付树 `58 passed in 2.73s`；实现后前次 `58 passed in 2.50s` |
+| 独立 AST 边界 | `1 passed, 57 deselected in 2.26s` |
+| accepted L5-2 回归 | `18 passed in 10.88s` |
+| accepted L5-1 回归 | `14 passed in 18.41s` |
+| Safety 回归 | 合同命令 `71 passed, 3 deselected in 2.23s`；额外宽跑三个 Safety 文件也为 `89 passed, 3 deselected` |
+| L4.5-11 privacy 回归 | `76 passed in 7.10s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.66s` |
+| `uv lock --check` | `Resolved 84 packages in 6ms` |
+| diff/scope/tracked | 提交前最终审计精确限定为 17.1 节三个 tracked 文件，working/cached diff check 均须无错误 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1714 passed, 362 deselected in 133.33s`；唯一失败为既有 `test_load_with_defaults` 预期 `local`、实际为强制值 `sandbox-test` |
+| 只移除 `APP_ENV` 的校准全量 | `1715 passed, 362 deselected in 135.79s` |
+
+全部执行没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway、网络或外部服务。
+
+### 17.6 R4 提交、限制与回退
+
+- 单一 R4 开发提交消息为 `fix: align L5-3 review append order`，exact parent 必须为 `b557a36fbf130073aa63e14ba53e984e6dac5a0b`，提交只含 17.1 节三个原允许文件。
+- Git SHA 不能在包含本文的同一提交中自引用；delivery exact HEAD 由提交后外部报告的 `git rev-parse HEAD`、上述 parent/message、三文件 scope 与 clean worktree 共同冻结，后续由独立 Reviewer/CI/PM 锚定验收。
+- in-memory snapshot integrity 仍是本地 reference-store structural/causal integrity，不是外部持久化、加密签名、数据库 transaction 或生产 durability；真实 Runtime/identity/DB/HTTP 与 L5-4 full recheck 仍未实现、未发布。
+- 若 R4 独立验收失败，使用 `git revert <r4-delivery-exact-head>` 保留历史，不 reset 或覆盖前四轮失败交付与 accepted L5-1/L5-2。
+
+---
+
+**R4 已交付，申请验收。**
