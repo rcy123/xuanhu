@@ -142,146 +142,81 @@ def _find_matches(tokens: list[tuple[str | None, int, int]]) -> list[tuple[int, 
 
     返回: 列表，每个元素为(start_idx, end_idx)，表示token流中的匹配范围（exclusive）
     """
-    n = len(tokens)
-    candidates: list[tuple[int, int, str]] = []  # (start, end, type)
-
-    def _is_digit_token(i: int) -> bool:
-        if i >= n:
-            return False
-        ch = tokens[i][0]
-        return ch is not None and ch in "0123456789"
-
-    def _is_x_token(i: int) -> bool:
-        if i >= n:
-            return False
-        ch = tokens[i][0]
-        return ch is not None and ch in "Xx"
-
-    def _is_separator_token(i: int) -> bool:
-        if i >= n:
-            return False
-        ch = tokens[i][0]
-        return ch is not None and ch in " -."
-
-    def _is_boundary_token(i: int) -> bool:
-        return i < n and tokens[i][0] is None and tokens[i][2] == -1
-
-    def _is_hard_token(i: int) -> bool:
-        return i < n and tokens[i][0] is None and tokens[i][2] != -1
-
-    def _is_digit_or_x_token(i: int) -> bool:
-        return _is_digit_token(i) or _is_x_token(i)
-
-    def _next_non_boundary(i: int) -> int:
-        """返回从i开始的下一个非B token的索引，或n。"""
-        while i < n and _is_boundary_token(i):
-            i += 1
-        return i
-
-    def _prev_non_boundary(i: int) -> int:
-        """返回从i-1往前的上一个非B token的索引，或-1。"""
-        j = i - 1
-        while j >= 0 and _is_boundary_token(j):
-            j -= 1
-        return j
-
-    def _collect_digits_with_boundaries(start: int, count: int) -> tuple[list[int], int]:
-        """从start开始收集count个digit token（跳过B边界）。
-        返回: (digit_indices, next_pos)
-        """
-        digits: list[int] = []
-        pos = start
-        while len(digits) < count and pos < n:
-            if _is_digit_token(pos):
-                digits.append(pos)
-                pos += 1
-            elif _is_boundary_token(pos):
-                pos += 1
-            else:
-                break
-        if len(digits) == count:
-            return digits, pos
-        return [], start
-
-    def _collect_exact_digits(start: int, count: int) -> tuple[list[int], int]:
-        """从start开始收集count个digit token（允许跳过B边界）。"""
-        digits: list[int] = []
-        pos = start
-        while len(digits) < count and pos < n:
-            if _is_digit_token(pos):
-                digits.append(pos)
-                pos += 1
-            elif _is_boundary_token(pos):
-                pos += 1
-            else:
-                break
-        if len(digits) == count:
-            return digits, pos
-        return [], start
-
-    def _check_boundary(start: int, end: int) -> bool:
-        """检查前后边界。返回True表示通过检查。"""
-        prev_idx = _prev_non_boundary(start)
-        next_idx = _next_non_boundary(end)
-        return not (
-            (prev_idx >= 0 and _is_digit_or_x_token(prev_idx))
-            or (next_idx < n and _is_digit_or_x_token(next_idx))
-        )
-
-    for i in range(n):
-        # 每个原始起点独立收集全部合同内候选；候选失败不能推进扫描游标。
-        if not _is_digit_token(i):
+    # B只影响最终raw span，不参与grammar或最近非B边界判断。先在线性遍历中
+    # 折叠B，保留每个显著token的原始索引，避免每个数字起点重复跳B和构造候选列表。
+    significant_indices: list[int] = []
+    significant_chars: list[str | None] = []
+    for token_index, (normalized, _, raw_char_index) in enumerate(tokens):
+        if normalized is None and raw_char_index == -1:
             continue
+        significant_indices.append(token_index)
+        significant_chars.append(normalized)
 
-        if tokens[i][0] == "1":
-            j = _next_non_boundary(i + 1)
-            second_digit = tokens[j][0] if j < n and _is_digit_token(j) else None
-            if second_digit is not None and second_digit in "3456789":
-                # 连续手机号: 1[3-9]D{9}
-                remaining_digits, _ = _collect_exact_digits(j + 1, 9)
-                if len(remaining_digits) == 9:
-                    end = remaining_digits[-1] + 1
-                    if _check_boundary(i, end):
-                        candidates.append((i, end, "phone"))
+    significant_count = len(significant_chars)
+    digit_run_lengths = [0] * (significant_count + 1)
+    for position in range(significant_count - 1, -1, -1):
+        normalized = significant_chars[position]
+        if normalized is not None and normalized in "0123456789":
+            digit_run_lengths[position] = digit_run_lengths[position + 1] + 1
 
-                # 分隔手机号: 1[3-9]D S D{4} S D{4}
-                k = _next_non_boundary(j + 1)
-                if k < n and _is_digit_token(k):
-                    first_separator = _next_non_boundary(k + 1)
-                    if first_separator < n and _is_separator_token(first_separator):
-                        separator = tokens[first_separator][0]
-                        middle_digits, after_middle = _collect_digits_with_boundaries(first_separator + 1, 4)
-                        second_separator = _next_non_boundary(after_middle)
-                        if (
-                            len(middle_digits) == 4
-                            and second_separator < n
-                            and _is_separator_token(second_separator)
-                            and tokens[second_separator][0] == separator
-                        ):
-                            final_digits, after_final = _collect_digits_with_boundaries(second_separator + 1, 4)
-                            if len(final_digits) == 4 and _check_boundary(i, after_final):
-                                candidates.append((i, after_final, "phone_sep"))
+    def _is_digit_or_x(normalized: str | None) -> bool:
+        return normalized is not None and normalized in "0123456789Xx"
 
-        # 身份证号: D{17}(D|X)。第18位之前也允许跨越一个或多个B。
-        digits_17, after_17 = _collect_exact_digits(i, 17)
-        if len(digits_17) == 17:
-            final_token = _next_non_boundary(after_17)
-            if final_token < n and (_is_digit_token(final_token) or _is_x_token(final_token)):
-                end = final_token + 1
-                if _check_boundary(i, end):
-                    candidates.append((i, end, "id_card"))
-
-    # 去重和冲突解决
-    # 按起点从左到右、同起点最长优先、仍相同时身份证优先
-    # 首先按起点排序，然后贪心选择不重叠的匹配
-    candidates.sort(key=lambda c: (c[0], -(c[1] - c[0]), 0 if c[2] == "id_card" else 1))
+    def _has_valid_boundary(start: int, end: int) -> bool:
+        return not (
+            (start > 0 and _is_digit_or_x(significant_chars[start - 1]))
+            or (end < significant_count and _is_digit_or_x(significant_chars[end]))
+        )
 
     selected: list[tuple[int, int]] = []
     last_end = -1
-    for start, end, _ in candidates:
-        if start >= last_end:
-            selected.append((start, end))
-            last_end = end
+    for position, normalized in enumerate(significant_chars):
+        start = significant_indices[position]
+        if start < last_end or normalized is None or normalized not in "0123456789":
+            continue
+
+        best_end_position = -1
+
+        if normalized == "1" and position + 1 < significant_count:
+            second = significant_chars[position + 1]
+            if second is not None and second in "3456789":
+                # 连续手机号: 1[3-9]D{9}
+                continuous_end = position + 11
+                if digit_run_lengths[position] >= 11 and _has_valid_boundary(position, continuous_end):
+                    best_end_position = continuous_end
+
+                # 分隔手机号: 1[3-9]D S D{4} S D{4}
+                separated_end = position + 13
+                if position + 12 < significant_count and digit_run_lengths[position] >= 3:
+                    separator = significant_chars[position + 3]
+                    if (
+                        separator is not None
+                        and separator in " -."
+                        and digit_run_lengths[position + 4] >= 4
+                        and significant_chars[position + 8] == separator
+                        and digit_run_lengths[position + 9] >= 4
+                        and _has_valid_boundary(position, separated_end)
+                    ):
+                        best_end_position = separated_end
+
+        # 身份证号: D{17}(D|X)。同起点最长优先，仍同长时身份证优先。
+        id_end = position + 18
+        if (
+            position + 17 < significant_count
+            and digit_run_lengths[position] >= 17
+            and _is_digit_or_x(significant_chars[position + 17])
+            and _has_valid_boundary(position, id_end)
+            and id_end >= best_end_position
+        ):
+            best_end_position = id_end
+
+        if best_end_position < 0:
+            continue
+
+        end = significant_indices[best_end_position - 1] + 1
+        # 身份证在上方以>=最后参与择优；同end时其优先级被保留，且range可观察结果相同。
+        selected.append((start, end))
+        last_end = end
 
     return selected
 

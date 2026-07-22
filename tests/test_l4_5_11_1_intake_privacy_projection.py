@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import statistics
+import time
 import uuid
 
 import pytest
@@ -42,6 +44,24 @@ def _build_user_json(input_payload: IntakeExtractionInput) -> list[dict[str, str
     packet, _ = build_intake_context(input_payload)
     user_content = packet.messages[-1].content
     return json.loads(user_content)
+
+
+_PERFORMANCE_WARMUPS = 10
+_PERFORMANCE_SAMPLES = 25
+_SINGLE_MESSAGE_LIMIT_MS = 10.0
+_EIGHT_MESSAGE_LIMIT_MS = 80.0
+
+
+def _median_call_ms(public_helper: object, contents: tuple[str, ...]) -> float:
+    for _ in range(_PERFORMANCE_WARMUPS):
+        public_helper(contents)  # type: ignore[operator]
+
+    samples_ns: list[int] = []
+    for _ in range(_PERFORMANCE_SAMPLES):
+        started_ns = time.perf_counter_ns()
+        public_helper(contents)  # type: ignore[operator]
+        samples_ns.append(time.perf_counter_ns() - started_ns)
+    return statistics.median(samples_ns) / 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +283,48 @@ def test_nfkc_hard_boundary_no_false_concatenation() -> None:
     result = project_model_input_identity_sequences((content,))
     # ㍑是HARD，应阻止跨字符拼接
     assert result[0] == content
+
+
+@pytest.mark.parametrize(
+    ("public_helper", "expected"),
+    [
+        (contains_model_input_identity_sequence, False),
+        (project_model_input_identity_sequences, ("7" * 4_000,)),
+    ],
+)
+def test_digit_dense_single_message_has_bounded_matcher_work(
+    public_helper: object,
+    expected: object,
+) -> None:
+    """最大合法单消息保持原样，预热后的函数中位数低于10ms。"""
+    contents = ("7" * 4_000,)
+    assert public_helper(contents) == expected  # type: ignore[operator]
+    median_ms = _median_call_ms(public_helper, contents)
+    assert median_ms < _SINGLE_MESSAGE_LIMIT_MS, (
+        f"median {median_ms:.3f} ms >= {_SINGLE_MESSAGE_LIMIT_MS:.1f} ms "
+        f"({_PERFORMANCE_WARMUPS} warmups, {_PERFORMANCE_SAMPLES} samples)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("public_helper", "expected"),
+    [
+        (contains_model_input_identity_sequence, False),
+        (project_model_input_identity_sequences, ("7" * 4_000,) * 8),
+    ],
+)
+def test_digit_dense_eight_message_batch_has_bounded_matcher_work(
+    public_helper: object,
+    expected: object,
+) -> None:
+    """8条最大合法消息保持原样，预热后的函数中位数低于80ms。"""
+    contents = ("7" * 4_000,) * 8
+    assert public_helper(contents) == expected  # type: ignore[operator]
+    median_ms = _median_call_ms(public_helper, contents)
+    assert median_ms < _EIGHT_MESSAGE_LIMIT_MS, (
+        f"median {median_ms:.3f} ms >= {_EIGHT_MESSAGE_LIMIT_MS:.1f} ms "
+        f"({_PERFORMANCE_WARMUPS} warmups, {_PERFORMANCE_SAMPLES} samples)"
+    )
 
 
 # ---------------------------------------------------------------------------
