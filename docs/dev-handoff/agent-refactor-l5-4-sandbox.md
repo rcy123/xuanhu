@@ -437,3 +437,11 @@ production 保持 `c71832b` 行为时，先新增三项关系矩阵回归，真�
 - PM 六项矩阵/组合复验 `6 passed in 2.39s`；exact HEAD 不变且 clean。
 - PM 结论：**L5-4 与 R5 accepted**（`ACC-20260722-037`、`DEC-20260722-030`），关闭 `R-L5-RECHECK-001`。初始～R4 失败历史全部保留。
 - 本节只完成 L5-4 单项验收；L5-1～L5-4 现为 4/4 individually accepted，但 L5 整体仍须在包含 acceptance management 事务的 clean exact HEAD 执行最终组合 Review/CI/PM 后另行关闭；L6 未开始。
+
+## 20. L5 最终组合第 1 轮（未通过，L5-4 reopened）
+
+- 冻结 exact HEAD：`be33ffc92ca37bffe69c1f40967f44aea7f7596d`；acceptance parent `847076e86275edc6a92470dbb749a695d9177757`；工作区前后 clean。
+- 最终独立 CI：L5 组合 `138 passed`，calibrated full `1763 passed, 362 deselected`；forced full 仅既有 defaults 差异；Safety/Runtime/Legacy/privacy/public flag/AST/Ruff/mypy/L0/lock/scope/tracked/clean 全通过。
+- 最终 Reviewer：P0=0、P1=0、P2=1、P3=0；唯一 P2 为 current `review_required` child 没有继承 parent review schema authority，同步改变 child/private schema 并重派生完整 refs 后 restore 仍接受。
+- PM 跨层 `13 passed`，并独立复现 parent v1 / child v2 的 `review_required` snapshot `restore=accepted`。
+- 结论：最终组合 **未通过**（`ACC-20260722-038`、`DEC-20260722-031`）；保留第 19 节和 `ACC-037` 的历史单项结论，但 L5-4 与 `R-L5-RECHECK-001` 重新打开，发布 R6；L5 当前 3/4，L6 未开始。
