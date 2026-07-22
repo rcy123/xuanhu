@@ -357,3 +357,68 @@ eligibility 在 lock 内先按 `(namespace, test_session_id, thread_id)` 取得�
 - PM 结论：**R2 未接受 / 发布 L5-3-R3**（`ACC-20260722-027`、`DEC-20260722-020`）。保留前三次 delivery、全部 RED/GREEN、CI 与 Review 证据；L5-4 不得发布。
 
 R3 合同见 [agent-refactor-l5-3-sandbox-rework-3-task.md](agent-refactor-l5-3-sandbox-rework-3-task.md)。
+
+## 15. L5-3-R3 开发交付（2026-07-22）
+
+### 15.1 状态、基线与限定范围
+
+- 状态：**R3 已交付，申请验收**；执行者不声明 accepted、clinical approved 或 production ready。
+- R3 clean release / exact parent：`80e989f6b6cd3d663a8a94bd92e508ef47628748`；其 parent 为失败 R2 delivery `03ba9104a9d79924fb4d1241429161a8d80f989e`。原 delivery、R1/R2、三轮 finding、`ACC-20260722-025/026/027`、`DEC-20260722-018/019/020` 与 R1/R2/R3 任务书全部保留，没有 reset、覆盖或删除失败历史。
+- R3 只修改原三个文件：`app/agent_runtime/sandbox_review.py`、`tests/test_l5_3_sandbox_reviewer_interrupt_resume.py` 与本文；没有修改 R3 任务书、PM 台账、accepted L5-1/L5-2、配置、依赖、Runtime、Legacy、HTTP/DB/Gateway 或 L5-4。
+
+### 15.2 两项先行回归与真实 RED
+
+在 production 仍为 `03ba9104a9d79924fb4d1241429161a8d80f989e` 行为、worktree 唯一修改为两项指定 regression 时，以第 8 节完整 fake env 与 `UV_OFFLINE=1` 运行专项。exact HEAD 仍为 `80e989f6b6cd3d663a8a94bd92e508ef47628748`，production diff 为空；结果为退出码 `1`，`2 failed, 55 passed in 2.76s`，57 项全部收集：
+
+1. `test_l5_3_live_stage_and_apply_reject_predecessor_clock_without_mutation`：issued 后把 fake clock 回拨到 predecessor 之前，stage/apply 实际返回 `staged/applied`，而非两次 fixed rejection；
+2. `test_l5_3_restart_snapshot_rejects_attempt_staged_after_challenge_applied`：把 loser staged transition 移到 winner `review_applied` 之后、同步重排 sequence 并重算所有 transition refs 后，restore `DID NOT RAISE`。
+
+RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfail、条件绕过、只依赖 stale ref 或弱化原 55 项。实现后的首次专项为 `57 passed in 2.46s`。
+
+### 15.3 Live/restore 共享 causal predicate
+
+- 新增单一 `_causal_observation_is_reachable` 谓词，统一表达每个 attempt 的 `issued_at <= predecessor_at <= observed_at < expires_at`；live mutation 前置校验与 snapshot restore 使用同一实现，避免两套 lower-bound 条件漂移；
+- stage 在 mutation 前以 challenge `issued_at` 为 predecessor；`now < issued_at` 返回既有 fixed rejection，attempt/challenge/checkpoint/event/transitions 与完整 snapshot 均不变，原 exclusive expiry tombstone 语义不变；
+- apply 从权威 append-only transitions 定位该 attempt 精确一条 staged transition，以其 `observed_at` 为 predecessor；缺失、重复或 `now < staged_at` 都返回既有 fixed `resume_rejected`，attempt 仍 sealed、challenge issued、checkpoint pending、event 为空且 snapshot 可 restore；
+- restore 对 staged 与 applied 使用同一 per-attempt predicate；固定 `SandboxReviewError` 边界继续无 cause/context，不泄漏动态时间、nonce、签名、对象 repr 或内部异常。
+
+### 15.4 Cross-attempt append-sequence causality
+
+- 对 applied challenge，winner 的 `attempt_applied`、`checkpoint_applied`、`review_applied` 三条 transition 必须保持固定顺序且 sequence 连续；
+- 同 challenge 的全部 `attempt_staged` transition 必须早于 winner 第一条 applied transition；即使攻击者移动 loser transition、重排全部 sequence 并重算 derived refs，restore 仍 fixed chainless reject；
+- cross-attempt 因果只使用 append-only sequence 表达“challenge applied 后不可再 stage”。不比较不同 attempt 的时间戳，也不要求 fake clock 全局单调；winner 自身仍满足 per-attempt lower bounds。
+
+R2 已关闭的 full sealed-attempt authority binding、single-use cardinality、current-marker-first eligibility、单 attempt restore temporal causality，以及 R1 的 expiry/event/current/chainless invariants 全部保留。本修复不实现 L5-4 stale 写入、full safety recheck 或任何生产 Runtime/DB/HTTP 集成。
+
+### 15.5 R3 最终门禁
+
+除 calibrated full 只移除 `APP_ENV` 外，全部命令使用第 8 节完整 fake env 与 `UV_OFFLINE=1`：
+
+| 门禁 | R3 结果 |
+|---|---|
+| L5-3/R3 专项 | 最终交付树 `57 passed in 3.20s`；实现后前次 `57 passed in 2.46s` |
+| 独立 AST 边界 | `1 passed, 56 deselected in 2.04s` |
+| accepted L5-2 回归 | `18 passed in 8.83s` |
+| accepted L5-1 回归 | `14 passed in 15.38s` |
+| Safety 回归 | `71 passed, 3 deselected in 2.35s` |
+| L4.5-11 privacy 回归 | `76 passed in 5.88s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；只有既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.14s` |
+| `uv lock --check` | `Resolved 84 packages in 5ms` |
+| diff/scope/tracked | 提交前最终审计精确限定为 15.1 节三个 tracked 文件，working/cached diff check 均须无错误 |
+| 强制 `APP_ENV=sandbox-test` 全量 | 有效完整运行 `1 failed, 1713 passed, 362 deselected in 136.29s`；唯一失败为既有 `test_load_with_defaults` 预期 `local`、实际为强制值 `sandbox-test` |
+| 只移除 `APP_ENV` 的校准全量 | `1714 passed, 362 deselected in 133.38s` |
+
+首次强制全量在 124.5 秒达到命令时限，未形成 pytest 结论；保持源码与环境不变、提高命令时限后的完整重跑给出上表有效结果。全部执行没有读取/显示 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动或连接应用、HTTP/E2E、容器、DB、Redis、Milvus、模型/embedding Gateway、网络或外部服务。
+
+### 15.6 R3 提交、限制与回退
+
+- 单一 R3 开发提交消息为 `fix: align L5-3 live and restored causality`，exact parent 必须为 `80e989f6b6cd3d663a8a94bd92e508ef47628748`，提交只含 15.1 节三个原允许文件。
+- Git SHA 不能在包含本文的同一提交中自引用；delivery exact HEAD 由提交后外部报告的 `git rev-parse HEAD`、上述 parent/message、三文件 scope 与 clean worktree 共同冻结，后续由独立 Reviewer/CI/PM 锚定验收。
+- in-memory snapshot integrity 仍是本地 reference-store structural/causal integrity，不是外部持久化、加密签名、数据库 transaction 或生产 durability；真实 Runtime/identity/DB/HTTP 与 L5-4 full recheck 仍未实现、未发布。
+- 若 R3 独立验收失败，使用 `git revert <r3-delivery-exact-head>` 保留历史，不 reset 或覆盖前三轮失败交付与 accepted L5-1/L5-2。
+
+---
+
+**R3 已交付，申请验收。**

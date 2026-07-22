@@ -1011,6 +1011,88 @@ def test_l5_3_restart_snapshot_rejects_noncausal_stage_and_apply_times(
     assert raised.value.__context__ is None
 
 
+def test_l5_3_live_stage_and_apply_reject_predecessor_clock_without_mutation() -> None:
+    stage_clock = _FakeClock()
+    stage_coordinator, stage_store, *_ = _coordinator(clock=stage_clock)
+    stage_delivery = _issue(stage_coordinator)
+    stage_before = stage_store.snapshot()
+    stage_clock.value = stage_delivery.challenge.issued_at - 1
+    stage_result = stage_coordinator.stage_verified_resume_attempt(
+        _submission(stage_delivery, SandboxReviewAction.CONFIRM)
+    )
+
+    apply_clock = _FakeClock()
+    apply_coordinator, apply_store, *_ = _coordinator(clock=apply_clock)
+    apply_delivery = _issue(apply_coordinator)
+    apply_clock.value = apply_delivery.challenge.issued_at + 10
+    staged = apply_coordinator.stage_verified_resume_attempt(
+        _submission(apply_delivery, SandboxReviewAction.CONFIRM)
+    )
+    assert staged.resume_attempt_ref is not None
+    apply_before = apply_store.snapshot()
+    apply_clock.value = apply_delivery.challenge.issued_at + 9
+    apply_result = apply_coordinator.resume(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    )
+
+    assert (stage_result.status, apply_result.status) == (
+        "resume_rejected",
+        "resume_rejected",
+    )
+    stage_after = stage_store.snapshot()
+    apply_after = apply_store.snapshot()
+    assert stage_after == stage_before
+    assert apply_after == apply_before
+    assert apply_after.attempts[0].state == "sealed"
+    assert apply_after.challenges[0].state == "issued"
+    assert apply_after.checkpoints[0].state == "review_pending"
+    assert apply_after.events == ()
+    assert SandboxInMemoryReviewStore(snapshot=stage_after).snapshot() == stage_after
+    assert SandboxInMemoryReviewStore(snapshot=apply_after).snapshot() == apply_after
+
+
+def test_l5_3_restart_snapshot_rejects_attempt_staged_after_challenge_applied() -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    loser = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.REJECT)
+    )
+    winner = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.CONFIRM)
+    )
+    assert loser.resume_attempt_ref is not None
+    assert winner.resume_attempt_ref is not None
+    assert coordinator.resume(
+        SandboxResumeCommandV1(resume_attempt_ref=winner.resume_attempt_ref)
+    ).status == "applied"
+    snapshot = store.snapshot().model_dump(mode="python")
+    loser_staged = next(
+        transition
+        for transition in snapshot["transitions"]
+        if transition["resume_attempt_ref"] == loser.resume_attempt_ref
+        and transition["to_state"] == "attempt_staged"
+    )
+    reordered = tuple(
+        transition
+        for transition in snapshot["transitions"]
+        if transition is not loser_staged
+    ) + (loser_staged,)
+    for sequence, transition in enumerate(reordered):
+        transition["sequence"] = sequence
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+    snapshot["transitions"] = reordered
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=snapshot)
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction() -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)

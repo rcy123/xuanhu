@@ -581,6 +581,22 @@ def _event_matches_authority(
     )
 
 
+def _causal_observation_is_reachable(
+    challenge: SandboxReviewChallengeV1,
+    *,
+    predecessor_at: int,
+    observed_at: int,
+) -> bool:
+    """Apply the same per-attempt causal time window live and on restore."""
+
+    return (
+        challenge.issued_at
+        <= predecessor_at
+        <= observed_at
+        < challenge.expires_at
+    )
+
+
 def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
     sources = snapshot.sources
     challenges = snapshot.challenges
@@ -768,10 +784,10 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
             if (
                 len(staged) != 1
                 or staged[0].sequence <= initial[0].sequence
-                or not (
-                    challenge.issued_at
-                    <= staged[0].observed_at
-                    < challenge.expires_at
+                or not _causal_observation_is_reachable(
+                    challenge,
+                    predecessor_at=challenge.issued_at,
+                    observed_at=staged[0].observed_at,
                 )
             ):
                 return False
@@ -797,14 +813,25 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
                     for transition in applied_transitions
                 ) != expected_states or applied_transitions[0].sequence <= staged[0].sequence:
                     return False
+                first_applied_sequence = applied_transitions[0].sequence
+                if tuple(
+                    transition.sequence for transition in applied_transitions
+                ) != tuple(
+                    range(first_applied_sequence, first_applied_sequence + 3)
+                ) or any(
+                    transition.to_state == "attempt_staged"
+                    and transition.sequence >= first_applied_sequence
+                    for transition in bound
+                ):
+                    return False
                 event = events_by_attempt[attempt.resume_attempt_ref][0]
                 if any(
                     transition.observed_at != event.applied_at
                     for transition in applied_transitions
-                ) or not (
-                    staged[0].observed_at
-                    <= event.applied_at
-                    < challenge.expires_at
+                ) or not _causal_observation_is_reachable(
+                    challenge,
+                    predecessor_at=staged[0].observed_at,
+                    observed_at=event.applied_at,
                 ):
                     return False
             elif applied_transitions:
@@ -1030,6 +1057,12 @@ class SandboxInMemoryReviewStore:
                 self._replace_challenge(challenge, state="expired")
                 self._operation_count += 1
                 return False
+            if not _causal_observation_is_reachable(
+                challenge,
+                predecessor_at=challenge.issued_at,
+                observed_at=now,
+            ):
+                return False
             if (
                 challenge.state != "issued"
                 or checkpoint.state != "review_pending"
@@ -1086,6 +1119,24 @@ class SandboxInMemoryReviewStore:
             if now >= challenge.expires_at:
                 self._replace_challenge(challenge, state="expired")
                 self._operation_count += 1
+                return "resume_rejected"
+            staged = tuple(
+                transition
+                for transition in self._transitions
+                if transition.challenge_ref == challenge.challenge_ref
+                and transition.resume_attempt_ref == attempt.resume_attempt_ref
+                and transition.from_state == "attempt_unstaged"
+                and transition.to_state == "attempt_staged"
+            )
+            if len(staged) != 1 or not _causal_observation_is_reachable(
+                challenge,
+                predecessor_at=(
+                    staged[0].observed_at
+                    if staged
+                    else challenge.issued_at
+                ),
+                observed_at=now,
+            ):
                 return "resume_rejected"
             if (
                 challenge.state != "issued"
