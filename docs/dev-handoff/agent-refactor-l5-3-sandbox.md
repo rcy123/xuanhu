@@ -493,3 +493,12 @@ RED 前没有修改 production、handoff 或范围外文件，没有 skip、xfai
 ---
 
 **R4 已交付，申请验收。**
+
+## 18. 项目经理 R4 独立验收（2026-07-22）
+
+- delivery `1f8503e0c28dd19dcc48b6e63b3e5103ce9adeda` 的 exact parent、三个文件 scope、tracked 与 clean 均正确。
+- 独立 CI 通过合同校准：L5-3 `58 passed`；L5-2 `18`；L5-1 `14`；Safety `71/3 deselected`；privacy `76`；L0 `131`；Ruff/mypy/lock/AST/diff 全绿。强制全量 `1 failed, 1714 passed, 362 deselected` 且唯一为既有 `APP_ENV` defaults 冲突；校准全量 `1715 passed, 362 deselected`。
+- 独立 Reviewer 确认 R4 指定 event/apply transition 顺序、非全局单调正例与全部历史 findings 通过，但发现 P2=1：反转 A/B 初始 transitions、重编号并重算 refs 后，restore 仍接受与 challenge issue 顺序相反的 live-unreachable history。
+- PM 结论：**R4 未接受 / 发布 L5-3-R5**（`ACC-20260722-029`、`DEC-20260722-022`）。R5 以全部显式 sequenced projections 为根因边界；不为无 sequence 的 keyed collections 发明顺序。保留前五次 delivery 和全部证据；L5-4 不得发布。
+
+R5 合同见 [agent-refactor-l5-3-sandbox-rework-5-task.md](agent-refactor-l5-3-sandbox-rework-5-task.md)。
