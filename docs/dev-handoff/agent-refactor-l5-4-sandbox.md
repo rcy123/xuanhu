@@ -131,3 +131,12 @@ $env:UV_OFFLINE='1'
 限制：in-memory snapshot 只模拟 restart，不提供进程外 durability；clock、nonce factory 与 signature verifier 是注入的测试边界；本模块不是 Runtime、API、持久层、真实 completion/export 或专业准入实现。
 
 使用单一开发提交，消息为 `feat: add L5-4 offline full recheck coordinator`，exact parent 必须为 `7ee8286ce56c406a392468d21d66a565155ce9f0`。Git SHA 不能在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD` 与独立 Reviewer/CI/PM 验收记录锚定。若验收失败，以该单一交付提交执行 `git revert <delivery-commit>` 并保留全部证据，不 reset 或覆盖历史。
+
+## 9. 第 1 次独立验收（未通过）
+
+- 冻结 delivery：`d5b8f0e775aac4c9d2ac89d6c9b8c6991a2e186a`；exact parent `7ee8286ce56c406a392468d21d66a565155ce9f0`；只新增第 8 节三个文件；Review/CI 前后 clean。
+- 独立 CI：L5-4 `32`、L5-3 `59`、L5-2 `18`、L5-1 `14`、Safety `71 passed, 3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock/AST/diff/scope/tracked/clean 全通过；校准全量 `1748 passed, 362 deselected`；强制环境为 `1 failed, 1747 passed, 362 deselected` 且仅既有 defaults 差异。
+- 独立 Reviewer：P0=0、P1=0、P2=2、P3=0，结论 rework required。
+- P2-1：combined restore 没有逐 revision 验证 namespace/session/thread/review schema 的继承和 challenge 关联；在重派生相关 refs 后，terminal blocked schema 或三 revision 链中间 namespace 可漂移并被接受。
+- P2-2：review source/challenge setup 异常被捕获后，revision render digest 路径在保护范围外再次调用 source build；source build failure 会返回动态异常且不提交已接受 modification 的 invalidation。
+- PM 结论：**未接受 / 发布 L5-4-R1 限定返工**（`ACC-20260722-032`、`DEC-20260722-025`）。保留本 delivery、RED/GREEN、CI 与 findings；L5 仍为 3/4，L6 未开始。
