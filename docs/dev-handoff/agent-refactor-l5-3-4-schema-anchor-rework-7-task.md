@@ -1,8 +1,8 @@
 # L5-3/4-R7 fixed review schema restore authority 限定返工任务书
 
-> 状态：已发布 / 待交付  
-> 发布日期：2026-07-22  
-> 依据：`ACC-20260722-040`、`DEC-20260722-033`  
+> 状态：已发布 / 待交付
+> 发布日期：2026-07-22
+> 依据：`ACC-20260722-040`、`DEC-20260722-033`
 > 执行起点：包含本任务书与 final R2 失败记录的 clean exact management release HEAD
 
 ## 唯一目标
