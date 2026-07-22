@@ -156,3 +156,106 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 - PM 结论：**未接受 / 发布 L5-1-R1 限定返工**。保留本提交和全部失败证据；L5-2 不得发布。
 
 R1 合同见 [agent-refactor-l5-1-sandbox-rework-1-task.md](agent-refactor-l5-1-sandbox-rework-1-task.md)。
+
+## 11. L5-1-R1 开发交付（2026-07-22）
+
+### 11.1 状态、基线与范围
+
+- 状态：**R1 已交付，申请验收**；执行者不声明 `accepted`、`sandbox_scope_satisfied`、临床批准或生产准入。
+- R1 clean release / 执行起点 exact HEAD：`53cbb9cad9bbd4630f4259409708966df4369e4d`。
+- R1 exact parent 中保留第 1 轮失败交付 `d3eb7b90611b477eb837c395215473f80fe9726f`、PM 验收失败历史、`ACC-20260722-019`、`DEC-20260722-014` 和 R1 任务书；没有 reset、覆盖或删除失败证据。
+- 开始时分支仍为 `codex/l4-5-11-context-privacy-hardening`，worktree/index clean，无 `AGENTS.md`，R1 合同和原任务/准入包均 tracked。
+- R1 只修改本 handoff 第 8 节相同的三个允许文件；不修改 R1 任务书、PM 台账、配置、依赖、公共开关、Legacy、Runtime、Gateway、review/record/export 或其他文件。
+
+### 11.2 四项真实行为 RED
+
+生产代码仍为 `d3eb7b9` 行为、工作区只修改专项测试时，在全部 loopback fake 环境下运行：
+
+```powershell
+uv run pytest tests/test_l5_1_sandbox_safety_adapter.py -q -rs
+```
+
+结果为退出码 `1`，`10 passed, 4 failed in 5.54s`。四个新测试均收集并按合同原因失败：
+
+1. `test_l5_1_pairwise_state_drift_cannot_change_identical_request_result`：同一 adapter / exact subject / bundle / command / run / trace 的 calls 1～2 返回 `block`、3～4 返回 `allow`，两次 canonical result 不同；
+2. `test_l5_1_arbitrary_stateful_callable_is_not_a_deterministic_authority`：旧 constructor 接受任意 stateful callable，没有拒绝；
+3. `test_l5_1_inline_fixture_manifest_is_complete_strict_and_digest_bound`：完整 manifest / scan DTO 不存在；
+4. `test_l5_1_thousand_true_maximum_results_are_resource_bounded`：digest-bound declarative authority case 不存在，因而没有 committed true-max authority/resource 覆盖。
+
+RED 时 HEAD 为 `53cbb9c...`，生产模块未修改，没有 skip、xfail、条件跳过、增加黑盒采样次数或先写生产代码。
+
+### 11.3 R1 单一确定性 authority
+
+R1 删除 `SandboxSafetyEvaluator` Protocol、`_evaluator` slot、任意 callable constructor 参数、两次调用和输出相等采样。`SandboxSafetyRuleAdapter()` 不持有 evaluator、cache、clock、random 或进程状态；传入任意 callable 会在进入 adapter 前得到 Python `TypeError`，call count 保持 `0`。
+
+唯一裁决 authority 现在是以下 immutable canonical 链：
+
+```text
+SandboxRuleBundleV1
+  └─ SandboxEvaluatorAuthorityV1(authority_digest)
+       └─ tuple[SandboxEvaluationCaseV1]
+            ├─ exact formula/profile/dataset digests
+            └─ SandboxSafetyEvaluationV1(decision + canonical issues)
+```
+
+- authority/case/evaluation/issue/rule/parameter 全部 frozen、strict、`extra="forbid"`，嵌套集合为 tuple，case ID、subject binding、issue ID 和 execution order 唯一且固定排序；
+- `authority_digest` 覆盖全部 case input binding 和 decision/issues 输出映射；`rule_bundle_digest` 再覆盖全部规则/参数与完整 authority；subject 显式绑定两者，`decision_subject_digest` 最终覆盖 subject；
+- adapter 只按 formula/profile/dataset 三个 exact digest 机械选择恰好一个 case，随后复制该唯一 authority 的 decision/issues；没有第二套裁决逻辑；
+- rule reference、版本、authority/bundle/subject digest、唯一 binding 和大小均在输出前验证；无 case 或多个 case 固定 fail closed；
+- calls 1～2 / 3～4 pair-wise drift 对手无法注入；同一 adapter、多次请求、新 adapter 和不同 `PYTHONHASHSEED` 均逐字节稳定；
+- 没有用 3 次/N 次/随机采样、时间、无界 cache 或第二套 authority 关闭 P1。
+
+### 11.4 完整 admitted synthetic manifest
+
+subject 现内嵌 frozen/strict `SandboxSyntheticManifestV1` 和 `SandboxIdentifierScanV1`。所有字段均为显式 required，不能因省略而由默认值补齐：
+
+- schema、dataset name/version、`personal_learning_synthetic_only`、`constructed_fixture`；
+- 同时保留原任务固定 `fixed_fictitious_manual`、`sandbox_only`、`not_clinically_adjudicated`；
+- 固定 source statement 明确不来自真实病历、个人记录、生产日志、聊天记录或外部数据集；
+- generator path/version/digest/seed 全为 `not_applicable`，另有人工构造 fixed-fictitious 技术 fixture 证据；
+- `case_count=1`，`content_sha256` 现场重算完整 canonical fixture case；
+- 固定非临床 `created_at` 和 `sandbox_fixture_author` 测试角色；
+- scan 绑定 tool/version/ruleset/time 和 `passed_no_prohibited_identifiers`，不保存任何命中原值；
+- `synthetic_manifest_digest` 覆盖 manifest，`synthetic_dataset_digest` 同时覆盖 manifest 和 canonical fixture content，并进入 authority case 与 subject digest 链。
+
+专项对 missing、extra、未知 provenance、case count、scan 非通过、content digest 和 manifest digest 篡改均固定拒绝；adapter 没有 callable、解释或下游 port，因此这些失败路径在 authority case 选择和任何副作用前结束。
+
+### 11.5 R1 GREEN 与最大资源证据
+
+全部命令继续使用第 7 节 fake 环境；除校准全量只移除 `APP_ENV` 外没有差异。
+
+| 门禁 | R1 结果 |
+|---|---|
+| R1/L5-1 专项 | 最终复跑 `14 passed in 13.25s` |
+| true-max 独立输出 | `1 passed in 9.23s`；指标如下 |
+| Safety 回归 | 最终复跑 `71 passed, 3 deselected in 1.73s` |
+| L4.5-11 两项 privacy 回归 | 最终复跑 `76 passed in 4.42s` |
+| Ruff | `All checks passed!` |
+| mypy | `Success: no issues found in 1 source file`；保留既有 `pymilvus.*` unused-section note |
+| L0 | 最终复跑 `131 passed in 2.04s` |
+| `uv lock --check` / `git diff --check` | lock `Resolved 84 packages in 4ms`；diff check 无错误 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1638 passed, 362 deselected in 128.12s`；唯一为第 5.1 节既有 defaults 冲突 |
+| 只移除 `APP_ENV`、保留全部 fake endpoint 的校准全量 | `1639 passed, 362 deselected in 127.83s` |
+
+最终 true-max committed test 使用：
+
+- Python `3.12.12`；CPU `Intel64 Family 6 Model 142 Stepping 12, GenuineIntel`；Windows/AMD64；
+- 同一合法 fixture 同时为 `64` formula items 和 `256` unique issues；subject `10,345` bytes、bundle `28,297` bytes、result `27,676` bytes，均低于 `256 KiB`；
+- 预热 `20` 次，正式 `1,000` 次；每次 `canonical_result_bytes` 与预期逐字节相同；
+- `perf_counter_ns` 单次计时，排序索引 `949`/`989` 为 p95/p99；Windows process working-set RSS 在循环前后 `gc.collect()` 后比较；
+- p95 `7.658 ms`、p99 `10.925 ms`、RSS 增长 `241,664 bytes`，分别满足 `<50 ms`、`<100 ms`、`<64 MiB`，未放宽门槛。
+
+开发过程中首次 mypy 仅发现两个 Literal schema default/argument 注解不精确；在允许的生产文件中改为 required literal 与字面量 builder 后最终 mypy 通过。manifest required-field 收紧后的专项仍为 `14 passed`。失败历史保留。
+
+### 11.6 边界、限制与提交约定
+
+- 没有读取/显示本地 `.env`，没有读取 ignored `data/`/`.codex_tmp`，没有启动应用、网络、HTTP/E2E、容器、数据库、Redis、Milvus、RAG、模型/embedding Gateway 或外部服务；fixture 只含 inline fixed-fictitious 技术值。
+- R1 仍不实现 persistence、graph node、L5-2 explanation、L5-3 challenge/review、L5-4 修改后重检、真实 record/export 或临床/生产语义；真实临床、患者服务、商业/公开生产和人体研究继续 NO-GO。
+- 强制 `APP_ENV=sandbox-test` 与既有 `test_load_with_defaults` 的冲突按 R1 合同原样保留，不修改合同外 test/config 制造通过；校准全量单独记录，不能替代精确失败命令。
+- 使用单一 R1 开发提交，消息为 `fix: make L5-1 sandbox authority structurally deterministic`；exact parent 必须为 `53cbb9cad9bbd4630f4259409708966df4369e4d`。
+- Git SHA 不能在包含本文的同一提交中自引用；冻结后通过 `git rev-parse HEAD`、提交消息和本文约定报告 exact delivery commit，由独立 Reviewer/CI/PM 在后续验收章节锚定。
+- 若 R1 独立验收失败，以单一 R1 提交执行 `git revert <r1-delivery-commit>`，保留全部历史；不得 reset 或覆盖。
+
+---
+
+**R1 已交付，申请验收。**

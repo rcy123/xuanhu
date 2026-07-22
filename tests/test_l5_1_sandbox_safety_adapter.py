@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import copy
 import gc
+import hashlib
 import os
 import platform
 import subprocess
@@ -15,9 +17,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.agent_runtime.sandbox_safety import (
+    MAX_CANONICAL_BYTES,
     MAX_FORMULA_ITEMS,
     MAX_ISSUES,
+    SandboxEvaluationCaseV1,
+    SandboxEvaluatorAuthorityV1,
     SandboxFormulaItemV1,
+    SandboxIdentifierScanV1,
     SandboxProfileFactV1,
     SandboxRuleBundleV1,
     SandboxRuleParameterV1,
@@ -30,16 +36,17 @@ from app.agent_runtime.sandbox_safety import (
     SandboxSafetyRuleAdapter,
     SandboxSafetySeverity,
     SandboxSafetySubjectV1,
+    SandboxSyntheticManifestV1,
+    canonical_json_bytes,
     canonical_result_bytes,
 )
 
 
 @dataclass
-class _FakeEvaluator:
+class _StatefulCallable:
     calls: int = 0
     exception_payload: str | None = None
     alternate: bool = False
-    issue_count: int = 1
 
     def evaluate(
         self,
@@ -55,18 +62,7 @@ class _FakeEvaluator:
             if self.alternate and self.calls % 2 == 0
             else SandboxSafetyDecision.BLOCK
         )
-        return SandboxSafetyEvaluationV1(
-            decision=decision,
-            issues=tuple(
-                SandboxSafetyIssueV1(
-                    issue_id=f"sandbox.issue.{index:03d}",
-                    rule_id="sandbox.rule.fixed.v1",
-                    severity=SandboxSafetySeverity.HIGH,
-                    execution_order=index,
-                )
-                for index in range(self.issue_count)
-            ),
-        )
+        return _evaluation(decision=decision)
 
 
 def _formula_items(count: int = 2) -> tuple[SandboxFormulaItemV1, ...]:
@@ -91,30 +87,26 @@ def _profile_facts() -> tuple[SandboxProfileFactV1, ...]:
     )
 
 
-def _subject(
+def _issues(count: int = 1) -> tuple[SandboxSafetyIssueV1, ...]:
+    return tuple(
+        SandboxSafetyIssueV1(
+            issue_id=f"sandbox.issue.{index:03d}",
+            rule_id="sandbox.rule.fixed.v1",
+            severity=SandboxSafetySeverity.HIGH,
+            execution_order=index,
+        )
+        for index in range(count)
+    )
+
+
+def _evaluation(
     *,
-    item_count: int = 2,
-    rule_bundle_digest: str | None = None,
-) -> SandboxSafetySubjectV1:
-    return SandboxSafetySubjectV1.build(
-        test_session_id="sandbox-test-session-001",
-        domain_state_version=7,
-        formula_artifact_id="synthetic-formula-artifact-001",
-        formula_revision=3,
-        formula_items=_formula_items(item_count),
-        profile_artifact_id="synthetic-profile-artifact-001",
-        profile_revision=2,
-        profile_facts=_profile_facts(),
-        graph_version="sandbox-graph.v1",
-        rule_bundle_version="sandbox-rule-bundle.v1",
-        rule_bundle_digest=(
-            _bundle().rule_bundle_digest if rule_bundle_digest is None else rule_bundle_digest
-        ),
-        synthetic_dataset_name="fixed-fictitious-manual-fixture",
-        synthetic_dataset_version="1.0.0",
-        dataset_provenance="fixed_fictitious_manual",
-        dataset_usage_scope="sandbox_only",
-        dataset_label_status="not_clinically_adjudicated",
+    issue_count: int = 1,
+    decision: SandboxSafetyDecision = SandboxSafetyDecision.BLOCK,
+) -> SandboxSafetyEvaluationV1:
+    return SandboxSafetyEvaluationV1(
+        decision=decision,
+        issues=_issues(issue_count),
     )
 
 
@@ -130,15 +122,102 @@ def _rules() -> tuple[SandboxRuleV1, ...]:
     )
 
 
-def _bundle(*, rules: tuple[SandboxRuleV1, ...] | None = None) -> SandboxRuleBundleV1:
-    return SandboxRuleBundleV1.build(
-        rule_bundle_version="sandbox-rule-bundle.v1",
-        rules=_rules() if rules is None else rules,
+def _manifest(*, item_count: int = 2) -> SandboxSyntheticManifestV1:
+    return SandboxSyntheticManifestV1.build(
+        dataset_name="fixed-fictitious-manual-fixture",
+        dataset_version="1.0.0",
+        formula_items=_formula_items(item_count),
+        profile_facts=_profile_facts(),
     )
 
 
+def _bundle(
+    *,
+    item_count: int = 2,
+    issue_count: int = 1,
+    decision: SandboxSafetyDecision = SandboxSafetyDecision.BLOCK,
+    rules: tuple[SandboxRuleV1, ...] | None = None,
+    manifest: SandboxSyntheticManifestV1 | None = None,
+) -> SandboxRuleBundleV1:
+    manifest = _manifest(item_count=item_count) if manifest is None else manifest
+    evaluation_case = SandboxEvaluationCaseV1.build(
+        case_id="fixed-fictitious-case-001",
+        formula_items=_formula_items(item_count),
+        profile_facts=_profile_facts(),
+        manifest=manifest,
+        evaluation=_evaluation(issue_count=issue_count, decision=decision),
+    )
+    authority = SandboxEvaluatorAuthorityV1.build(cases=(evaluation_case,))
+    return SandboxRuleBundleV1.build(
+        rule_bundle_version="sandbox-rule-bundle.v1",
+        rules=_rules() if rules is None else rules,
+        evaluator_authority=authority,
+    )
+
+
+def _subject(
+    *,
+    item_count: int = 2,
+    issue_count: int = 1,
+    decision: SandboxSafetyDecision = SandboxSafetyDecision.BLOCK,
+    rule_bundle_digest: str | None = None,
+    bundle: SandboxRuleBundleV1 | None = None,
+    manifest: SandboxSyntheticManifestV1 | None = None,
+) -> SandboxSafetySubjectV1:
+    manifest = _manifest(item_count=item_count) if manifest is None else manifest
+    bundle = (
+        _bundle(
+            item_count=item_count,
+            issue_count=issue_count,
+            decision=decision,
+            manifest=manifest,
+        )
+        if bundle is None
+        else bundle
+    )
+    return SandboxSafetySubjectV1.build(
+        test_session_id="sandbox-test-session-001",
+        domain_state_version=7,
+        formula_artifact_id="synthetic-formula-artifact-001",
+        formula_revision=3,
+        formula_items=_formula_items(item_count),
+        profile_artifact_id="synthetic-profile-artifact-001",
+        profile_revision=2,
+        profile_facts=_profile_facts(),
+        graph_version="sandbox-graph.v1",
+        rule_bundle_version=bundle.rule_bundle_version,
+        rule_bundle_digest=(
+            bundle.rule_bundle_digest if rule_bundle_digest is None else rule_bundle_digest
+        ),
+        evaluator_authority_digest=bundle.evaluator_authority.authority_digest,
+        synthetic_manifest=manifest,
+    )
+
+
+def _fixture(
+    *,
+    item_count: int = 2,
+    issue_count: int = 1,
+    decision: SandboxSafetyDecision = SandboxSafetyDecision.BLOCK,
+) -> tuple[SandboxSafetySubjectV1, SandboxRuleBundleV1]:
+    manifest = _manifest(item_count=item_count)
+    bundle = _bundle(
+        item_count=item_count,
+        issue_count=issue_count,
+        decision=decision,
+        manifest=manifest,
+    )
+    subject = _subject(
+        item_count=item_count,
+        issue_count=issue_count,
+        decision=decision,
+        bundle=bundle,
+        manifest=manifest,
+    )
+    return subject, bundle
+
+
 def _run(
-    evaluator: _FakeEvaluator,
     *,
     subject: object | None = None,
     bundle: object | None = None,
@@ -146,9 +225,10 @@ def _run(
     run_id: str = "sandbox-run-001",
     trace_id: str = "sandbox-trace-001",
 ):
-    return SandboxSafetyRuleAdapter(evaluator).evaluate(
-        _subject() if subject is None else subject,
-        _bundle() if bundle is None else bundle,
+    default_subject, default_bundle = _fixture()
+    return SandboxSafetyRuleAdapter().evaluate(
+        default_subject if subject is None else subject,
+        default_bundle if bundle is None else bundle,
         command_id=command_id,
         run_id=run_id,
         trace_id=trace_id,
@@ -156,14 +236,13 @@ def _run(
 
 
 def _assert_error(
-    evaluator: _FakeEvaluator,
     code: SandboxSafetyFailureCode,
     *,
     subject: object | None = None,
     bundle: object | None = None,
 ) -> SandboxSafetyAdapterError:
     with pytest.raises(SandboxSafetyAdapterError) as raised:
-        _run(evaluator, subject=subject, bundle=bundle)
+        _run(subject=subject, bundle=bundle)
     assert raised.value.code is code
     assert str(raised.value) == code.value
     assert raised.value.__cause__ is None
@@ -174,64 +253,14 @@ def _assert_error(
 def _hash_seed_probe(seed: str) -> str:
     script = textwrap.dedent(
         """
+        import runpy
         from app.agent_runtime.sandbox_safety import (
-            SandboxFormulaItemV1, SandboxProfileFactV1, SandboxRuleBundleV1,
-            SandboxRuleParameterV1, SandboxRuleV1, SandboxSafetyDecision,
-            SandboxSafetyEvaluationV1, SandboxSafetyIssueV1,
-            SandboxSafetyRuleAdapter, SandboxSafetySeverity,
-            SandboxSafetySubjectV1, canonical_result_bytes,
+            SandboxSafetyRuleAdapter, canonical_result_bytes,
         )
 
-        bundle = SandboxRuleBundleV1.build(
-            rule_bundle_version="sandbox-rule-bundle.v1",
-            rules=(SandboxRuleV1(
-                rule_id="sandbox.rule.fixed.v1",
-                rule_revision=1,
-                parameters=(SandboxRuleParameterV1(
-                    name="threshold", value="fixed-technical-value"
-                ),),
-            ),),
-        )
-        subject = SandboxSafetySubjectV1.build(
-            test_session_id="sandbox-test-session-001",
-            domain_state_version=7,
-            formula_artifact_id="synthetic-formula-artifact-001",
-            formula_revision=3,
-            formula_items=(SandboxFormulaItemV1(
-                item_id="synthetic-item-000",
-                component="fixed-fictitious-component-000",
-                amount_milliunits=1,
-                unit="synthetic_unit",
-            ),),
-            profile_artifact_id="synthetic-profile-artifact-001",
-            profile_revision=2,
-            profile_facts=(SandboxProfileFactV1(
-                fact_id="synthetic-profile-fact-001",
-                name="fixed-fictitious-technical-profile",
-                value="bounded-test-value",
-            ),),
-            graph_version="sandbox-graph.v1",
-            rule_bundle_version="sandbox-rule-bundle.v1",
-            rule_bundle_digest=bundle.rule_bundle_digest,
-            synthetic_dataset_name="fixed-fictitious-manual-fixture",
-            synthetic_dataset_version="1.0.0",
-            dataset_provenance="fixed_fictitious_manual",
-            dataset_usage_scope="sandbox_only",
-            dataset_label_status="not_clinically_adjudicated",
-        )
-        class Evaluator:
-            def evaluate(self, subject, bundle):
-                return SandboxSafetyEvaluationV1(
-                    decision=SandboxSafetyDecision.BLOCK,
-                    issues=(SandboxSafetyIssueV1(
-                        issue_id="sandbox.issue.000",
-                        rule_id="sandbox.rule.fixed.v1",
-                        severity=SandboxSafetySeverity.HIGH,
-                        execution_order=0,
-                    ),),
-                )
-
-        result = SandboxSafetyRuleAdapter(Evaluator()).evaluate(
+        namespace = runpy.run_path("tests/test_l5_1_sandbox_safety_adapter.py")
+        subject, bundle = namespace["_fixture"]()
+        result = SandboxSafetyRuleAdapter().evaluate(
             subject,
             bundle,
             command_id="sandbox-command-001",
@@ -305,8 +334,8 @@ def _rss_bytes() -> int:
 
 
 def test_l5_1_same_subject_and_bundle_produce_same_result_digest() -> None:
-    first = _run(_FakeEvaluator())
-    second = _run(_FakeEvaluator())
+    first = _run()
+    second = _run()
 
     assert first == second
     assert first.result_digest == second.result_digest
@@ -316,13 +345,11 @@ def test_l5_1_same_subject_and_bundle_produce_same_result_digest() -> None:
 
 def test_l5_1_run_envelope_does_not_change_decision_digest() -> None:
     first = _run(
-        _FakeEvaluator(),
         command_id="sandbox-command-001",
         run_id="sandbox-run-001",
         trace_id="sandbox-trace-001",
     )
     second = _run(
-        _FakeEvaluator(),
         command_id="sandbox-command-002",
         run_id="sandbox-run-002",
         trace_id="sandbox-trace-002",
@@ -336,20 +363,29 @@ def test_l5_1_run_envelope_does_not_change_decision_digest() -> None:
 
 
 def test_l5_1_rule_bundle_digest_change_invalidates_subject() -> None:
+    subject, _ = _fixture()
     changed_rule = SandboxRuleV1(
         rule_id="sandbox.rule.fixed.v1",
         rule_revision=2,
         parameters=(SandboxRuleParameterV1(name="threshold", value="changed-technical-value"),),
     )
-    evaluator = _FakeEvaluator()
+    changed_bundle = _bundle(rules=(changed_rule,))
 
     _assert_error(
-        evaluator,
         SandboxSafetyFailureCode.DIGEST_MISMATCH,
-        subject=_subject(),
-        bundle=_bundle(rules=(changed_rule,)),
+        subject=subject,
+        bundle=changed_bundle,
     )
-    assert evaluator.calls == 0
+
+    allow_bundle = _bundle(decision=SandboxSafetyDecision.ALLOW)
+    assert allow_bundle.evaluator_authority.authority_digest != (
+        _bundle().evaluator_authority.authority_digest
+    )
+    _assert_error(
+        SandboxSafetyFailureCode.DIGEST_MISMATCH,
+        subject=subject,
+        bundle=allow_bundle,
+    )
 
 
 def test_l5_1_missing_extra_parse_error_and_version_mismatch_fail_closed() -> None:
@@ -366,9 +402,7 @@ def test_l5_1_missing_extra_parse_error_and_version_mismatch_fail_closed() -> No
         (mismatch, SandboxSafetyFailureCode.VERSION_MISMATCH),
     )
     for candidate, code in cases:
-        evaluator = _FakeEvaluator()
-        _assert_error(evaluator, code, subject=candidate)
-        assert evaluator.calls == 0
+        _assert_error(code, subject=candidate)
 
 
 def test_l5_1_stale_formula_or_profile_digest_rejected_before_evaluation() -> None:
@@ -377,14 +411,12 @@ def test_l5_1_stale_formula_or_profile_digest_rejected_before_evaluation() -> No
     stale_profile = subject.model_copy(update={"profile_content_digest": "1" * 64})
 
     for candidate in (stale_formula, stale_profile):
-        evaluator = _FakeEvaluator()
-        _assert_error(evaluator, SandboxSafetyFailureCode.DIGEST_MISMATCH, subject=candidate)
-        assert evaluator.calls == 0
+        _assert_error(SandboxSafetyFailureCode.DIGEST_MISMATCH, subject=candidate)
 
 
 def test_l5_1_result_and_nested_issues_are_immutable() -> None:
-    evaluator = _FakeEvaluator()
-    result = _run(evaluator)
+    subject, bundle = _fixture()
+    result = _run(subject=subject, bundle=bundle)
 
     with pytest.raises(ValidationError):
         result.decision = SandboxSafetyDecision.ALLOW  # type: ignore[misc]
@@ -392,41 +424,51 @@ def test_l5_1_result_and_nested_issues_are_immutable() -> None:
         result.issues[0].severity = SandboxSafetySeverity.LOW  # type: ignore[misc]
     with pytest.raises(AttributeError):
         result.issues.append(result.issues[0])  # type: ignore[attr-defined]
+    with pytest.raises(ValidationError):
+        subject.synthetic_manifest.case_count = 2  # type: ignore[misc,assignment]
+    with pytest.raises(ValidationError):
+        bundle.evaluator_authority.cases[0].evaluation.decision = (  # type: ignore[misc]
+            SandboxSafetyDecision.ALLOW
+        )
 
     source_rules = list(_rules())
-    bundle = SandboxRuleBundleV1.build(
+    authority = bundle.evaluator_authority
+    copied_bundle = SandboxRuleBundleV1.build(
         rule_bundle_version="sandbox-rule-bundle.v1",
         rules=source_rules,
+        evaluator_authority=authority,
     )
     source_rules.append(source_rules[0].model_copy(update={"rule_id": "sandbox.rule.alias.v1"}))
-    assert len(bundle.rules) == 1
+    assert len(copied_bundle.rules) == 1
 
 
 def test_l5_1_evaluator_exception_is_chainless_and_contains_no_payload() -> None:
     payload = "FIXTURE_PAYLOAD_DO_NOT_EXPOSE"
-    evaluator = _FakeEvaluator(exception_payload=payload)
-    error = _assert_error(evaluator, SandboxSafetyFailureCode.EVALUATOR_FAILED)
+    callable_authority = _StatefulCallable(exception_payload=payload)
 
-    rendered = f"{error!s} {error!r}"
-    assert payload not in rendered
-    assert evaluator.calls == 1
+    with pytest.raises(TypeError) as raised:
+        SandboxSafetyRuleAdapter(callable_authority)  # type: ignore[call-arg]
 
-    nondeterministic = _FakeEvaluator(alternate=True)
-    _assert_error(nondeterministic, SandboxSafetyFailureCode.EVALUATOR_NONDETERMINISTIC)
-    assert nondeterministic.calls == 2
+    assert payload not in f"{raised.value!s} {raised.value!r}"
+    assert callable_authority.calls == 0
+    assert not hasattr(SandboxSafetyRuleAdapter(), "_evaluator")
 
 
 def test_l5_1_limit_plus_one_rejected_before_evaluator_call() -> None:
     assert MAX_FORMULA_ITEMS == 64
-    evaluator = _FakeEvaluator()
-    oversized_subject = _subject(item_count=MAX_FORMULA_ITEMS + 1)
+    oversized_subject, oversized_bundle = _fixture(item_count=MAX_FORMULA_ITEMS + 1)
+    _assert_error(
+        SandboxSafetyFailureCode.LIMIT_EXCEEDED,
+        subject=oversized_subject,
+        bundle=oversized_bundle,
+    )
 
-    _assert_error(evaluator, SandboxSafetyFailureCode.LIMIT_EXCEEDED, subject=oversized_subject)
-    assert evaluator.calls == 0
-
-    too_many_issues = _FakeEvaluator(issue_count=MAX_ISSUES + 1)
-    _assert_error(too_many_issues, SandboxSafetyFailureCode.LIMIT_EXCEEDED)
-    assert too_many_issues.calls == 1
+    too_many_subject, too_many_bundle = _fixture(issue_count=MAX_ISSUES + 1)
+    _assert_error(
+        SandboxSafetyFailureCode.LIMIT_EXCEEDED,
+        subject=too_many_subject,
+        bundle=too_many_bundle,
+    )
 
 
 def test_l5_1_no_settings_env_data_gateway_review_record_export_or_network_import() -> None:
@@ -456,16 +498,15 @@ def test_l5_1_no_settings_env_data_gateway_review_record_export_or_network_impor
         name.startswith(("app.core", "app.db", "app.services", "app.repositories"))
         for name in imported_modules
     )
+    assert "SandboxSafetyEvaluator" not in source
     assert ".env" not in source
     assert "data/" not in source
-    assert _run(_FakeEvaluator()).decision is SandboxSafetyDecision.BLOCK
+    assert _run().decision is SandboxSafetyDecision.BLOCK
 
 
 def test_l5_1_thousand_runs_are_reproducible_and_resource_bounded() -> None:
-    evaluator = _FakeEvaluator()
-    adapter = SandboxSafetyRuleAdapter(evaluator)
-    subject = _subject(item_count=MAX_FORMULA_ITEMS)
-    bundle = _bundle()
+    subject, bundle = _fixture(item_count=MAX_FORMULA_ITEMS)
+    adapter = SandboxSafetyRuleAdapter()
     expected = adapter.evaluate(
         subject,
         bundle,
@@ -509,7 +550,224 @@ def test_l5_1_thousand_runs_are_reproducible_and_resource_bounded() -> None:
         "L5_1_RESOURCE "
         f"python={platform.python_version()} "
         f"cpu={platform.machine()} "
-        "samples=1000 warmup=20 method=perf_counter_ns+process_rss "
+        "formula_items=64 issues=1 samples=1000 warmup=20 "
+        "method=perf_counter_ns+process_rss "
+        f"p95_ms={p95_ms:.3f} p99_ms={p99_ms:.3f} rss_growth_bytes={rss_growth}\n"
+    )
+    assert p95_ms < 50
+    assert p99_ms < 100
+    assert rss_growth < 64 * 1024 * 1024
+
+
+def test_l5_1_pairwise_state_drift_cannot_change_identical_request_result() -> None:
+    @dataclass
+    class PairwiseDriftEvaluator:
+        calls: int = 0
+
+        def evaluate(
+            self,
+            subject: SandboxSafetySubjectV1,
+            bundle: SandboxRuleBundleV1,
+        ) -> SandboxSafetyEvaluationV1:
+            del subject, bundle
+            self.calls += 1
+            decision = (
+                SandboxSafetyDecision.BLOCK
+                if self.calls <= 2
+                else SandboxSafetyDecision.ALLOW
+            )
+            return _evaluation(decision=decision)
+
+    attacker = PairwiseDriftEvaluator()
+    with pytest.raises(TypeError):
+        SandboxSafetyRuleAdapter(attacker)  # type: ignore[call-arg]
+    assert attacker.calls == 0
+
+    subject, bundle = _fixture()
+    adapter = SandboxSafetyRuleAdapter()
+    results = tuple(
+        adapter.evaluate(
+            subject,
+            bundle,
+            command_id="sandbox-command-pairwise",
+            run_id="sandbox-run-pairwise",
+            trace_id="sandbox-trace-pairwise",
+        )
+        for _ in range(4)
+    )
+    assert len({canonical_result_bytes(result) for result in results}) == 1
+    assert len({result.result_digest for result in results}) == 1
+
+
+def test_l5_1_arbitrary_stateful_callable_is_not_a_deterministic_authority() -> None:
+    callable_authority = _StatefulCallable(alternate=True)
+
+    with pytest.raises(TypeError):
+        SandboxSafetyRuleAdapter(callable_authority)  # type: ignore[call-arg]
+
+    assert callable_authority.calls == 0
+    assert SandboxSafetyRuleAdapter.__slots__ == ()
+
+
+def test_l5_1_inline_fixture_manifest_is_complete_strict_and_digest_bound() -> None:
+    subject, bundle = _fixture()
+    manifest = subject.synthetic_manifest
+    scan = manifest.prohibited_identifier_scan
+    fixture_content = {
+        "cases": (
+            {
+                "formula_items": subject.formula_items,
+                "profile_facts": subject.profile_facts,
+            },
+        )
+    }
+    expected_content_digest = hashlib.sha256(canonical_json_bytes(fixture_content)).hexdigest()
+    expected_manifest_digest = hashlib.sha256(canonical_json_bytes(manifest)).hexdigest()
+    expected_dataset_digest = hashlib.sha256(
+        canonical_json_bytes({"fixture_content": fixture_content, "manifest": manifest})
+    ).hexdigest()
+
+    assert manifest.schema_version == "sandbox-synthetic-manifest.v1"
+    assert manifest.dataset_name == subject.synthetic_dataset_name
+    assert manifest.dataset_version == subject.synthetic_dataset_version
+    assert manifest.admission_scope == "personal_learning_synthetic_only"
+    assert manifest.provenance_type == "constructed_fixture"
+    assert manifest.fixture_provenance == "fixed_fictitious_manual"
+    assert manifest.usage_scope == "sandbox_only"
+    assert manifest.source_statement == (
+        "not_from_real_medical_records_personal_records_production_logs_chat_records_or_external_datasets"
+    )
+    assert {
+        manifest.generator_path,
+        manifest.generator_version,
+        manifest.generator_digest,
+        manifest.seed,
+    } == {"not_applicable"}
+    assert manifest.construction_evidence == (
+        "manually_constructed_fixed_fictitious_technical_fixture"
+    )
+    assert manifest.case_count == 1
+    assert manifest.content_sha256 == expected_content_digest
+    assert manifest.created_at == "2000-01-01T00:00:00Z"
+    assert manifest.created_by_test_role == "sandbox_fixture_author"
+    assert scan == SandboxIdentifierScanV1.passed()
+    assert scan.result == "passed_no_prohibited_identifiers"
+    assert manifest.label_status == "not_clinically_adjudicated"
+    assert subject.synthetic_manifest_digest == expected_manifest_digest
+    assert subject.synthetic_dataset_digest == expected_dataset_digest
+    assert _run(subject=subject, bundle=bundle).decision is SandboxSafetyDecision.BLOCK
+
+    with pytest.raises(ValidationError):
+        manifest.dataset_name = "changed"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        scan.result = "failed"  # type: ignore[misc,assignment]
+
+    valid = subject.model_dump(mode="python")
+
+    def changed_manifest(field: str, value: object, *, remove: bool = False) -> dict[str, object]:
+        candidate = copy.deepcopy(valid)
+        raw_manifest = candidate["synthetic_manifest"]
+        assert isinstance(raw_manifest, dict)
+        if remove:
+            raw_manifest.pop(field)
+        else:
+            raw_manifest[field] = value
+        return candidate
+
+    schema_invalid = (
+        changed_manifest("dataset_name", None, remove=True),
+        changed_manifest("admission_scope", None, remove=True),
+        changed_manifest("generator_digest", None, remove=True),
+        changed_manifest("prohibited_identifier_scan", None, remove=True),
+        changed_manifest("label_status", None, remove=True),
+        changed_manifest("unexpected", "forbidden"),
+        changed_manifest("provenance_type", "external_dataset"),
+        changed_manifest("case_count", 2),
+    )
+    failed_scan = copy.deepcopy(valid)
+    raw_manifest = failed_scan["synthetic_manifest"]
+    assert isinstance(raw_manifest, dict)
+    raw_scan = raw_manifest["prohibited_identifier_scan"]
+    assert isinstance(raw_scan, dict)
+    raw_scan["result"] = "failed_matches_present"
+
+    for candidate in (*schema_invalid, failed_scan):
+        _assert_error(
+            SandboxSafetyFailureCode.SCHEMA_INVALID,
+            subject=candidate,
+            bundle=bundle,
+        )
+
+    bad_content = changed_manifest("content_sha256", "0" * 64)
+    _assert_error(
+        SandboxSafetyFailureCode.DIGEST_MISMATCH,
+        subject=bad_content,
+        bundle=bundle,
+    )
+    bad_manifest_digest = subject.model_copy(update={"synthetic_manifest_digest": "1" * 64})
+    _assert_error(
+        SandboxSafetyFailureCode.DIGEST_MISMATCH,
+        subject=bad_manifest_digest,
+        bundle=bundle,
+    )
+
+
+def test_l5_1_thousand_true_maximum_results_are_resource_bounded() -> None:
+    subject, bundle = _fixture(item_count=MAX_FORMULA_ITEMS, issue_count=MAX_ISSUES)
+    adapter = SandboxSafetyRuleAdapter()
+    expected = adapter.evaluate(
+        subject,
+        bundle,
+        command_id="sandbox-command-true-maximum",
+        run_id="sandbox-run-true-maximum",
+        trace_id="sandbox-trace-true-maximum",
+    )
+    expected_bytes = canonical_result_bytes(expected)
+    assert len(subject.formula_items) == MAX_FORMULA_ITEMS
+    assert len(expected.issues) == MAX_ISSUES
+    assert len({issue.issue_id for issue in expected.issues}) == MAX_ISSUES
+    assert len(canonical_json_bytes(subject)) <= MAX_CANONICAL_BYTES
+    assert len(canonical_json_bytes(bundle)) <= MAX_CANONICAL_BYTES
+    assert len(expected_bytes) <= MAX_CANONICAL_BYTES
+
+    for _ in range(20):
+        actual = adapter.evaluate(
+            subject,
+            bundle,
+            command_id="sandbox-command-true-maximum",
+            run_id="sandbox-run-true-maximum",
+            trace_id="sandbox-trace-true-maximum",
+        )
+        assert canonical_result_bytes(actual) == expected_bytes
+
+    gc.collect()
+    rss_before = _rss_bytes()
+    timings_ms: list[float] = []
+    for _ in range(1_000):
+        started = time.perf_counter_ns()
+        actual = adapter.evaluate(
+            subject,
+            bundle,
+            command_id="sandbox-command-true-maximum",
+            run_id="sandbox-run-true-maximum",
+            trace_id="sandbox-trace-true-maximum",
+        )
+        timings_ms.append((time.perf_counter_ns() - started) / 1_000_000)
+        assert canonical_result_bytes(actual) == expected_bytes
+    gc.collect()
+    rss_growth = max(0, _rss_bytes() - rss_before)
+    ordered = sorted(timings_ms)
+    p95_ms = ordered[949]
+    p99_ms = ordered[989]
+    processor = platform.processor().replace(" ", "_") or platform.machine()
+
+    sys.stdout.write(
+        "L5_1_R1_RESOURCE "
+        f"python={platform.python_version()} cpu={processor} "
+        f"formula_items={len(subject.formula_items)} issues={len(expected.issues)} "
+        f"subject_bytes={len(canonical_json_bytes(subject))} "
+        f"bundle_bytes={len(canonical_json_bytes(bundle))} result_bytes={len(expected_bytes)} "
+        "samples=1000 warmup=20 method=perf_counter_ns+process_working_set_rss "
         f"p95_ms={p95_ms:.3f} p99_ms={p99_ms:.3f} rss_growth_bytes={rss_growth}\n"
     )
     assert p95_ms < 50
