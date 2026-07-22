@@ -383,6 +383,84 @@ def _challenge_matches_revision(
     )
 
 
+def _issue_projection_and_current_are_integral(
+    snapshot: SandboxReviewStoreSnapshotV1,
+    revisions: tuple[SandboxRevisionRecordV1, ...],
+) -> bool:
+    first = revisions[0]
+    scope = (first.namespace, first.test_session_id, first.thread_id)
+
+    def in_scope(record: object) -> bool:
+        return (
+            getattr(record, "namespace", None),
+            getattr(record, "test_session_id", None),
+            getattr(record, "thread_id", None),
+        ) == scope
+
+    initial_checkpoints = tuple(
+        checkpoint
+        for checkpoint in snapshot.checkpoints
+        if in_scope(checkpoint)
+        and checkpoint.challenge_ref == first.challenge_ref
+        and checkpoint.checkpoint_id == first.checkpoint_id
+        and checkpoint.interrupt_id == first.interrupt_id
+    )
+    if len(initial_checkpoints) != 1:
+        return False
+    initial_issue_sequence = initial_checkpoints[0].issue_sequence
+    projected_challenge_refs = tuple(
+        checkpoint.challenge_ref
+        for checkpoint in sorted(
+            (
+                checkpoint
+                for checkpoint in snapshot.checkpoints
+                if in_scope(checkpoint)
+                and checkpoint.issue_sequence >= initial_issue_sequence
+            ),
+            key=lambda checkpoint: checkpoint.issue_sequence,
+        )
+    )
+    outer_challenge_refs = tuple(
+        revision.challenge_ref
+        for revision in revisions
+        if revision.challenge_ref is not None
+    )
+    if projected_challenge_refs != outer_challenge_refs:
+        return False
+
+    current = revisions[-1]
+    if current.status == "review_required":
+        expected = current
+    elif current.status in {"blocked", "recheck_failed", "review_setup_failed"}:
+        if len(revisions) < 2:
+            return False
+        expected = revisions[-2]
+    elif current.status == "modify_applied":
+        expected = current
+    else:
+        return False
+    if expected.challenge_ref is None:
+        return False
+
+    expected_checkpoints = tuple(
+        checkpoint
+        for checkpoint in snapshot.checkpoints
+        if in_scope(checkpoint)
+        and checkpoint.challenge_ref == expected.challenge_ref
+        and checkpoint.checkpoint_id == expected.checkpoint_id
+    )
+    markers = tuple(
+        marker for marker in snapshot.current_authorities if in_scope(marker)
+    )
+    return (
+        len(expected_checkpoints) == 1
+        and len(markers) == 1
+        and markers[0].issue_sequence == expected_checkpoints[0].issue_sequence
+        and markers[0].checkpoint_id == expected.checkpoint_id
+        and markers[0].challenge_ref == expected.challenge_ref
+    )
+
+
 def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
     revisions = snapshot.revisions
     runs = snapshot.runs
@@ -554,6 +632,10 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
             or invalidation.old_event_refs != old_events
         ):
             return False
+    if not _issue_projection_and_current_are_integral(
+        snapshot.review_snapshot, revisions
+    ):
+        return False
     current = revisions[-1]
     if current.result is not None and (
         current.result.decision_subject_digest != _digest(current.subject)
@@ -570,7 +652,12 @@ def _snapshot_is_integral(snapshot: SandboxRecheckSnapshotV1) -> bool:
         sources = tuple(
             source
             for source in snapshot.review_snapshot.sources
-            if source.source.safety_subject == current.subject
+            if source.namespace == current.namespace
+            and source.test_session_id == current.test_session_id
+            and source.thread_id == current.thread_id
+            and source.checkpoint_id == current.checkpoint_id
+            and source.interrupt_id == current.interrupt_id
+            and source.source.safety_subject == current.subject
             and source.source.safety_result == current.result
             and source.source.explanation_result is None
         )

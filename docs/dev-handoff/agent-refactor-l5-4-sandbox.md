@@ -260,3 +260,54 @@ production 保持 `8b345b9` 行为、工作区唯一修改为四类 R2 回归时
 - 独立 Reviewer：P0=0、P1=0、P2=1、P3=0；R1 的 shared command predicate 与 terminal retained-authority 两项均 resolved。
 - 剩余 P2：only-initial combined snapshot 可继续引用 historical applied-modify challenge，即使 private L5-3 snapshot 已有新的 same-scope pending challenge 且 current marker 已改变；outer chain 尚未闭合到完整 issue projection/current marker。
 - PM 结论：**未接受 / 发布 L5-4-R3 限定返工**（`ACC-20260722-034`、`DEC-20260722-027`）。保留初始/R1/R2 deliveries 与全部证据；L5 仍为 3/4，L6 未开始。
+
+## 14. L5-4-R3 current issue projection 根因闭合
+
+### 14.1 状态与起点
+
+- 状态：**L5-4-R3 已交付，申请验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`f35d58ca24f8f8f7d4e6e4ebd8a180915d69e81a`；初始/R1/R2 失败 deliveries、`ACC-20260722-032/033/034`、`DEC-20260722-025/026/027` 与全部返工任务书继续 append-only 保留。
+- R3 只修改原三个 L5-4 文件；未修改任务书、PM 台账、accepted L5-1/L5-2/L5-3、配置、依赖、锁文件、Runtime 或外部边界。
+
+### 14.2 真实 R3 RED 与 GREEN
+
+production 保持 `23a561a` 行为、工作区唯一 production 变化尚未开始时，先增加三项状态关系回归；完整 fake env 与 `UV_OFFLINE=1` 下结果为退出码 `1`、`3 failed in 2.32s`，三项均因旧实现 **DID NOT RAISE**：
+
+1. only-initial outer chain 仍指向 historical applied-modify challenge，但 private same-scope current 已被后来 pending issue 取代；
+2. BLOCK terminal outer chain 保持不变，但 private same-scope current 已不再是 terminal parent；同步更新 invalidation challenge set 并重算 `invalidation_ref` 后旧 restore 仍错误接受；
+3. outer initial + current child 跳过 private same-scope 中间 issue；同步更新 invalidation challenge set 并重算 `invalidation_ref` 后旧 restore 仍错误接受。
+
+因此拒绝不依赖 stale derived ref，也没有删除 historical challenge/event。根因修复后，三项负例与跨 scope 正例定向为 `4 passed in 1.96s`；跨 scope 正例随后进一步强化为 private issue 顺序 `initial -> other-scope -> current child`，单项为 `1 passed in 2.30s`；最终完整专项为 `43 passed in 3.46s`，R2 的 39 项全部保留。
+
+### 14.3 单一 projection/current 不变量
+
+- 新 `_issue_projection_and_current_are_integral(...)` 是 restore 唯一新增的 R3 根因 predicate：先以 initial revision 的 exact challenge/checkpoint/interrupt 定位显式 `issue_sequence`，再按 issue sequence 投影同 namespace/session/thread 的完整 suffix；
+- 该 same-scope suffix 必须与 outer revision chain 的全部非空 `challenge_ref` 精确同序、同基数；initial 之前的同 scope 历史允许保留，其他 scope 的 issue 可在 initial 与 child 之间穿插并被忽略；
+- expected current 由状态统一选择：only-initial `modify_applied` 指向 initial，current `review_required` 指向自身，`blocked/recheck_failed/review_setup_failed` 指向 parent；同 scope current marker 必须精确唯一并与 expected issue sequence、challenge、checkpoint 一致；
+- current review source 的 exact 查询同步限定 namespace/session/thread/checkpoint/interrupt，避免其他 scope 使用相同 subject/result 时被错误计入；shared live/restore command predicate、exact event ownership、terminal authority absence 与 source-build single-call atomic commit 均保持不变。
+
+### 14.4 R3 最终门禁
+
+| 门禁 | R3 结果 |
+|---|---|
+| L5-4/R3 专项 | `43 passed in 3.46s` |
+| accepted L5-3 | `59 passed in 2.21s` |
+| accepted L5-2 | `18 passed in 6.55s` |
+| accepted L5-1 | `14 passed in 13.67s` |
+| Safety 回归 | `71 passed, 3 deselected in 1.80s` |
+| L4.5-11 两项 privacy 回归 | `76 passed in 4.76s` |
+| Ruff / mypy | `All checks passed!`；production 1 source / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 | `131 passed in 2.31s` |
+| AST 离线边界 | `1 passed in 1.80s` |
+| `uv lock --check` | `Resolved 84 packages in 3ms`；lock 未改变 |
+| 强制 `APP_ENV=sandbox-test` 全量 | `1 failed, 1758 passed, 362 deselected in 148.94s`；唯一为既有 `tests/test_config.py::test_load_with_defaults` 的 `local` / `sandbox-test` defaults 差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1759 passed, 362 deselected in 146.89s` |
+
+最终内容冻结前重新执行双全量，没有复用跨 scope 正例强化前的全量结果。全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；未读取 `.env`、ignored `data/` 或 `.codex_tmp`，未启动网络、应用或外部服务。
+
+### 14.5 范围、提交、限制与回退
+
+- 提交前 `git diff --check`、exact 三文件 scope 与 tracked 检查必须通过；单一 R3 开发提交消息为 `fix: close L5-4 current issue projection`，exact parent 为 `f35d58ca24f8f8f7d4e6e4ebd8a180915d69e81a`，提交后工作区必须 clean。
+- Git SHA 无法在包含本文的同一提交内自引用；冻结后由 `git rev-parse HEAD`、提交消息和本节 exact parent 共同报告，并由独立 Reviewer/CI/PM 锚定。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。
+- 若 R3 验收失败，以单一 R3 delivery 执行 `git revert <r3-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。

@@ -1201,6 +1201,238 @@ def test_l5_4_terminal_status_rejects_retained_private_review_authority() -> Non
     assert raised.value.__context__ is None
 
 
+def test_l5_4_only_initial_rejects_later_same_scope_current_challenge() -> None:
+    review_snapshot, clock, nonce_factory, verifier = _accepted_modify_snapshot()
+    baseline = SandboxRecheckCoordinator(
+        review_snapshot=review_snapshot,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    ).snapshot()
+    store = SandboxInMemoryReviewStore(snapshot=review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    pending = review.create_single_use_challenge(
+        review_snapshot.sources[0].source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD,
+        checkpoint_id="sandbox-recheck-checkpoint-later-initial",
+        interrupt_id="sandbox-recheck-interrupt-later-initial",
+    )
+    private_snapshot = store.snapshot()
+    assert private_snapshot.challenges[0].state == "applied"
+    assert private_snapshot.challenges[-1].challenge_ref == pending.challenge.challenge_ref
+    assert private_snapshot.current_authorities[0].challenge_ref == (
+        pending.challenge.challenge_ref
+    )
+
+    bad = copy.deepcopy(baseline.model_dump(mode="python"))
+    bad["review_snapshot"] = private_snapshot.model_dump(mode="python")
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_terminal_rejects_later_same_scope_current_challenge() -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    candidate, bundle = _subject_and_bundle(
+        domain_state_version=8,
+        formula_revision=4,
+        amount_milliunits=2,
+        dataset_version="terminal-current.2",
+        decision=SandboxSafetyDecision.BLOCK,
+        issue_count=1,
+    )
+    coordinator.apply_revision(
+        _revision_command(
+            coordinator,
+            candidate=candidate,
+            bundle=bundle,
+            suffix="terminal-current",
+        )
+    )
+    baseline = coordinator.snapshot()
+    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    pending = review.create_single_use_challenge(
+        baseline.review_snapshot.sources[0].source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD,
+        checkpoint_id="sandbox-recheck-checkpoint-later-terminal",
+        interrupt_id="sandbox-recheck-interrupt-later-terminal",
+    )
+    private_snapshot = store.snapshot()
+    assert baseline.revisions[-1].status == "blocked"
+    assert baseline.revisions[-1].challenge_ref is None
+    assert private_snapshot.current_authorities[0].challenge_ref == (
+        pending.challenge.challenge_ref
+    )
+
+    bad = copy.deepcopy(baseline.model_dump(mode="python"))
+    bad["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    bad["invalidations"][0]["old_challenge_refs"] = tuple(
+        challenge.challenge_ref for challenge in private_snapshot.challenges
+    )
+    _refresh_mapping_ref(
+        bad["invalidations"][0],
+        prefix="sandbox-recheck-invalidation-",
+        field="invalidation_ref",
+    )
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_outer_revision_chain_cannot_skip_same_scope_issue() -> None:
+    coordinator, initial_review_snapshot, clock, nonce_factory, verifier = _coordinator()
+    outcome = coordinator.apply_revision(
+        _revision_command(coordinator, suffix="same-scope-suffix-child")
+    )
+    assert outcome.status == "review_required"
+    baseline = coordinator.snapshot()
+    child = baseline.revisions[-1]
+    child_source = next(
+        source.source
+        for source in baseline.review_snapshot.sources
+        if source.source.safety_subject == child.subject
+        and source.source.safety_result == child.result
+    )
+
+    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    skipped = review.create_single_use_challenge(
+        initial_review_snapshot.sources[0].source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD,
+        checkpoint_id="sandbox-recheck-checkpoint-skipped",
+        interrupt_id="sandbox-recheck-interrupt-skipped",
+    )
+    recreated_child = review.create_single_use_challenge(
+        child_source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD,
+        checkpoint_id=child.checkpoint_id,
+        interrupt_id=child.interrupt_id,
+    )
+    private_snapshot = store.snapshot()
+    assert recreated_child.challenge.challenge_ref == child.challenge_ref
+    assert private_snapshot.current_authorities[0].challenge_ref == child.challenge_ref
+    assert tuple(
+        challenge.challenge_ref for challenge in private_snapshot.challenges
+    ) == (
+        initial_review_snapshot.challenges[0].challenge_ref,
+        skipped.challenge.challenge_ref,
+        child.challenge_ref,
+    )
+
+    bad = copy.deepcopy(baseline.model_dump(mode="python"))
+    bad["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    bad["invalidations"][0]["old_challenge_refs"] = (
+        initial_review_snapshot.challenges[0].challenge_ref,
+        skipped.challenge.challenge_ref,
+    )
+    _refresh_mapping_ref(
+        bad["invalidations"][0],
+        prefix="sandbox-recheck-invalidation-",
+        field="invalidation_ref",
+    )
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=bad,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_l5_4_issue_projection_ignores_other_scope_interleaving() -> None:
+    coordinator, initial_review_snapshot, clock, nonce_factory, verifier = _coordinator()
+    coordinator.apply_revision(
+        _revision_command(coordinator, suffix="other-scope-positive")
+    )
+    baseline = coordinator.snapshot()
+    current = baseline.revisions[-1]
+    current_source = next(
+        source.source
+        for source in baseline.review_snapshot.sources
+        if source.source.safety_subject == current.subject
+        and source.source.safety_result == current.result
+    )
+    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    review = SandboxReviewCoordinator(
+        store=store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    other_scope = review.create_single_use_challenge(
+        current_source,
+        namespace="sandbox.recheck.other-scope",
+        thread_id="sandbox-recheck-thread-other-scope",
+        checkpoint_id="sandbox-recheck-checkpoint-other-scope",
+        interrupt_id="sandbox-recheck-interrupt-other-scope",
+    )
+    recreated_current = review.create_single_use_challenge(
+        current_source,
+        namespace=current.namespace,
+        thread_id=current.thread_id,
+        checkpoint_id=current.checkpoint_id,
+        interrupt_id=current.interrupt_id,
+    )
+    private_snapshot = store.snapshot()
+    assert other_scope.challenge.challenge_ref != current.challenge_ref
+    assert recreated_current.challenge.challenge_ref == current.challenge_ref
+    assert tuple(
+        checkpoint.challenge_ref for checkpoint in private_snapshot.checkpoints
+    ) == (
+        initial_review_snapshot.challenges[0].challenge_ref,
+        other_scope.challenge.challenge_ref,
+        current.challenge_ref,
+    )
+    assert len(private_snapshot.current_authorities) == 2
+
+    expanded = copy.deepcopy(baseline.model_dump(mode="python"))
+    expanded["review_snapshot"] = private_snapshot.model_dump(mode="python")
+    restarted = SandboxRecheckCoordinator(
+        snapshot=expanded,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+    assert restarted.snapshot().review_snapshot == private_snapshot
+
+
 def test_l5_4_snapshot_and_inputs_are_isolated_immutable_copies() -> None:
     coordinator, *_ = _coordinator()
     command = _revision_command(coordinator)
