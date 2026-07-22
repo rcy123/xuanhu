@@ -251,3 +251,13 @@ Canonical JSON 保持完整诚实：没有通过隐藏 action、identity、sourc
 ---
 
 **R1 已交付，申请验收。**
+
+## 12. 项目经理 R1 独立验收（2026-07-22）
+
+- 冻结 R1：`f5b7211a51418f2cd09348fc60c993576568a5b2`；exact parent `e3f1472d2956aa9a1e350938d28adc00e6b8d41f`；三文件 scope 与 clean 正确。
+- 独立 CI：专项 `48 passed`、校准全量 `1705 passed, 362 deselected`；强制 fake env 仅既有 defaults 冲突；回归、Ruff/mypy/L0/lock/AST/scope/tracked 全通过。
+- 原四项复验：exact expiry、event-only stale ref、distinct-checkpoint current marker、nested cause/context 原复现 resolved。
+- 独立 Reviewer：P0=0、P1=3、P2=1、P3=0；结论 `rework required`。attempt ref 未绑定完整 body；single-use restore 可有两个 applied；复用 checkpoint ID 的 current eligibility 误拒；restore 未验证 exclusive-expiry 时间因果。
+- PM 结论：**R1 未接受 / 发布 L5-3-R2**（`ACC-20260722-026`、`DEC-20260722-019`）。保留第 1 次与 R1 全部失败/CI/Review 证据；L5-4 不得发布。
+
+R2 合同见 [agent-refactor-l5-3-sandbox-rework-2-task.md](agent-refactor-l5-3-sandbox-rework-2-task.md)。
