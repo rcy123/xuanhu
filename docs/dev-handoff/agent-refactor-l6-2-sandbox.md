@@ -117,3 +117,22 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 ---
 
 **已交付，申请验收。**
+
+---
+
+## PM 验收结论（ACC-20260723-050）
+
+| 项目 | 结果 |
+|---|---|
+| 验收人 | Codex（工程项目经理） |
+| 验收日期 | 2026-07-23 |
+| 结论 | **通过 / accepted** |
+| 专项测试 | L6-2 专项 `16 passed in 2.23s` |
+| L6-1/L5 回归 | `204 passed in 24.52s`（L6-1 12 + L6-2 16 + L5 14/18/84/60） |
+| 校准全量 | `1813 passed, 366 deselected in 112.67s` |
+| 静态门禁 | Ruff `All checks passed!`；mypy `Success: no issues`；`uv lock --check` 通过 |
+| PM 探针 | 5/5 全部通过（合法 record 通过；篡改 formula/注入字段/篡改 confirm ref/篡改 safety decision 均固定拒绝） |
+| scope/tracked/diff/exact/clean | 通过（只修改允许的 3 个文件 + PM 管理文档） |
+| 验收依据 | `ACC-20260723-050`、`DEC-20260723-043`、`DEC-20260723-044` |
+
+**L6-2 已验收。下一动作：发布 L6-3 病历持久化（Sandbox）。**
