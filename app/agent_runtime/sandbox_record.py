@@ -74,6 +74,134 @@ class SandboxMedicalRecordData(_StrictFrozenModel):
         return self
 
 
+class SandboxRecordConsistencyVerifier:
+    """Deterministic consistency verifier for assembled sandbox medical records.
+
+    The verifier checks that an assembled record's fields are consistent with
+    the original recheck snapshot and review state. It never calls a model,
+    generates free text, or mutates inputs.
+    """
+
+    __slots__ = ()
+
+    def verify(
+        self,
+        record: SandboxMedicalRecordData,
+        *,
+        recheck_snapshot: object,
+    ) -> bool:
+        """Verify record consistency against recheck snapshot, or fail closed."""
+        return self._verify(record, recheck_snapshot=recheck_snapshot)
+
+    @staticmethod
+    def _verify(
+        record: SandboxMedicalRecordData,
+        *,
+        recheck_snapshot: object,
+    ) -> bool:
+        """Verify record or return False; never propagates a payload-bearing exception."""
+        try:
+            if isinstance(recheck_snapshot, SandboxRecheckSnapshotV1):
+                snapshot = recheck_snapshot
+            else:
+                snapshot = SandboxRecheckSnapshotV1.model_validate_json(
+                    canonical_review_bytes(recheck_snapshot), strict=True
+                )
+
+            revisions = snapshot.revisions
+            if not revisions:
+                return False
+
+            current = revisions[-1]
+            if current.status != "review_required":
+                return False
+
+            if current.result is None or current.result.decision is not SandboxSafetyDecision.ALLOW:
+                return False
+
+            if current.challenge_ref is None:
+                return False
+
+            review_snapshot = snapshot.review_snapshot
+            review_challenges = tuple(
+                challenge
+                for challenge in review_snapshot.challenges
+                if challenge.challenge_ref == current.challenge_ref
+            )
+            if len(review_challenges) != 1:
+                return False
+            challenge = review_challenges[0]
+
+            if challenge.state != "applied":
+                return False
+
+            review_events = tuple(
+                event
+                for event in review_snapshot.events
+                if event.challenge_ref == current.challenge_ref
+                and event.action is SandboxReviewAction.CONFIRM
+            )
+            if len(review_events) != 1:
+                return False
+            applied_event = review_events[0]
+
+            review_attempts = tuple(
+                attempt
+                for attempt in review_snapshot.attempts
+                if attempt.resume_attempt_ref == applied_event.resume_attempt_ref
+                and attempt.challenge_ref == current.challenge_ref
+                and attempt.state == "applied"
+            )
+            if len(review_attempts) != 1:
+                return False
+
+            # Verify review_confirm_ref matches the applied CONFIRM event
+            if record.review_confirm_ref != applied_event.resume_attempt_ref:
+                return False
+
+            # Verify session_id matches
+            if record.session_id != current.test_session_id:
+                return False
+
+            # Verify reviewed_formula matches current revision's subject formula_items
+            expected_formula = tuple(
+                {
+                    "item_id": item.item_id,
+                    "component": item.component,
+                    "amount_milliunits": item.amount_milliunits,
+                    "unit": item.unit,
+                }
+                for item in current.subject.formula_items
+            )
+            if record.reviewed_formula != expected_formula:
+                return False
+
+            # Verify safety_result matches current revision's result
+            expected_safety_result = current.result.model_dump(mode="json")
+            if record.safety_result != expected_safety_result:
+                return False
+
+            # Verify revision_id matches current revision
+            expected_revision_id = _revision_id(current.revision_ref)
+            if record.revision_id != expected_revision_id:
+                return False
+
+            # Verify record_id is correctly derived from all fields
+            expected_record_id = _record_id(
+                session_id=record.session_id,
+                revision_id=record.revision_id,
+                reviewed_formula=record.reviewed_formula,
+                safety_result=record.safety_result,
+                review_confirm_ref=record.review_confirm_ref,
+                assembled_at=record.assembled_at,
+                record_version=record.record_version,
+                disclaimer=record.disclaimer,
+            )
+            return record.record_id == expected_record_id
+        except Exception:
+            return False
+
+
 class SandboxRecordAssembler:
     """Deterministically assemble a medical record from confirmed review state.
 
