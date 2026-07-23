@@ -600,3 +600,10 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 结论：**L5-3/L5-4 与 R8 accepted**（`ACC-20260723-043`、`DEC-20260723-036`）；`R-L5-RESUME-001` 与 `R-L5-RECHECK-001` 再次关闭，L5 恢复 4/4 individually accepted。
 - 后续：必须从包含本 shared acceptance 的新 clean exact HEAD 执行全新的 final R4 Reviewer/CI/PM；本节不关闭 L5，不启动 L6。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory reference composition；不授权 Runtime、HTTP、持久层、真实 clinical/patient/public production。
+
+## 29. L5 最终组合第 4 轮（未通过，L5-3/L5-4 reopened）
+
+- 冻结 exact HEAD `14c0496093e3054db2b4771463f5d018d639efc1`；独立 CI 组合 `158`、calibrated full `1783`，PM `25 + 13`，全部 Git 门禁通过。
+- 最终 Reviewer P0=0、P1=1、P2=0、P3=0：下层 applied attempt/event action 可完整协调改变并重派生 refs，而 signed digest 未与 persisted challenge/action 重算绑定；private restore 接受后本层 completion eligibility 也可从 blocked 翻为 eligible。
+- 结论：final R4 **未通过**（`ACC-20260723-044`、`DEC-20260723-037`）；R5～R8 acceptance 历史保留，L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
+- R9 只修改 L5-3 shared digest authority 与两层回归；`sandbox_recheck.py` production 不加重复判断，不持久化 plaintext nonce/signature。L6 未发布、未开始。

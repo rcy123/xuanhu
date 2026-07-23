@@ -723,3 +723,12 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 - 结论：**L5-3/L5-4 与 R8 accepted**（`ACC-20260723-043`、`DEC-20260723-036`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
 - 后续：本节不关闭 L5 整体。必须从包含本 shared acceptance 的新 clean exact HEAD 调用全新的 final R4 Reviewer、独立 CI 与 PM；不得复用前三轮结果，L6 未开始。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory reference composition；不授权 Runtime、HTTP、持久层、真实数据、临床或公开生产。
+
+## 27. L5 最终组合第 4 轮（未通过，L5-3 reopened）
+
+- 冻结 exact HEAD：`14c0496093e3054db2b4771463f5d018d639efc1`；R8 delivery/acceptance 均为祖先；前后 clean。
+- 最终独立 CI：四层 `14/18/72/54`、组合 `158`、calibrated full `1783 passed, 362 deselected`；forced 仅既有 defaults 差异；全部相邻/静态/scope/tracked 门禁通过。
+- PM：跨层 `25 passed` + R8 定向 `13 passed`，常规 live、并发、失效与 shared proof constraint 行为保持。
+- 最终 Reviewer：P0=0、P1=1、P2=0、P3=0。完整协调改变 applied attempt/event action 并重派生全部 private refs 后，restore 仍接受原 signed digest，因而 blocked/eligible 可翻转；既有回归只重算 event ref，实际命中 stale attempt ref。
+- 结论：final R4 **未通过**（`ACC-20260723-044`、`DEC-20260723-037`）；历史 acceptance 保留，但 L5-3 与两个工程风险重新打开；shared R9 已发布。
+- R9 必须以单一 persisted-challenge signed authority helper 收敛 live/restore，不持久化 plaintext nonce/signature，不在 L5-4 production 复制条件；L6 未开始。
