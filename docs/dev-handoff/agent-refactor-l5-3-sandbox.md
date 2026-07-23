@@ -666,3 +666,49 @@ production diff 为空、工作区仅新增两层 regression 时，完整 fake e
 - 最终 Reviewer：P0=0、P1=0、P2=1、P3=0。live proof 的三个 identifier 使用统一长度/格式约束，但 persisted sealed attempt/event 没有复用；协调修改并重派生 refs 后 restore 接受 live DTO 明确拒绝的值。
 - 结论：final R3 **未通过**（`ACC-20260723-042`、`DEC-20260723-035`）；历史 acceptance 保留，但 L5-3 与两个工程风险重新打开；shared R8 已发布。
 - R8 必须以单一 constrained alias 收敛三字段×三模型全族，不逐字段复制条件；同时证明 L5-4 composition，L6 未开始。
+
+## 25. L5-3/4-R8 proof identifier constraint 同源交付（2026-07-23）
+
+### 25.1 状态、起点与范围
+
+- 状态：**R8 已交付，申请独立验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`d4a33eb3ec017202dad78cc1e2cd11e36290ca28`；其中保留 final R3 失败、`ACC-20260723-042`、`DEC-20260723-035` 与 [R8 任务书](agent-refactor-l5-3-4-proof-constraint-rework-8-task.md)。
+- 单一 R8 交付只修改任务书允许的五个 tracked 文件：L5-3 shared production、L5-3/L5-4 两层专项与两份 handoff；`sandbox_recheck.py` production、PM 六台账、任务书、L5-1/L5-2、配置、依赖与锁文件均未修改。
+
+### 25.2 tests-first RED 与最小修复
+
+production 零 diff、工作区只有两份专项测试变化时，完整 fake env 与 `UV_OFFLINE=1` 下先运行 proof identifier 定向集合：
+
+- L5-3 收集 `72` 项、选中 `10` 项，真实 RED 为 `10 failed, 62 deselected in 2.49s`。其中 9 项把 applied snapshot 的 reviewer ID、signature scheme、key ID 分别改为 empty、129-char、pattern-invalid；attempt/event 同步修改并重算 attempt/event/全部引用 attempt 的 transition refs，旧 store 均 `DID NOT RAISE`。第 10 项证明三模型九个 annotation 尚无单一具名 alias。
+- L5-4 收集 `54` 项、选中 `3` 项，真实 RED 为 `3 failed, 51 deselected in 2.25s`。三个代表值分别覆盖 reviewer empty、scheme 129-char、key pattern-invalid；private attempt/event/transition refs 完整重派生后，旧 outer coordinator 均 `DID NOT RAISE`。
+
+最小 production 修复只新增私有 `_ReviewTestIdentifier = Annotated[str, Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN)]`，并让 `SandboxTestReviewProofV1`、`_SealedAttemptV1`、`SandboxTestReviewEventV1` 的三个同名字段全部复用。没有增加第二套 restore predicate，也没有修改关系完整性、状态机、ref 派生或 L5-4 production。修复后同一定向集合为 `10 passed, 62 deselected` 与 `3 passed, 51 deselected`。
+
+结构/正例同时证明：九个 annotation 精确指向同一具名 alias；public proof DTO 对三个字段均接受 1-char 与 128-char 合法 identifier；正常 live issue→stage→apply snapshot 可逐字 round-trip。invalid persisted value 在关系完整性检查前即由模型构造拒绝，store/coordinator 继续归一化为固定、chainless 错误且输入 canonical bytes 不变。
+
+### 25.3 R8 最终门禁
+
+| 门禁 | R8 结果 |
+|---|---|
+| R8 定向 / L5-3 / L5-4 | `10/3 passed`；完整专项 `72 passed in 3.51s` / `54 passed in 4.43s` |
+| accepted L5-1 / L5-2 | `14 passed in 13.25s` / `18 passed in 6.72s` |
+| Safety / privacy | `71 passed, 3 deselected in 1.95s` / `76 passed in 4.54s` |
+| Runtime/Legacy/public / public flag | `57 passed, 13 deselected in 0.86s` / `10 passed in 1.83s`；本轮显式纳入 runtime audit integration 文件，多收集的标记项保持 deselected |
+| AST/结构边界 | 新 alias、shared schema、两层离线/ownership 共 `6 passed, 120 deselected in 2.04s` |
+| Ruff / mypy | `All checks passed!`；两份 production / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 / lock | `131 passed in 2.23s`；`Resolved 84 packages in 3ms`，lock 未变化 |
+| 强制全量 | `1 failed, 1782 passed, 362 deselected in 123.12s`；唯一为 `tests/test_config.py::test_load_with_defaults` 的 `local` / 强制 `sandbox-test` 既有差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1783 passed, 362 deselected in 121.30s` |
+
+全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；没有读取 `.env`、ignored `data/` 或 `.codex_tmp`，没有访问网络或启动应用、HTTP、容器、数据库、Gateway 或外部服务。双全量都针对最终 production/test 内容执行；没有删除失败证据、skip、xfail 或修改范围外配置制造通过。
+
+### 25.4 提交、限制与回退
+
+- 单一开发提交消息为 `fix: unify L5 proof identifier constraints`；exact parent 必须为 `d4a33eb3ec017202dad78cc1e2cd11e36290ca28`；提交只含 25.1 节五个 tracked 文件，提交后 worktree/index 必须 clean。
+- Git SHA 无法在包含本文的同一提交中自引用；冻结后由 `git rev-parse HEAD`、上述 parent/message、五文件 scope 与 clean 状态共同报告，并由新的独立 Reviewer/CI/PM 锚定。
+- 本交付仍只是固定虚构/合成、offline unit/in-memory reference restore；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。L5 当前仍为 2/4，L6 未发布、未开始。
+- 若 R8 独立验收失败，对单一 R8 delivery 执行 `git revert <r8-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+---
+
+**R8 已交付，申请独立验收。**

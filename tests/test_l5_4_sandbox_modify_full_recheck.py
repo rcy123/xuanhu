@@ -436,6 +436,53 @@ def _rederive_review_challenge_schema(
     return new_challenge_ref
 
 
+def _rederive_review_proof_identifier(
+    review_snapshot: dict[str, object], *, field: str, value: str
+) -> None:
+    assert field in {
+        "sandbox_test_reviewer_id",
+        "sandbox_test_signature_scheme",
+        "sandbox_test_key_id",
+    }
+    attempt_refs: dict[str, str] = {}
+    for attempt in review_snapshot["attempts"]:
+        old_attempt_ref = attempt["resume_attempt_ref"]
+        attempt[field] = value
+        attempt_body = {
+            key: item
+            for key, item in attempt.items()
+            if key not in {"resume_attempt_ref", "state"}
+        }
+        new_attempt_ref = (
+            "sandbox-attempt-"
+            + hashlib.sha256(canonical_json_bytes(attempt_body)).hexdigest()
+        )
+        attempt["resume_attempt_ref"] = new_attempt_ref
+        attempt_refs[old_attempt_ref] = new_attempt_ref
+
+    for event in review_snapshot["events"]:
+        old_attempt_ref = event["resume_attempt_ref"]
+        if old_attempt_ref not in attempt_refs:
+            continue
+        event[field] = value
+        event["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        _refresh_mapping_ref(
+            event,
+            prefix="sandbox-review-event-",
+            field="event_ref",
+        )
+    for transition in review_snapshot["transitions"]:
+        old_attempt_ref = transition["resume_attempt_ref"]
+        if old_attempt_ref not in attempt_refs:
+            continue
+        transition["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        _refresh_mapping_ref(
+            transition,
+            prefix="sandbox-transition-",
+            field="transition_ref",
+        )
+
+
 def _rederive_current_child_review_schema(
     bad: dict[str, object], *, schema_version: str
 ) -> None:
@@ -485,6 +532,47 @@ def test_l5_4_initial_only_restore_rejects_coordinated_nonfixed_review_schema() 
     changed["current_revision_ref"] = initial_ref
     assert old_challenge_ref != new_challenge_ref
     assert old_challenge_ref.encode() not in canonical_json_bytes(changed)
+    before = canonical_json_bytes(changed)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=changed,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+
+    assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_json_bytes(changed) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("sandbox_test_reviewer_id", ""),
+        ("sandbox_test_signature_scheme", "a" * 129),
+        ("sandbox_test_key_id", "invalid value"),
+    ),
+    ids=("reviewer-empty", "scheme-too-long", "key-pattern"),
+)
+def test_l5_4_restore_rejects_coordinated_invalid_private_proof_identifier(
+    field: str, invalid_value: str
+) -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    baseline = coordinator.snapshot()
+    assert len(baseline.revisions) == 1
+    assert baseline.revisions[0].status == "modify_applied"
+    assert len(baseline.review_snapshot.attempts) == 1
+    assert len(baseline.review_snapshot.events) == 1
+
+    changed = copy.deepcopy(baseline.model_dump(mode="python"))
+    _rederive_review_proof_identifier(
+        changed["review_snapshot"],
+        field=field,
+        value=invalid_value,
+    )
     before = canonical_json_bytes(changed)
 
     with pytest.raises(SandboxRecheckError) as raised:

@@ -436,6 +436,66 @@ def _rederive_review_snapshot_schema(
     return new_challenge_ref
 
 
+def _rederive_review_snapshot_proof_identifier(
+    snapshot: dict[str, object], *, field: str, value: str
+) -> None:
+    assert field in {
+        "sandbox_test_reviewer_id",
+        "sandbox_test_signature_scheme",
+        "sandbox_test_key_id",
+    }
+    attempts = snapshot["attempts"]
+    assert isinstance(attempts, tuple)
+    attempt_refs: dict[str, str] = {}
+    for attempt in attempts:
+        assert isinstance(attempt, dict)
+        old_attempt_ref = attempt["resume_attempt_ref"]
+        assert isinstance(old_attempt_ref, str)
+        attempt[field] = value
+        new_attempt_ref = _derived_record_ref(
+            "sandbox-attempt-",
+            {
+                key: item
+                for key, item in attempt.items()
+                if key != "state"
+            },
+            ref_field="resume_attempt_ref",
+        )
+        attempt["resume_attempt_ref"] = new_attempt_ref
+        attempt_refs[old_attempt_ref] = new_attempt_ref
+
+    events = snapshot["events"]
+    assert isinstance(events, tuple)
+    for event in events:
+        assert isinstance(event, dict)
+        old_attempt_ref = event["resume_attempt_ref"]
+        assert isinstance(old_attempt_ref, str)
+        if old_attempt_ref not in attempt_refs:
+            continue
+        event[field] = value
+        event["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        event["event_ref"] = _derived_record_ref(
+            "sandbox-review-event-",
+            event,
+            ref_field="event_ref",
+        )
+
+    transitions = snapshot["transitions"]
+    assert isinstance(transitions, tuple)
+    for transition in transitions:
+        assert isinstance(transition, dict)
+        old_attempt_ref = transition["resume_attempt_ref"]
+        if old_attempt_ref not in attempt_refs:
+            continue
+        assert isinstance(old_attempt_ref, str)
+        transition["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+
+
 def _stage_and_resume(
     coordinator: SandboxReviewCoordinator,
     delivery,
@@ -487,6 +547,128 @@ def test_l5_3_restore_rejects_coordinated_nonfixed_review_schema(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert canonical_review_bytes(changed) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    tuple(
+        (field, invalid_value)
+        for field in (
+            "sandbox_test_reviewer_id",
+            "sandbox_test_signature_scheme",
+            "sandbox_test_key_id",
+        )
+        for invalid_value in ("", "a" * 129, "invalid value")
+    ),
+    ids=(
+        "reviewer-empty",
+        "reviewer-too-long",
+        "reviewer-pattern",
+        "scheme-empty",
+        "scheme-too-long",
+        "scheme-pattern",
+        "key-empty",
+        "key-too-long",
+        "key-pattern",
+    ),
+)
+def test_l5_3_restore_rejects_coordinated_invalid_proof_identifier(
+    field: str, invalid_value: str
+) -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _, resumed = _stage_and_resume(
+        coordinator,
+        delivery,
+        SandboxReviewAction.MODIFY_FIXTURE,
+    )
+    assert resumed.status == "applied"
+    baseline = store.snapshot()
+    assert len(baseline.attempts) == len(baseline.events) == 1
+    assert SandboxInMemoryReviewStore(snapshot=baseline).snapshot() == baseline
+
+    changed = baseline.model_dump(mode="python")
+    _rederive_review_snapshot_proof_identifier(
+        changed,
+        field=field,
+        value=invalid_value,
+    )
+    before = canonical_review_bytes(changed)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=changed)
+
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_review_bytes(changed) == before
+
+
+def test_l5_3_proof_identifier_constraints_share_one_named_alias_and_roundtrip() -> None:
+    source = Path("app/agent_runtime/sandbox_review.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    alias = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_ReviewTestIdentifier"
+            for target in statement.targets
+        )
+    )
+    assert ast.unparse(alias.value) == (
+        "Annotated[str, Field(min_length=1, max_length=128, "
+        "pattern=_IDENTIFIER_PATTERN)]"
+    )
+    constrained_fields = {
+        "sandbox_test_reviewer_id",
+        "sandbox_test_signature_scheme",
+        "sandbox_test_key_id",
+    }
+    model_names = {
+        "SandboxTestReviewProofV1",
+        "_SealedAttemptV1",
+        "SandboxTestReviewEventV1",
+    }
+    annotations = tuple(
+        statement.annotation
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef) and class_node.name in model_names
+        for statement in class_node.body
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id in constrained_fields
+    )
+    assert len(annotations) == 9
+    assert all(
+        isinstance(annotation, ast.Name)
+        and annotation.id == "_ReviewTestIdentifier"
+        for annotation in annotations
+    )
+
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    submission = _submission(delivery, SandboxReviewAction.CONFIRM)
+    proof_data = submission.proof.model_dump(mode="python")
+    for field in constrained_fields:
+        for valid_value in ("a", "a" * 128):
+            candidate = dict(proof_data)
+            candidate[field] = valid_value
+            assert (
+                SandboxTestReviewProofV1.model_validate(candidate, strict=True)
+                .model_dump(mode="python")[field]
+                == valid_value
+            )
+
+    staged, resumed = _stage_and_resume(
+        coordinator,
+        delivery,
+        SandboxReviewAction.CONFIRM,
+    )
+    assert staged.resume_attempt_ref is not None
+    assert resumed.status == "applied"
+    snapshot = store.snapshot()
+    assert SandboxInMemoryReviewStore(snapshot=snapshot).snapshot() == snapshot
 
 
 def test_l5_3_fixed_schema_guard_is_shared_before_state_branches_and_v1_roundtrips() -> None:

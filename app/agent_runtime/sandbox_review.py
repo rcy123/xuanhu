@@ -8,7 +8,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -29,6 +29,10 @@ _CHALLENGE_TTL_SECONDS = 900
 _REVIEW_SCHEMA_VERSION = "sandbox-review-challenge.v1"
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+_ReviewTestIdentifier = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN),
+]
 
 
 class _StrictFrozenModel(BaseModel):
@@ -279,18 +283,12 @@ class SandboxChallengeDeliveryV1(_StrictFrozenModel):
 
 
 class SandboxTestReviewProofV1(_StrictFrozenModel):
-    sandbox_test_reviewer_id: str = Field(
-        min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN
-    )
+    sandbox_test_reviewer_id: _ReviewTestIdentifier
     sandbox_test_role: Literal["sandbox_reviewer_test_role"]
     sandbox_test_organization_label: Literal["local_synthetic_sandbox"]
     sandbox_test_qualification_label: Literal["not_a_medical_credential"]
-    sandbox_test_signature_scheme: str = Field(
-        min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN
-    )
-    sandbox_test_key_id: str = Field(
-        min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN
-    )
+    sandbox_test_signature_scheme: _ReviewTestIdentifier
+    sandbox_test_key_id: _ReviewTestIdentifier
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     sandbox_test_signature: str = Field(min_length=1, repr=False)
 
@@ -377,12 +375,12 @@ class _SealedAttemptV1(_StrictFrozenModel):
     namespace: str
     test_session_id: str
     action: SandboxReviewAction
-    sandbox_test_reviewer_id: str
+    sandbox_test_reviewer_id: _ReviewTestIdentifier
     sandbox_test_role: Literal["sandbox_reviewer_test_role"]
     sandbox_test_organization_label: Literal["local_synthetic_sandbox"]
     sandbox_test_qualification_label: Literal["not_a_medical_credential"]
-    sandbox_test_signature_scheme: str
-    sandbox_test_key_id: str
+    sandbox_test_signature_scheme: _ReviewTestIdentifier
+    sandbox_test_key_id: _ReviewTestIdentifier
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     state: Literal["sealed", "applied"]
 
@@ -414,12 +412,12 @@ class SandboxTestReviewEventV1(_StrictFrozenModel):
     synthetic_dataset_digest: str = Field(pattern=_DIGEST_PATTERN)
     review_render_digest: str = Field(pattern=_DIGEST_PATTERN)
     action: SandboxReviewAction
-    sandbox_test_reviewer_id: str
+    sandbox_test_reviewer_id: _ReviewTestIdentifier
     sandbox_test_role: Literal["sandbox_reviewer_test_role"]
     sandbox_test_organization_label: Literal["local_synthetic_sandbox"]
     sandbox_test_qualification_label: Literal["not_a_medical_credential"]
-    sandbox_test_signature_scheme: str
-    sandbox_test_key_id: str
+    sandbox_test_signature_scheme: _ReviewTestIdentifier
+    sandbox_test_key_id: _ReviewTestIdentifier
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     applied_at: int
 

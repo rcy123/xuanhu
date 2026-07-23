@@ -564,3 +564,29 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 最终 Reviewer P0=0、P1=0、P2=1、P3=0：L5-3 persisted attempt/event 未复用 live proof 的三项 identifier 约束；完整重派生 applied history 可被 shared store 接受，因而可能传递到本层 private snapshot。
 - 结论：final R3 **未通过**（`ACC-20260723-042`、`DEC-20260723-035`）；R5～R7 acceptance 历史保留，L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
 - R8 只修改 L5-3 shared types/模型与两层回归；`sandbox_recheck.py` production 不加重复判断。L6 未发布、未开始。
+
+## 27. L5-3/4-R8 proof identifier constraint composition 交付（2026-07-23）
+
+### 27.1 精确起点与两层 tests-first RED
+
+- 状态：**R8 已交付，申请独立验收**；exact parent 为 clean management release `d4a33eb3ec017202dad78cc1e2cd11e36290ca28`；任务依据为 [R8 任务书](agent-refactor-l5-3-4-proof-constraint-rework-8-task.md)。
+- production 未修改时，L5-3 三字段×三类非法值与共享 alias 结构共 `10 failed, 62 deselected`；本层对 reviewer empty、scheme 129-char、key pattern-invalid 三个代表值完整重派生 private attempt/event/transition refs，真实 RED 为 `3 failed, 51 deselected`。旧 shared store 与 outer coordinator 都错误接受，拒绝预期不依赖 stale ref、单侧字段变化、删除记录、skip 或 xfail。
+- 最小修复只落在 `sandbox_review.py`：live proof、sealed attempt 与 review event 的九个 annotation 共用单一私有 `_ReviewTestIdentifier`。Pydantic 在进入 shared 关系完整性检查前拒绝非法 persisted value；`sandbox_recheck.py` production 零 diff，本层通过构造下层 `SandboxInMemoryReviewStore(snapshot=...)` 自动继承固定拒绝。
+- 修复后两层定向为 `10/3 passed`；本层 outer 失败保持固定 `SANDBOX_RECHECK_REJECTED`、无 cause/context，输入 canonical bytes 不变。合法 1/128 字符 public proof、正常 live applied snapshot round-trip、R7 fixed schema、R6 child inheritance 与 R5 finite qualification ownership 均保持。
+
+### 27.2 回归与门禁
+
+- L5-4 完整专项 `54 passed in 4.43s`，既有 51 项全部保留并新增三个 composition 参数子例；L5-3 完整专项 `72 passed in 3.51s`。
+- L5-1/L5-2 `14/18`；Safety `71/3 deselected`；privacy `76`；Runtime/Legacy/public `57/13 deselected`；public flag `10`；AST/结构 `6/120 deselected`；L0 `131`；Ruff、两 production mypy、lock 与 diff check 全部通过。Runtime 组合显式纳入 runtime audit integration 文件，新增收集项保持 integration deselected，不属于产品失败。
+- forced full 为 `1 failed, 1782 passed, 362 deselected in 123.12s`，唯一是既有 defaults 差异；只移除 `APP_ENV` 且保留全部 fake endpoints 的 calibrated full 为 `1783 passed, 362 deselected in 121.30s`。
+
+### 27.3 范围、限制、提交与回退
+
+- R8 单一提交只含 `app/agent_runtime/sandbox_review.py`、两层专项与两份 handoff；未修改本层 production、任务书、PM 六台账、配置、依赖或锁文件。提交消息为 `fix: unify L5 proof identifier constraints`，exact parent 为 `d4a33eb3ec017202dad78cc1e2cd11e36290ca28`。
+- 全部执行使用 inline fixed-fictitious/synthetic、offline/in-memory fixture；未读取 `.env`、ignored `data/`、`.codex_tmp`，未访问网络或启动服务。
+- Git SHA 由提交后外部报告；后续必须在该 exact clean delivery 上执行新的独立 Reviewer/CI/PM，不能复用 final R3。当前不声明 accepted；L5 仍为 2/4，L6 未发布、未开始。
+- 若 R8 验收失败，对单一 R8 delivery 执行 `git revert <r8-delivery-commit>`，保留历史且不 reset/amend。
+
+---
+
+**R8 已交付，申请独立验收。**
