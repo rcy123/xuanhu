@@ -782,3 +782,41 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 - 独立 Reviewer：P0=0、P1=1、P2=0、P3=0。同步改变 action 与两处 digest、再完整重派生 attempt/event/4 transition refs 后，R9 helper 只对 snapshot 自身值自校验，restore 仍接受并把 blocked 翻为 eligible。
 - 结论：**R9 未接受**（`ACC-20260723-045`、`DEC-20260723-038`）；delivery 与全部证据保留，L5-3/L5-4 和两个工程风险保持 reopened；R10 架构收敛已发布。
 - R10 必须用 bounded/repr-hidden synthetic signature proof + injected offline verifier 建立 snapshot 外 authority；plaintext nonce 仍不持久化，L6 未开始。
+
+## 30. L5-3/4-R10 persisted signature proof restore 架构收敛交付（2026-07-23）
+
+### 30.1 精确起点与 tests-first RED
+
+- 状态：**R10 已交付，申请独立验收**；执行者不声明 accepted、专业批准或 production ready。clean exact parent 为 `c352968909d725d7342622817ada91fa0e2b732e`，其中保留 R9 delivery、独立 Review P1、`ACC-20260723-045`、`DEC-20260723-038` 与 [R10 任务书](agent-refactor-l5-3-4-signature-proof-rework-10-task.md)。
+- production 两文件零 diff、工作区仅两份专项测试变化时，L5-3 收集 `84` 项、R10 定向选中 `11` 项，真实 RED 为 `10 failed, 1 passed, 73 deselected in 2.84s`：非空 attempt 无 verifier 仍被接受，store 尚无 verifier 注入参数，sealed attempt 未保存 signature，public signature 无固定上限，false/exception、signature drift、restart 与结构要求均按预期失败；empty store 无 verifier 正例已通过。
+- 双向核心负例另以 R9 原接口精确复跑，收集 `84` 项、选中 `2` 项，为 `2 failed, 82 deselected in 2.32s`。`REJECT→CONFIRM` 与 `CONFIRM→REJECT` 均同步改变 attempt/event action，使用 public R9 digest wrapper 重算并替换两处 digest，重派生 attempt/event 与四条相关 transition refs；未调用 signer、未重签、未删除记录、没有 stale ref，旧 store 均 `DID NOT RAISE`，且失败前已确认 eligibility 分别翻转为 eligible/blocked。
+
+### 30.2 外部 verifier authority 与 GREEN
+
+- public `SandboxTestReviewProofV1.sandbox_test_signature` 与 private sealed attempt 的同名字段现在都固定 `1..512` 字符且 `repr=False`；live stage 继续先校验 nonce、重算 R9 persisted-challenge digest、调用既有 verifier，只有成功后才把原 synthetic signature proof 密封进 attempt。attempt ref 覆盖 signature，event 精确不复制 signature。
+- `SandboxInMemoryReviewStore` 对含 attempts 的恢复要求 injected `SandboxSignatureVerifier`。snapshot 模型先执行 R9 challenge/action/identity→digest 关系完整性，再逐 attempt 使用 persisted digest/scheme/key/signature 重验；missing、false、exception 与 proof drift 均归一化为固定 `SANDBOX_REVIEW_REJECTED`，无 cause/context，输入 canonical bytes 不变。验证完全成功后才发布 candidate snapshot，失败不会留下部分 initial state。
+- 测试 fake signer 与 fake verifier 已拆分；verifier 不暴露 signature 生成方法，所有篡改只保留原 live signature。sealed CONFIRM 与 applied CONFIRM/REJECT 三种 L5-3 restart 均逐 attempt 调用 verifier 精确 `1` 次；false/exception/drift 也各精确调用 `1` 次；empty snapshot 不需要 verifier。signature 存在于 sealed attempt canonical snapshot，但不进入 attempt/snapshot `repr`、event、resume command、异常或日志；plaintext nonce 仍不持久化。
+- 同一 R10 定向修复后为 `11 passed, 73 deselected in 1.84s`；完整 L5-3 专项为 `84 passed in 2.94s`，超过任务阈值且保留原 75 项。
+
+### 30.3 最终门禁、范围与回退
+
+| 门禁 | R10 结果 |
+|---|---|
+| L5-3 / L5-4 / 四层组合 | `84 passed` / `60 passed` / `176 passed` |
+| R7 / R8 / R9 | `4 passed` / `13 passed` / `6 passed` |
+| 32 并发 / 状态机 | `2 passed` / `8 passed` |
+| Safety / 相邻 Safety / privacy | `71 passed, 3 deselected` / `18 passed` / `76 passed` |
+| Runtime/Legacy/public / public flag | `57 passed, 13 deselected` / `10 passed` |
+| AST/离线/ownership | `10 passed, 134 deselected` |
+| Ruff / mypy | 全仓 `All checks passed!`；四个 L5 production `Success: no issues found in 4 source files`，仅既有 `pymilvus.*` unused-section note |
+| L0 / lock | `131 passed`；`Resolved 84 packages in 3ms`，lock 未变化 |
+| 强制全量 | `1 failed, 1800 passed, 362 deselected in 123.23s`；唯一为 `tests/test_config.py::test_load_with_defaults` 的 `local` / 强制 `sandbox-test` 既有差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1801 passed, 362 deselected in 122.64s` |
+
+- 单一 R10 delivery 只含任务书允许的六个 tracked 文件：两份 production、两份专项与两份 handoff；PM 六台账、任务书、L5-1/L5-2、配置、依赖与锁文件均未修改。提交消息为 `fix: verify persisted L5 signature proofs`，exact parent 为 `c352968909d725d7342622817ada91fa0e2b732e`。
+- 全部 fixture 与 signature proof 继续是 inline fixed-fictitious/synthetic、offline/in-memory；没有读取 `.env`、ignored `data/` 或 `.codex_tmp`，没有访问网络或启动应用、HTTP、容器、数据库、Redis、Gateway 或外部 signer/verifier 服务。L6 未发布、未开始。
+- Git SHA 由提交后外部报告；后续必须在 exact clean delivery 上执行新的独立 Reviewer/CI/PM，不能复用 R9 或 final R1～R4。若 R10 独立验收失败，对单一 delivery 执行 `git revert <r10-delivery-commit>`，保留全部历史且不 reset/amend。
+
+---
+
+**R10 已交付，申请独立验收。**

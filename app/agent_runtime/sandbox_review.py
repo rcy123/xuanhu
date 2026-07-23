@@ -290,7 +290,9 @@ class SandboxTestReviewProofV1(_StrictFrozenModel):
     sandbox_test_signature_scheme: _ReviewTestIdentifier
     sandbox_test_key_id: _ReviewTestIdentifier
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
-    sandbox_test_signature: str = Field(min_length=1, repr=False)
+    sandbox_test_signature: str = Field(
+        min_length=1, max_length=512, repr=False
+    )
 
 
 class SandboxResumeSubmissionV1(_StrictFrozenModel):
@@ -410,6 +412,9 @@ class _SealedAttemptV1(_StrictFrozenModel):
     sandbox_test_signature_scheme: _ReviewTestIdentifier
     sandbox_test_key_id: _ReviewTestIdentifier
     sandbox_test_signed_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
+    sandbox_test_signature: str = Field(
+        min_length=1, max_length=512, repr=False
+    )
     state: Literal["sealed", "applied"]
 
     @model_validator(mode="after")
@@ -941,16 +946,37 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
 class SandboxInMemoryReviewStore:
     """Thread-safe, sandbox-only in-memory reference domain store."""
 
-    def __init__(self, *, snapshot: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        snapshot: object | None = None,
+        signature_verifier: SandboxSignatureVerifier | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._operation_count = 0
         initial: SandboxReviewStoreSnapshotV1 | None = None
         with suppress(Exception):
-            initial = (
+            candidate = (
                 SandboxReviewStoreSnapshotV1()
                 if snapshot is None
                 else _deep_model(SandboxReviewStoreSnapshotV1, snapshot)
             )
+            if candidate.attempts:
+                if signature_verifier is None:
+                    raise SandboxReviewError()
+                for attempt in candidate.attempts:
+                    if not signature_verifier.verify(
+                        signed_payload_digest=(
+                            attempt.sandbox_test_signed_payload_digest
+                        ),
+                        sandbox_test_signature_scheme=(
+                            attempt.sandbox_test_signature_scheme
+                        ),
+                        sandbox_test_key_id=attempt.sandbox_test_key_id,
+                        sandbox_test_signature=attempt.sandbox_test_signature,
+                    ):
+                        raise SandboxReviewError()
+            initial = candidate
         if initial is None:
             raise SandboxReviewError()
         self._sources = list(initial.sources)
@@ -1703,6 +1729,7 @@ class SandboxReviewCoordinator:
                 sandbox_test_signature_scheme=proof.sandbox_test_signature_scheme,
                 sandbox_test_key_id=proof.sandbox_test_key_id,
                 sandbox_test_signed_payload_digest=signed_payload_digest,
+                sandbox_test_signature=proof.sandbox_test_signature,
                 state="sealed",
             )
             attempt = _SealedAttemptV1(
@@ -1723,6 +1750,7 @@ class SandboxReviewCoordinator:
                 sandbox_test_signature_scheme=proof.sandbox_test_signature_scheme,
                 sandbox_test_key_id=proof.sandbox_test_key_id,
                 sandbox_test_signed_payload_digest=signed_payload_digest,
+                sandbox_test_signature=proof.sandbox_test_signature,
                 state="sealed",
             )
             if not self._store.stage(

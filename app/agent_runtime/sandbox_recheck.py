@@ -854,7 +854,8 @@ class SandboxRecheckCoordinator:
                 if not _snapshot_results_are_reproducible(restored):
                     raise SandboxRecheckError()
                 review_store = SandboxInMemoryReviewStore(
-                    snapshot=restored.review_snapshot
+                    snapshot=restored.review_snapshot,
+                    signature_verifier=self._signature_verifier,
                 )
             if restored is None or review_store is None:
                 raise SandboxRecheckError()
@@ -973,7 +974,8 @@ class SandboxRecheckCoordinator:
                     )
                     review_render_digest = source.review_render_digest
                     candidate_store = SandboxInMemoryReviewStore(
-                        snapshot=self._review_store.snapshot()
+                        snapshot=self._review_store.snapshot(),
+                        signature_verifier=self._signature_verifier,
                     )
                     candidate_review = self._new_review_coordinator(candidate_store)
                     delivery = candidate_review.create_single_use_challenge(
@@ -1069,7 +1071,8 @@ class SandboxRecheckCoordinator:
             )
             if candidate_store is None:
                 candidate_store = SandboxInMemoryReviewStore(
-                    snapshot=candidate_snapshot.review_snapshot
+                    snapshot=candidate_snapshot.review_snapshot,
+                    signature_verifier=self._signature_verifier,
                 )
             self._revisions.append(revision)
             self._runs.append(run)

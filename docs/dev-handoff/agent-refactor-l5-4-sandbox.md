@@ -640,3 +640,29 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - Reviewer P0=0、P1=1、P2=0、P3=0：private snapshot 可同步重算 action、signed digest 与全部 refs；下层 self-validation 接受后，本层 outer completion 也从 blocked 翻为 eligible。
 - 结论：**R9 未接受**（`ACC-20260723-045`、`DEC-20260723-038`）；R5～R9 与 final 历史保留，L5-3/L5-4 和两个工程风险继续 reopened，L5 当前 2/4。
 - R10 允许本层 production 只做必要的 verifier 传递：initial/current/candidate shared store 共用 coordinator 已注入的 verifier；不得复制 action/digest/signature 条件，不接外部服务，不启动 L6。
+
+## 32. L5-3/4-R10 persisted signature proof composition 交付（2026-07-23）
+
+### 32.1 精确起点、outer RED 与最小传递
+
+- 状态：**R10 已交付，申请独立验收**；clean exact parent 为 `c352968909d725d7342622817ada91fa0e2b732e`，任务依据为 [R10 任务书](agent-refactor-l5-3-4-signature-proof-rework-10-task.md)。
+- production 两文件零 diff、工作区仅两份专项测试变化时，本层收集 `60` 项、R10 定向选中 `6` 项，真实 RED 为 `6 failed, 54 deselected in 2.75s`。两个 current-review composition 分别完整执行 `REJECT→CONFIRM` 与 `CONFIRM→REJECT`：同步改变 private attempt/event action，使用 R9 public digest wrapper 重算并替换两处 digest，重派生 attempt/event/四条 transition refs，保留原 live signature 且不调用 signer；旧 outer restore 均 `DID NOT RAISE`，并在失败前确认 completion eligibility 双向翻转。其余四项证明三处 shared store 尚未转发 verifier，restart verifier calls 实际为零。
+- production 本层只修改 `SandboxRecheckCoordinator` 已存在的三个 shared store 构造：initial restore、current copy-on-write candidate 与 terminal/fallback candidate 均显式传入同一个 `self._signature_verifier`。没有复制 action/digest/signature 条件，没有新增 verifier、密钥、外部端口或第二套判断。
+
+### 32.2 composition GREEN 与 verifier 调用证据
+
+- 下层 store 先保留 R9 persisted challenge/action/identity digest 关系，再用 snapshot 外 verifier 重验 sealed attempt 的 persisted digest/scheme/key/signature；因此两方向 action+digest+refs 篡改在 outer completion 解释前固定返回 `SANDBOX_RECHECK_REJECTED`，无 cause/context，输入 canonical bytes 不变。
+- L5-4 current sealed CONFIRM、applied CONFIRM 与 applied REJECT 三种 restart 均通过；combined snapshot 的 initial+current 两个 attempts 使用同一注入 verifier 精确调用 `2` 次，恢复后 snapshot 逐字相同，completion 分别保持 blocked/eligible/blocked，sealed restart 后可继续一次性 apply 为 eligible。
+- 测试 fake signer/verifier 角色分离，verifier 无签名生成方法，篡改测试从不重签。event 不持有 signature，plaintext nonce 不进入 combined snapshot 或 resume command；本层没有网络、Runtime、DB 或外部 verifier 能力。
+- 同一定向修复后为 `6 passed, 54 deselected in 1.94s`；完整 L5-4 专项为 `60 passed in 3.76s`，超过任务阈值并保留原 56 项。L5 四层组合为 `176 passed`。
+
+### 32.3 门禁、范围与回退
+
+- R7/R8/R9 `4/13/6`、32 并发 `2`、状态机 `8`、AST/离线结构 `10`、Safety `71/3 deselected + 18`、privacy `76`、Runtime/Legacy/public `57/13 deselected`、public flag `10`、L0 `131`、Ruff/mypy/lock 全部通过。
+- forced full 为 `1 failed, 1800 passed, 362 deselected in 123.23s` 且唯一为既有 defaults 差异；只移除 `APP_ENV` 的 calibrated full 为 `1801 passed, 362 deselected in 122.64s`。
+- 单一 R10 delivery 精确只含任务书允许的六个 tracked 文件；提交消息为 `fix: verify persisted L5 signature proofs`，exact parent 为 `c352968909d725d7342622817ada91fa0e2b732e`。PM 六台账、任务书、配置、依赖与锁文件未修改。
+- 全部执行继续使用 fixed-fictitious/synthetic、offline/in-memory fixture 与 loopback fake endpoints；未读取 `.env`、ignored `data/`、`.codex_tmp`，未访问网络或启动服务。当前不声明 accepted；后续必须在 exact clean delivery 上执行新的独立 Reviewer/CI/PM。若验收失败，对单一 R10 delivery 执行 `git revert <r10-delivery-commit>`，保留历史且不 reset/amend。L6 未发布、未开始。
+
+---
+
+**R10 已交付，申请独立验收。**

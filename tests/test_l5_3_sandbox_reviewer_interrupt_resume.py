@@ -103,14 +103,19 @@ class _NestedReviewErrorStore(SandboxInMemoryReviewStore):
         raise AssertionError("unreachable")
 
 
-class _FakeSignatureVerifier:
-    def __init__(self, *, raises: str | None = None) -> None:
-        self.calls = 0
-        self.raises = raises
-
+class _FakeSigner:
     @staticmethod
     def signature(payload_digest: str) -> str:
         return hashlib.sha256(f"sandbox-signature:{payload_digest}".encode()).hexdigest()
+
+
+class _FakeSignatureVerifier:
+    def __init__(
+        self, *, raises: str | None = None, result: bool | None = None
+    ) -> None:
+        self.calls = 0
+        self.raises = raises
+        self.result = result
 
     def verify(
         self,
@@ -123,10 +128,15 @@ class _FakeSignatureVerifier:
         self.calls += 1
         if self.raises is not None:
             raise RuntimeError(self.raises)
+        if self.result is not None:
+            return self.result
+        expected_signature = hashlib.sha256(
+            f"sandbox-signature:{signed_payload_digest}".encode()
+        ).hexdigest()
         return (
             sandbox_test_signature_scheme == _SCHEME
             and sandbox_test_key_id == _KEY_ID
-            and sandbox_test_signature == self.signature(signed_payload_digest)
+            and sandbox_test_signature == expected_signature
         )
 
 
@@ -286,6 +296,13 @@ def _coordinator(
     )
 
 
+def _restore_store(snapshot: object) -> SandboxInMemoryReviewStore:
+    return SandboxInMemoryReviewStore(
+        snapshot=snapshot,
+        signature_verifier=_FakeSignatureVerifier(),
+    )
+
+
 def _issue(
     coordinator: SandboxReviewCoordinator,
     source: SandboxReviewSourceV1 | None = None,
@@ -320,7 +337,7 @@ def _submission(delivery, action: SandboxReviewAction) -> SandboxResumeSubmissio
         sandbox_test_signature_scheme=_SCHEME,
         sandbox_test_key_id=_KEY_ID,
         sandbox_test_signed_payload_digest=payload_digest,
-        sandbox_test_signature=_FakeSignatureVerifier.signature(payload_digest),
+        sandbox_test_signature=_FakeSigner.signature(payload_digest),
     )
     return SandboxResumeSubmissionV1(
         namespace=_NAMESPACE,
@@ -499,7 +516,7 @@ def _rederive_review_snapshot_proof_identifier(
 def _rederive_review_snapshot_action(
     snapshot: dict[str, object],
     *,
-    challenge_ref: str,
+    challenge,
     action: SandboxReviewAction,
 ) -> None:
     attempts = snapshot["attempts"]
@@ -507,15 +524,31 @@ def _rederive_review_snapshot_action(
     exact_attempts = [
         attempt
         for attempt in attempts
-        if attempt["challenge_ref"] == challenge_ref
+        if attempt["challenge_ref"] == challenge.challenge_ref
     ]
     assert len(exact_attempts) == 1
     attempt = exact_attempts[0]
     assert isinstance(attempt, dict)
     old_attempt_ref = attempt["resume_attempt_ref"]
     assert isinstance(old_attempt_ref, str)
-    persisted_digest = attempt["sandbox_test_signed_payload_digest"]
+    persisted_signature = attempt.get("sandbox_test_signature")
+    changed_digest = review_signed_payload_digest(
+        challenge=challenge,
+        action=action,
+        plaintext_nonce=_NONCE,
+        sandbox_test_reviewer_id=attempt["sandbox_test_reviewer_id"],
+        sandbox_test_role=attempt["sandbox_test_role"],
+        sandbox_test_organization_label=attempt[
+            "sandbox_test_organization_label"
+        ],
+        sandbox_test_qualification_label=attempt[
+            "sandbox_test_qualification_label"
+        ],
+        sandbox_test_signature_scheme=attempt["sandbox_test_signature_scheme"],
+        sandbox_test_key_id=attempt["sandbox_test_key_id"],
+    )
     attempt["action"] = action
+    attempt["sandbox_test_signed_payload_digest"] = changed_digest
     new_attempt_ref = _derived_record_ref(
         "sandbox-attempt-",
         {
@@ -538,6 +571,7 @@ def _rederive_review_snapshot_action(
     event = exact_events[0]
     assert isinstance(event, dict)
     event["action"] = action
+    event["sandbox_test_signed_payload_digest"] = changed_digest
     event["resume_attempt_ref"] = new_attempt_ref
     event["event_ref"] = _derived_record_ref(
         "sandbox-review-event-",
@@ -560,8 +594,51 @@ def _rederive_review_snapshot_action(
         )
         rewritten_transitions += 1
     assert rewritten_transitions == 4
-    assert attempt["sandbox_test_signed_payload_digest"] == persisted_digest
-    assert event["sandbox_test_signed_payload_digest"] == persisted_digest
+    assert attempt["sandbox_test_signed_payload_digest"] == changed_digest
+    assert event["sandbox_test_signed_payload_digest"] == changed_digest
+    assert attempt.get("sandbox_test_signature") == persisted_signature
+
+
+def _rederive_review_snapshot_signature(
+    snapshot: dict[str, object], *, changed_signature: str
+) -> None:
+    attempts = snapshot["attempts"]
+    assert isinstance(attempts, tuple)
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert isinstance(attempt, dict)
+    old_attempt_ref = attempt["resume_attempt_ref"]
+    assert isinstance(old_attempt_ref, str)
+    assert "sandbox_test_signature" in attempt
+    attempt["sandbox_test_signature"] = changed_signature
+    new_attempt_ref = _derived_record_ref(
+        "sandbox-attempt-",
+        {key: value for key, value in attempt.items() if key != "state"},
+        ref_field="resume_attempt_ref",
+    )
+    attempt["resume_attempt_ref"] = new_attempt_ref
+
+    events = snapshot["events"]
+    assert isinstance(events, tuple)
+    for event in events:
+        assert isinstance(event, dict)
+        if event["resume_attempt_ref"] != old_attempt_ref:
+            continue
+        event["resume_attempt_ref"] = new_attempt_ref
+        event["event_ref"] = _derived_record_ref(
+            "sandbox-review-event-", event, ref_field="event_ref"
+        )
+
+    transitions = snapshot["transitions"]
+    assert isinstance(transitions, tuple)
+    for transition in transitions:
+        assert isinstance(transition, dict)
+        if transition["resume_attempt_ref"] != old_attempt_ref:
+            continue
+        transition["resume_attempt_ref"] = new_attempt_ref
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-", transition, ref_field="transition_ref"
+        )
 
 
 def _stage_and_resume(
@@ -596,7 +673,7 @@ def test_l5_3_restore_rejects_coordinated_nonfixed_review_schema(
         assert resumed.status == "applied"
     baseline = store.snapshot()
     assert baseline.challenges[0].state == snapshot_state
-    assert SandboxInMemoryReviewStore(snapshot=baseline).snapshot() == baseline
+    assert _restore_store(baseline).snapshot() == baseline
 
     changed = baseline.model_dump(mode="python")
     old_challenge_ref = changed["challenges"][0]["challenge_ref"]
@@ -609,7 +686,7 @@ def test_l5_3_restore_rejects_coordinated_nonfixed_review_schema(
     before = canonical_review_bytes(changed)
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=changed)
+        _restore_store(changed)
 
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
@@ -653,7 +730,7 @@ def test_l5_3_restore_rejects_coordinated_invalid_proof_identifier(
     assert resumed.status == "applied"
     baseline = store.snapshot()
     assert len(baseline.attempts) == len(baseline.events) == 1
-    assert SandboxInMemoryReviewStore(snapshot=baseline).snapshot() == baseline
+    assert _restore_store(baseline).snapshot() == baseline
 
     changed = baseline.model_dump(mode="python")
     _rederive_review_snapshot_proof_identifier(
@@ -664,7 +741,7 @@ def test_l5_3_restore_rejects_coordinated_invalid_proof_identifier(
     before = canonical_review_bytes(changed)
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=changed)
+        _restore_store(changed)
 
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
@@ -736,7 +813,7 @@ def test_l5_3_proof_identifier_constraints_share_one_named_alias_and_roundtrip()
     assert staged.resume_attempt_ref is not None
     assert resumed.status == "applied"
     snapshot = store.snapshot()
-    assert SandboxInMemoryReviewStore(snapshot=snapshot).snapshot() == snapshot
+    assert _restore_store(snapshot).snapshot() == snapshot
 
 
 def test_l5_3_signed_digest_live_and_restore_share_one_authority_helper() -> None:
@@ -888,7 +965,7 @@ def test_l5_3_fixed_schema_guard_is_shared_before_state_branches_and_v1_roundtri
             assert resumed.status == "applied"
         snapshot = store.snapshot()
         assert snapshot.challenges[0].state == expected_state
-        assert SandboxInMemoryReviewStore(snapshot=snapshot).snapshot() == snapshot
+        assert _restore_store(snapshot).snapshot() == snapshot
 
 
 @pytest.mark.parametrize(
@@ -938,7 +1015,7 @@ def test_l5_3_valid_confirm_and_reject_apply_exactly_once_with_all_bindings(
         thread_id=_THREAD_ID,
         checkpoint_id=_CHECKPOINT_ID,
     ).status == expected_eligibility
-    restarted_store = SandboxInMemoryReviewStore(snapshot=snapshot)
+    restarted_store = _restore_store(snapshot)
     restarted = SandboxReviewCoordinator(
         store=restarted_store,
         clock=_FakeClock(),
@@ -1297,7 +1374,7 @@ def test_l5_3_restart_snapshot_rejects_changed_event_action_and_derived_refs(
         snapshot.pop("current_authorities", None)
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=snapshot)
+        _restore_store(snapshot)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1329,7 +1406,12 @@ def test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_chan
 ) -> None:
     coordinator, store, *_ = _coordinator()
     delivery = _issue(coordinator)
-    _stage_and_resume(coordinator, delivery, original_action)
+    submission = _submission(delivery, original_action)
+    staged = coordinator.stage_verified_resume_attempt(submission)
+    assert staged.resume_attempt_ref is not None
+    assert coordinator.resume(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    ).status == "applied"
     assert coordinator.eligibility(
         namespace=_NAMESPACE,
         test_session_id=delivery.challenge.test_session_id,
@@ -1337,20 +1419,24 @@ def test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_chan
         checkpoint_id=_CHECKPOINT_ID,
     ).status == original_status
     snapshot = store.snapshot().model_dump(mode="python")
-    original_digest = snapshot["attempts"][0][
-        "sandbox_test_signed_payload_digest"
-    ]
+    original_digest = snapshot["attempts"][0]["sandbox_test_signed_payload_digest"]
+    original_signature = submission.proof.sandbox_test_signature
     _rederive_review_snapshot_action(
         snapshot,
-        challenge_ref=delivery.challenge.challenge_ref,
+        challenge=delivery.challenge,
         action=changed_action,
     )
-    assert snapshot["attempts"][0]["sandbox_test_signed_payload_digest"] == original_digest
-    assert snapshot["events"][0]["sandbox_test_signed_payload_digest"] == original_digest
+    assert snapshot["attempts"][0]["sandbox_test_signed_payload_digest"] != original_digest
+    assert snapshot["events"][0]["sandbox_test_signed_payload_digest"] != original_digest
+    assert snapshot["attempts"][0]["sandbox_test_signature"] == original_signature
+    assert original_signature == submission.proof.sandbox_test_signature
     before = canonical_review_bytes(snapshot)
 
     with pytest.raises(SandboxReviewError) as raised:
-        restored_store = SandboxInMemoryReviewStore(snapshot=snapshot)
+        restored_store = SandboxInMemoryReviewStore(
+            snapshot=snapshot,
+            signature_verifier=_FakeSignatureVerifier(),
+        )
         restored = SandboxReviewCoordinator(
             store=restored_store,
             clock=_FakeClock(),
@@ -1367,6 +1453,205 @@ def test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_chan
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert canonical_review_bytes(snapshot) == before
+
+
+def test_l5_3_restore_requires_verifier_for_nonempty_attempt_snapshot() -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    staged = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.CONFIRM)
+    )
+    assert staged.status == "staged"
+    baseline = store.snapshot()
+    assert len(baseline.attempts) == 1
+    before = canonical_review_bytes(baseline)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=baseline)
+
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_review_bytes(baseline) == before
+
+
+@pytest.mark.parametrize(
+    ("result", "raises"),
+    ((False, None), (None, "restore-verifier-secret")),
+    ids=("false", "exception"),
+)
+def test_l5_3_restore_rejects_failed_signature_verifier_without_mutation(
+    result: bool | None, raises: str | None
+) -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    staged = coordinator.stage_verified_resume_attempt(
+        _submission(delivery, SandboxReviewAction.CONFIRM)
+    )
+    assert staged.status == "staged"
+    baseline = store.snapshot()
+    before = canonical_review_bytes(baseline)
+    verifier = _FakeSignatureVerifier(result=result, raises=raises)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(
+            snapshot=baseline,
+            signature_verifier=verifier,
+        )
+
+    assert verifier.calls == 1
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "restore-verifier-secret" not in repr(raised.value)
+    assert canonical_review_bytes(baseline) == before
+
+
+def test_l5_3_restore_rejects_original_signature_proof_drift() -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _, resumed = _stage_and_resume(
+        coordinator, delivery, SandboxReviewAction.CONFIRM
+    )
+    assert resumed.status == "applied"
+    changed = store.snapshot().model_dump(mode="python")
+    original_signature = changed["attempts"][0]["sandbox_test_signature"]
+    _rederive_review_snapshot_signature(
+        changed,
+        changed_signature="0" * len(original_signature),
+    )
+    before = canonical_review_bytes(changed)
+    verifier = _FakeSignatureVerifier()
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(
+            snapshot=changed,
+            signature_verifier=verifier,
+        )
+
+    assert changed["attempts"][0]["sandbox_test_signature"] != original_signature
+    assert verifier.calls == 1
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_review_bytes(changed) == before
+
+
+@pytest.mark.parametrize(
+    ("attempt_state", "action", "expected_eligibility"),
+    (
+        ("sealed", SandboxReviewAction.CONFIRM, "blocked"),
+        ("applied", SandboxReviewAction.CONFIRM, "eligible"),
+        ("applied", SandboxReviewAction.REJECT, "blocked"),
+    ),
+    ids=("sealed-confirm", "applied-confirm", "applied-reject"),
+)
+def test_l5_3_signature_verified_restart_accepts_sealed_and_applied_attempts(
+    attempt_state: str,
+    action: SandboxReviewAction,
+    expected_eligibility: str,
+) -> None:
+    coordinator, store, clock, nonce_factory, _ = _coordinator()
+    delivery = _issue(coordinator)
+    staged = coordinator.stage_verified_resume_attempt(_submission(delivery, action))
+    assert staged.resume_attempt_ref is not None
+    if attempt_state == "applied":
+        assert coordinator.resume(
+            SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+        ).status == "applied"
+    snapshot = store.snapshot()
+    signature = snapshot.attempts[0].sandbox_test_signature
+    verifier = _FakeSignatureVerifier()
+
+    restarted_store = SandboxInMemoryReviewStore(
+        snapshot=snapshot,
+        signature_verifier=verifier,
+    )
+    restarted = SandboxReviewCoordinator(
+        store=restarted_store,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+
+    assert verifier.calls == 1
+    assert restarted_store.snapshot() == snapshot
+    assert signature.encode() in canonical_review_bytes(snapshot)
+    assert signature not in repr(snapshot)
+    assert all(
+        "sandbox_test_signature" not in type(event).model_fields
+        for event in snapshot.events
+    )
+    assert restarted.eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=delivery.challenge.test_session_id,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+    ).status == expected_eligibility
+    if attempt_state == "sealed":
+        assert restarted.resume(
+            SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+        ).status == "applied"
+
+
+def test_l5_3_empty_store_restore_does_not_require_signature_verifier() -> None:
+    empty = SandboxInMemoryReviewStore().snapshot()
+    assert empty.attempts == ()
+    assert SandboxInMemoryReviewStore(snapshot=empty).snapshot() == empty
+
+
+def test_l5_3_signature_proof_is_bounded_hidden_and_restore_verified() -> None:
+    tree = ast.parse(
+        Path("app/agent_runtime/sandbox_review.py").read_text(encoding="utf-8")
+    )
+    classes = {
+        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
+    }
+    signature_fields = []
+    for model_name in ("SandboxTestReviewProofV1", "_SealedAttemptV1"):
+        field = next(
+            statement
+            for statement in classes[model_name].body
+            if isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == "sandbox_test_signature"
+        )
+        assert isinstance(field.value, ast.Call)
+        keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in field.value.keywords}
+        assert keywords == {"min_length": "1", "max_length": "512", "repr": "False"}
+        signature_fields.append(field)
+    assert len(signature_fields) == 2
+    assert not any(
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id == "sandbox_test_signature"
+        for statement in classes["SandboxTestReviewEventV1"].body
+    )
+    assert not hasattr(_FakeSignatureVerifier, "signature")
+
+    store_init = next(
+        node
+        for node in classes["SandboxInMemoryReviewStore"].body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assert "signature_verifier" in {
+        argument.arg for argument in (*store_init.args.args, *store_init.args.kwonlyargs)
+    }
+    assert any(
+        isinstance(node, ast.Call) and ast.unparse(node.func).endswith(".verify")
+        for node in ast.walk(classes["SandboxInMemoryReviewStore"])
+    )
+
+    coordinator, *_ = _coordinator()
+    proof = _submission(_issue(coordinator), SandboxReviewAction.CONFIRM).proof
+    body = proof.model_dump(mode="python")
+    body["sandbox_test_signature"] = "x" * 512
+    assert len(
+        SandboxTestReviewProofV1.model_validate(body, strict=True).sandbox_test_signature
+    ) == 512
+    body["sandbox_test_signature"] = "x" * 513
+    with pytest.raises(ValidationError):
+        SandboxTestReviewProofV1.model_validate(body, strict=True)
 
 
 def test_l5_3_restart_snapshot_rejects_two_applied_attempts_for_one_challenge() -> None:
@@ -1444,7 +1729,7 @@ def test_l5_3_restart_snapshot_rejects_two_applied_attempts_for_one_challenge() 
         snapshot["transitions"] = snapshot["transitions"] + (transition,)
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=snapshot)
+        _restore_store(snapshot)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1483,9 +1768,7 @@ def test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility() -> Non
         checkpoint_id="sandbox-checkpoint-002",
     ).status == "blocked"
 
-    restarted_store = SandboxInMemoryReviewStore(
-        snapshot=store.snapshot().model_dump(mode="python")
-    )
+    restarted_store = _restore_store(store.snapshot().model_dump(mode="python"))
     restarted = SandboxReviewCoordinator(
         store=restarted_store,
         clock=clock,
@@ -1526,9 +1809,7 @@ def test_l5_3_reused_checkpoint_id_resolves_current_interrupt_eligibility() -> N
         checkpoint_id=_CHECKPOINT_ID,
     ).status
 
-    restarted_store = SandboxInMemoryReviewStore(
-        snapshot=store.snapshot().model_dump(mode="python")
-    )
+    restarted_store = _restore_store(store.snapshot().model_dump(mode="python"))
     restarted = SandboxReviewCoordinator(
         store=restarted_store,
         clock=clock,
@@ -1600,7 +1881,7 @@ def test_l5_3_restart_snapshot_rejects_noncausal_stage_and_apply_times(
         )
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=snapshot)
+        _restore_store(snapshot)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1642,8 +1923,8 @@ def test_l5_3_live_stage_and_apply_reject_predecessor_clock_without_mutation() -
     assert apply_after.challenges[0].state == "issued"
     assert apply_after.checkpoints[0].state == "review_pending"
     assert apply_after.events == ()
-    assert SandboxInMemoryReviewStore(snapshot=stage_after).snapshot() == stage_after
-    assert SandboxInMemoryReviewStore(snapshot=apply_after).snapshot() == apply_after
+    assert _restore_store(stage_after).snapshot() == stage_after
+    assert _restore_store(apply_after).snapshot() == apply_after
 
 
 def test_l5_3_restart_snapshot_rejects_attempt_staged_after_challenge_applied() -> None:
@@ -1682,7 +1963,7 @@ def test_l5_3_restart_snapshot_rejects_attempt_staged_after_challenge_applied() 
     snapshot["transitions"] = reordered
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=snapshot)
+        _restore_store(snapshot)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1730,7 +2011,7 @@ def test_l5_3_restart_snapshot_rejects_event_order_opposite_review_applied_order
     )
     assert live_snapshot.events[0].applied_at > live_snapshot.events[1].applied_at
     assert (
-        SandboxInMemoryReviewStore(snapshot=live_snapshot).snapshot()
+        _restore_store(live_snapshot).snapshot()
         == live_snapshot
     )
 
@@ -1746,7 +2027,7 @@ def test_l5_3_restart_snapshot_rejects_event_order_opposite_review_applied_order
     tampered["events"] = reversed_events
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=tampered)
+        _restore_store(tampered)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1778,7 +2059,7 @@ def test_l5_3_restart_snapshot_rejects_initial_transition_order_opposite_issue_o
         < live_snapshot.challenges[0].issued_at
     )
     assert (
-        SandboxInMemoryReviewStore(snapshot=live_snapshot).snapshot()
+        _restore_store(live_snapshot).snapshot()
         == live_snapshot
     )
 
@@ -1794,7 +2075,7 @@ def test_l5_3_restart_snapshot_rejects_initial_transition_order_opposite_issue_o
     tampered["transitions"] = reversed_initial
 
     with pytest.raises(SandboxReviewError) as raised:
-        SandboxInMemoryReviewStore(snapshot=tampered)
+        _restore_store(tampered)
     assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1809,7 +2090,7 @@ def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction
     without_challenge = dict(snapshot)
     without_challenge["challenges"] = ()
     with pytest.raises(SandboxReviewError) as missing_challenge:
-        SandboxInMemoryReviewStore(snapshot=without_challenge)
+        _restore_store(without_challenge)
     assert missing_challenge.value.__cause__ is None
     assert missing_challenge.value.__context__ is None
 
@@ -1818,7 +2099,7 @@ def test_l5_3_missing_checkpoint_or_challenge_is_rejected_without_reconstruction
     without_checkpoint = store.snapshot().model_dump(mode="python")
     without_checkpoint["checkpoints"] = ()
     with pytest.raises(SandboxReviewError) as missing_checkpoint:
-        SandboxInMemoryReviewStore(snapshot=without_checkpoint)
+        _restore_store(without_checkpoint)
     assert missing_checkpoint.value.__cause__ is None
     assert missing_checkpoint.value.__context__ is None
 
@@ -1944,12 +2225,10 @@ def test_l5_3_events_are_immutable_append_only_and_secret_free() -> None:
         assert event_secret not in event_repr
     persisted = canonical_review_bytes(store.snapshot())
     persisted_repr = repr(store.snapshot())
-    for store_secret in (
-        _NONCE.hex(),
-        submission.proof.sandbox_test_signature,
-    ):
-        assert store_secret.encode() not in persisted
-        assert store_secret not in persisted_repr
+    assert _NONCE.hex().encode() not in persisted
+    assert _NONCE.hex() not in persisted_repr
+    assert submission.proof.sandbox_test_signature.encode() in persisted
+    assert submission.proof.sandbox_test_signature not in persisted_repr
     assert staged.resume_attempt_ref is not None
 
 

@@ -71,10 +71,15 @@ class _NonceFactory:
         return self.value
 
 
-class _SignatureVerifier:
+class _Signer:
     @staticmethod
     def signature(payload_digest: str) -> str:
         return hashlib.sha256(f"sandbox-signature:{payload_digest}".encode()).hexdigest()
+
+
+class _SignatureVerifier:
+    def __init__(self) -> None:
+        self.calls = 0
 
     def verify(
         self,
@@ -84,10 +89,14 @@ class _SignatureVerifier:
         sandbox_test_key_id: str,
         sandbox_test_signature: str,
     ) -> bool:
+        self.calls += 1
+        expected_signature = hashlib.sha256(
+            f"sandbox-signature:{signed_payload_digest}".encode()
+        ).hexdigest()
         return (
             sandbox_test_signature_scheme == _SCHEME
             and sandbox_test_key_id == _KEY_ID
-            and sandbox_test_signature == self.signature(signed_payload_digest)
+            and sandbox_test_signature == expected_signature
         )
 
 
@@ -208,7 +217,7 @@ def _submission(delivery, action: SandboxReviewAction) -> SandboxResumeSubmissio
             sandbox_test_signature_scheme=_SCHEME,
             sandbox_test_key_id=_KEY_ID,
             sandbox_test_signed_payload_digest=payload_digest,
-            sandbox_test_signature=_SignatureVerifier.signature(payload_digest),
+            sandbox_test_signature=_Signer.signature(payload_digest),
         ),
     )
 
@@ -486,19 +495,35 @@ def _rederive_review_proof_identifier(
 def _rederive_review_action(
     review_snapshot: dict[str, object],
     *,
-    challenge_ref: str,
+    challenge,
     action: SandboxReviewAction,
 ) -> None:
     exact_attempts = [
         attempt
         for attempt in review_snapshot["attempts"]
-        if attempt["challenge_ref"] == challenge_ref
+        if attempt["challenge_ref"] == challenge.challenge_ref
     ]
     assert len(exact_attempts) == 1
     attempt = exact_attempts[0]
     old_attempt_ref = attempt["resume_attempt_ref"]
-    persisted_digest = attempt["sandbox_test_signed_payload_digest"]
+    persisted_signature = attempt.get("sandbox_test_signature")
+    changed_digest = review_signed_payload_digest(
+        challenge=challenge,
+        action=action,
+        plaintext_nonce=_NONCE,
+        sandbox_test_reviewer_id=attempt["sandbox_test_reviewer_id"],
+        sandbox_test_role=attempt["sandbox_test_role"],
+        sandbox_test_organization_label=attempt[
+            "sandbox_test_organization_label"
+        ],
+        sandbox_test_qualification_label=attempt[
+            "sandbox_test_qualification_label"
+        ],
+        sandbox_test_signature_scheme=attempt["sandbox_test_signature_scheme"],
+        sandbox_test_key_id=attempt["sandbox_test_key_id"],
+    )
     attempt["action"] = action
+    attempt["sandbox_test_signed_payload_digest"] = changed_digest
     attempt_body = {
         key: value
         for key, value in attempt.items()
@@ -518,6 +543,7 @@ def _rederive_review_action(
     assert len(exact_events) == 1
     event = exact_events[0]
     event["action"] = action
+    event["sandbox_test_signed_payload_digest"] = changed_digest
     event["resume_attempt_ref"] = new_attempt_ref
     _refresh_mapping_ref(
         event,
@@ -537,8 +563,9 @@ def _rederive_review_action(
         )
         rewritten_transitions += 1
     assert rewritten_transitions == 4
-    assert attempt["sandbox_test_signed_payload_digest"] == persisted_digest
-    assert event["sandbox_test_signed_payload_digest"] == persisted_digest
+    assert attempt["sandbox_test_signed_payload_digest"] == changed_digest
+    assert event["sandbox_test_signed_payload_digest"] == changed_digest
+    assert attempt.get("sandbox_test_signature") == persisted_signature
 
 
 def _rederive_current_child_review_schema(
@@ -692,10 +719,32 @@ def test_l5_4_restore_rejects_coordinated_private_review_action_change(
     ).status == original_status
 
     changed = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+    original_digest = changed["review_snapshot"]["attempts"][-1][
+        "sandbox_test_signed_payload_digest"
+    ]
+    original_signature = changed["review_snapshot"]["attempts"][-1][
+        "sandbox_test_signature"
+    ]
     _rederive_review_action(
         changed["review_snapshot"],
-        challenge_ref=outcome.delivery.challenge.challenge_ref,
+        challenge=outcome.delivery.challenge,
         action=changed_action,
+    )
+    assert (
+        changed["review_snapshot"]["attempts"][-1][
+            "sandbox_test_signed_payload_digest"
+        ]
+        != original_digest
+    )
+    assert (
+        changed["review_snapshot"]["events"][-1][
+            "sandbox_test_signed_payload_digest"
+        ]
+        != original_digest
+    )
+    assert (
+        changed["review_snapshot"]["attempts"][-1]["sandbox_test_signature"]
+        == original_signature
     )
     before = canonical_json_bytes(changed)
 
@@ -717,6 +766,93 @@ def test_l5_4_restore_rejects_coordinated_private_review_action_change(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert canonical_json_bytes(changed) == before
+
+
+def test_l5_4_all_shared_store_constructions_forward_one_signature_verifier() -> None:
+    tree = ast.parse(
+        Path("app/agent_runtime/sandbox_recheck.py").read_text(encoding="utf-8")
+    )
+    coordinator_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SandboxRecheckCoordinator"
+    )
+    store_calls = tuple(
+        node
+        for node in ast.walk(coordinator_class)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "SandboxInMemoryReviewStore"
+    )
+    assert len(store_calls) == 3
+    assert all(
+        {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+        }.get("signature_verifier")
+        == "self._signature_verifier"
+        for call in store_calls
+    )
+    assert not hasattr(_SignatureVerifier, "signature")
+
+
+@pytest.mark.parametrize(
+    ("attempt_state", "action", "expected_eligibility"),
+    (
+        ("sealed", SandboxReviewAction.CONFIRM, "blocked"),
+        ("applied", SandboxReviewAction.CONFIRM, "eligible"),
+        ("applied", SandboxReviewAction.REJECT, "blocked"),
+    ),
+    ids=("sealed-confirm", "applied-confirm", "applied-reject"),
+)
+def test_l5_4_signature_verified_restart_accepts_current_review_attempts(
+    attempt_state: str,
+    action: SandboxReviewAction,
+    expected_eligibility: str,
+) -> None:
+    coordinator, _, clock, nonce_factory, _ = _coordinator()
+    outcome = coordinator.apply_revision(
+        _revision_command(
+            coordinator,
+            suffix=f"signature-restart-{attempt_state}-{action.value}",
+        )
+    )
+    assert outcome.status == "review_required"
+    assert outcome.delivery is not None
+    staged = coordinator.stage_current_review(_submission(outcome.delivery, action))
+    assert staged.resume_attempt_ref is not None
+    if attempt_state == "applied":
+        assert coordinator.resume_current_review(
+            SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+        ).status == "applied"
+    snapshot = coordinator.snapshot()
+    assert len(snapshot.review_snapshot.attempts) == 2
+    verifier = _SignatureVerifier()
+
+    restarted = SandboxRecheckCoordinator(
+        snapshot=snapshot,
+        clock=clock,
+        nonce_factory=nonce_factory,
+        signature_verifier=verifier,
+    )
+
+    assert verifier.calls == 2
+    assert restarted.snapshot() == snapshot
+    assert restarted.completion_eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=_SESSION,
+        thread_id=_THREAD,
+        checkpoint_id=outcome.delivery.challenge.checkpoint_id,
+    ).status == expected_eligibility
+    if attempt_state == "sealed":
+        assert restarted.resume_current_review(
+            SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+        ).status == "applied"
+        assert restarted.completion_eligibility(
+            namespace=_NAMESPACE,
+            test_session_id=_SESSION,
+            thread_id=_THREAD,
+            checkpoint_id=outcome.delivery.challenge.checkpoint_id,
+        ).status == "eligible"
 
 
 def test_l5_4_normal_modify_runs_full_recheck_and_requires_new_review() -> None:
@@ -1404,7 +1540,10 @@ def test_l5_4_restart_rejects_self_consistent_current_child_schema_drift() -> No
     before_restore = copy.deepcopy(bad)
 
     with pytest.raises(SandboxReviewError) as private_raised:
-        SandboxInMemoryReviewStore(snapshot=bad["review_snapshot"])
+        SandboxInMemoryReviewStore(
+            snapshot=bad["review_snapshot"],
+            signature_verifier=verifier,
+        )
     assert str(private_raised.value) == "SANDBOX_REVIEW_REJECTED"
     assert private_raised.value.__cause__ is None
     assert private_raised.value.__context__ is None
@@ -1638,7 +1777,10 @@ def test_l5_4_initial_modify_event_must_belong_to_exact_applied_challenge() -> N
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
     ).snapshot()
-    store = SandboxInMemoryReviewStore(snapshot=review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -1708,7 +1850,10 @@ def test_l5_4_only_initial_rejects_later_same_scope_current_challenge() -> None:
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
     ).snapshot()
-    store = SandboxInMemoryReviewStore(snapshot=review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -1762,7 +1907,10 @@ def test_l5_4_terminal_rejects_later_same_scope_current_challenge() -> None:
         )
     )
     baseline = coordinator.snapshot()
-    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=baseline.review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -1820,7 +1968,10 @@ def test_l5_4_outer_revision_chain_cannot_skip_same_scope_issue() -> None:
         and source.source.safety_result == child.result
     )
 
-    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=initial_review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -1888,7 +2039,10 @@ def test_l5_4_issue_projection_ignores_other_scope_interleaving() -> None:
         if source.source.safety_subject == current.subject
         and source.source.safety_result == current.result
     )
-    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=initial_review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -1947,7 +2101,10 @@ def test_l5_4_completion_uses_exact_current_source_with_other_scope_history() ->
         and source.source.safety_result == current.result
     )
 
-    store = SandboxInMemoryReviewStore(snapshot=initial_review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=initial_review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -2051,7 +2208,10 @@ def test_l5_4_terminal_ignores_other_scope_same_subject_authority(
     baseline, terminal, source, clock, nonce_factory, verifier = (
         _review_setup_failed_terminal_snapshot(monkeypatch)
     )
-    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=baseline.review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
@@ -2096,7 +2256,10 @@ def test_l5_4_terminal_rejects_same_revision_source_authority(
     baseline, terminal, source, clock, nonce_factory, verifier = (
         _review_setup_failed_terminal_snapshot(monkeypatch)
     )
-    store = SandboxInMemoryReviewStore(snapshot=baseline.review_snapshot)
+    store = SandboxInMemoryReviewStore(
+        snapshot=baseline.review_snapshot,
+        signature_verifier=verifier,
+    )
     review = SandboxReviewCoordinator(
         store=store,
         clock=clock,
