@@ -597,3 +597,53 @@ R4 event projection、R3 live/restore causal predicate 与 cross-attempt stage/a
 - 根因：live issue 使用模块固定 `_REVIEW_SCHEMA_VERSION`，但 shared snapshot restore 只校验记录彼此一致，没有校验 challenge 使用唯一受支持版本。
 - 结论：最终组合 **未通过**（`ACC-20260722-040`、`DEC-20260722-033`）；`ACC-030` 历史单项结论保留，但 L5-3 与 `R-L5-RESUME-001` 重新打开；shared R7 已发布。
 - 边界：R7 只在 L5-3 shared restore 持有 fixed schema authority，并以 L5-3/L5-4 两层回归证明；不增加迁移、多版本兼容、Runtime 或外部能力，L6 未开始。
+
+## 22. L5-3/4-R7 fixed review schema restore authority 交付（2026-07-23）
+
+### 22.1 状态、基线与范围
+
+- 状态：**R7 已交付，申请独立验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`54e357f89f5d6f206dd7ae685151cf242e32e0d1`；其中保留 final R2 失败、`ACC-20260722-040`、`DEC-20260722-033` 与 R7 任务书。
+- 单一 R7 交付只修改任务书允许的五个 tracked 文件：L5-3 shared production、本专项、L5-4 专项及两份 handoff；`sandbox_recheck.py` production、PM 六台账、任务书、L5-1/L5-2、配置、依赖与锁文件均未修改。
+
+### 22.2 两层完整重派生 RED 与 GREEN
+
+production diff 为空、工作区仅新增两层 regression 时，完整 fake env 与 `UV_OFFLINE=1` 下定向收集 4 项，真实 RED 为 `4 failed in 2.54s`：
+
+1. L5-3 `issued` 与 `applied/modify_fixture` 两个真实 snapshot 把 challenge schema 从固定 v1 协调改为 v2；同时重算 challenge、attempt、event、transition refs 以及 checkpoint/current 绑定后，旧 store 均错误接受；
+2. AST 结构检查确认 `_snapshot_is_integral` 的 shared challenge loop 没有 fixed schema guard；
+3. L5-4 真实 `modify_applied` initial-only snapshot 作同样 private 全链重派生，再重算 initial revision/current ref 后，旧 coordinator 仍错误接受。
+
+上述 RED 不依赖 stale ref、单侧字段修改、删除历史、skip 或 xfail。最小 production 修复只在 L5-3 shared challenge restore loop、任何 `challenge.state` 分支之前，无条件验证 `challenge.sandbox_schema_version == _REVIEW_SCHEMA_VERSION`；live provisional/final challenge 继续共用同一模块常量。没有修改 L5-4 production，也没有增加 migration、registry、negotiation 或多版本机制。修复后同 4 项为 `4 passed in 2.08s`。
+
+结构/正例回归还证明未修改 v1 的 `issued/expired/applied` 三种 snapshot 均可逐字 round-trip。R6 的 current-child 完整重派生用例同步加强为：L5-3 private store 已在 shared boundary 固定拒绝，L5-4 outer coordinator 也固定拒绝，且输入不变；这只是把历史测试前提校准到 R7 authority，没有弱化 R6 child==parent 守卫或其他既有断言。
+
+### 22.3 最终门禁
+
+| 门禁 | R7 结果 |
+|---|---|
+| R7 四项定向 | `4 passed in 2.08s` |
+| L5-3 / L5-4 完整专项 | `62 passed in 2.35s`；`51 passed in 3.55s` |
+| L5-1 / L5-2 | `14 passed in 13.51s`；`18 passed in 6.47s` |
+| Safety / privacy | `71 passed, 3 deselected in 1.99s`；`76 passed in 4.58s` |
+| Runtime/Legacy/public / public flag | `57 passed, 11 deselected in 0.89s`；`10 passed in 1.94s` |
+| AST/结构边界 | `5 passed in 2.26s` |
+| Ruff / mypy | `All checks passed!`；两份 production / 0 issues；仅既有 `pymilvus.*` unused-section note |
+| L0 / lock | `131 passed in 2.31s`；`Resolved 84 packages in 3ms`，lock 未变化 |
+| 强制全量首次 | `2 failed, 1768 passed, 362 deselected in 149.49s`；除既有 defaults 外，出现一次既有 L3 deadline/privacy code 偏差，证据保留 |
+| L3 同环境复验 | 参数族连续 5 轮均为 `4 passed, 52 deselected`，每轮覆盖首次偏差参数 |
+| 强制全量有效复跑 | `1 failed, 1769 passed, 362 deselected in 149.18s`；唯一为 `test_load_with_defaults` 的 local / sandbox-test 既有差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1770 passed, 362 deselected in 147.97s` |
+
+全部 fixture 继续是 inline fixed-fictitious/synthetic 技术数据；没有读取 `.env`、ignored `data/` 或 `.codex_tmp`，没有访问网络或启动应用、HTTP、容器、数据库、Gateway 或外部服务。首次 forced 偶发结果没有被删除或写成通过；有效完整复跑与校准全量均针对最终代码内容。
+
+### 22.4 提交、限制与回退
+
+- 单一开发提交消息为 `fix: anchor L5 review schema restore authority`；exact parent 必须为 `54e357f89f5d6f206dd7ae685151cf242e32e0d1`；提交只含 22.1 节五个文件，提交后 worktree/index 必须 clean。
+- Git SHA 无法在包含本文的同一提交中自引用；冻结后由 `git rev-parse HEAD`、上述 parent/message、五文件 scope 与 clean 状态共同报告，并由新的独立 Reviewer/CI/PM 锚定。
+- 本交付仍只是固定虚构/合成、offline unit/in-memory reference restore；不提供进程外 durability、Runtime、HTTP、DB、真实 completion/export、专业准入或公开生产能力。L5 当前仍为 2/4，L6 未发布、未开始。
+- 若 R7 独立验收失败，对单一 R7 delivery 执行 `git revert <r7-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+---
+
+**R7 已交付，申请独立验收。**

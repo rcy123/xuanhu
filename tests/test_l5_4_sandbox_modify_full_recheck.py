@@ -19,6 +19,7 @@ from app.agent_runtime.sandbox_review import (
     SandboxResumeSubmissionV1,
     SandboxReviewAction,
     SandboxReviewCoordinator,
+    SandboxReviewError,
     SandboxReviewSourceV1,
     SandboxTestReviewProofV1,
     review_signed_payload_digest,
@@ -361,6 +362,80 @@ def _rederive_single_child_command_chain(bad: dict[str, object]) -> None:
     bad["current_revision_ref"] = child_ref
 
 
+def _rederive_review_challenge_schema(
+    review_snapshot: dict[str, object],
+    *,
+    old_challenge_ref: str,
+    schema_version: str,
+) -> str:
+    exact_challenges = [
+        challenge
+        for challenge in review_snapshot["challenges"]
+        if challenge["challenge_ref"] == old_challenge_ref
+    ]
+    assert len(exact_challenges) == 1
+    challenge = exact_challenges[0]
+    challenge["sandbox_schema_version"] = schema_version
+    challenge_authority = dict(challenge)
+    challenge_authority.pop("challenge_ref")
+    challenge_authority.pop("state")
+    new_challenge_ref = (
+        "sandbox-challenge-"
+        + hashlib.sha256(canonical_json_bytes(challenge_authority)).hexdigest()
+    )
+    challenge["challenge_ref"] = new_challenge_ref
+
+    attempt_refs: dict[str, str] = {}
+    for attempt in review_snapshot["attempts"]:
+        if attempt["challenge_ref"] != old_challenge_ref:
+            continue
+        old_attempt_ref = attempt["resume_attempt_ref"]
+        attempt["challenge_ref"] = new_challenge_ref
+        attempt_body = {
+            key: value
+            for key, value in attempt.items()
+            if key not in {"resume_attempt_ref", "state"}
+        }
+        new_attempt_ref = (
+            "sandbox-attempt-"
+            + hashlib.sha256(canonical_json_bytes(attempt_body)).hexdigest()
+        )
+        attempt["resume_attempt_ref"] = new_attempt_ref
+        attempt_refs[old_attempt_ref] = new_attempt_ref
+
+    for event in review_snapshot["events"]:
+        if event["challenge_ref"] != old_challenge_ref:
+            continue
+        event["challenge_ref"] = new_challenge_ref
+        event["sandbox_schema_version"] = schema_version
+        event["resume_attempt_ref"] = attempt_refs[event["resume_attempt_ref"]]
+        _refresh_mapping_ref(
+            event,
+            prefix="sandbox-review-event-",
+            field="event_ref",
+        )
+    for transition in review_snapshot["transitions"]:
+        if transition["challenge_ref"] != old_challenge_ref:
+            continue
+        transition["challenge_ref"] = new_challenge_ref
+        if transition["resume_attempt_ref"] is not None:
+            transition["resume_attempt_ref"] = attempt_refs[
+                transition["resume_attempt_ref"]
+            ]
+        _refresh_mapping_ref(
+            transition,
+            prefix="sandbox-transition-",
+            field="transition_ref",
+        )
+    for checkpoint in review_snapshot["checkpoints"]:
+        if checkpoint["challenge_ref"] == old_challenge_ref:
+            checkpoint["challenge_ref"] = new_challenge_ref
+    for marker in review_snapshot["current_authorities"]:
+        if marker["challenge_ref"] == old_challenge_ref:
+            marker["challenge_ref"] = new_challenge_ref
+    return new_challenge_ref
+
+
 def _rederive_current_child_review_schema(
     bad: dict[str, object], *, schema_version: str
 ) -> None:
@@ -373,45 +448,57 @@ def _rederive_current_child_review_schema(
         if challenge["challenge_ref"] == old_challenge_ref
     ]
     assert len(exact_challenges) == 1
-    challenge = exact_challenges[0]
-    assert challenge["state"] == "issued"
-    challenge["sandbox_schema_version"] = schema_version
-    challenge_authority = dict(challenge)
-    challenge_authority.pop("challenge_ref")
-    challenge_authority.pop("state")
-    new_challenge_ref = (
-        "sandbox-challenge-"
-        + hashlib.sha256(canonical_json_bytes(challenge_authority)).hexdigest()
-    )
-    challenge["challenge_ref"] = new_challenge_ref
-
-    for checkpoint in review_snapshot["checkpoints"]:
-        if checkpoint["challenge_ref"] == old_challenge_ref:
-            checkpoint["challenge_ref"] = new_challenge_ref
-    for transition in review_snapshot["transitions"]:
-        if transition["challenge_ref"] == old_challenge_ref:
-            transition["challenge_ref"] = new_challenge_ref
-            _refresh_mapping_ref(
-                transition,
-                prefix="sandbox-transition-",
-                field="transition_ref",
-            )
-    for marker in review_snapshot["current_authorities"]:
-        if marker["challenge_ref"] == old_challenge_ref:
-            marker["challenge_ref"] = new_challenge_ref
-
-    assert not any(
-        attempt["challenge_ref"] == old_challenge_ref
-        for attempt in review_snapshot["attempts"]
-    )
-    assert not any(
-        event["challenge_ref"] == old_challenge_ref
-        for event in review_snapshot["events"]
+    assert exact_challenges[0]["state"] == "issued"
+    new_challenge_ref = _rederive_review_challenge_schema(
+        review_snapshot,
+        old_challenge_ref=old_challenge_ref,
+        schema_version=schema_version,
     )
     child["review_schema_version"] = schema_version
     child["challenge_ref"] = new_challenge_ref
     bad["runs"][0]["challenge_ref"] = new_challenge_ref
     _rederive_single_child_command_chain(bad)
+
+
+def test_l5_4_initial_only_restore_rejects_coordinated_nonfixed_review_schema() -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    baseline = coordinator.snapshot()
+    assert len(baseline.revisions) == 1
+    assert baseline.revisions[0].status == "modify_applied"
+    assert baseline.runs == baseline.invalidations == baseline.receipts == ()
+
+    changed = copy.deepcopy(baseline.model_dump(mode="python"))
+    initial = changed["revisions"][0]
+    old_challenge_ref = initial["challenge_ref"]
+    new_challenge_ref = _rederive_review_challenge_schema(
+        changed["review_snapshot"],
+        old_challenge_ref=old_challenge_ref,
+        schema_version="sandbox-review-challenge.v2",
+    )
+    initial["review_schema_version"] = "sandbox-review-challenge.v2"
+    initial["challenge_ref"] = new_challenge_ref
+    initial_ref = _refresh_mapping_ref(
+        initial,
+        prefix="sandbox-recheck-revision-",
+        field="revision_ref",
+    )
+    changed["current_revision_ref"] = initial_ref
+    assert old_challenge_ref != new_challenge_ref
+    assert old_challenge_ref.encode() not in canonical_json_bytes(changed)
+    before = canonical_json_bytes(changed)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        SandboxRecheckCoordinator(
+            snapshot=changed,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+
+    assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_json_bytes(changed) == before
 
 
 def test_l5_4_normal_modify_runs_full_recheck_and_requires_new_review() -> None:
@@ -1094,10 +1181,16 @@ def test_l5_4_restart_rejects_self_consistent_current_child_schema_drift() -> No
     _rederive_current_child_review_schema(
         bad, schema_version="sandbox-review-challenge.v2"
     )
-    assert SandboxInMemoryReviewStore(snapshot=bad["review_snapshot"]).snapshot()
     assert bad["revisions"][0]["review_schema_version"] == parent_schema
     assert bad["revisions"][1]["review_schema_version"] != parent_schema
     before_restore = copy.deepcopy(bad)
+
+    with pytest.raises(SandboxReviewError) as private_raised:
+        SandboxInMemoryReviewStore(snapshot=bad["review_snapshot"])
+    assert str(private_raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert private_raised.value.__cause__ is None
+    assert private_raised.value.__context__ is None
+    assert bad == before_restore
 
     with pytest.raises(SandboxRecheckError) as raised:
         SandboxRecheckCoordinator(

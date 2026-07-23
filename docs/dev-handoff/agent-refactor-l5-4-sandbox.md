@@ -522,3 +522,29 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 最终 Reviewer：P0=0、P1=0、P2=1、P3=0。把真实 initial applied review snapshot 的固定 v1 整体协调为 v2并重派生全部 L5-3 refs 后，L5-3 store 与 L5-4 initial-only coordinator 均接受；R6 child==parent guard 在无 child 时不会执行。
 - 结论：最终组合 **未通过**（`ACC-20260722-040`、`DEC-20260722-033`）；R5/R6 单项 acceptance 历史保留，但 L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
 - R7 所有权：修复必须位于 L5-3 shared snapshot restore；L5-4 production 不增加重复条件，只新增 composition 回归证明下层拒绝向上传递。L6 未发布、未开始。
+
+## 24. L5-3/4-R7 shared fixed schema authority 交付（2026-07-23）
+
+### 24.1 精确起点与两层 RED
+
+- 状态：**R7 已交付，申请独立验收**；exact parent 为 clean management release `54e357f89f5d6f206dd7ae685151cf242e32e0d1`。
+- production 未修改时，L5-3 issued/applied、shared-loop AST 与本文件 initial-only composition 共 4 项真实为 `4 failed in 2.54s`。本层负例使用真实 `modify_applied` 初始 review，把 fixed v1 完整改成 v2，重算 challenge/attempt/event/transition refs、checkpoint/current 绑定、initial revision ref 与 outer current pointer；旧 private store 和旧 outer coordinator 都接受。
+- 最小修复只落在 `sandbox_review.py::_snapshot_is_integral` 的公共 challenge loop：每个 challenge 在任何状态分支前必须等于 live issue 共用的 `_REVIEW_SCHEMA_VERSION`。`sandbox_recheck.py` production 零 diff，本层通过构造 `SandboxInMemoryReviewStore(snapshot=...)` 自动继承下层拒绝。
+- 修复后 4 项定向 `4 passed in 2.08s`；initial-only mismatch 固定返回 `SANDBOX_RECHECK_REJECTED`，无 cause/context，输入 canonical bytes 不变。正常 L5-4 多 revision chain 与 R6 child==parent guard 均保持。
+
+### 24.2 L5-4 回归与门禁
+
+- L5-4 完整专项最终 `51 passed in 3.55s`；既有 50 项全部保留，并新增 initial-only 完整重派生 composition。R6 current-child 用例不再断言 private v2 可恢复，而是证明 shared store 与 outer coordinator 双层 fixed reject；该校准符合 R7 单一 authority，不改变 R6 的 outer inheritance 约束。
+- L5-3 完整专项 `62 passed in 2.35s`；L5-1/L5-2 `14/18`；Safety `71/3 deselected`；privacy `76`；离线 Runtime/Legacy/public `57/11 deselected`；public flag `10`；AST/结构 `5`；L0 `131`；Ruff、两 production mypy、lock 与 diff check 全部通过。
+- 首次 forced full 为 `2 failed, 1768 passed, 362 deselected`：既有 defaults 差异外出现一次仓库已记录过的 L3 参数偏差；同 forced 环境下该四参数族连续 5 轮全绿后，完整 forced 复跑为 `1 failed, 1769 passed, 362 deselected` 且唯一剩 defaults 差异。首次证据保留。仅移除 `APP_ENV` 的 calibrated full 为 `1770 passed, 362 deselected`。
+
+### 24.3 范围、限制、提交与回退
+
+- R7 单一提交只含 `app/agent_runtime/sandbox_review.py`、两层专项与两份 handoff；未修改本层 production、任务书、PM 六台账、配置、依赖或锁文件。提交消息为 `fix: anchor L5 review schema restore authority`，exact parent 为 `54e357f89f5d6f206dd7ae685151cf242e32e0d1`。
+- 全部执行使用 inline fixed-fictitious/synthetic、offline/in-memory fixture；未读取 `.env`、ignored `data/`、`.codex_tmp`，未访问网络或启动服务。
+- Git SHA 由提交后外部报告；后续必须在该 exact clean delivery 上执行新的独立 Reviewer/CI/PM，不能复用 final R2。当前不声明 accepted；L5 仍为 2/4，L6 未发布、未开始。
+- 若 R7 验收失败，对单一 R7 delivery 执行 `git revert <r7-delivery-commit>`，保留历史且不 reset/amend。
+
+---
+
+**R7 已交付，申请独立验收。**

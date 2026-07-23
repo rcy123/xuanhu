@@ -742,6 +742,8 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
         )
 
     for challenge in challenges:
+        if challenge.sandbox_schema_version != _REVIEW_SCHEMA_VERSION:
+            return False
         bound = transitions_by_challenge.get(challenge.challenge_ref, [])
         challenge_attempts = tuple(
             attempt

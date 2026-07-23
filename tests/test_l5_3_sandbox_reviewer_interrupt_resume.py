@@ -342,6 +342,100 @@ def _derived_record_ref(
     return prefix + hashlib.sha256(canonical_review_bytes(body)).hexdigest()
 
 
+def _rederive_review_snapshot_schema(
+    snapshot: dict[str, object], *, schema_version: str
+) -> str:
+    challenges = snapshot["challenges"]
+    assert isinstance(challenges, tuple)
+    assert len(challenges) == 1
+    challenge = challenges[0]
+    assert isinstance(challenge, dict)
+    old_challenge_ref = challenge["challenge_ref"]
+    assert isinstance(old_challenge_ref, str)
+    challenge["sandbox_schema_version"] = schema_version
+    challenge_body = {
+        key: value
+        for key, value in challenge.items()
+        if key not in {"challenge_ref", "state"}
+    }
+    new_challenge_ref = (
+        "sandbox-challenge-"
+        + hashlib.sha256(canonical_review_bytes(challenge_body)).hexdigest()
+    )
+    challenge["challenge_ref"] = new_challenge_ref
+
+    attempts = snapshot["attempts"]
+    assert isinstance(attempts, tuple)
+    attempt_refs: dict[str, str] = {}
+    for attempt in attempts:
+        assert isinstance(attempt, dict)
+        if attempt["challenge_ref"] != old_challenge_ref:
+            continue
+        old_attempt_ref = attempt["resume_attempt_ref"]
+        assert isinstance(old_attempt_ref, str)
+        attempt["challenge_ref"] = new_challenge_ref
+        attempt_body = {
+            key: value
+            for key, value in attempt.items()
+            if key not in {"resume_attempt_ref", "state"}
+        }
+        new_attempt_ref = (
+            "sandbox-attempt-"
+            + hashlib.sha256(canonical_review_bytes(attempt_body)).hexdigest()
+        )
+        attempt["resume_attempt_ref"] = new_attempt_ref
+        attempt_refs[old_attempt_ref] = new_attempt_ref
+
+    events = snapshot["events"]
+    assert isinstance(events, tuple)
+    for event in events:
+        assert isinstance(event, dict)
+        if event["challenge_ref"] != old_challenge_ref:
+            continue
+        event["challenge_ref"] = new_challenge_ref
+        event["sandbox_schema_version"] = schema_version
+        old_attempt_ref = event["resume_attempt_ref"]
+        assert isinstance(old_attempt_ref, str)
+        event["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        event["event_ref"] = _derived_record_ref(
+            "sandbox-review-event-",
+            event,
+            ref_field="event_ref",
+        )
+
+    transitions = snapshot["transitions"]
+    assert isinstance(transitions, tuple)
+    for transition in transitions:
+        assert isinstance(transition, dict)
+        if transition["challenge_ref"] != old_challenge_ref:
+            continue
+        transition["challenge_ref"] = new_challenge_ref
+        old_attempt_ref = transition["resume_attempt_ref"]
+        if old_attempt_ref is not None:
+            assert isinstance(old_attempt_ref, str)
+            transition["resume_attempt_ref"] = attempt_refs[old_attempt_ref]
+        transition["transition_ref"] = _derived_record_ref(
+            "sandbox-transition-",
+            transition,
+            ref_field="transition_ref",
+        )
+
+    checkpoints = snapshot["checkpoints"]
+    assert isinstance(checkpoints, tuple)
+    for checkpoint in checkpoints:
+        assert isinstance(checkpoint, dict)
+        if checkpoint["challenge_ref"] == old_challenge_ref:
+            checkpoint["challenge_ref"] = new_challenge_ref
+    markers = snapshot["current_authorities"]
+    assert isinstance(markers, tuple)
+    for marker in markers:
+        assert isinstance(marker, dict)
+        if marker["challenge_ref"] == old_challenge_ref:
+            marker["challenge_ref"] = new_challenge_ref
+
+    return new_challenge_ref
+
+
 def _stage_and_resume(
     coordinator: SandboxReviewCoordinator,
     delivery,
@@ -354,6 +448,126 @@ def _stage_and_resume(
         SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
     )
     return staged, resumed
+
+
+@pytest.mark.parametrize(
+    "snapshot_state",
+    ("issued", "applied"),
+)
+def test_l5_3_restore_rejects_coordinated_nonfixed_review_schema(
+    snapshot_state: str,
+) -> None:
+    coordinator, store, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    if snapshot_state == "applied":
+        _, resumed = _stage_and_resume(
+            coordinator,
+            delivery,
+            SandboxReviewAction.MODIFY_FIXTURE,
+        )
+        assert resumed.status == "applied"
+    baseline = store.snapshot()
+    assert baseline.challenges[0].state == snapshot_state
+    assert SandboxInMemoryReviewStore(snapshot=baseline).snapshot() == baseline
+
+    changed = baseline.model_dump(mode="python")
+    old_challenge_ref = changed["challenges"][0]["challenge_ref"]
+    new_challenge_ref = _rederive_review_snapshot_schema(
+        changed,
+        schema_version="sandbox-review-challenge.v2",
+    )
+    assert new_challenge_ref != old_challenge_ref
+    assert old_challenge_ref.encode() not in canonical_review_bytes(changed)
+    before = canonical_review_bytes(changed)
+
+    with pytest.raises(SandboxReviewError) as raised:
+        SandboxInMemoryReviewStore(snapshot=changed)
+
+    assert str(raised.value) == "SANDBOX_REVIEW_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_review_bytes(changed) == before
+
+
+def test_l5_3_fixed_schema_guard_is_shared_before_state_branches_and_v1_roundtrips() -> None:
+    source = Path("app/agent_runtime/sandbox_review.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    integrity = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_snapshot_is_integral"
+    )
+    challenge_loop = next(
+        node
+        for node in integrity.body
+        if isinstance(node, ast.For)
+        and ast.unparse(node.target) == "challenge"
+        and ast.unparse(node.iter) == "challenges"
+    )
+    fixed_guard_indexes = tuple(
+        index
+        for index, statement in enumerate(challenge_loop.body)
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test)
+        == "challenge.sandbox_schema_version != _REVIEW_SCHEMA_VERSION"
+    )
+    state_branch_indexes = tuple(
+        index
+        for index, statement in enumerate(challenge_loop.body)
+        if any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "challenge"
+            and node.attr == "state"
+            for node in ast.walk(statement)
+        )
+    )
+    assert len(fixed_guard_indexes) == 1
+    assert state_branch_indexes
+    assert fixed_guard_indexes[0] < min(state_branch_indexes)
+
+    issue_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_single_use_challenge"
+    )
+    live_schema_values = tuple(
+        keyword.value
+        for call in ast.walk(issue_method)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func)
+        in {"SandboxReviewChallengeV1", "SandboxReviewChallengeV1.model_construct"}
+        for keyword in call.keywords
+        if keyword.arg == "sandbox_schema_version"
+    )
+    assert len(live_schema_values) == 2
+    assert all(
+        isinstance(value, ast.Name) and value.id == "_REVIEW_SCHEMA_VERSION"
+        for value in live_schema_values
+    )
+
+    for expected_state in ("issued", "expired", "applied"):
+        coordinator, store, clock, *_ = _coordinator()
+        delivery = _issue(coordinator)
+        if expected_state == "expired":
+            clock.value = delivery.challenge.expires_at
+            assert (
+                coordinator.stage_verified_resume_attempt(
+                    _submission(delivery, SandboxReviewAction.CONFIRM)
+                ).status
+                == "resume_rejected"
+            )
+        elif expected_state == "applied":
+            _, resumed = _stage_and_resume(
+                coordinator,
+                delivery,
+                SandboxReviewAction.MODIFY_FIXTURE,
+            )
+            assert resumed.status == "applied"
+        snapshot = store.snapshot()
+        assert snapshot.challenges[0].state == expected_state
+        assert SandboxInMemoryReviewStore(snapshot=snapshot).snapshot() == snapshot
 
 
 @pytest.mark.parametrize(
