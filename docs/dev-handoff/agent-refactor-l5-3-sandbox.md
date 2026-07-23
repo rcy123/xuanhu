@@ -773,3 +773,12 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 ---
 
 **R9 已交付，申请独立验收。**
+
+## 29. L5-3/4-R9 独立 Review（未通过）
+
+- 冻结 delivery `259a5634f79b8078b3a4c714e273a42af8b48dc7` / parent `e3f5dbed95f0b6495c3678325f231a3e6fd48419`；精确 5 文件、L5-4 production 零 diff、前后 clean。
+- 独立 CI：R9 `4+2`、四层 `14/18/75/56`、组合 `163`、calibrated full `1788 passed, 362 deselected`；全部相邻/静态/scope/tracked 门禁通过，forced 仅既有 defaults 差异。
+- PM：R9 `6 passed` + 正常双动作/一次性值/restart/L5-4 正例 `5 passed`，HEAD 不变且 clean。
+- 独立 Reviewer：P0=0、P1=1、P2=0、P3=0。同步改变 action 与两处 digest、再完整重派生 attempt/event/4 transition refs 后，R9 helper 只对 snapshot 自身值自校验，restore 仍接受并把 blocked 翻为 eligible。
+- 结论：**R9 未接受**（`ACC-20260723-045`、`DEC-20260723-038`）；delivery 与全部证据保留，L5-3/L5-4 和两个工程风险保持 reopened；R10 架构收敛已发布。
+- R10 必须用 bounded/repr-hidden synthetic signature proof + injected offline verifier 建立 snapshot 外 authority；plaintext nonce 仍不持久化，L6 未开始。

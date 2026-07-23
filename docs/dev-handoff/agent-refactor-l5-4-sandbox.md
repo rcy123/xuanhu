@@ -633,3 +633,10 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 ---
 
 **R9 已交付，申请独立验收。**
+
+## 31. L5-3/4-R9 独立 Review（未通过）
+
+- exact delivery `259a5634f79b8078b3a4c714e273a42af8b48dc7` / parent `e3f5dbed95f0b6495c3678325f231a3e6fd48419`；独立 CI 组合 `163`、calibrated full `1788`，PM `6 + 5`，Git 门禁全部通过。
+- Reviewer P0=0、P1=1、P2=0、P3=0：private snapshot 可同步重算 action、signed digest 与全部 refs；下层 self-validation 接受后，本层 outer completion 也从 blocked 翻为 eligible。
+- 结论：**R9 未接受**（`ACC-20260723-045`、`DEC-20260723-038`）；R5～R9 与 final 历史保留，L5-3/L5-4 和两个工程风险继续 reopened，L5 当前 2/4。
+- R10 允许本层 production 只做必要的 verifier 传递：initial/current/candidate shared store 共用 coordinator 已注入的 verifier；不得复制 action/digest/signature 条件，不接外部服务，不启动 L6。
