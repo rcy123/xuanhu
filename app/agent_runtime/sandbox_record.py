@@ -1,4 +1,5 @@
-"""Offline sandbox medical record DTO and deterministic assembler (L6-1)."""
+"""Offline sandbox medical record DTO, deterministic assembler (L6-1), and
+consistency verifier (L6-2)."""
 
 from __future__ import annotations
 
@@ -27,6 +28,22 @@ RECORD_SCHEMA_VERSION: Literal["sandbox-medical-record.v1"] = "sandbox-medical-r
 
 class _StrictFrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+def _parse_recheck_snapshot(value: object) -> SandboxRecheckSnapshotV1 | None:
+    """Parse a recheck snapshot from any supported input type, or return None."""
+    try:
+        if isinstance(value, SandboxRecheckSnapshotV1):
+            return value
+        if isinstance(value, bytes):
+            return SandboxRecheckSnapshotV1.model_validate_json(value, strict=True)
+        if isinstance(value, str):
+            return SandboxRecheckSnapshotV1.model_validate_json(value, strict=True)
+        if isinstance(value, dict):
+            return SandboxRecheckSnapshotV1.model_validate(value, strict=True)
+    except Exception:
+        return None
+    return None
 
 
 class SandboxRecordError(ValueError):
@@ -101,12 +118,9 @@ class SandboxRecordConsistencyVerifier:
     ) -> bool:
         """Verify record or return False; never propagates a payload-bearing exception."""
         try:
-            if isinstance(recheck_snapshot, SandboxRecheckSnapshotV1):
-                snapshot = recheck_snapshot
-            else:
-                snapshot = SandboxRecheckSnapshotV1.model_validate_json(
-                    canonical_review_bytes(recheck_snapshot), strict=True
-                )
+            snapshot = _parse_recheck_snapshot(recheck_snapshot)
+            if snapshot is None:
+                return False
 
             revisions = snapshot.revisions
             if not revisions:
@@ -246,12 +260,9 @@ class SandboxRecordAssembler:
     ) -> SandboxMedicalRecordData | None:
         """Build the record or return None; never propagates a payload-bearing exception."""
         try:
-            if isinstance(recheck_snapshot, SandboxRecheckSnapshotV1):
-                snapshot = recheck_snapshot
-            else:
-                snapshot = SandboxRecheckSnapshotV1.model_validate_json(
-                    canonical_review_bytes(recheck_snapshot), strict=True
-                )
+            snapshot = _parse_recheck_snapshot(recheck_snapshot)
+            if snapshot is None:
+                return None
             revisions = snapshot.revisions
             if not revisions:
                 return None
