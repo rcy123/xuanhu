@@ -647,3 +647,13 @@ production diff 为空、工作区仅新增两层 regression 时，完整 fake e
 ---
 
 **R7 已交付，申请独立验收。**
+
+## 23. L5-3/4-R7 独立 shared acceptance（通过）
+
+- 冻结 delivery：`d3ee3ce48fd39c115df30d8aad446edac14770a6`；parent `54e357f89f5d6f206dd7ae685151cf242e32e0d1`；精确 5 个允许且 tracked 的文件，前后 exact/clean 与 diff check 通过。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0；shared fixed schema guard 位于 challenge loop 且早于状态分支，live 两构造点共用同一常量；两层完整重派生与合法三状态 round-trip 成立。
+- 独立 CI：R7 `4`、L5-3/4 `62/51`、L5-1/2 `14/18`、Safety `71/3 deselected`、privacy `76`、Runtime/Legacy/public `57/11 deselected`、public flag `10`、AST `5`、L0 `131`、Ruff/mypy/lock 全通过。
+- 双全量：forced `1 failed, 1769 passed, 362 deselected` 且唯一为既有 defaults 差异、无额外波动；calibrated `1770 passed, 362 deselected`。
+- PM 六项 `6 passed`：R7 两层、shared guard、R6 child guard、R5 helper ownership；HEAD 未变且 clean。
+- 结论：**L5-3/L5-4 与 R7 accepted**（`ACC-20260723-041`、`DEC-20260723-034`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
+- 后续：本节不关闭 L5 整体。必须从包含 shared acceptance 的新 clean exact HEAD 调用全新的 final R3 Reviewer、独立 CI 与 PM；不得复用前两轮结果，L6 未开始。

@@ -548,3 +548,12 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 ---
 
 **R7 已交付，申请独立验收。**
+
+## 25. L5-3/4-R7 独立 shared acceptance（通过）
+
+- 精确 delivery `d3ee3ce48fd39c115df30d8aad446edac14770a6` / parent `54e357f89f5d6f206dd7ae685151cf242e32e0d1`；5 文件 scope/tracked/diff/exact/clean 全通过；`sandbox_recheck.py` production 零 diff。
+- 独立 Reviewer P0/P1/P2/P3 全 0；独立 CI R7 `4`、L5-3/4 `62/51`、calibrated full `1770 passed, 362 deselected`，全部相邻/静态门禁通过；forced 只含既有 defaults 差异。
+- PM 六项 `6 passed`；initial-only composition 由下层 shared store 固定拒绝，R6 child==parent 与 R5 finite qualification ownership 均保持。
+- 结论：**L5-3/L5-4 与 R7 accepted**（`ACC-20260723-041`、`DEC-20260723-034`）；`R-L5-RESUME-001` 与 `R-L5-RECHECK-001` 再次关闭，L5 恢复 4/4 individually accepted。
+- 后续：必须从包含本 shared acceptance 的新 clean exact HEAD 执行全新的 final R3 Reviewer/CI/PM；本节不关闭 L5，不启动 L6。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory reference composition；不授权 Runtime、HTTP、持久层、真实 clinical/patient/public production。
