@@ -820,3 +820,13 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 ---
 
 **R10 已交付，申请独立验收。**
+
+## 31. L5-3/4-R10 独立 shared acceptance（通过）
+
+- 冻结 delivery `e985d2e4890e01447897a049880b9ca250832870` / parent `c352968909d725d7342622817ada91fa0e2b732e`；精确 6 文件、前后 exact/clean 与 diff check 通过。
+- 独立 Reviewer P0/P1/P2/P3 全 0；两专项 `144 passed`；scheme/key/reviewer 协调变化、多 attempts、proof drift、missing/false/exception verifier、candidate 残留与 sealed REJECT 均无旁路。
+- 独立 CI：R10 `11/6`、四层 `14/18/84/60`、组合 `176`、R7/R8/R9 `4/13/6`、并发 `2`、状态机 `8`、全部相邻/静态门禁通过；forced 仅既有 defaults 差异，calibrated `1801 passed, 362 deselected`。
+- PM `17 passed`：双向 action+digest+refs、proof/verifier 失败族、sealed/applied 双动作、empty store、结构/角色隔离与 L5-4 传递；HEAD 不变且 clean。
+- 结论：**L5-3/L5-4 与 R10 accepted**（`ACC-20260723-046`、`DEC-20260723-039`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
+- 后续：本节不关闭 L5 整体。必须从包含本 shared acceptance 的新 clean exact HEAD 调用全新的 final R5 Reviewer、独立 CI 与 PM，不复用前四轮结果；L6 未开始。
+- 边界仍为 fixed-synthetic、offline unit/in-memory；proof 非真实凭据，plaintext nonce 不持久化，不授权 Runtime、HTTP、持久层、真实数据、临床或公开生产。

@@ -666,3 +666,13 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 ---
 
 **R10 已交付，申请独立验收。**
+
+## 33. L5-3/4-R10 独立 shared acceptance（通过）
+
+- exact delivery `e985d2e4890e01447897a049880b9ca250832870` / parent `c352968909d725d7342622817ada91fa0e2b732e`；精确 6 文件、scope/tracked/diff/exact/clean 全通过。
+- 独立 Reviewer P0/P1/P2/P3 全 0；独立 CI R10 `11/6`、L5-3/L5-4 `84/60`、组合 `176`、calibrated full `1801 passed, 362 deselected`；全部相邻/静态门禁通过。
+- 本层双向 private composition、initial/current verifier calls 与三处传递全部通过；没有复制 action/digest/signature 判断，candidate 失败无残留。
+- PM R10 `17 passed`；exact HEAD 未变且 clean。
+- 结论：**L5-3/L5-4 与 R10 accepted**（`ACC-20260723-046`、`DEC-20260723-039`）；两个工程风险再次关闭，L5 恢复 4/4 individually accepted。
+- 后续：必须从包含本 shared acceptance 的新 clean exact HEAD 执行全新的 final R5 Reviewer/CI/PM；本节不关闭 L5，不启动 L6。
+- 边界仍为 fixed-synthetic、offline unit/in-memory；proof 非真实凭据，plaintext nonce 不持久化，不授权 Runtime、HTTP、持久层、真实 clinical/patient/public production。
