@@ -712,3 +712,14 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 ---
 
 **R8 已交付，申请独立验收。**
+
+## 26. L5-3/4-R8 独立 shared acceptance（通过）
+
+- 冻结 delivery：`6119654bd37c0d6da95f02933c37f9dd294cd269`；parent `d4a33eb3ec017202dad78cc1e2cd11e36290ca28`；精确 5 个允许且 tracked 的文件，前后 exact/clean 与 diff check 通过。
+- 独立 Reviewer：P0=0、P1=0、P2=0、P3=0；三模型九个字段共用单一私有 alias，非法协调 snapshot 在模型构造阶段固定拒绝，有效 1/128 边界与正常 round-trip 保持；独立 L5-3/L5-4 `126 passed`。
+- 独立 CI：R8 `10/3`、L5-1/2/3/4 `14/18/72/54`、组合 `158`、并发 `2`、状态机 `8`、Safety `71/3 deselected + 18`、privacy `76`、Runtime/Legacy/public `57/13 deselected`、flag `10`、AST `6/120 deselected`、L0 `131`、Ruff/mypy/lock 全通过。
+- 双全量：forced `1 failed, 1782 passed, 362 deselected` 且唯一为既有 defaults 差异；calibrated `1783 passed, 362 deselected`。Runtime 首次宽集合 `47/14` 到当前集合 `57/13` 仅是收集口径校准，全程无失败。
+- PM：R8 字段矩阵/shared structure/L5-4 composition `13 passed`；求值后类型探针 `9/9`；exact HEAD 未变且 clean。
+- 结论：**L5-3/L5-4 与 R8 accepted**（`ACC-20260723-043`、`DEC-20260723-036`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
+- 后续：本节不关闭 L5 整体。必须从包含本 shared acceptance 的新 clean exact HEAD 调用全新的 final R4 Reviewer、独立 CI 与 PM；不得复用前三轮结果，L6 未开始。
+- 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory reference composition；不授权 Runtime、HTTP、持久层、真实数据、临床或公开生产。
