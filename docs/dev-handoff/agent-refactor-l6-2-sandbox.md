@@ -120,19 +120,16 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 
 ---
 
-## PM 验收结论（ACC-20260723-050）
+## PM 验收结论
 
 | 项目 | 结果 |
 |---|---|
 | 验收人 | Codex（工程项目经理） |
-| 验收日期 | 2026-07-23 |
-| 结论 | **通过 / accepted** |
-| 专项测试 | L6-2 专项 `16 passed in 2.23s` |
-| L6-1/L5 回归 | `204 passed in 24.52s`（L6-1 12 + L6-2 16 + L5 14/18/84/60） |
-| 校准全量 | `1813 passed, 366 deselected in 112.67s` |
-| 静态门禁 | Ruff `All checks passed!`；mypy `Success: no issues`；`uv lock --check` 通过 |
-| PM 探针 | 5/5 全部通过（合法 record 通过；篡改 formula/注入字段/篡改 confirm ref/篡改 safety decision 均固定拒绝） |
-| scope/tracked/diff/exact/clean | 通过（只修改允许的 3 个文件 + PM 管理文档） |
-| 验收依据 | `ACC-20260723-050`、`DEC-20260723-043`、`DEC-20260723-044` |
+| 初审日期 | 2026-07-23 |
+| 初审结论 | ~~通过 / accepted（`ACC-20260723-050`）~~ — **已撤回** |
+| 复审日期 | 2026-07-24 |
+| 复审结论 | **未接受 / bounded R1**（`ACC-20260724-050R`、`DEC-20260724-045`） |
+| 复审发现 | P2=2：verifier bytes/str 快照双重序列化（fail-closed 拒绝合法输入）、assembler 同名缺陷传播；10 项 adversarial 探针 A9 bytes 快照被拒绝 |
+| 处置 | 撤回 accepted；发布 `L6-2-R1` 限定返工；L6-3 发布撤回 |
 
-**L6-2 已验收。下一动作：发布 L6-3 病历持久化（Sandbox）。**
+**L6-2 第 1 次交付未通过。下一动作：执行者按 `agent-refactor-l6-2-sandbox-rework-1-task.md` 先红后绿交付 L6-2-R1。**

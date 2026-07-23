@@ -134,3 +134,16 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 | 验收依据 | `ACC-20260723-049`、`DEC-20260723-042`、`DEC-20260723-043` |
 
 **L6-1 已验收。下一动作：发布 L6-2 病历一致性验证（Sandbox）。**
+
+---
+
+## L6-1 adversarial 复审补充（2026-07-24）
+
+L6-2 复审期间对 L6-1 进行 23 项 adversarial 独立探针，全部通过：
+
+- DTO 绑定（12 项）：record_id 由 SHA-256 覆盖全部 8 个 canonical 字段派生，篡改任一字段触发 `record_id mismatch` 拒绝；frozen、`extra="forbid"`、strict 全部有效
+- Assembler 边界（5 项）：wrong thread_id/checkpoint_id/session_id/namespace 全部固定 `SandboxRecordError`；formula 提取与 snapshot subject 一致
+- 确定性 + 抗碰撞（3 项）：同输入字节级相同；不同 `assembled_at` 产生不同 record_id
+- 静态边界（3 项）：无 `open/print/exec/eval`，无网络 token，`__slots__==()`
+
+**L6-1 confirmed accepted，无实质缺陷。** L6-2 的 bytes/str 双序列化缺陷局限于 L6-2 verifier 和 assembler 的 else 分支，不连坐 L6-1 的 DTO/Assembler 核心逻辑。
