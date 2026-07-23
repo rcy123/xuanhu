@@ -607,3 +607,29 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 最终 Reviewer P0=0、P1=1、P2=0、P3=0：下层 applied attempt/event action 可完整协调改变并重派生 refs，而 signed digest 未与 persisted challenge/action 重算绑定；private restore 接受后本层 completion eligibility 也可从 blocked 翻为 eligible。
 - 结论：final R4 **未通过**（`ACC-20260723-044`、`DEC-20260723-037`）；R5～R8 acceptance 历史保留，L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
 - R9 只修改 L5-3 shared digest authority 与两层回归；`sandbox_recheck.py` production 不加重复判断，不持久化 plaintext nonce/signature。L6 未发布、未开始。
+
+## 30. L5-3/4-R9 signed action authority composition 交付（2026-07-23）
+
+### 30.1 精确起点与 outer tests-first RED
+
+- 状态：**R9 已交付，申请独立验收**；exact parent 为 clean management release `e3f5dbed95f0b6495c3678325f231a3e6fd48419`；任务依据为 [R9 任务书](agent-refactor-l5-3-4-signed-authority-rework-9-task.md)。
+- production 零 diff、工作区仅两份专项变化时，本层定向收集 `56` 项、选中 `2` 项，真实 RED 为 `2 failed, 54 deselected in 2.38s`。两个 current-review composition 分别覆盖 `REJECT→CONFIRM` 与 `CONFIRM→REJECT`：同步修改 private attempt/event action，完整重派生 attempt/event 与全部四条相关 transition refs，保持原 signed digest；旧 outer restore 均 `DID NOT RAISE`，并在失败前确认 completion eligibility 分别从 blocked 翻为 eligible、从 eligible 翻为 blocked。
+- 负例不依赖 stale ref、单侧 action、删除记录、skip 或 xfail。`sandbox_recheck.py` production 始终零 diff；本层不增加 action/digest 条件，只通过构造 shared `SandboxInMemoryReviewStore` 继承下层固定拒绝。
+
+### 30.2 composition GREEN 与门禁
+
+- L5-3 唯一 `_persisted_review_signed_authority_digest(...)` 现在统一 live public digest 与 restore：public 仅传入 plaintext nonce 的 SHA-256，restore 从 persisted challenge `nonce_digest` 与 attempt action/identity 重算；event 继续精确匹配 attempt。任一漂移在 outer completion 解释前由 private store 拒绝。
+- 同两项修复后为 `2 passed, 54 deselected in 1.91s`；完整本专项 `56 passed in 3.70s`，既有 54 项全部保持。outer 失败继续固定为 `SANDBOX_RECHECK_REJECTED`、无 cause/context、无动态 payload且输入 canonical bytes 不变；正常 current CONFIRM/REJECT 与 restart、R8 identifier constraints、R7 fixed schema、R6 child inheritance 和 R5 finite qualification ownership 均保持。
+- 四层组合 `163 passed`；R7/R8 `4/13`、并发 `2`、状态机 `8`、Safety `71/3 deselected + 18`、privacy `76`、Runtime/Legacy/public `57`、flag `10`、AST/离线结构 `8/123 deselected`、L0 `131`、Ruff/mypy/lock 全部通过。
+- forced full 为 `1 failed, 1787 passed, 362 deselected in 124.57s` 且唯一为既有 defaults 差异；只移除 `APP_ENV` 的 calibrated full 为 `1788 passed, 362 deselected in 121.77s`。
+
+### 30.3 范围、限制、提交与回退
+
+- R9 单一 delivery 只含 `app/agent_runtime/sandbox_review.py`、两层专项与两份 handoff；未修改本层 production、任务书、PM 六台账、配置、依赖或锁文件。提交消息为 `fix: bind L5 signed action authority`，exact parent 为 `e3f5dbed95f0b6495c3678325f231a3e6fd48419`。
+- 全部执行使用 inline fixed-fictitious/synthetic、offline/in-memory fixture；未读取 `.env`、ignored `data/`、`.codex_tmp`，未访问网络或启动服务。不保存 plaintext nonce/signature，不调用 restore-time verifier，不提供 Runtime、HTTP、DB 或外部能力。
+- Git SHA 由提交后外部报告；后续必须在 exact clean delivery 上执行新的独立 Reviewer/CI/PM，不能复用 final R1～R4。当前不声明 accepted；L5 仍为 2/4，L6 未发布、未开始。
+- 若 R9 独立验收失败，对单一 R9 delivery 执行 `git revert <r9-delivery-commit>`，保留历史且不 reset/amend。
+
+---
+
+**R9 已交付，申请独立验收。**

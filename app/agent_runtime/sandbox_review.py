@@ -324,11 +324,39 @@ def review_signed_payload_digest(
 ) -> str:
     """Bind the signature to every challenge, action, identity, and nonce field."""
 
+    return _persisted_review_signed_authority_digest(
+        challenge=challenge,
+        action=action,
+        nonce_digest=_bytes_sha256(plaintext_nonce),
+        sandbox_test_reviewer_id=sandbox_test_reviewer_id,
+        sandbox_test_role=sandbox_test_role,
+        sandbox_test_organization_label=sandbox_test_organization_label,
+        sandbox_test_qualification_label=sandbox_test_qualification_label,
+        sandbox_test_signature_scheme=sandbox_test_signature_scheme,
+        sandbox_test_key_id=sandbox_test_key_id,
+    )
+
+
+def _persisted_review_signed_authority_digest(
+    *,
+    challenge: SandboxReviewChallengeV1,
+    action: SandboxReviewAction,
+    nonce_digest: str,
+    sandbox_test_reviewer_id: str,
+    sandbox_test_role: str,
+    sandbox_test_organization_label: str,
+    sandbox_test_qualification_label: str,
+    sandbox_test_signature_scheme: str,
+    sandbox_test_key_id: str,
+) -> str:
+    """Derive one signed digest from persisted challenge and test identity authority."""
+
+    if nonce_digest != challenge.nonce_digest:
+        raise ValueError("review nonce digest mismatch")
     return _sha256(
         {
             "action": action,
-            "challenge": challenge,
-            "plaintext_nonce": plaintext_nonce.hex(),
+            "challenge_authority": _challenge_authority(challenge),
             "sandbox_test_key_id": sandbox_test_key_id,
             "sandbox_test_organization_label": sandbox_test_organization_label,
             "sandbox_test_qualification_label": sandbox_test_qualification_label,
@@ -698,6 +726,24 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
             or attempt_checkpoint.source_ref != attempt.source_ref
             or attempt.namespace != attempt_challenge.namespace
             or attempt.test_session_id != attempt_challenge.test_session_id
+            or attempt.sandbox_test_signed_payload_digest
+            != _persisted_review_signed_authority_digest(
+                challenge=attempt_challenge,
+                action=attempt.action,
+                nonce_digest=attempt_challenge.nonce_digest,
+                sandbox_test_reviewer_id=attempt.sandbox_test_reviewer_id,
+                sandbox_test_role=attempt.sandbox_test_role,
+                sandbox_test_organization_label=(
+                    attempt.sandbox_test_organization_label
+                ),
+                sandbox_test_qualification_label=(
+                    attempt.sandbox_test_qualification_label
+                ),
+                sandbox_test_signature_scheme=(
+                    attempt.sandbox_test_signature_scheme
+                ),
+                sandbox_test_key_id=attempt.sandbox_test_key_id,
+            )
         ):
             return False
 

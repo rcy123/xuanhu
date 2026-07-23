@@ -483,6 +483,64 @@ def _rederive_review_proof_identifier(
         )
 
 
+def _rederive_review_action(
+    review_snapshot: dict[str, object],
+    *,
+    challenge_ref: str,
+    action: SandboxReviewAction,
+) -> None:
+    exact_attempts = [
+        attempt
+        for attempt in review_snapshot["attempts"]
+        if attempt["challenge_ref"] == challenge_ref
+    ]
+    assert len(exact_attempts) == 1
+    attempt = exact_attempts[0]
+    old_attempt_ref = attempt["resume_attempt_ref"]
+    persisted_digest = attempt["sandbox_test_signed_payload_digest"]
+    attempt["action"] = action
+    attempt_body = {
+        key: value
+        for key, value in attempt.items()
+        if key not in {"resume_attempt_ref", "state"}
+    }
+    new_attempt_ref = (
+        "sandbox-attempt-"
+        + hashlib.sha256(canonical_json_bytes(attempt_body)).hexdigest()
+    )
+    attempt["resume_attempt_ref"] = new_attempt_ref
+
+    exact_events = [
+        event
+        for event in review_snapshot["events"]
+        if event["resume_attempt_ref"] == old_attempt_ref
+    ]
+    assert len(exact_events) == 1
+    event = exact_events[0]
+    event["action"] = action
+    event["resume_attempt_ref"] = new_attempt_ref
+    _refresh_mapping_ref(
+        event,
+        prefix="sandbox-review-event-",
+        field="event_ref",
+    )
+
+    rewritten_transitions = 0
+    for transition in review_snapshot["transitions"]:
+        if transition["resume_attempt_ref"] != old_attempt_ref:
+            continue
+        transition["resume_attempt_ref"] = new_attempt_ref
+        _refresh_mapping_ref(
+            transition,
+            prefix="sandbox-transition-",
+            field="transition_ref",
+        )
+        rewritten_transitions += 1
+    assert rewritten_transitions == 4
+    assert attempt["sandbox_test_signed_payload_digest"] == persisted_digest
+    assert event["sandbox_test_signed_payload_digest"] == persisted_digest
+
+
 def _rederive_current_child_review_schema(
     bad: dict[str, object], *, schema_version: str
 ) -> None:
@@ -582,6 +640,78 @@ def test_l5_4_restore_rejects_coordinated_invalid_private_proof_identifier(
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
         )
+
+    assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canonical_json_bytes(changed) == before
+
+
+@pytest.mark.parametrize(
+    ("original_action", "changed_action", "original_status", "changed_status"),
+    (
+        (
+            SandboxReviewAction.REJECT,
+            SandboxReviewAction.CONFIRM,
+            "blocked",
+            "eligible",
+        ),
+        (
+            SandboxReviewAction.CONFIRM,
+            SandboxReviewAction.REJECT,
+            "eligible",
+            "blocked",
+        ),
+    ),
+    ids=("reject-to-confirm", "confirm-to-reject"),
+)
+def test_l5_4_restore_rejects_coordinated_private_review_action_change(
+    original_action: SandboxReviewAction,
+    changed_action: SandboxReviewAction,
+    original_status: str,
+    changed_status: str,
+) -> None:
+    coordinator, _, clock, nonce_factory, verifier = _coordinator()
+    outcome = coordinator.apply_revision(
+        _revision_command(coordinator, suffix="signed-authority-008")
+    )
+    assert outcome.status == "review_required"
+    assert outcome.delivery is not None
+    staged = coordinator.stage_current_review(
+        _submission(outcome.delivery, original_action)
+    )
+    assert staged.resume_attempt_ref is not None
+    assert coordinator.resume_current_review(
+        SandboxResumeCommandV1(resume_attempt_ref=staged.resume_attempt_ref)
+    ).status == "applied"
+    assert coordinator.completion_eligibility(
+        namespace=_NAMESPACE,
+        test_session_id=_SESSION,
+        thread_id=_THREAD,
+        checkpoint_id=outcome.delivery.challenge.checkpoint_id,
+    ).status == original_status
+
+    changed = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
+    _rederive_review_action(
+        changed["review_snapshot"],
+        challenge_ref=outcome.delivery.challenge.challenge_ref,
+        action=changed_action,
+    )
+    before = canonical_json_bytes(changed)
+
+    with pytest.raises(SandboxRecheckError) as raised:
+        restored = SandboxRecheckCoordinator(
+            snapshot=changed,
+            clock=clock,
+            nonce_factory=nonce_factory,
+            signature_verifier=verifier,
+        )
+        assert restored.completion_eligibility(
+            namespace=_NAMESPACE,
+            test_session_id=_SESSION,
+            thread_id=_THREAD,
+            checkpoint_id=outcome.delivery.challenge.checkpoint_id,
+        ).status == changed_status
 
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
     assert raised.value.__cause__ is None

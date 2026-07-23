@@ -732,3 +732,44 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 - 最终 Reviewer：P0=0、P1=1、P2=0、P3=0。完整协调改变 applied attempt/event action 并重派生全部 private refs 后，restore 仍接受原 signed digest，因而 blocked/eligible 可翻转；既有回归只重算 event ref，实际命中 stale attempt ref。
 - 结论：final R4 **未通过**（`ACC-20260723-044`、`DEC-20260723-037`）；历史 acceptance 保留，但 L5-3 与两个工程风险重新打开；shared R9 已发布。
 - R9 必须以单一 persisted-challenge signed authority helper 收敛 live/restore，不持久化 plaintext nonce/signature，不在 L5-4 production 复制条件；L6 未开始。
+
+## 28. L5-3/4-R9 signed action authority 同源交付（2026-07-23）
+
+### 28.1 状态、起点与 tests-first RED
+
+- 状态：**R9 已交付，申请独立验收**；执行者不声明 accepted、专业批准或 production ready。
+- clean management release / exact parent：`e3f5dbed95f0b6495c3678325f231a3e6fd48419`；其中保留 final R4 失败、`ACC-20260723-044`、`DEC-20260723-037` 与 [R9 任务书](agent-refactor-l5-3-4-signed-authority-rework-9-task.md)。开始时分支正确、worktree/index clean，任务书 tracked。
+- production 零 diff、工作区仅两份专项测试变化时，L5-3 定向收集 `75` 项、选中 `4` 项，真实 RED 为 `4 failed, 71 deselected in 2.36s`：两个结构用例证明具名 persisted-challenge helper 尚不存在；`REJECT→CONFIRM` 与 `CONFIRM→REJECT` 两个真实 applied snapshot 同步修改 attempt/event action，重派生 attempt/event ref 与全部四条引用该 attempt 的 transition refs，并保持原 signed digest，旧 store 均 `DID NOT RAISE`。用例在失败前分别确认 eligibility 已从 blocked 翻为 eligible、从 eligible 翻为 blocked，因此 RED 不依赖 stale attempt/event/transition ref。
+- 旧 coordinated-action 回归已升级为上述双参数全链重派生；没有删除旧用例、skip、xfail、条件放宽、单侧 action 变更或过时引用制造通过。RED 时 `sandbox_review.py` 与 `sandbox_recheck.py` production 均零 diff，exact HEAD 未变。
+
+### 28.2 单一 signed authority 与 GREEN
+
+- `review_signed_payload_digest(...)` 保留原 public 参数；它只对一次性 plaintext nonce 做固定 SHA-256，再把该 `nonce_digest`、challenge、action 与既有 sandbox test identity 字段委托给唯一具名 `_persisted_review_signed_authority_digest(...)`。
+- 私有 helper 先要求传入摘要精确等于 challenge 已持久化的 `nonce_digest`，再只对 `_challenge_authority(challenge)`、action 与 test identity 形成 canonical digest；不接收 plaintext nonce 或 signature，不调用 verifier，不保存 secret/key，也没有第二套 digest 字段映射。
+- shared snapshot restore 在 attempt 与 challenge/source/checkpoint 关系检查中，以 `challenge.nonce_digest + attempt action/identity` 调用同一 helper并比对 persisted signed digest；该 guard 位于 event 关系、challenge applied 状态与任何 eligibility 解释之前。event 继续精确匹配已验证 attempt。
+- 同一定向集合修复后为 `4 passed, 71 deselected in 2.10s`。完整专项为 `75 passed in 2.58s`；正常 CONFIRM/REJECT live apply 均可按原 snapshot restart 并分别保持 eligible/blocked；32-byte plaintext nonce 仍仅首次返回一次，不进入 snapshot/`repr`，signature 原文仍不持久化，fixed store failure 无 cause/context 且输入 canonical bytes 不变。
+
+### 28.3 R9 门禁、范围与回退
+
+| 门禁 | R9 结果 |
+|---|---|
+| L5-3 / L5-4 / 四层组合 | `75 passed` / `56 passed` / `163 passed` |
+| R9 双向定向 / R7 / R8 | `4 + 2 passed` / `4 passed` / `13 passed` |
+| L5-1 / L5-2 | `14 passed` / `18 passed` |
+| 32 并发 / 状态机 | `2 passed` / `8 passed` |
+| Safety / 相邻 Safety / privacy | `71 passed, 3 deselected` / `18 passed` / `76 passed` |
+| Runtime/Legacy/public / public flag | `57 passed` / `10 passed` |
+| AST/离线/ownership | `8 passed, 123 deselected` |
+| Ruff / mypy | 全仓 `All checks passed!`；四个 L5 production `Success: no issues found in 4 source files`，仅既有 `pymilvus.*` unused-section note |
+| L0 / lock | `131 passed`；`Resolved 84 packages in 3ms`，lock 未变化 |
+| 强制全量 | `1 failed, 1787 passed, 362 deselected in 124.57s`；唯一为 `tests/test_config.py::test_load_with_defaults` 的 `local` / 强制 `sandbox-test` 既有差异 |
+| 只移除 `APP_ENV` 的校准全量 | `1788 passed, 362 deselected in 121.77s` |
+
+- 单一 R9 delivery 只含 `app/agent_runtime/sandbox_review.py`、L5-3/L5-4 两份专项与两份 handoff；`app/agent_runtime/sandbox_recheck.py` production 零 diff，PM 六台账、任务书、L5-1/L5-2、配置、依赖与锁文件均未修改。提交消息为 `fix: bind L5 signed action authority`，exact parent 为 `e3f5dbed95f0b6495c3678325f231a3e6fd48419`。
+- 全部 fixture 继续是 inline fixed-fictitious/synthetic、offline/in-memory；没有读取 `.env`、ignored `data/` 或 `.codex_tmp`，没有访问网络或启动应用、HTTP、容器、数据库、Gateway 或外部服务。
+- Git SHA 由提交后外部报告；后续必须在该 exact clean delivery 上执行新的独立 Reviewer/CI/PM，不能复用 final R1～R4。当前 L5 仍为 2/4，L6 未发布、未开始。
+- 若 R9 独立验收失败，对单一 R9 delivery 执行 `git revert <r9-delivery-commit>` 并保留全部历史，不 reset、amend 或覆盖。
+
+---
+
+**R9 已交付，申请独立验收。**
