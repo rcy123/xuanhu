@@ -269,3 +269,10 @@ subject 现内嵌 frozen/strict `SandboxSyntheticManifestV1` 和 `SandboxIdentif
 - 强制 `APP_ENV=sandbox-test` 的精确全量唯一 defaults 冲突原样保留；只移除 `APP_ENV`、保持全部 fake endpoints 的校准全量证明代码无回归，不修改合同外配置/测试。
 - 结论：**L5-1 与 L5-1-R1 accepted**；关闭 `R-L5-DET-001`、`R-L5-EVID-001`；允许项目经理另行发布 L5-2，当前事务不实施 L5-2。
 - 边界：这是个人学习、非临床、离线 synthetic sandbox 工程验收，不是临床、法律、隐私、伦理、监管或生产批准；G1～G6、EXT-001/EXT-002 和真实/公开用途 NO-GO 不变。
+
+## 13. L5 最终组合第 5 轮 PM 关闭（2026-07-23）
+
+- 最终组合冻结点为 `c052c5014d98e508fbfe861316ff5428574c197b`；全新独立 Reviewer P0/P1/P2/P3 全为 0，独立 CI 与根 PM 通过，工作区前后 clean。
+- 本专项在 final R5 为 `14 passed`，四层组合 `176 passed`；同一 subject/bundle 同裁决、run envelope 不干扰、pair-wise state drift 和零外部 capability 均保持。
+- `ACC-20260723-047` / `DEC-20260723-040` 确认 L5-1 继续 accepted，并将 L5 个人学习离线工程沙盒标记 accepted / engineering complete。
+- 本结论只适用于 fixed-synthetic、offline unit/in-memory；不是 `clinical_approved`，不授权 Runtime、HTTP/E2E、容器、数据库、部署、真实临床/患者/公开生产。L6 未发布、未开始。

@@ -676,3 +676,11 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 结论：**L5-3/L5-4 与 R10 accepted**（`ACC-20260723-046`、`DEC-20260723-039`）；两个工程风险再次关闭，L5 恢复 4/4 individually accepted。
 - 后续：必须从包含本 shared acceptance 的新 clean exact HEAD 执行全新的 final R5 Reviewer/CI/PM；本节不关闭 L5，不启动 L6。
 - 边界仍为 fixed-synthetic、offline unit/in-memory；proof 非真实凭据，plaintext nonce 不持久化，不授权 Runtime、HTTP、持久层、真实 clinical/patient/public production。
+
+## 34. L5 最终组合第 5 轮 PM 关闭（2026-07-23）
+
+- 最终组合冻结点为 `c052c5014d98e508fbfe861316ff5428574c197b`；全新独立 Reviewer P0/P1/P2/P3 全为 0，独立 CI 与根 PM 通过，工作区前后 clean。
+- L5-4 在 final R5 为 `60 passed`，四层组合 `176 passed`；R10 composition 定向 `6 passed`。三处 shared store 继续传递同一 verifier，不复制 action/digest/signature 或状态判断。
+- 修改后旧 review/eligibility 失效、新 review applied 前 completion blocked、32 并发 modification 单成功、initial/current restart、失败 candidate 零残留与 public flag 默认关闭全部保持。
+- `ACC-20260723-047` / `DEC-20260723-040` 确认 L5-4 继续 accepted，并将 L5 个人学习离线工程沙盒标记 accepted / engineering complete；`R-L5-RECHECK-001` 保持 closed。
+- 本结论只适用于 fixed-synthetic、offline unit/in-memory；不是 `clinical_approved`，不实现真实 complete/export，不授权 Runtime、HTTP、数据库、部署、临床/患者/公开生产。L6 未发布、未开始。

@@ -830,3 +830,11 @@ production 零 diff、工作区只有两份专项测试变化时，完整 fake e
 - 结论：**L5-3/L5-4 与 R10 accepted**（`ACC-20260723-046`、`DEC-20260723-039`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
 - 后续：本节不关闭 L5 整体。必须从包含本 shared acceptance 的新 clean exact HEAD 调用全新的 final R5 Reviewer、独立 CI 与 PM，不复用前四轮结果；L6 未开始。
 - 边界仍为 fixed-synthetic、offline unit/in-memory；proof 非真实凭据，plaintext nonce 不持久化，不授权 Runtime、HTTP、持久层、真实数据、临床或公开生产。
+
+## 32. L5 最终组合第 5 轮 PM 关闭（2026-07-23）
+
+- 最终组合冻结点为 `c052c5014d98e508fbfe861316ff5428574c197b`；全新独立 Reviewer P0/P1/P2/P3 全为 0，独立 CI 与根 PM 通过，工作区前后 clean。
+- L5-3 在 final R5 为 `84 passed`，四层组合 `176 passed`；R10 定向 `11 passed`。额外多 attempts proof drift、身份字段协调变化、digest-before-verifier、sealed REJECT、candidate 零残留与零网络/子进程探针均通过。
+- 根 PM 另复验 R10 两层 `17 passed` 与最终语义矩阵 `36 passed`；replay/expiry/cross-session、32 并发单成功、current applied review gate 和 public flag 默认关闭保持。
+- `ACC-20260723-047` / `DEC-20260723-040` 确认 L5-3 继续 accepted，并将 L5 个人学习离线工程沙盒标记 accepted / engineering complete；`R-L5-RESUME-001` 保持 closed。
+- proof 仍只是假定的 fixed-synthetic test material，plaintext nonce 不持久化；本结论不是 `clinical_approved`，不授权真实 signer/key、Runtime、HTTP、持久层、患者/公开生产。L6 未发布、未开始。

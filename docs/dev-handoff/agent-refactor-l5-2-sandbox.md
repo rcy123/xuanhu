@@ -258,3 +258,10 @@ true-max committed test 继续使用 64 个 unique issues/rules 与 64 个 exact
 ---
 
 **L5-2 已完成 / accepted；下一动作仅为项目经理另行发布 L5-3。**
+
+## 13. L5 最终组合第 5 轮 PM 关闭（2026-07-23）
+
+- 最终组合冻结点为 `c052c5014d98e508fbfe861316ff5428574c197b`；全新独立 Reviewer P0/P1/P2/P3 全为 0，独立 CI 与根 PM 通过，工作区前后 clean。
+- 本专项在 final R5 为 `18 passed`，四层组合 `176 passed`；valid attach、恶意修改固定 unavailable、source result/digest byte identity 与解释 non-interference 均保持。
+- `ACC-20260723-047` / `DEC-20260723-040` 确认 L5-2 继续 accepted，并将 L5 个人学习离线工程沙盒标记 accepted / engineering complete。
+- 本结论只适用于 fixed-synthetic、offline unit/in-memory；不是 `clinical_approved`，不授权真实 generator/模型服务、Runtime、HTTP/E2E、数据库、部署或真实临床/公开生产。L6 未发布、未开始。
