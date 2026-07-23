@@ -557,3 +557,10 @@ exact `6fe77cd` 的 production 内容仍为 R5 `847076e` 行为。production dif
 - 结论：**L5-3/L5-4 与 R7 accepted**（`ACC-20260723-041`、`DEC-20260723-034`）；`R-L5-RESUME-001` 与 `R-L5-RECHECK-001` 再次关闭，L5 恢复 4/4 individually accepted。
 - 后续：必须从包含本 shared acceptance 的新 clean exact HEAD 执行全新的 final R3 Reviewer/CI/PM；本节不关闭 L5，不启动 L6。
 - 边界仍为 fixed-fictitious/synthetic、offline unit/in-memory reference composition；不授权 Runtime、HTTP、持久层、真实 clinical/patient/public production。
+
+## 26. L5 最终组合第 3 轮（未通过，L5-3/L5-4 reopened）
+
+- 冻结 exact HEAD `78c9b13c7790eef5fb3f01705c2ebfef2a3efa36`；独立 CI 组合 `145`、calibrated full `1770`，PM `13 + 4`，全部 Git 门禁通过。
+- 最终 Reviewer P0=0、P1=0、P2=1、P3=0：L5-3 persisted attempt/event 未复用 live proof 的三项 identifier 约束；完整重派生 applied history 可被 shared store 接受，因而可能传递到本层 private snapshot。
+- 结论：final R3 **未通过**（`ACC-20260723-042`、`DEC-20260723-035`）；R5～R7 acceptance 历史保留，L5-3/L5-4 与两个工程风险重新打开，L5 当前 2/4。
+- R8 只修改 L5-3 shared types/模型与两层回归；`sandbox_recheck.py` production 不加重复判断。L6 未发布、未开始。

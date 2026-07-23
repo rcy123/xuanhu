@@ -657,3 +657,12 @@ production diff 为空、工作区仅新增两层 regression 时，完整 fake e
 - PM 六项 `6 passed`：R7 两层、shared guard、R6 child guard、R5 helper ownership；HEAD 未变且 clean。
 - 结论：**L5-3/L5-4 与 R7 accepted**（`ACC-20260723-041`、`DEC-20260723-034`）；再次关闭两个工程风险；L5 恢复 4/4 individually accepted。
 - 后续：本节不关闭 L5 整体。必须从包含 shared acceptance 的新 clean exact HEAD 调用全新的 final R3 Reviewer、独立 CI 与 PM；不得复用前两轮结果，L6 未开始。
+
+## 24. L5 最终组合第 3 轮（未通过，L5-3 reopened）
+
+- 冻结 exact HEAD：`78c9b13c7790eef5fb3f01705c2ebfef2a3efa36`；R7 delivery/acceptance 均为祖先；前后 clean。
+- 最终独立 CI：四层 `14/18/62/51`、组合 `145`、calibrated full `1770 passed, 362 deselected`；forced 仅既有 defaults 差异；全部相邻/静态/scope/tracked 门禁通过。
+- PM：跨层 `13 passed` + R7 定向 `4 passed`，正常 live 与 shared schema 行为保持。
+- 最终 Reviewer：P0=0、P1=0、P2=1、P3=0。live proof 的三个 identifier 使用统一长度/格式约束，但 persisted sealed attempt/event 没有复用；协调修改并重派生 refs 后 restore 接受 live DTO 明确拒绝的值。
+- 结论：final R3 **未通过**（`ACC-20260723-042`、`DEC-20260723-035`）；历史 acceptance 保留，但 L5-3 与两个工程风险重新打开；shared R8 已发布。
+- R8 必须以单一 constrained alias 收敛三字段×三模型全族，不逐字段复制条件；同时证明 L5-4 composition，L6 未开始。
