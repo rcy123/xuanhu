@@ -111,3 +111,24 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 ---
 
 **已交付，申请验收。**
+
+---
+
+## PM 验收结论（ACC-20260724-050R1）
+
+| 项目 | 结果 |
+|---|---|
+| 验收人 | Codex（工程项目经理） |
+| 验收日期 | 2026-07-24 |
+| 结论 | **通过 / accepted** |
+| P2-1 关闭 | verifier bytes/str 双序列化已修复：共享 `_parse_recheck_snapshot` helper，显式 isinstance 分支 |
+| P2-2 关闭 | assembler 同名缺陷同步修复：两处输入解析分支统一调用 helper |
+| 专项测试 | L6-2-R1 专项 `32 passed in 2.76s`（原 16 + 4 RED 缺陷对照 + 6 verifier 矩阵 + 6 assembler 矩阵） |
+| L6-1/L5 回归 | `422 passed, 3 deselected in 24.16s`（12/32/14/18/84/60/71/131） |
+| 校准全量 | `1829 passed, 366 deselected in 103.92s` |
+| 静态门禁 | Ruff/mypy/lock 全通过 |
+| PM 探针 | 22/22 全部通过（verifier 6 + assembler 6 + 5 字段篡改 + 4 cross-check） |
+| scope/tracked/diff/exact/clean | 通过（只修改允许的 3 个文件 + PM 管理文档） |
+| 验收依据 | `ACC-20260724-050R1`、`DEC-20260724-045`、`DEC-20260724-046` |
+
+**L6-2-R1 已验收。L6-2 通过 R1 恢复 accepted。下一动作：重新发布 L6-3 病历持久化（Sandbox）。**

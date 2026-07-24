@@ -133,3 +133,9 @@ $env:XUANHU_LANGGRAPH_PUBLIC_ENABLED='false'
 | 处置 | 撤回 accepted；发布 `L6-2-R1` 限定返工；L6-3 发布撤回 |
 
 **L6-2 第 1 次交付未通过。下一动作：执行者按 `agent-refactor-l6-2-sandbox-rework-1-task.md` 先红后绿交付 L6-2-R1。**
+
+---
+
+## L6-2 通过 R1 恢复 accepted（2026-07-24）
+
+L6-2-R1（`a913377`）通过 PM 独立验收，两个 P2 缺陷已关闭（`ACC-20260724-050R1`、`DEC-20260724-046`）。L6-2 标记 accepted（通过 R1）。详见 R1 handoff。

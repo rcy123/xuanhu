@@ -7,7 +7,7 @@
 | 状态 | 已发布 / 待交付 |
 | 发布人 | Codex（工程项目经理） |
 | 发布日期 | 2026-07-24 |
-| 基线 | `d8dfa44`（L6-2 验收提交） |
+| 基线 | `a913377`（L6-2-R1 验收提交） |
 | 依赖 | L5-PREP-0、L5-1、L5-2、L5-3、L5-4、L6-1、L6-2 全部 accepted |
 | 阻塞 | 无活跃工程阻塞 |
 | 交付文件 | `docs/dev-handoff/agent-refactor-l6-3-sandbox-task.md`（本文件） |
@@ -21,20 +21,24 @@
 1. 实现 `SandboxRecordStore`（in-memory、确定性、幂等）：
    - `put(record)` 对同一 `record_id` 幂等：相同 record 重复写入不报错、不增加版本
    - 相同 `record_id` 但字段不同 → 固定拒绝（`SandboxRecordError`）
-   - `get(record_id)` 返回已存 record 或固定失败（无 None 渗透、无异常穿透）
-   - 不持有 clock、random、network、DB、文件句柄；`__slots__ == ()`
+   - `get(record_id)` 返回已存 record；未命中 → `raise SandboxRecordError()`（无 None 渗透、无异常穿透）
+   - `__slots__ = ("_records",)`，仅持有内部存储；不持有 clock、random、network、DB、文件句柄
 2. 实现确定性落盘边界（**不接触真实磁盘/DB**）：
-   - 提供一个纯函数化的 `serialize_record(record) -> bytes`（canonical JSON，字节稳定）
+   - 提供一个纯函数化的 `serialize_record(record: SandboxMedicalRecordData) -> bytes`（canonical JSON，字节稳定）
+   - 使用 `canonical_review_bytes(record.model_dump(mode="json"))` 保证与 L6-1 `_record_id` 内部 canonical 字节一致（`sort_keys=True`）
    - 同一 record 多次序列化 → 字节级相同
+   - 不同 record（不同 `record_id`）→ 字节不同
    - 不写入真实文件、不调用 `open`、不连接 DB、不发起网络调用
 3. 验证边界：
-   - 幂等 put（同 record 重复）→ 不报错、版本不变
-   - 篡改后同 record_id put → 固定拒绝
-   - get 不存在 record_id → 固定失败（chainless、payload-free）
+   - 幂等 put（同 record 重复）→ 不报错、存储不变
+   - 篡改后同 record_id put → 固定拒绝（`SandboxRecordError`）
+   - get 已存在 record_id → 返回原 record
+   - get 不存在 record_id → `SandboxRecordError`（chainless、payload-free）
    - 序列化确定性 → 同输入字节级相同
 4. 建立 L6-3 专项测试：
    - 幂等 put → 通过
    - 篡改后同 id → 固定拒绝
+   - get hit → 返回原 record
    - get miss → 固定失败
    - 序列化字节稳定
 
@@ -76,14 +80,15 @@
    - 无 store 时同 record_id 篡改后写入被接受（或无 store 类无法测）
    - 无 serialize 函数时序列化不确定（或无函数可调用）
 2. 修复后 GREEN 必须覆盖：
-   - 幂等 put（同 record 重复）→ 不报错、版本/计数不变
+   - 幂等 put（同 record 重复）→ 不报错、存储内容不变
    - 篡改后同 record_id put → 固定拒绝（`SandboxRecordError`）
    - get 命中 → 返回原 record
-   - get miss → 固定失败（chainless、payload-free）
+   - get miss → `raise SandboxRecordError()`（chainless、payload-free）
    - `serialize_record` 同输入 → 字节级相同
    - `serialize_record` 不同输入 → 字节不同
-   - store `__slots__ == ()`
+   - store `__slots__ == ("_records",)`
    - AST 边界：无 `open/print/breakpoint/exec/eval/compile`、无 network/socket/http 调用
+   - 不新增未被 `test_l6_1_red_no_settings_env_network_imports` 批准的 import 根
 
 ## 验收标准
 
@@ -93,18 +98,18 @@
 
 ### 独立 CI
 - L6-3 专项测试全部通过
-- L6-1/L6-2 专项 `12 + 16 passed`
+- L6-1/L6-2 专项 `12 + 32 passed`
 - L5-1/2/3/4 回归专项全部通过（`14/18/84/60`）
 - Safety `71/3 deselected`、privacy `76`、L0 `131`、Ruff/mypy/lock 全通过
-- 校准全量 `1813 passed, 366 deselected`（或当前基线等价）
+- 校准全量 `1829 passed, 366 deselected`（或当前基线等价）
 - scope/tracked/diff/exact/clean 全通过
 
 ### PM 探针
 - 五项定向探针：
-  1. 幂等 put（同 record 重复）→ 不报错、版本不变
+  1. 幂等 put（同 record 重复）→ 不报错、存储内容不变
   2. 篡改后同 record_id put → 固定拒绝
   3. get 命中 → 返回原 record
-  4. get miss → 固定失败（chainless、payload-free）
+  4. get miss → `SandboxRecordError`（chainless、payload-free）
   5. `serialize_record` 同输入 → 字节级相同
 
 ## 停止条件
@@ -126,3 +131,18 @@
 - L6-3 完成后由 PM 另行发布 L6-4
 - 真实临床、患者服务、公开生产继续 NO-GO
 - G1～G6、EXT-001、EXT-002 继续 `deferred_for_clinical_use`
+
+## 与 L6-1/L6-2 的设计一致性
+
+1. **`serialize_record` 的 canonical JSON 格式**：
+   - 必须与 L6-1 的 `_record_id` 内部 `_digest` 使用相同的 canonical 序列化（即 `canonical_review_bytes(record.model_dump(mode="json"))`，`sort_keys=True`）
+   - 确保同一 record 的 `serialize_record` 输出与 L6-1 record_id 派生时的字节摘要一致
+
+2. **`SandboxRecordError` 复用**：
+   - Store 的所有固定拒绝路径直接复用已有的 `SandboxRecordError`（已在 L6-1 中定义）
+   - 不新增异常类型，保持 chainless、payload-free
+
+3. **Store 与 Verifier 的关系**：
+   - Store 只做持久化语义，不做字段一致性校验
+   - 调用方自行决定是否在 put 前调用 verifier 校验 record
+   - Store 不引用 `SandboxRecordConsistencyVerifier`
