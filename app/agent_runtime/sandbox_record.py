@@ -389,3 +389,46 @@ def _revision_id(revision_ref: str) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(canonical_review_bytes(value)).hexdigest()
+
+
+class SandboxRecordStore:
+    """Deterministic in-memory store for sandbox medical records.
+
+    Idempotent put, fixed rejection on tampered record_id, slot-only state.
+    """
+
+    __slots__ = ("_records",)
+
+    def __init__(self) -> None:
+        self._records: dict[str, SandboxMedicalRecordData] = {}
+
+    def put(self, record: SandboxMedicalRecordData) -> None:
+        """Store a record, idempotent for the same record.
+
+        Raises ``SandboxRecordError`` when a record with the same
+        ``record_id`` but differing fields is already stored.
+        """
+        existing = self._records.get(record.record_id)
+        if existing is None:
+            self._records[record.record_id] = record
+        elif existing != record:
+            raise SandboxRecordError()
+
+    def get(self, record_id: str) -> SandboxMedicalRecordData:
+        """Retrieve a record by its ``record_id``.
+
+        Raises ``SandboxRecordError`` when no record is found.
+        """
+        existing = self._records.get(record_id)
+        if existing is None:
+            raise SandboxRecordError()
+        return existing
+
+
+def serialize_record(record: SandboxMedicalRecordData) -> bytes:
+    """Serialize a record to canonical JSON bytes.
+
+    Deterministic — same record always produces identical bytes.
+    Uses the same canonical serialization as L6-1 ``_record_id``.
+    """
+    return canonical_review_bytes(record.model_dump(mode="json"))
