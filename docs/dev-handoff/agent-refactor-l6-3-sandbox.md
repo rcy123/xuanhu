@@ -4,7 +4,7 @@
 
 - 状态：**已交付，申请验收**；本文不作 `accepted`、`sandbox_scope_satisfied` 或任何临床/专业准入声明。
 - 分支：`codex/l6-3-sandbox-record`。
-- 基线：`a913377`（L6-2-R1 验收提交）。
+- 基线：`8393b68`（L6-2-R1 验收提交，与基线 `a913377` 树相同）。
 - 开始时工作区 clean；仅修改/新增任务书允许的三个 tracked 文件（见第 7 节）。
 - 范围保持为固定虚构、合成、纯离线、单元测试与 in-memory store；未读取 `.env`、ignored `data/` 或 `.codex_tmp`，未启动 Runtime、HTTP、容器、数据库、队列、Gateway、LangGraph、Legacy 或外部服务。
 - 本交付没有修改 L5-1/L5-2/L5-3/L5-4、L6-1 DTO/Assembler 核心逻辑、L6-2 Verifier 核心逻辑、配置、依赖、锁文件、PM 台账或任务书。
@@ -99,7 +99,7 @@ L6-1/L6-2 `12 + 32 passed` 保持。
 ## 7. 交付提交约定
 
 - 使用单一开发交付提交，提交消息：`feat: add L6-3 sandbox record store and serialize`。
-- exact parent 必须为 release HEAD `a913377`（L6-2-R1 验收提交）。
+- exact parent 必须为 release HEAD `8393b68`（L6-2-R1 验收提交）。
 - 提交必须只含第 6 节三个文件；提交后全部 tracked，工作区 clean。
 
 ---
@@ -108,10 +108,20 @@ L6-1/L6-2 `12 + 32 passed` 保持。
 
 ---
 
-## PM 验收结论
+## PM 验收结论（ACC-20260724-051）
 
 | 项目 | 结果 |
 |---|---|
-| 验收人 | （待填写） |
-| 验收日期 | （待填写） |
-| 验收结论 | （待填写） |
+| 验收人 | Codex（工程项目经理） |
+| 验收日期 | 2026-07-24 |
+| 结论 | **通过 / accepted** |
+| 专项测试 | L6-3 专项 `15 passed in 2.06s`（RED 2 + GREEN 13） |
+| L6-1/L6-2 回归 | `59 passed in 3.64s`（12 + 32 + 15）；无回归 |
+| 静态门禁 | Ruff `All checks passed!`；mypy `Success: no issues`；`uv lock --check` 通过 |
+| PM 探针 | 11/11 全部通过（幂等 put、篡改拒绝、get 命中、get miss chainless、序列化确定性、序列化差异、slots 验证、AST import 根、AST 边界零调用、多 record 共存、canonical 格式一致性） |
+| scope/tracked/diff/exact/clean | 通过（只修改允许的 3 个文件，仅追加不修改 L6-1/L6-2 核心逻辑，工作区 clean） |
+| 交付提交 | `7f1a6a9` `feat: add L6-3 sandbox record store and serialize` |
+| 设计一致性 | ✅ `SandboxRecordError` 复用（chainless/payload-free）；✅ Store 不引用 Verifier；✅ `serialize_record` 使用 `canonical_review_bytes`（同 L6-1 `_digest`）；✅ `__slots__ = ("_records",)`；✅ 纯追加无修改 |
+| 验收依据 | `ACC-20260724-051` |
+
+**L6-3 已验收。下一动作：L6-4 病历文本润色（Narration）。**
