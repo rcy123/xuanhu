@@ -432,3 +432,48 @@ def serialize_record(record: SandboxMedicalRecordData) -> bytes:
     Uses the same canonical serialization as L6-1 ``_record_id``.
     """
     return canonical_review_bytes(record.model_dump(mode="json"))
+
+
+class SandboxRecordNarration:
+    """Deterministic, template-based narration for sandbox medical records.
+
+    Translates a structured ``SandboxMedicalRecordData`` into a fixed-format
+    human-readable string.  No LLM calls, no randomness, no side effects.
+    """
+
+    __slots__ = ()
+
+    @staticmethod
+    def narrate(record: SandboxMedicalRecordData) -> str:
+        """Produce a deterministic text narration from a medical record.
+
+        Returns a fixed-format string containing all key fields.
+        The same record always produces identical output — no randomness,
+        no model calls, no external input.
+        """
+        parts: list[str] = [
+            "Sandbox Medical Record Narration",
+            "=" * 50,
+            f"Record ID:       {record.record_id}",
+            f"Session ID:      {record.session_id}",
+            f"Revision ID:     {record.revision_id}",
+            f"Assembled At:    {record.assembled_at}",
+            f"Record Version:  {record.record_version}",
+            f"Disclaimer:      {record.disclaimer}",
+            "",
+            "Reviewed Formula Items:",
+        ]
+        for item in record.reviewed_formula:
+            parts.append(
+                f"  - Item: {item.get('item_id', '?')}, "
+                f"Component: {item.get('component', '?')}, "
+                f"Amount: {item.get('amount_milliunits', '?')} {item.get('unit', '?')}"
+            )
+        parts.append("")
+        parts.append("Safety Result:")
+        for key, value in record.safety_result.items():
+            parts.append(f"  - {key}: {value}")
+        parts.append("")
+        parts.append(f"Review Confirm Ref: {record.review_confirm_ref}")
+        parts.append("")
+        return "\n".join(parts)
