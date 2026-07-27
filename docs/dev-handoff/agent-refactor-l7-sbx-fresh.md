@@ -248,7 +248,8 @@ L7-PROD、真实 RAG/DB/Runtime/临床/公开用途仍为 **NO-GO**。本实现�
 ## Exact Implementation Commit
 
 ```text
-当前 HEAD: 22e439a docs: publish fresh L7 sandbox evidence task
+实现提交: ca9caa766018541ac60184a9aed524702ca83a8c
+发布基线: 22e439a814442a84f4ca6b244e70a583f7da17a9
 新增文件:
   app/agent_runtime/sandbox_evidence.py
   tests/test_sandbox_evidence_l7.py
@@ -259,3 +260,10 @@ L7-PROD、真实 RAG/DB/Runtime/临床/公开用途仍为 **NO-GO**。本实现�
 > 注：本实现符合 `docs/dev-handoff/agent-refactor-l7-sbx-fresh-task.md` 的全部要求。
 > 停止条件未命中：未修改允许列表外文件，未读取旧 L7/stash/`.env`/真实数据，未引入新依赖，
 > 未使用网络/DB/模型，未引入 L5/L6 回归。
+
+## PM 交付接收（尚未验收）
+
+- 交付已保存为 exact implementation commit `ca9caa7`，进入独立 Review；本段不构成 accepted。
+- PM 独立复跑专项：`76 passed in 6.68s`；定向 Ruff check 与 mypy 通过。
+- PM 定向 format 门禁：`uv run ruff format --check app/agent_runtime/sandbox_evidence.py tests/test_sandbox_evidence_l7.py` 报 `sandbox_evidence.py` 需要重排，开发者 handoff 中“already formatted”的声明未被复现。
+- 初步架构核对待 reviewer 判定：任务合同要求 live bundle registry/authorizer、injected claim verifier 和实例遮蔽 fail-closed；交付类清单与 handoff 已知限制显示这些边界可能未闭合。
