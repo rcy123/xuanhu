@@ -393,3 +393,155 @@ $ uv run pytest -m "not integration" -q
 - `SandboxEvidenceRegistry.recognize` 内嵌 authorizer 调用在 registry 锁下；若 authorizer 慢或有副作用，会阻塞其他 registry 操作
 - `from __future__ import annotations` 使所有注解推迟求值；Protocol 的 `isinstance` 检查只验证方法名，不验证签名
 - 实例方法遮蔽通过 `__slots__` 防御；但 `_verifier` 等 slot 属性值仍可被直接赋值替换（Python 语言特性）
+
+---
+
+## R2 返工交付 — 回调身份/状态漂移密封（2026-07-28）
+
+> **基线**：`9861beb`
+> **R1 硬化 HEAD**：`c57a100`
+> **当前 HEAD**：`9861beb`
+> **R2 硬化基线**：`9861beb` → R2 hardening diff
+> **返工焦点**：回调后 identity/state-drift 密封（slot 属性值替换 + 容器原地篡改的 fail-closed 检测）
+
+### RED 验证记录（144 项测试，16 项硬化测试失败）
+
+在 `9861beb` 生产代码上执行 16 项新增 R2 硬化测试，全部 FAIL（DID NOT RAISE SandboxEvidenceError）：
+
+```text
+$ UV_OFFLINE=1 uv run pytest tests/test_sandbox_evidence_l7.py::TestR2CallbackIdentitySealing tests/test_sandbox_evidence_l7.py::TestR2AuthorizerIdentitySealing -v --tb=line
+======================= 16 failed, 128 passed in 2.00s ========================
+```
+
+| # | 测试 | RED 原因 |
+|---|---|---|
+| 1 | `test_verifier_replaces_verifier_raises` | Verifier 回调替换 `pipeline._verifier` 不被检测 |
+| 2 | `test_verifier_replaces_store_raises` | Verifier 回调替换 `pipeline._store` 不被检测 |
+| 3 | `test_verifier_replaces_registry_raises` | Verifier 回调替换 `pipeline._registry` 不被检测 |
+| 4 | `test_verifier_replaces_lock_raises` | Verifier 回调替换 `pipeline._lock` 不被检测 |
+| 5 | `test_verifier_mutates_store_bundles_raises` | Verifier 回调清空 `store._bundles` 不被检测 |
+| 6 | `test_verifier_replaces_store_registry_authorizer_raises` | Verifier 回调替换 `store._registry._authorizer` 不被检测 |
+| 7 | `test_verifier_mutates_registry_recognized_raises` | Verifier 回调清空 `registry._recognized` 不被检测 |
+| 8 | `test_verifier_mutates_registry_epoch_raises` | Verifier 回调重置 `registry._epoch` 不被检测 |
+| 9 | `test_verifier_mutates_registry_reauthorizable_raises` | Verifier 回调清空 `registry._reauthorizable` 不被检测 |
+| 10 | `test_verify_claims_replaces_verifier_raises` | `verify_claims` 路径下 verifier 回调替换 `_verifier` 不被检测 |
+| 11 | `test_authorizer_replaces_self_during_add_recognized_raises` | Authorizer 回调替换 `registry._authorizer` 不被检测 |
+| 12 | `test_authorizer_replaces_recognized_during_add_recognized_raises` | Authorizer 回调替换 `registry._recognized` 不被检测 |
+| 13 | `test_authorizer_replaces_lock_during_add_recognized_raises` | Authorizer 回调替换 `registry._lock` 不被检测 |
+| 14 | `test_authorizer_replaces_self_during_reauthorize_raises` | reauthorize 时 authorizer 替换自身不被检测 |
+| 15 | `test_authorizer_replaces_recognized_during_reauthorize_raises` | reauthorize 时 authorizer 替换 `_recognized` 不被检测 |
+| 16 | `test_authorizer_replaces_self_during_recognize_raises` | recognize 时 authorizer 替换自身不被检测 |
+
+### GREEN 验证记录
+
+```text
+$ UV_OFFLINE=1 uv run pytest tests/test_sandbox_evidence_l7.py -q
+============================ 144 passed in 11.83s =============================
+```
+
+76 原始 + 35 项 R1 + 17 项 R1 硬化 + 16 项 R2 硬化测试全部通过。
+
+### 组合门禁
+
+```text
+$ UV_OFFLINE=1 uv run pytest tests/test_l5_authority_rework.py tests/test_sandbox_evidence_l7.py -q
+======================= 212 passed in 12.91s ========================
+```
+
+```text
+$ UV_OFFLINE=1 uv run pytest -m "not integration" -q
+============== 2107 passed, 362 deselected in 118.12s ===============
+```
+
+### 门禁结果汇总
+
+| 门禁 | 结果 |
+|---|---|
+| L7 专项（144 项） | ✅ 144 passed |
+| L5/L6/L7 组合（212 项） | ✅ 212 passed |
+| 非集成全量（2469 项） | ✅ 2107 passed, 362 deselected |
+| scoped ruff check | ✅ All checks passed |
+| scoped ruff format --check | ✅ 2 files already formatted |
+| scoped mypy `app/agent_runtime/sandbox_evidence.py` | ✅ Success |
+| full mypy `app scripts` (160 files) | ✅ Success: no issues found |
+| `uv lock --check` | ✅ Resolved 84 packages |
+| `git diff --check` | ✅ 无空白问题 |
+| `ruff check .`（全仓） | ✅ All checks passed |
+
+### R2 硬化实现清单
+
+| 保护层 | 类 | 方法 |
+|---|---|---|
+| Pre-callback 状态捕获 | `SandboxEvidenceRegistry` | `_capture_callback_context()` — 捕获 lock/authorizer/recognized/reauthorizable/epoch 的 `id` 和 len |
+| Post-callback 验证 | `SandboxEvidenceRegistry` | `_verify_callback_context(ctx)` — 验证所有 slot 身份的 `is` 一致性、容器 len、epoch 值；失配则恢复安全不变量并 raise |
+| Authorizer 回调保护 | `recognize()` | capture → callback → verify |
+| Authorizer 回调保护 | `add_recognized()` | capture → callback → verify (before state mutation) |
+| Authorizer 回调保护 | `reauthorize()` | capture → callback → verify (before state mutation) |
+| Pre-callback 状态捕获 | `SandboxEvidenceStore` | `_capture_callback_context()` — 捕获 lock/registry/bundles/len/sealed/reentry，递归捕获 registry 上下文 |
+| Post-callback 验证 | `SandboxEvidenceStore` | `_verify_callback_context(ctx)` — 验证 slot 身份、bundles len、状态值；递归验证 registry |
+| Pre-callback 状态捕获 | `EvidencePipeline` | `_capture_callback_context()` — 捕获 store/verifier/registry/lock/reentry + 递归 store/registry 上下文 |
+| Post-callback 验证 | `EvidencePipeline` | `_verify_callback_context(ctx)` — 验证 pipeline slot 身份 + 递归 store/registry 验证 |
+| Verifier 回调保护 | `pipeline.run()` RAG 路径 | capture → callback → verify（try/finally reentry 保护区内） |
+| Verifier 回调保护 | `pipeline.run()` no-RAG 路径 | capture → callback → verify（`with self._lock` 内） |
+| Verifier 回调保护 | `pipeline.verify_claims()` | capture → callback → verify |
+| 容器原地篡改检测 | store._bundles / registry._recognized / reauthorizable | 捕获 `len()` 前后比较 |
+
+### R2 防御设计
+
+每个 untrusted 回调（authorizer 和 verifier）的调用处，现在都遵循固定模式：
+
+```python
+# Capture — 快照所有关键引用和状态的 is 身份 + len + epoch
+_ctx = self._capture_callback_context()
+# Invoke — 执行 untrusted 回调
+result = self._authorizer.authorize(bundle_digest=bundle_digest)
+# Verify — 回调后验证身份/状态未漂移；失配则恢复并 raise fail-closed
+self._verify_callback_context(_ctx)
+```
+
+上下文捕获是**递归**的：Pipeline 捕获 → Store 捕获 → Registry 捕获。验证同理。确保回调无法通过任何引用链替换保护对象。
+
+失配时的恢复行为：
+- `_lock`：替换 → 恢复为原始 lock 再 raise（避免用 attacker 提供的锁）
+- `_authorizer`：替换 → 恢复为原始 authorizer 再 raise
+- `_recognized`/`_reauthorizable`/`_bundles`：替换 → 恢复为原始容器再 raise
+- `_epoch`：篡改 → 恢复原始 epoch 值再 raise
+- 容器 len 变化（原地 clear）：直接 raise（无法恢复已丢失的条目，但 seal 阻止进一步操作）
+
+### 已验证的威胁面
+
+| 攻击向量 | 密封机制 |
+|---|---|
+| Verifier 回调替换 `pipeline._verifier` | Pipeline 级 slot `is` 检查 |
+| Verifier 回调替换 `pipeline._store` | Pipeline 级 slot `is` 检查 |
+| Verifier 回调替换 `pipeline._registry` | Pipeline 级 slot `is` 检查 |
+| Verifier 回调替换 `pipeline._lock` | Pipeline 级 slot `is` 检查 + 恢复 |
+| Verifier 回调原地 clear `store._bundles` | Store 级 `len` 检查 |
+| Verifier 回调替换 `store._registry._authorizer` | Store 递归 Registry 的 `is` 检查 |
+| Verifier 回调原地 clear `registry._recognized` | Registry 级 `len` 检查 |
+| Verifier 回调原地 clear `registry._reauthorizable` | Registry 级 `len` 检查 |
+| Verifier 回调重置 `registry._epoch` | Registry 级 `==` 值检查 |
+| Authorizer 回调替换 `registry._authorizer` | Registry 级 `is` 检查 + 恢复 |
+| Authorizer 回调替换 `registry._recognized` | Registry 级 `is` 检查 + 恢复 |
+| Authorizer 回调替换 `registry._lock` | Registry 级 `is` 检查 + 恢复 |
+
+### 残余风险
+
+- `_reentry_guard` 在 `SandboxEvidenceStore` 和 `EvidencePipeline` 中独立管理；若需要跨实例共享重入检测需未来扩展
+- `SandboxEvidenceRegistry.recognize` 内嵌 authorizer 调用在 registry 锁下；若 authorizer 慢或有副作用，会阻塞其他 registry 操作
+- `from __future__ import annotations` 使所有注解推迟求值；Protocol 的 `isinstance` 检查只验证方法名，不验证签名
+- **已缓解**：R1 标记的 slot 属性替换风险（`_verifier` 等）现在由 R2 的 pre/post callback 身份捕获/验证覆盖。回调后第一时间检查所有关键 slot 的身份，失配即 fail-closed。
+- 双向交叉引用（pipeline.store.registry 引用链）在同一模块内静态构建；不受保护。但 `_capture`/`_verify` 递归覆盖整个引用链。
+
+### 停止条件检查
+
+- ✅ 仅修改 allowlist 内 2 个文件（`sandbox_evidence.py` + `test_sandbox_evidence_l7.py`）
+- ✅ RED-first：16 项测试在 `9861beb` 上全部 FAIL（DID NOT RAISE）
+- ✅ GREEN 实现后全部 144 项测试 PASS（76 原始 + 35 R1 + 17 R1 硬化 + 16 R2）
+- ✅ 回调真实执行断言（每个测试使用 `threading.Event` 验证）
+- ✅ 失配时 fail-closed 使用 `SANDBOX_EVIDENCE_INTEGRITY_FAILURE`
+- ✅ 失配时恢复安全不变量（锁、authorizer、容器引用）
+- ✅ 无网络/DB/模型/真实数据/`.env`/stash/`.claude/` 访问
+- ✅ 无死锁、无限递归或 matcher/例外表扩张
+- ✅ 未修改 PM/task 记录、其他源码、配置、依赖或 lockfile
+- ✅ 未提交（仅工作树变更）

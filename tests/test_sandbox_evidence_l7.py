@@ -2867,3 +2867,618 @@ class TestR1HardeningPipelineVerifier:
         reg.revoke(bundle.bundle_digest)
 
         assert store.get(bundle.bundle_digest) is None
+
+
+# ===================================================================
+# 16. R2 Hardening — callback identity/state-drift sealing (RED)
+# ===================================================================
+
+
+@pytest.fixture
+def _r2_invoked_flag() -> threading.Event:
+    """Fixture providing a fresh threading.Event for R2 callback-verification tests."""
+    return threading.Event()
+
+
+class TestR2CallbackIdentitySealing:
+    """P0: Verifier callback identity/state-drift sealing in pipeline.run().
+
+    An untrusted verifier callback captured in pipeline.run()'s reentry-guard
+    section must not be able to silently replace pipeline internal references
+    (self._store, self._verifier, self._registry, self._lock) or directly
+    mutate protected containers (store._bundles, registry._recognized,
+    registry._reauthorizable, registry._epoch).
+
+    After the callback returns, pipeline.run() MUST verify that all critical
+    identities and protected state are unchanged.  On any mismatch it MUST
+    raise SandboxEvidenceError(code='SANDBOX_EVIDENCE_INTEGRITY_FAILURE').
+
+    Every test in this class asserts:
+      1. The callback actually executed (Event/counter is set).
+      2. pipeline.run() fails closed with SandboxEvidenceError.
+      3. The error code is SANDBOX_EVIDENCE_INTEGRITY_FAILURE (sealing
+         check), *not* an exception from the callback itself.
+    """
+
+    # -- helpers ---------------------------------------------------------------
+
+    _TAG = "TestR2CallbackIdentitySealing"
+
+    @staticmethod
+    def _make_store_and_registry() -> tuple:
+        """Build a permissive store+registry pair for R2 pipeline tests."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        reg = RegistryCls(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        return store, reg
+
+    # -- Pipeline-level slot replacement tests --------------------------------
+
+    def test_verifier_replaces_verifier_raises(self) -> None:
+        """Verifier callback replacing pipeline._verifier must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Replace pipeline._verifier with a different object
+                pipeline._verifier = m.CitationVerifier()  # type: ignore[method-assign]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_replaces_store_raises(self) -> None:
+        """Verifier callback replacing pipeline._store must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+        # Second store to use as the replacement
+        store2, _ = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                pipeline._store = store2  # type: ignore[method-assign]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_replaces_registry_raises(self) -> None:
+        """Verifier callback replacing pipeline._registry must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+        reg2 = RegistryCls(authorizer=_PermissiveAuthorizer())  # replacement
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                pipeline._registry = reg2  # type: ignore[method-assign]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_replaces_lock_raises(self) -> None:
+        """Verifier callback replacing pipeline._lock must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                pipeline._lock = threading.RLock()  # type: ignore[method-assign]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    # -- Store-level container mutation tests ---------------------------------
+
+    def test_verifier_mutates_store_bundles_raises(self) -> None:
+        """Verifier callback clearing store._bundles must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Directly clear the internal bundles dict
+                store._bundles.clear()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    # -- Registry-level slot replacement tests (via store reference) ----------
+
+    def test_verifier_replaces_store_registry_authorizer_raises(self) -> None:
+        """Verifier callback replacing store._registry._authorizer must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Replace the registry's authorizer via store reference
+                store.registry._authorizer = _DenyingAuthorizer()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_mutates_registry_recognized_raises(self) -> None:
+        """Verifier callback clearing registry._recognized must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Clear the registry's recognized set via store reference
+                store.registry._recognized.clear()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_mutates_registry_epoch_raises(self) -> None:
+        """Verifier callback resetting registry._epoch must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Reset epoch to 0 — revert the monotonic counter
+                store.registry._epoch = 0
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    def test_verifier_mutates_registry_reauthorizable_raises(self) -> None:
+        """Verifier callback clearing registry._reauthorizable must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                # Clear the reauthorizable set via store reference
+                store.registry._reauthorizable.clear()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="fatigue",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+    # -- verify_claims path protection ----------------------------------------
+
+    def test_verify_claims_replaces_verifier_raises(self) -> None:
+        """Verifier callback in verify_claims replacing pipeline._verifier must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _EvilVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                pipeline._verifier = m.CitationVerifier()  # type: ignore[method-assign]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_EvilVerifier(),
+        )
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.verify_claims(
+                agent_kind=AgentKind.SYNDROME,
+                claims=(),
+                links=(),
+                fallback=FallbackPolicy.RAG_SUPPORTED,
+            )
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: verifier callback was not invoked"
+
+
+class TestR2AuthorizerIdentitySealing:
+    """P0: Authorizer callback identity/state-drift sealing in registry ops.
+
+    An untrusted authorizer callback invoked during SandboxEvidenceRegistry
+    operations (recognize, add_recognized, reauthorize) must not be able to
+    silently replace registry internal references (self._authorizer,
+    self._recognized, self._reauthorizable, self._lock) or directly mutate
+    protected state (epoch, recognized set, reauthorizable set).
+
+    Every test in this class asserts:
+      1. The callback actually executed (Event/counter is set).
+      2. The registry operation fails closed with SandboxEvidenceError.
+      3. The error code is SANDBOX_EVIDENCE_INTEGRITY_FAILURE, *not* an
+         exception from the callback itself.
+    """
+
+    _TAG = "TestR2AuthorizerIdentitySealing"
+
+    # -- add_recognized callback protection -----------------------------------
+
+    def test_authorizer_replaces_self_during_add_recognized_raises(self) -> None:
+        """Authorizer callback replacing registry._authorizer during add_recognized must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+
+        class _EvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._authorizer = _PermissiveAuthorizer()
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())  # type: ignore[call-arg]
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("a" * 64)
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+    def test_authorizer_replaces_recognized_during_add_recognized_raises(self) -> None:
+        """Authorizer callback replacing registry._recognized during add_recognized must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+
+        class _EvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._recognized = {}  # type: ignore[method-assign]
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())  # type: ignore[call-arg]
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("a" * 64)
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+    def test_authorizer_replaces_lock_during_add_recognized_raises(self) -> None:
+        """Authorizer callback replacing registry._lock during add_recognized must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+
+        class _EvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._lock = threading.RLock()  # type: ignore[method-assign]
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())  # type: ignore[call-arg]
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("a" * 64)
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+    # -- reauthorize callback protection --------------------------------------
+
+    def test_authorizer_replaces_self_during_reauthorize_raises(self) -> None:
+        """Authorizer callback replacing registry._authorizer during reauthorize must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        digest = "a" * 64
+        # Use a call-count-based authorizer so replacement only happens on reauthorize
+        auth_state = {"calls": 0}
+
+        class _StatefulEvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                auth_state["calls"] += 1
+                if auth_state["calls"] == 2:  # second call = during reauthorize
+                    invoked.set()
+                    reg._authorizer = _DenyingAuthorizer()
+                return True
+
+        reg = RegistryCls(authorizer=_StatefulEvilAuthorizer())  # type: ignore[call-arg]
+        reg.add_recognized(digest)  # call 1: passes normally
+        reg.revoke(digest)
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize(digest)  # call 2: replaces _authorizer → caught
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+    def test_authorizer_replaces_recognized_during_reauthorize_raises(self) -> None:
+        """Authorizer callback replacing registry._recognized during reauthorize must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        digest = "a" * 64
+        auth_state = {"calls": 0}
+
+        class _StatefulEvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                auth_state["calls"] += 1
+                if auth_state["calls"] == 2:  # second call = during reauthorize
+                    invoked.set()
+                    reg._recognized = {}  # type: ignore[method-assign]
+                return True
+
+        reg = RegistryCls(authorizer=_StatefulEvilAuthorizer())  # type: ignore[call-arg]
+        reg.add_recognized(digest)  # call 1: passes normally
+        reg.revoke(digest)
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize(digest)  # call 2: replaces _recognized → caught
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+    # -- recognize callback protection ----------------------------------------
+
+    def test_authorizer_replaces_self_during_recognize_raises(self) -> None:
+        """Authorizer callback replacing registry._authorizer during recognize must fail closed."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+
+        invoked = threading.Event()
+        digest = "a" * 64
+        auth_state = {"calls": 0}
+
+        class _StatefulEvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                auth_state["calls"] += 1
+                if auth_state["calls"] == 2:  # second call = during recognize()
+                    invoked.set()
+                    reg._authorizer = _DenyingAuthorizer()
+                return True
+
+        reg = RegistryCls(authorizer=_StatefulEvilAuthorizer())  # type: ignore[call-arg]
+        reg.add_recognized(digest)  # call 1: passes normally
+
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.recognize(digest)  # call 2: replaces _authorizer → caught
+
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE", (
+            f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
+        )
+        assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"

@@ -693,6 +693,46 @@ class SandboxEvidenceRegistry:
         self._authorizer = authorizer
         self._reentry_guard = 0
 
+    # -- Callback identity/state-drift sealing ---------------------------------
+
+    def _capture_callback_context(self) -> dict[str, Any]:
+        """Capture identity/state snapshot before an untrusted authorizer callback."""
+        return {
+            "lock": self._lock,
+            "authorizer": self._authorizer,
+            "recognized": self._recognized,
+            "recognized_len": len(self._recognized),
+            "reauthorizable": self._reauthorizable,
+            "reauthorizable_len": len(self._reauthorizable),
+            "epoch": self._epoch,
+        }
+
+    def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
+        """Verify post-callback state matches pre-callback snapshot.
+
+        On identity or state mismatch, restore safe invariants where possible
+        and raise fail-closed with ``SandboxEvidenceError``.
+        """
+        if self._lock is not ctx["lock"]:
+            self._lock = ctx["lock"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._authorizer is not ctx["authorizer"]:
+            self._authorizer = ctx["authorizer"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._recognized is not ctx["recognized"]:
+            self._recognized = ctx["recognized"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if len(self._recognized) != ctx["recognized_len"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._reauthorizable is not ctx["reauthorizable"]:
+            self._reauthorizable = ctx["reauthorizable"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if len(self._reauthorizable) != ctx["reauthorizable_len"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._epoch != ctx["epoch"]:
+            self._epoch = ctx["epoch"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+
     @property
     def epoch(self) -> int:
         """Current monotonic epoch — increments on each state change."""
@@ -708,7 +748,10 @@ class SandboxEvidenceRegistry:
         SandboxEvidenceError.
         """
         with self._lock:
-            if not self._authorizer.authorize(bundle_digest=bundle_digest):
+            ctx = self._capture_callback_context()
+            auth_result = self._authorizer.authorize(bundle_digest=bundle_digest)
+            self._verify_callback_context(ctx)
+            if not auth_result:
                 return False
             return bundle_digest in self._recognized
 
@@ -720,8 +763,10 @@ class SandboxEvidenceRegistry:
         The epoch is incremented on each successful state change.
         """
         with self._lock:
+            ctx = self._capture_callback_context()
             if not self._authorizer.authorize(bundle_digest=bundle_digest):
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
+            self._verify_callback_context(ctx)
             self._epoch += 1
             self._recognized[bundle_digest] = self._epoch
             self._reauthorizable.add(bundle_digest)
@@ -751,8 +796,10 @@ class SandboxEvidenceRegistry:
                 return False
             if bundle_digest not in self._reauthorizable:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
+            ctx = self._capture_callback_context()
             if not self._authorizer.authorize(bundle_digest=bundle_digest):
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
+            self._verify_callback_context(ctx)
             self._epoch += 1
             self._recognized[bundle_digest] = self._epoch
             return True
@@ -888,6 +935,50 @@ class SandboxEvidenceStore:
     def registry(self) -> SandboxEvidenceRegistry:
         """Expose the injected registry."""
         return self._registry
+
+    # -- Callback identity/state-drift sealing ---------------------------------
+
+    def _capture_callback_context(self) -> dict[str, Any]:
+        """Capture identity/state snapshot for pipeline-level callback sealing."""
+        ctx: dict[str, Any] = {
+            "lock": self._lock,
+            "registry": self._registry,
+            "bundles": self._bundles,
+            "bundles_len": len(self._bundles),
+            "sealed": self._sealed,
+            "reentry_guard": self._reentry_guard,
+        }
+        if self._registry is not None:
+            ctx["registry_ctx"] = self._registry._capture_callback_context()
+        return ctx
+
+    def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
+        """Verify post-callback state matches pre-callback snapshot.
+
+        On identity or state drift, restore safe invariants where possible
+        and raise fail-closed with ``SandboxEvidenceError``.
+        """
+        if self._lock is not ctx["lock"]:
+            self._lock = ctx["lock"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._registry is not ctx["registry"]:
+            self._registry = ctx["registry"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._bundles is not ctx["bundles"]:
+            self._bundles = ctx["bundles"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if len(self._bundles) != ctx["bundles_len"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._sealed != ctx["sealed"]:
+            self._sealed = ctx["sealed"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._reentry_guard != ctx["reentry_guard"]:
+            self._reentry_guard = ctx["reentry_guard"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._registry is not None:
+            reg_ctx = ctx.get("registry_ctx")
+            if reg_ctx is not None:
+                self._registry._verify_callback_context(reg_ctx)
 
     def put(self, bundle: SandboxEvidenceBundleV1) -> None:
         """Store a bundle idempotently.
@@ -1090,6 +1181,48 @@ class EvidencePipeline:
         """Resolve the effective registry — pipeline-level or store-level."""
         return self._registry if self._registry is not None else self._store.registry
 
+    # -- Callback identity/state-drift sealing ---------------------------------
+
+    def _capture_callback_context(self) -> dict[str, Any]:
+        """Capture identity/state snapshot before an untrusted verifier callback."""
+        ctx: dict[str, Any] = {
+            "store": self._store,
+            "verifier": self._verifier,
+            "registry": self._registry,
+            "lock": self._lock,
+            "reentry_guard": self._reentry_guard,
+        }
+        # Capture store and registry internals for deep state-drift detection
+        try:
+            store_ctx = self._store._capture_callback_context()
+            ctx["store_ctx"] = store_ctx
+        except AttributeError:
+            pass
+        return ctx
+
+    def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
+        """Verify post-callback state matches pre-callback snapshot.
+
+        On identity or state mismatch, restore safe invariants where possible
+        and raise fail-closed with ``SandboxEvidenceError``.
+        """
+        if self._store is not ctx["store"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._verifier is not ctx["verifier"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._registry is not ctx["registry"]:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._lock is not ctx["lock"]:
+            self._lock = ctx["lock"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        if self._reentry_guard != ctx["reentry_guard"]:
+            self._reentry_guard = ctx["reentry_guard"]
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        # Delegate to store-level verification
+        store_ctx = ctx.get("store_ctx")
+        if store_ctx is not None:
+            self._store._verify_callback_context(store_ctx)
+
     def run(
         self,
         *,
@@ -1115,6 +1248,7 @@ class EvidencePipeline:
 
         if fallback is FallbackPolicy.MODEL_KNOWLEDGE_ONLY:
             with self._lock:
+                _ctx = self._capture_callback_context()
                 result = self._verifier.verify(
                     agent_kind=agent_kind,
                     bundles={},
@@ -1122,6 +1256,7 @@ class EvidencePipeline:
                     links=(),
                     fallback=fallback,
                 )
+                self._verify_callback_context(_ctx)
             return EvidencePipelineResult(
                 result=result,
                 fallback=fallback,
@@ -1157,6 +1292,8 @@ class EvidencePipeline:
             # verifier callback from replacing store references)
             bundle_map: dict[str, SandboxEvidenceBundleV1] = {b.bundle_digest: b for b in retrieval_result.bundles}
 
+            # Capture pre-callback state for identity/state-drift sealing
+            _ctx = self._capture_callback_context()
             # Verify — now under reentry guard so reentrant pipeline.run
             # during verifier callback is detected and rejected.
             verifier_result = self._verifier.verify(
@@ -1166,6 +1303,8 @@ class EvidencePipeline:
                 links=(),
                 fallback=fallback,
             )
+            # Verify identity/state unchanged after untrusted callback
+            self._verify_callback_context(_ctx)
         finally:
             self._reentry_guard -= 1
 
@@ -1225,10 +1364,15 @@ class EvidencePipeline:
                 if cached is not None:
                     bundle_map[link.bundle_digest] = cached
 
-        return self._verifier.verify(
+        # Capture pre-callback state for identity/state-drift sealing
+        _ctx = self._capture_callback_context()
+        result = self._verifier.verify(
             agent_kind=agent_kind,
             bundles=bundle_map,
             claims=claims,
             links=links,
             fallback=fallback,
         )
+        # Verify identity/state unchanged after untrusted callback
+        self._verify_callback_context(_ctx)
+        return result
