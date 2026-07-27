@@ -18,10 +18,10 @@
 
 ## 当前任务
 
-L5-SBX、L6-SBX 已在 `45acf54` 完成权限与记录边界收敛并重新验收；旧 L7 已由 `21004b9` 全量撤回。唯一下一动作是从 `45acf54` 重新发布 L7-SBX bounded task；L5/L6/L7 产品轨道继续 NO-GO。
+L5-SBX、L6-SBX 已在 `e8e0973` 完成实时撤权、sealed state 与记录边界 R2 收敛，并由 `ACC-20260727-058` 重新验收；旧 L7 已由 `21004b9` 全量撤回。唯一下一动作是从 `e8e0973` 重新发布 L7-SBX bounded task；L5/L6/L7 产品轨道继续 NO-GO。
 
 当前权威状态：[00-当前状态.md](项目管理/00-当前状态.md)
-本轮交付：[agent-refactor-l5-l6-authority-convergence-rework-1.md](../dev-handoff/agent-refactor-l5-l6-authority-convergence-rework-1.md)
+本轮交付：[agent-refactor-l6-authority-revocation-rework-2.md](../dev-handoff/agent-refactor-l6-authority-revocation-rework-2.md)
 
 ## 历史流水
 

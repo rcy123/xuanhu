@@ -901,8 +901,8 @@ npm run build
 
 本节只覆盖当前完成状态，不改写上述目标路线和产品完成定义。
 
-- L5-SBX、L6-SBX：`45acf54` 的 offline/fixed-synthetic/in-memory reference composition 已由 `ACC-20260727-056` 重新验收。它证明权限重放、review/recheck、v2 record、canonical in-memory persistence 和 deterministic narration 的参考合同，不代表应用已接线。
+- L5-SBX、L6-SBX：`ACC-20260727-056` / `45acf54` 曾完成第一轮重新验收，后因实时撤权缺口由 `ACC-20260727-057` 追加式重新打开；当前以 `e8e0973` / `ACC-20260727-058` 的 offline/fixed-synthetic/in-memory reference composition 为准。它证明权限重放、实时 authorizer、sealed review/recheck、active v2 record projection、canonical in-memory persistence 和 deterministic narration 的参考合同，不代表应用已接线。
 - L5-PROD、L6-PROD：未完成。Doctor Review 硬 Gate、narration 后 verifier/allowlist agent、产品 RecordSubgraph/API、数据库幂等、`session.done`、no-RAG E2E 和可信 bootstrap 配置仍须另行设计、实现与验收。
-- L7：旧发布 `e8f0666` 与实现 `c5b7152` 已由 `21004b9` 撤回。当前只允许以 `45acf54` 为 clean 基线重新发布 L7-SBX；L7-PROD 不获授权。
+- L7：旧发布 `e8f0666` 与实现 `c5b7152` 已由 `21004b9` 撤回。当前只允许以 `e8e0973` 为 clean 基线重新发布新的 L7-SBX bounded task；L7-PROD 不获授权。
 - 第 15 节所要求的数据库集成门禁仍适用于产品实现。本轮因 `TEST_DATABASE_URL`、`DATABASE_URL` 未配置而未执行 DB integration，因此不得用 SBX 验收替代该门禁。
 - 第 18 节“大修完成定义”保持不变；当前项目尚未达到整体大修完成。
