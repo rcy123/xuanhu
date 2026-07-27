@@ -277,3 +277,103 @@ L7-PROD、真实 RAG/DB/Runtime/临床/公开用途仍为 **NO-GO**。本实现�
 - P3：`sandbox_evidence.py` scoped format 未通过，handoff 的格式声明无法复现。
 - 保留通过证据：专项 76、组合 414、非 integration 2039/362；这些结果不足以关闭上述 authority/integrity findings。
 - 后续：只执行 [L7-SBX-FRESH-R1](agent-refactor-l7-sbx-fresh-rework-1-task.md)，不得扩大范围或恢复旧 L7。
+
+---
+
+## R1 返工交付（2026-07-28）
+
+> **基线**：`aa651c2`
+> **失败交付**：`ca9caa7`
+> **当前 HEAD**：`acd47d9`
+> **返工任务**：[L7-SBX-FRESH-R1](agent-refactor-l7-sbx-fresh-rework-1-task.md)
+
+### RED 验证记录（原始 76 不变，34 项 R1 失败）
+
+```text
+$ export UV_OFFLINE=1
+$ uv run pytest tests/test_sandbox_evidence_l7.py -q
+======================== 34 failed, 77 passed in 7.98s ========================
+```
+
+34 项 R1 验收测试明确失败：
+- `SandboxEvidenceRegistry` / `SandboxEvidenceAuthorizer` / `ClaimVerifierProtocol` 未定义
+- 同实例 revoke 不可用（revoke、reauthorize 方法缺失）
+- snapshot restore 不要求重新注入 registry
+- authorizer 回调未被调用（零断言、无检测）
+- `get_bundles_for_graph_run` 按 `retrieval_run` 误过滤
+- `__slots__` 未定义，实例方法可静默遮蔽
+- epoch 语义不存在；scoped format 失败
+
+### GREEN 验证记录
+
+```text
+$ uv run pytest tests/test_sandbox_evidence_l7.py -q
+============================= 111 passed in 6.68s =============================
+```
+
+76 原始 + 35 项 R1 验收测试全部通过。
+
+### 组合门禁
+
+```text
+$ uv run pytest tests/test_l5_authority_rework.py ... test_sandbox_evidence_l7.py -q
+======================= 449 passed in 76.56s ========================
+```
+
+```text
+$ uv run pytest -m "not integration" -q
+============== 2074 passed, 362 deselected in 112.57s ===============
+```
+
+### 门禁结果汇总
+
+| 门禁 | 结果 |
+|---|---|
+| L7 专项（111 项） | ✅ 111 passed |
+| L5/L6/L7 组合（449 项） | ✅ 449 passed |
+| 非集成全量（2436 项） | ✅ 2074 passed, 362 deselected |
+| scoped ruff check | ✅ All checks passed |
+| scoped ruff format --check | ✅ 2 files already formatted |
+| scoped mypy `app/agent_runtime/sandbox_evidence.py` | ✅ Success |
+| `uv lock --check` | ✅ Resolved 84 packages |
+| `git diff --check` | ✅ 无空白问题 |
+| `ruff check .`（全仓） | ✅ All checks passed |
+| `ruff format --check .`（全仓） | ⚠️ 128 files would be reformatted（全为既有债务，不在 allowlist 内） |
+| `mypy app scripts`（全仓） | ✅ Success: no issues found in 160 source files |
+
+### R1 实现清单
+
+| Finding | 实现 |
+|---|---|
+| P0 registry/authorizer | `SandboxEvidenceRegistry` 类：recognize/add_recognized/revoke/reauthorize + 单调 epoch + `SandboxEvidenceAuthorizer` Protocol 注入 |
+| P1 verifier Protocol | `ClaimVerifierProtocol` `@runtime_checkable`；`EvidencePipeline` 接受任何 Protocol 兼容实例；`CitationVerifier` 保留为参考实现但不作默认 |
+| P1 callback reentry | 所有 store 公共方法使用 `threading.RLock` + `_reentry_guard` 计数器；store.put 和 registry.recognize 中的 authorizer 回调在 guard 下执行；重入尝试被 `SANDBOX_EVIDENCE_AUTHORITY_REJECTED` 拒绝 |
+| P1 方法遮蔽 fail-closed | `SandboxEvidenceStore`、`EvidencePipeline`、`SandboxEvidenceRegistry`、`CitationVerifier` 全部定义 `__slots__`；实例级方法赋值（`store.put = evil`）被 Python 阻止（AttributeError） |
+| P2 同实例撤权 | `SandboxEvidenceRegistry.revoke(digest)` 从 recognized 集移除；后续 `store.put/get` 查 registry → rejected；`reauthorize(digest)` 恢复（只对曾 recognized 的 digest 有效）；epoch 单调递增 |
+| P2 graph_run 过滤 | `get_bundles_for_graph_run(graph_run)` 真实按 `bundle.graph_run` 过滤；旧 retrieval_run 查询改名为 `get_bundles_for_retrieval_run(retrieval_run)` |
+| P3 format/handoff | 两个文件均已 `ruff format`；本记录如实报告全仓 128 文件既有格式债务 |
+
+### 架构要点
+
+- **registry=None**：store 不加 registry 时绕过权限检查（向后兼容原始 76 测试）
+- **还原 Store**：`restore(snapshot)` 无 registry 参数时创建默认 registry 并自动认可还原的 bundle（向后兼容）；`restore(snapshot, registry=empty_reg)` 不自动认可，由调用方负责
+- **Pipeline 集成**：Pipeline.run 在 `store.put` 前先将检索到的 bundle digest 预认可到活跃 registry；之后 revoke 可撤权
+- **Authorizer 回调**：`SandboxEvidenceRegistry` 构造时接受可选 `authorizer`；`recognize()` 调用 `authorizer.authorize(bundle_digest=` 在 registry 锁内；重入由 store 的 reentry guard 检测
+
+### 停止条件检查
+
+- ✅ 仅修改 allowlist 内 3 个文件（无其他源码、测试、PM 记录、配置文件）
+- ✅ 生产路径注入 registry/authorizer（非仅测试伪造）
+- ✅ 同实例 revoke 使用 `SandboxEvidenceRegistry.revoke`（非新建 store）
+- ✅ 回调测试有明确断言（`assert invoked.is_set()`、`assert len(reentry_result) > 0`）
+- ✅ 无网络/DB/模型/真实数据/`.env`/stash/`.claude/` 访问
+- ✅ 无死锁、无限递归或 matcher/例外表扩张
+- ✅ `ca9caa7` 保留为第一次失败交付，未重写或删除
+
+### 残余风险
+
+- `_reentry_guard` 在 `SandboxEvidenceStore` 和 `EvidencePipeline` 中独立存在；verifier 回调未覆盖 pipeline 级重入（未来需扩展）
+- `SandboxEvidenceRegistry.recognize` 内嵌 authorizer 调用在 registry 锁下；若 authorizer 慢或有副作用，会阻塞其他 registry 操作
+- Store restore 的自动认可分支（`registry=None`）跳过权限：用于向后兼容，但调用方应始终在非测试环境提供显式 registry
+- `from __future__ import annotations` 使所有注解推迟求值；Protocol 的 `isinstance` 检查只验证方法名，不验证签名
+

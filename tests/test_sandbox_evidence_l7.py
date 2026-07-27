@@ -71,6 +71,7 @@ def _fake_packet(
     content: str = "Syndrome X is characterized by deficiency.",
     content_digest: str | None = None,
     retrieval_run: str | None = None,
+    graph_run: str = _GRAPH_RUN,
 ) -> SandboxEvidencePacketV1:
     if retrieval_run is None:
         retrieval_run = _RETRIEVAL_RUN
@@ -85,7 +86,7 @@ def _fake_packet(
         content_digest=content_digest,
         retrieval_trace=SandboxRetrievalTraceV1(
             retrieval_run=retrieval_run,
-            graph_run=_GRAPH_RUN,
+            graph_run=graph_run,
             graph_trace=_GRAPH_TRACE,
         ),
     )
@@ -96,9 +97,10 @@ def _fake_bundle(
     query: str = "syndrome basis query",
     retrieval_run: str = _RETRIEVAL_RUN,
     node_name: str = "syndrome_retrieval",
+    graph_run: str = _GRAPH_RUN,
 ) -> SandboxEvidenceBundleV1:
     if packets is None:
-        packets = (_fake_packet(retrieval_run=retrieval_run),)
+        packets = (_fake_packet(retrieval_run=retrieval_run, graph_run=graph_run),)
     content_digest = _text_digest(
         json.dumps(
             [p.model_dump(mode="json") for p in packets],
@@ -112,7 +114,7 @@ def _fake_bundle(
         packets=packets,
         bundle_digest=bundle_digest,
         content_digest=content_digest,
-        graph_run=_GRAPH_RUN,
+        graph_run=graph_run,
         graph_trace=_GRAPH_TRACE,
         retrieval_run=retrieval_run,
         node_name=node_name,
@@ -479,7 +481,7 @@ class TestEvidenceStore:
             packets=(_fake_packet(evidence_id="ev-hidden", retrieval_run="rr-hidden"),),
         )
         store.put(hidden)
-        visible = store.get_bundles_for_graph_run("rr-visible")
+        visible = store.get_bundles_for_retrieval_run("rr-visible")
         assert all(b.retrieval_run == "rr-visible" for b in visible)
 
     def test_snapshot_roundtrip(self) -> None:
@@ -563,8 +565,10 @@ class TestEvidenceStore:
         snap = store.snapshot()
 
         restored = SandboxEvidenceStore.restore(snap)
-        # A new operation on the restored store must not self-authorize
+        # New bundles need explicit authorization after restore
         b2 = _fake_bundle(query="new", retrieval_run="rr-new")
+        if restored.registry is not None:
+            restored.registry.add_recognized(b2.bundle_digest)
         restored.put(b2)
         snap2 = restored.snapshot()
         # Prove snap2 came from explicit put, not from self-recompute
@@ -825,7 +829,7 @@ class TestEvidencePipeline:
         assert len(result.bundles) > 0
         # Verifier returns model_knowledge_only (no claims/links provided)
         # but retrieval happened — bundles were stored
-        stored_bundles = store.get_bundles_for_graph_run(result.bundles[0].retrieval_run)
+        stored_bundles = store.get_bundles_for_retrieval_run(result.bundles[0].retrieval_run)
         assert len(stored_bundles) > 0
         assert all(b.retrieval_run == result.bundles[0].retrieval_run for b in stored_bundles)
 
@@ -1073,12 +1077,11 @@ class TestThreatModel:
         def evil_put(bundle: object) -> None:
             raise RuntimeError("shadowed")
 
-        store.put = evil_put  # type: ignore[method-assign]
-        # The shadowed call raises RuntimeError from the evil function
-        with pytest.raises(RuntimeError):
-            store.put(_fake_bundle())
+        # With __slots__, instance-level method assignment raises AttributeError
+        with pytest.raises(AttributeError):
+            store.put = evil_put  # type: ignore[method-assign]
 
-        # But the store's original data remains intact via get
+        # The store's original data remains intact via get
         assert store.get(bundle.bundle_digest) is not None
 
     def test_authority_replacement_rejected(self) -> None:
@@ -1183,3 +1186,521 @@ class TestFormulaNodeContent:
         assert isinstance(result, SandboxEvidenceResultV1)
         assert len(result.bundles) > 0
         assert all(b.node_name == "formula_retrieval" for b in result.bundles)
+
+
+# ===================================================================
+# 14. R1 Authority & state integrity (ACC-20260727-059 findings)
+# ===================================================================
+
+
+class TestR1RegistryAndAuthorizer:
+    """P0: Live bundle registry and authorizer (finding: production has none)."""
+
+    def test_registry_class_defined(self) -> None:
+        """SandboxEvidenceRegistry must be defined for live authority."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        assert hasattr(m, "SandboxEvidenceRegistry"), "R1 RED: SandboxEvidenceRegistry not defined"
+
+    def test_authorizer_protocol_defined(self) -> None:
+        """SandboxEvidenceAuthorizer Protocol must be defined."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        assert hasattr(m, "SandboxEvidenceAuthorizer"), "R1 RED: SandboxEvidenceAuthorizer not defined"
+
+    def test_registry_accepts_recognize(self) -> None:
+        """Registry.recognize(digest) -> bool must exist."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        assert callable(getattr(reg, "recognize", None)), "R1 RED: registry.recognize not callable"
+
+    def test_registry_accepts_add_recognized(self) -> None:
+        """Registry.add_recognized(digest) must exist."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        assert callable(getattr(reg, "add_recognized", None)), "R1 RED: registry.add_recognized not callable"
+
+    def test_registry_epoch_property(self) -> None:
+        """Registry must expose epoch for monotonic check."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        epoch = getattr(reg, "epoch", None)
+        assert epoch is not None, "R1 RED: registry.epoch not accessible"
+
+    def test_store_accepts_registry_parameter(self) -> None:
+        """SandboxEvidenceStore must accept registry= parameter."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        assert store is not None
+
+
+class TestR1RevokeReauthorize:
+    """P2: Same-instance revoke/reauthorize (finding: new-store faked)."""
+
+    def test_registry_revoke_method(self) -> None:
+        """Registry must have revoke(digest) method."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        assert callable(getattr(reg, "revoke", None)), "R1 RED: registry.revoke not callable"
+
+    def test_registry_reauthorize_method(self) -> None:
+        """Registry must have reauthorize(digest) -> bool method."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        assert callable(getattr(reg, "reauthorize", None)), "R1 RED: registry.reauthorize not callable"
+
+    def test_registry_revoke_removes_recognized(self) -> None:
+        """After revoke, registry.recognize returns False for that digest."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        digest = "a" * 64
+        reg.add_recognized(digest)
+        assert reg.recognize(digest)
+        reg.revoke(digest)
+        assert not reg.recognize(digest)
+
+    def test_revoke_then_store_put_rejected(self) -> None:
+        """After revoke(digest), store.put for same digest must raise."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        assert store.get(bundle.bundle_digest) is not None
+        reg.revoke(bundle.bundle_digest)
+        with pytest.raises(SandboxEvidenceError):
+            store.put(bundle)
+
+    def test_revoke_then_store_get_returns_none(self) -> None:
+        """After revoke, store.get for revoked digest must return None."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        reg.revoke(bundle.bundle_digest)
+        assert store.get(bundle.bundle_digest) is None
+
+    def test_reauthorize_restores_put(self) -> None:
+        """reauthorize after revoke allows store.put to succeed."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        reg.revoke(bundle.bundle_digest)
+        assert reg.reauthorize(bundle.bundle_digest), "reauthorize must return True"
+        store.put(bundle)  # Must succeed
+        assert store.get(bundle.bundle_digest) is not None
+
+    def test_reauthorize_rejected_for_unknown_digest(self) -> None:
+        """reauthorize must fail for digest never recognized."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        unknown = "f" * 64
+        with pytest.raises(SandboxEvidenceError):
+            reg.reauthorize(unknown)
+
+    def test_revoke_before_any_put_is_noop(self) -> None:
+        """Revoking an unrecognized digest does not raise."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        unknown = "e" * 64
+        reg.revoke(unknown)  # Should not raise
+
+
+class TestR1VerifierProtocol:
+    """P1: External snapshot-external verifier Protocol."""
+
+    def test_verifier_protocol_defined(self) -> None:
+        """ClaimVerifierProtocol must be defined."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        assert hasattr(m, "ClaimVerifierProtocol"), "R1 RED: ClaimVerifierProtocol not defined"
+
+    def test_pipeline_verifier_param_accepts_protocol(self) -> None:
+        """Pipeline must accept a Protocol-based verifier."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        VerifierCls = getattr(m, "ClaimVerifierProtocol", None)
+        assert VerifierCls is not None, "R1 RED: ClaimVerifierProtocol not defined"
+        store = SandboxEvidenceStore()
+
+        class _TestVerifier:
+            def verify(self, **kwargs: object) -> object:
+                return m.ClaimVerifierResult.MODEL_KNOWLEDGE_ONLY
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_TestVerifier(),
+        )
+        assert pipeline is not None
+
+    def test_citation_verifier_not_used_as_default(self) -> None:
+        """Pipeline must not set CitationVerifier as default — caller must inject."""
+        import inspect
+
+        sig = inspect.signature(EvidencePipeline.__init__)
+        verifier_param = sig.parameters.get("verifier")
+        assert verifier_param is not None
+        if verifier_param.default is not inspect.Parameter.empty:
+            import app.agent_runtime.sandbox_evidence as m
+
+            assert type(verifier_param.default) is not m.CitationVerifier, "R1: CitationVerifier must not be default"
+
+
+class TestR1CallbacksAndReentry:
+    """P1: Authorizer/verifier callbacks with reentry guard."""
+
+    def test_authorizer_callback_during_put(self) -> None:
+        """Authorizer must be invoked when registry checks during store.put."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+
+        invoked = threading.Event()
+
+        class _TestAuth:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                return True
+
+        reg = RegistryCls(authorizer=_TestAuth())  # type: ignore[call-arg]
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        assert invoked.is_set(), "R1 RED: authorizer was not invoked"
+
+    def test_reentry_during_callback_rejected(self) -> None:
+        """Reentrant store call during authorize callback must raise."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+
+        registry_used = threading.Event()
+        reentry_result: list[Exception | None] = []
+
+        class _ReentrantAuth:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                registry_used.set()
+                try:
+                    store.put(_fake_bundle(query="reentry"))
+                except SandboxEvidenceError as e:
+                    reentry_result.append(e)
+                except Exception as e:
+                    reentry_result.append(e)
+                return True
+
+        reg = RegistryCls(authorizer=_ReentrantAuth())  # type: ignore[call-arg]
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle(query="original")
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        assert registry_used.is_set(), "authorizer was not called"
+        assert len(reentry_result) > 0, "R1 RED: reentry was not detected — no error raised"
+        assert isinstance(reentry_result[0], SandboxEvidenceError), (
+            f"R1 RED: reentry must raise SandboxEvidenceError, got {type(reentry_result[0]).__name__}"
+        )
+
+    def test_verifier_callback_during_pipeline_run(self) -> None:
+        """Verifier must be invoked during pipeline.run RAG path."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        VerifierCls = getattr(m, "ClaimVerifierProtocol", None)
+        assert VerifierCls is not None, "R1 RED: ClaimVerifierProtocol not defined"
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+
+        invoked = threading.Event()
+
+        class _TestVerifier:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_TestVerifier(),
+        )
+        pipeline.run(
+            agent_kind=AgentKind.SYNDROME,
+            query="test",
+            graph_run=_GRAPH_RUN,
+            graph_trace=_GRAPH_TRACE,
+        )
+        assert invoked.is_set(), "R1 RED: verifier was not invoked"
+
+
+class TestR1MethodShadowing:
+    """P1: Instance method shadowing must fail-closed."""
+
+    def test_store_has_slots(self) -> None:
+        """SandboxEvidenceStore must use __slots__ to prevent instance dict."""
+        assert hasattr(SandboxEvidenceStore, "__slots__"), "R1 RED: SandboxEvidenceStore has no __slots__"
+
+    def test_pipeline_has_slots(self) -> None:
+        """EvidencePipeline must use __slots__."""
+        assert hasattr(EvidencePipeline, "__slots__"), "R1 RED: EvidencePipeline has no __slots__"
+
+    def test_store_put_cannot_be_shadowed(self) -> None:
+        """Instance-level store.put = evil must raise AttributeError."""
+        store = SandboxEvidenceStore()
+
+        def evil_put(bundle: object) -> None:
+            raise RuntimeError("shadowed")
+
+        with pytest.raises(AttributeError):
+            store.put = evil_put  # type: ignore[method-assign]
+
+    def test_pipeline_run_cannot_be_shadowed(self) -> None:
+        """Instance-level pipeline.run = evil must raise AttributeError."""
+        store = SandboxEvidenceStore()
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=CitationVerifier(),
+        )
+
+        def evil_run(**kwargs: object) -> object:
+            return None
+
+        with pytest.raises(AttributeError):
+            pipeline.run = evil_run  # type: ignore[method-assign]
+
+    def test_registry_has_slots(self) -> None:
+        """Registry class must prevent instance shadowing via __slots__."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        assert hasattr(RegistryCls, "__slots__"), "R1 RED: SandboxEvidenceRegistry has no __slots__"
+
+
+class TestR1GraphRunFilter:
+    """P2: get_bundles_for_graph_run must filter by bundle.graph_run."""
+
+    def test_get_bundles_for_graph_run_uses_graph_run(self) -> None:
+        """get_bundles_for_graph_run(graph_run) must filter by bundle.graph_run."""
+        store = SandboxEvidenceStore()
+        b1 = _fake_bundle(query="q1", retrieval_run="retrieval-A", graph_run="graph-A")
+        b2 = _fake_bundle(
+            query="q2",
+            retrieval_run="retrieval-B",
+            graph_run="graph-A",
+            packets=(_fake_packet(evidence_id="ev-2", retrieval_run="retrieval-B", graph_run="graph-A"),),
+        )
+        store.put(b1)
+        store.put(b2)
+        result = store.get_bundles_for_graph_run("graph-A")
+        assert len(result) == 2, f"R1 RED: expected 2 bundles for graph-A, got {len(result)}"
+        for b in result:
+            assert b.graph_run == "graph-A", f"R1 RED: bundle has graph_run={b.graph_run}, expected graph-A"
+
+    def test_different_graph_run_no_cross_visibility(self) -> None:
+        """Two different graph runs must not share visible bundles."""
+        store = SandboxEvidenceStore()
+        b1 = _fake_bundle(query="q1", retrieval_run="retrieval-X", graph_run="graph-X")
+        b2 = _fake_bundle(
+            query="q2",
+            retrieval_run="retrieval-Y",
+            graph_run="graph-Y",
+            packets=(_fake_packet(evidence_id="ev-y", retrieval_run="retrieval-Y", graph_run="graph-Y"),),
+        )
+        store.put(b1)
+        store.put(b2)
+        result_x = store.get_bundles_for_graph_run("graph-X")
+        assert len(result_x) == 1
+        assert result_x[0].graph_run == "graph-X"
+        result_y = store.get_bundles_for_graph_run("graph-Y")
+        assert len(result_y) == 1
+        assert result_y[0].graph_run == "graph-Y"
+
+    def test_get_bundles_for_retrieval_run_method_exists(self) -> None:
+        """Retrieval-run query must be available under distinct method name."""
+        assert hasattr(SandboxEvidenceStore, "get_bundles_for_retrieval_run"), (
+            "R1 RED: get_bundles_for_retrieval_run not defined"
+        )
+
+
+class TestR1SnapshotRestoreAuthority:
+    """P1/P2: Restore requires external authority re-injection."""
+
+    def test_restored_store_rejects_put_without_registry(self) -> None:
+        """Restored store with explicit empty registry must reject operations."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        snap = store.snapshot()
+        reg_empty = RegistryCls()  # Explicit empty registry
+        restored = SandboxEvidenceStore.restore(snap, registry=reg_empty)  # type: ignore[call-arg]
+        with pytest.raises(SandboxEvidenceError):
+            restored.put(bundle)
+
+    def test_restore_accepts_registry_parameter(self) -> None:
+        """restore must accept registry= for restored authority."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        bundle = _fake_bundle()
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+        snap = store.snapshot()
+        reg2 = RegistryCls()
+        reg2.add_recognized(bundle.bundle_digest)
+        restored = SandboxEvidenceStore.restore(snap, registry=reg2)  # type: ignore[call-arg]
+        assert restored.get(bundle.bundle_digest) is not None
+
+    def test_new_registry_no_auto_authority(self) -> None:
+        """Restored store with new registry must not auto-recognize."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+        b1 = _fake_bundle(query="q1")
+        reg.add_recognized(b1.bundle_digest)
+        store.put(b1)
+        snap = store.snapshot()
+        reg2 = RegistryCls()
+        restored = SandboxEvidenceStore.restore(snap, registry=reg2)  # type: ignore[call-arg]
+        assert restored.get(b1.bundle_digest) is None, "R1 RED: restored store without authority returns bundle"
+
+
+class TestR1EpochSemantics:
+    """§4: Monotonic epoch guards against replay."""
+
+    def test_epoch_increments_on_add_recognized(self) -> None:
+        """Registry epoch must increment when adding recognized digest."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        e0 = reg.epoch
+        reg.add_recognized("a" * 64)
+        assert reg.epoch > e0, "R1 RED: epoch did not increment on add_recognized"
+
+    def test_epoch_increments_on_revoke(self) -> None:
+        """Registry epoch must increment on revoke."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        reg.add_recognized("a" * 64)
+        e0 = reg.epoch
+        reg.revoke("a" * 64)
+        assert reg.epoch > e0, "R1 RED: epoch did not increment on revoke"
+
+    def test_epoch_increments_on_reauthorize(self) -> None:
+        """Registry epoch must increment on reauthorize."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        reg = RegistryCls()
+        reg.add_recognized("a" * 64)
+        reg.revoke("a" * 64)
+        e0 = reg.epoch
+        reg.reauthorize("a" * 64)
+        assert reg.epoch > e0, "R1 RED: epoch did not increment on reauthorize"
+
+
+class TestR1ExternalAuthorizerPipeline:
+    """P0/P1: Pipeline integration with live registry — revoke enforcement."""
+
+    def test_pipeline_run_with_registry_then_revoke_hides_bundles(self) -> None:
+        """Pipeline.run stores and recognizes bundles; revoke hides them."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None, "R1 RED: SandboxEvidenceRegistry not defined"
+        VerifierCls = getattr(m, "ClaimVerifierProtocol", None)
+        assert VerifierCls is not None, "R1 RED: ClaimVerifierProtocol not defined"
+
+        reg = RegistryCls()
+        store = SandboxEvidenceStore(registry=reg)  # type: ignore[call-arg]
+
+        class _TestVerifier:
+            def verify(self, **kwargs: object) -> object:
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store,
+            syndrome_node=SyndromeRetrievalNode(),
+            formula_node=FormulaRetrievalNode(),
+            verifier=_TestVerifier(),
+        )
+        result = pipeline.run(
+            agent_kind=AgentKind.SYNDROME,
+            query="fatigue",
+            graph_run=_GRAPH_RUN,
+            graph_trace=_GRAPH_TRACE,
+        )
+        # Bundles should be stored AND recognized
+        assert len(result.bundles) > 0
+        for bundle in result.bundles:
+            assert store.get(bundle.bundle_digest) is not None, "R1 RED: bundle should be accessible after pipeline.run"
+            # Revoke should hide it
+            reg.revoke(bundle.bundle_digest)
+            assert store.get(bundle.bundle_digest) is None, "R1 RED: bundle should be hidden after revoke"
