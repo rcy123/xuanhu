@@ -267,3 +267,13 @@ L7-PROD、真实 RAG/DB/Runtime/临床/公开用途仍为 **NO-GO**。本实现�
 - PM 独立复跑专项：`76 passed in 6.68s`；定向 Ruff check 与 mypy 通过。
 - PM 定向 format 门禁：`uv run ruff format --check app/agent_runtime/sandbox_evidence.py tests/test_sandbox_evidence_l7.py` 报 `sandbox_evidence.py` 需要重排，开发者 handoff 中“already formatted”的声明未被复现。
 - 初步架构核对待 reviewer 判定：任务合同要求 live bundle registry/authorizer、injected claim verifier 和实例遮蔽 fail-closed；交付类清单与 handoff 已知限制显示这些边界可能未闭合。
+
+## 第一次独立 Review 与 PM 结论
+
+- 裁决：**REWORK**；P0=1、P1=3、P2=2、P3=1；`ACC-20260727-059`。
+- P0：生产路径不存在 fixed live bundle registry/authorizer，store/snapshot 只做内部 digest 自洽。
+- P1：`CitationVerifier` 不是 snapshot-external injected authority；callback reentry 测试未接入 authorizer 且零断言；实例方法遮蔽未 fail-closed。
+- P2：所谓撤权通过新建空 store 模拟，不是同实例 revoke；`get_bundles_for_graph_run` 实际按 retrieval_run 查询。
+- P3：`sandbox_evidence.py` scoped format 未通过，handoff 的格式声明无法复现。
+- 保留通过证据：专项 76、组合 414、非 integration 2039/362；这些结果不足以关闭上述 authority/integrity findings。
+- 后续：只执行 [L7-SBX-FRESH-R1](agent-refactor-l7-sbx-fresh-rework-1-task.md)，不得扩大范围或恢复旧 L7。
