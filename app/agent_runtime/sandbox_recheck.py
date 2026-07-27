@@ -6,6 +6,7 @@ import hashlib
 import threading
 from collections.abc import Callable
 from contextlib import suppress
+from enum import Enum
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -22,6 +23,7 @@ from app.agent_runtime.sandbox_review import (
     SandboxReviewStoreSnapshotV1,
     SandboxRuleBundleAuthorizer,
     SandboxSignatureVerifier,
+    SandboxTestReviewEventV1,
 )
 from app.agent_runtime.sandbox_safety import (
     SandboxRuleBundleV1,
@@ -38,6 +40,7 @@ from app.agent_runtime.sandbox_safety import (
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _REF_PATTERN = r"^sandbox-recheck-[a-z-]+[0-9a-f]{64}$"
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+_RLOCK_TYPE = type(threading.RLock())
 
 
 class _StrictFrozenModel(BaseModel):
@@ -85,6 +88,30 @@ class SandboxRecheckResumeResultV1(_StrictFrozenModel):
 
 class SandboxCompletionEligibilityV1(_StrictFrozenModel):
     status: Literal["eligible", "blocked"]
+
+
+class SandboxAuthorizedRecordProjectionV1(_StrictFrozenModel):
+    """Narrow current-authority projection for one L6 record operation."""
+
+    namespace: str
+    test_session_id: str
+    thread_id: str
+    checkpoint_id: str
+    revision_ref: str = Field(pattern=_REF_PATTERN)
+    subject: SandboxSafetySubjectV1
+    safety_result: SandboxSafetyResultV1
+    review_confirm_ref: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    review_confirmed_at: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def result_is_recordable(self) -> SandboxAuthorizedRecordProjectionV1:
+        if self.safety_result.decision is not SandboxSafetyDecision.ALLOW:
+            raise ValueError("record projection is not allowed")
+        return self
 
 
 class SandboxModificationResultV1(_StrictFrozenModel):
@@ -267,6 +294,94 @@ def _derived_ref(prefix: str, value: BaseModel, ref_field: str) -> str:
 
 def _deep_model[ModelT: BaseModel](model_type: type[ModelT], value: object) -> ModelT:
     return model_type.model_validate_json(canonical_json_bytes(value), strict=True)
+
+
+def _model_graph_is_exact(value: object) -> bool:
+    """Reject hidden Pydantic state before canonical rebuilding can erase it."""
+
+    if isinstance(value, BaseModel):
+        fields = type(value).model_fields
+        return (
+            set(value.__dict__) == set(fields)
+            and value.__pydantic_extra__ is None
+            and value.__pydantic_private__ is None
+            and all(
+                _model_graph_is_exact(getattr(value, field_name))
+                for field_name in fields
+            )
+        )
+    if isinstance(value, tuple):
+        return type(value) is tuple and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    if isinstance(value, dict):
+        return type(value) is dict and all(
+            _model_graph_is_exact(key) and _model_graph_is_exact(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return type(value) is list and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    if isinstance(value, (set, frozenset)):
+        return type(value) in {set, frozenset} and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    return isinstance(value, Enum) or type(value) in {
+        bool,
+        bytes,
+        float,
+        int,
+        str,
+        type(None),
+    }
+
+
+def _model_graphs_match(left: object, right: object) -> bool:
+    """Compare exact types and values after a strict canonical round trip."""
+
+    if isinstance(left, BaseModel) or isinstance(right, BaseModel):
+        if type(left) is not type(right) or not isinstance(left, BaseModel):
+            return False
+        if not isinstance(right, BaseModel):
+            return False
+        fields = type(left).model_fields
+        return (
+            _model_graph_is_exact(left)
+            and _model_graph_is_exact(right)
+            and all(
+                _model_graphs_match(
+                    getattr(left, field_name),
+                    getattr(right, field_name),
+                )
+                for field_name in fields
+            )
+        )
+    if isinstance(left, (tuple, list)) or isinstance(right, (tuple, list)):
+        return (
+            type(left) is type(right)
+            and isinstance(left, (tuple, list))
+            and isinstance(right, (tuple, list))
+            and len(left) == len(right)
+            and all(
+                _model_graphs_match(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            type(left) is dict
+            and type(right) is dict
+            and len(left) == len(right)
+            and all(
+                _model_graphs_match(left_key, right_key)
+                and _model_graphs_match(left_value, right_value)
+                for (left_key, left_value), (right_key, right_value) in zip(
+                    left.items(), right.items(), strict=True
+                )
+            )
+        )
+    return type(left) is type(right) and left == right
 
 
 def _build_derived[ModelT: BaseModel](
@@ -899,8 +1014,13 @@ class SandboxRecheckCoordinator:
                     current_revision_ref=self._current_revision_ref,
                     review_snapshot=self._review_store.snapshot(),
                 )
+                if not _model_graph_is_exact(value):
+                    raise SandboxRecheckError()
                 candidate = _deep_model(SandboxRecheckSnapshotV1, value)
-                if not _snapshot_results_are_reproducible(candidate):
+                if (
+                    not _model_graphs_match(value, candidate)
+                    or not _snapshot_results_are_reproducible(candidate)
+                ):
                     raise SandboxRecheckError()
                 if not self._all_snapshot_bundles_are_recognized(candidate):
                     raise SandboxRecheckError()
@@ -1200,6 +1320,288 @@ class SandboxRecheckCoordinator:
                 command=result.command,
             )
 
+    def _completion_authority(
+        self,
+        *,
+        expected_scope: tuple[str, str, str, str] | None,
+    ) -> tuple[SandboxRevisionRecordV1, SandboxTestReviewEventV1] | None:
+        before = SandboxRecheckCoordinator._validated_authority_snapshot(self)
+        if before is None:
+            return None
+        current = before.revisions[-1]
+        current_scope = (
+            current.namespace,
+            current.test_session_id,
+            current.thread_id,
+            current.checkpoint_id,
+        )
+        if expected_scope is not None and (
+            type(expected_scope) is not tuple
+            or len(expected_scope) != 4
+            or any(type(value) is not str for value in expected_scope)
+            or expected_scope != current_scope
+        ):
+            return None
+        namespace, test_session_id, thread_id, checkpoint_id = current_scope
+        if (
+            current.status != "review_required"
+            or current.result is None
+            or current.result.decision is not SandboxSafetyDecision.ALLOW
+            or current.challenge_ref is None
+        ):
+            return None
+        snapshot = before.review_snapshot
+        markers = tuple(
+            marker
+            for marker in snapshot.current_authorities
+            if (
+                marker.namespace,
+                marker.test_session_id,
+                marker.thread_id,
+                marker.checkpoint_id,
+                marker.challenge_ref,
+            )
+            == (
+                namespace,
+                test_session_id,
+                thread_id,
+                checkpoint_id,
+                current.challenge_ref,
+            )
+        )
+        checkpoints = tuple(
+            checkpoint
+            for checkpoint in snapshot.checkpoints
+            if checkpoint.challenge_ref == current.challenge_ref
+            and checkpoint.checkpoint_id == checkpoint_id
+            and checkpoint.state == "review_applied"
+        )
+        challenges = tuple(
+            challenge
+            for challenge in snapshot.challenges
+            if challenge.challenge_ref == current.challenge_ref
+            and challenge.state == "applied"
+        )
+        sources = tuple(
+            source
+            for source in snapshot.sources
+            if _source_matches_revision_exactly(source, current)
+        )
+        events = tuple(
+            event
+            for event in snapshot.events
+            if event.challenge_ref == current.challenge_ref
+            and event.action is SandboxReviewAction.CONFIRM
+        )
+        if not (
+            len(markers)
+            == len(checkpoints)
+            == len(challenges)
+            == len(sources)
+            == len(events)
+            == 1
+        ):
+            return None
+        source_bundle = sources[0].source.safety_rule_bundle
+        if current.rule_bundle is None or source_bundle != current.rule_bundle:
+            return None
+        bindings = SandboxRecheckCoordinator._authority_bindings(self)
+        if bindings is None:
+            return None
+        authorizer = self._rule_bundle_authorizer
+        try:
+            authorized = authorizer.authorize(
+                rule_bundle=_deep_model(SandboxRuleBundleV1, source_bundle)
+            )
+        except Exception:
+            return None
+        if authorized is not True:
+            return None
+        after_authorize_bindings = SandboxRecheckCoordinator._authority_bindings(
+            self
+        )
+        if not SandboxRecheckCoordinator._same_authority_bindings(
+            bindings,
+            after_authorize_bindings,
+        ):
+            return None
+        after = SandboxRecheckCoordinator._validated_authority_snapshot(self)
+        if after is None or after != before:
+            return None
+        return current, events[0]
+
+    def _authority_bindings(self) -> tuple[object, ...] | None:
+        """Retain every mutable container and collaborator by object identity."""
+
+        try:
+            if (
+                type(self) is not SandboxRecheckCoordinator
+                or type(self._review_store) is not SandboxInMemoryReviewStore
+                or type(self._review) is not SandboxReviewCoordinator
+            ):
+                return None
+            store = self._review_store
+            review = self._review
+            return (
+                self._lock,
+                self._clock,
+                self._nonce_factory,
+                self._signature_verifier,
+                self._rule_bundle_authorizer,
+                self._revisions,
+                self._runs,
+                self._invalidations,
+                self._receipts,
+                self._recognized_rule_bundle_digests,
+                store,
+                store._lock,
+                store._sources,
+                store._challenges,
+                store._checkpoints,
+                store._attempts,
+                store._events,
+                store._transitions,
+                store._current_authorities,
+                review,
+                review._store,
+                review._clock,
+                review._nonce_factory,
+                review._signature_verifier,
+                review._rule_bundle_authorizer,
+                review._recognition_lock,
+                review._recognized_rule_bundle_digests,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _same_authority_bindings(
+        before: tuple[object, ...] | None,
+        after: tuple[object, ...] | None,
+    ) -> bool:
+        return (
+            before is not None
+            and after is not None
+            and len(before) == len(after)
+            and all(left is right for left, right in zip(before, after, strict=True))
+        )
+
+    def _validated_authority_snapshot(self) -> SandboxRecheckSnapshotV1 | None:
+        """Verify callbacks, then finish on a callback-free state capture."""
+
+        try:
+            if type(self._recognized_rule_bundle_digests) is not frozenset:
+                return None
+            recognized = self._recognized_rule_bundle_digests
+            signature_verifier = self._signature_verifier
+            bindings = SandboxRecheckCoordinator._authority_bindings(self)
+            if bindings is None:
+                return None
+            before = SandboxRecheckCoordinator._capture_authority_snapshot(
+                self,
+                recognized=recognized,
+            )
+            if before is None:
+                return None
+            SandboxInMemoryReviewStore(
+                snapshot=before.review_snapshot,
+                signature_verifier=signature_verifier,
+            )
+            after_verify_bindings = SandboxRecheckCoordinator._authority_bindings(
+                self
+            )
+            if not SandboxRecheckCoordinator._same_authority_bindings(
+                bindings,
+                after_verify_bindings,
+            ):
+                return None
+            after = SandboxRecheckCoordinator._capture_authority_snapshot(
+                self,
+                recognized=recognized,
+            )
+            if after is None or after != before:
+                return None
+            final_bindings = SandboxRecheckCoordinator._authority_bindings(self)
+            if not SandboxRecheckCoordinator._same_authority_bindings(
+                after_verify_bindings,
+                final_bindings,
+            ):
+                return None
+            return after
+        except Exception:
+            return None
+
+    def _capture_authority_snapshot(
+        self,
+        *,
+        recognized: frozenset[str],
+    ) -> SandboxRecheckSnapshotV1 | None:
+        """Capture and validate state without calling external collaborators."""
+
+        try:
+            if (
+                type(self) is not SandboxRecheckCoordinator
+                or type(self._lock) is not _RLOCK_TYPE
+                or type(self._review_store) is not SandboxInMemoryReviewStore
+                or type(self._review) is not SandboxReviewCoordinator
+                or type(self._revisions) is not list
+                or type(self._runs) is not list
+                or type(self._invalidations) is not list
+                or type(self._receipts) is not list
+                or any(
+                    type(item) is not SandboxRevisionRecordV1
+                    for item in self._revisions
+                )
+                or any(
+                    type(item) is not SandboxRecheckRunV1
+                    for item in self._runs
+                )
+                or any(
+                    type(item) is not SandboxInvalidationV1
+                    for item in self._invalidations
+                )
+                or any(
+                    type(item) is not _CommandReceiptV1
+                    for item in self._receipts
+                )
+                or self._review._store is not self._review_store
+                or self._review._rule_bundle_authorizer
+                is not self._rule_bundle_authorizer
+                or self._review._signature_verifier
+                is not self._signature_verifier
+                or type(self._review._recognition_lock) is not _RLOCK_TYPE
+                or type(self._review._recognized_rule_bundle_digests)
+                is not frozenset
+                or self._review._recognized_rule_bundle_digests != recognized
+            ):
+                return None
+            review_snapshot = SandboxInMemoryReviewStore._sealed_snapshot(
+                self._review_store
+            )
+            value = SandboxRecheckSnapshotV1(
+                revisions=tuple(self._revisions),
+                runs=tuple(self._runs),
+                invalidations=tuple(self._invalidations),
+                receipts=tuple(self._receipts),
+                current_revision_ref=self._current_revision_ref,
+                review_snapshot=review_snapshot,
+            )
+            if not _model_graph_is_exact(value):
+                return None
+            candidate = _deep_model(SandboxRecheckSnapshotV1, value)
+            if (
+                not _model_graphs_match(value, candidate)
+                or not _snapshot_results_are_reproducible(candidate)
+                or not SandboxRecheckCoordinator._snapshot_bundle_digests(
+                    candidate
+                )
+                <= recognized
+            ):
+                return None
+            return candidate
+        except Exception:
+            return None
+
     def completion_eligibility(
         self,
         *,
@@ -1208,84 +1610,72 @@ class SandboxRecheckCoordinator:
         thread_id: str,
         checkpoint_id: str,
     ) -> SandboxCompletionEligibilityV1:
+        if (
+            type(self) is not SandboxRecheckCoordinator
+            or type(self._lock) is not _RLOCK_TYPE
+            or any(
+                type(value) is not str
+                for value in (
+                    namespace,
+                    test_session_id,
+                    thread_id,
+                    checkpoint_id,
+                )
+            )
+        ):
+            return SandboxCompletionEligibilityV1(status="blocked")
         with self._lock:
             try:
-                current = self._revisions[-1]
-                if (
-                    current.status != "review_required"
-                    or current.result is None
-                    or current.result.decision is not SandboxSafetyDecision.ALLOW
-                    or current.challenge_ref is None
-                    or (namespace, test_session_id, thread_id, checkpoint_id)
-                    != (
-                        current.namespace,
-                        current.test_session_id,
-                        current.thread_id,
-                        current.checkpoint_id,
-                    )
-                ):
-                    return SandboxCompletionEligibilityV1(status="blocked")
-                snapshot = self._review_store.snapshot()
-                markers = tuple(
-                    marker
-                    for marker in snapshot.current_authorities
-                    if (
-                        marker.namespace,
-                        marker.test_session_id,
-                        marker.thread_id,
-                        marker.checkpoint_id,
-                        marker.challenge_ref,
-                    )
-                    == (
+                authority = SandboxRecheckCoordinator._completion_authority(
+                    self,
+                    expected_scope=(
                         namespace,
                         test_session_id,
                         thread_id,
                         checkpoint_id,
-                        current.challenge_ref,
-                    )
+                    ),
                 )
-                checkpoints = tuple(
-                    checkpoint
-                    for checkpoint in snapshot.checkpoints
-                    if checkpoint.challenge_ref == current.challenge_ref
-                    and checkpoint.checkpoint_id == checkpoint_id
-                    and checkpoint.state == "review_applied"
+                return SandboxCompletionEligibilityV1(
+                    status="eligible" if authority is not None else "blocked"
                 )
-                challenges = tuple(
-                    challenge
-                    for challenge in snapshot.challenges
-                    if challenge.challenge_ref == current.challenge_ref
-                    and challenge.state == "applied"
-                )
-                sources = tuple(
-                    source
-                    for source in snapshot.sources
-                    if _source_matches_revision_exactly(source, current)
-                )
-                events = tuple(
-                    event
-                    for event in snapshot.events
-                    if event.challenge_ref == current.challenge_ref
-                    and event.action is SandboxReviewAction.CONFIRM
-                )
-                if not (
-                    len(markers)
-                    == len(checkpoints)
-                    == len(challenges)
-                    == len(sources)
-                    == len(events)
-                    == 1
-                ):
-                    return SandboxCompletionEligibilityV1(status="blocked")
-                status = self._review.eligibility(
-                    namespace=namespace,
-                    test_session_id=test_session_id,
-                    thread_id=thread_id,
-                    checkpoint_id=checkpoint_id,
-                ).status
-                return SandboxCompletionEligibilityV1(status=status)
             except Exception:
                 return SandboxCompletionEligibilityV1(status="blocked")
+
+    def authorized_record_projection(self) -> SandboxAuthorizedRecordProjectionV1:
+        """Linearize one L6 operation at the live bundle authorization read."""
+
+        if (
+            type(self) is not SandboxRecheckCoordinator
+            or type(self._lock) is not _RLOCK_TYPE
+        ):
+            raise SandboxRecheckError()
+        with self._lock:
+            try:
+                authority = SandboxRecheckCoordinator._completion_authority(
+                    self,
+                    expected_scope=None,
+                )
+                if authority is None:
+                    raise SandboxRecheckError()
+                revision, event = authority
+                if revision.result is None:
+                    raise SandboxRecheckError()
+                return _deep_model(
+                    SandboxAuthorizedRecordProjectionV1,
+                    SandboxAuthorizedRecordProjectionV1(
+                        namespace=revision.namespace,
+                        test_session_id=revision.test_session_id,
+                        thread_id=revision.thread_id,
+                        checkpoint_id=revision.checkpoint_id,
+                        revision_ref=revision.revision_ref,
+                        subject=revision.subject,
+                        safety_result=revision.result,
+                        review_confirm_ref=event.resume_attempt_ref,
+                        review_confirmed_at=event.applied_at,
+                    ),
+                )
+            except Exception:
+                raise SandboxRecheckError() from None
 
     def _current_modify_is_applied(
         self, current: SandboxRevisionRecordV1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -12,11 +13,13 @@ from app.agent_runtime.sandbox_record import (
     SandboxMedicalRecordData,
     SandboxRecordError,
     SandboxRecordStore,
-    canonical_review_bytes,
     deserialize_record,
     serialize_record,
 )
-from app.agent_runtime.sandbox_review import SandboxReviewAction
+from app.agent_runtime.sandbox_review import (
+    SandboxReviewAction,
+    canonical_review_bytes,
+)
 from tests.test_sandbox_record_l6_1 import (
     _assemble,
     _confirm_distinct_review_required_state,
@@ -81,7 +84,9 @@ def test_l6_3_first_write_requires_l5_authority() -> None:
         ),
     ),
 )
-def test_l6_3_invalid_first_write_is_rejected(tamper) -> None:
+def test_l6_3_invalid_first_write_is_rejected(
+    tamper: Callable[[SandboxMedicalRecordData], SandboxMedicalRecordData],
+) -> None:
     coordinator = _confirm_review_required_state()
     record = _assemble(coordinator)
     store = SandboxRecordStore()
@@ -105,7 +110,7 @@ def test_l6_3_concurrent_same_record_put_is_atomic_and_idempotent() -> None:
         list(executor.map(put_once, range(64)))
 
     assert store.get(record.record_id) == record
-    assert len(store._records) == 1  # type: ignore[attr-defined]
+    assert len(store._records) == 1
 
 
 def test_l6_3_canonical_round_trip_is_byte_identical() -> None:
@@ -134,7 +139,7 @@ def test_l6_3_get_rejects_storage_key_record_id_mismatch() -> None:
     record = _assemble()
     store = SandboxRecordStore()
     wrong_key = "sandbox-record-" + "0" * 64
-    store._records[wrong_key] = serialize_record(record)  # type: ignore[attr-defined]
+    store._records[wrong_key] = serialize_record(record)
 
     with pytest.raises(SandboxRecordError):
         store.get(wrong_key)
@@ -162,7 +167,9 @@ def test_l6_3_deserialize_rejects_noncanonical_json_text() -> None:
     ),
     ids=("bad-json", "empty-object", "oversized", "bytearray", "none"),
 )
-def test_l6_3_deserialize_rejects_invalid_or_oversized_payload(payload) -> None:
+def test_l6_3_deserialize_rejects_invalid_or_oversized_payload(
+    payload: object,
+) -> None:
     with pytest.raises(SandboxRecordError) as raised:
         deserialize_record(payload)
 
@@ -182,6 +189,7 @@ def test_l6_3_serialize_rejects_hidden_or_stale_state() -> None:
 def test_l6_3_get_miss_and_bad_key_fail_fixed_closed() -> None:
     store = SandboxRecordStore()
 
+    key: object
     for key in ("sandbox-record-" + "f" * 64, [], None):
         with pytest.raises(SandboxRecordError) as raised:
             store.get(key)
@@ -196,7 +204,7 @@ def test_l6_3_store_uses_lock_and_canonical_bytes_only() -> None:
     store.put(record, recheck_coordinator=coordinator)
 
     assert SandboxRecordStore.__slots__ == ("_lock", "_records")
-    assert type(store._records[record.record_id]) is bytes  # type: ignore[attr-defined]
+    assert type(store._records[record.record_id]) is bytes
 
 
 def test_l6_3_module_has_no_io_network_or_process_calls() -> None:

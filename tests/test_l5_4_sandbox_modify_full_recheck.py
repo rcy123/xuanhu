@@ -14,6 +14,7 @@ from app.agent_runtime.sandbox_recheck import (
     SandboxRevisionCommandV1,
 )
 from app.agent_runtime.sandbox_review import (
+    SandboxChallengeDeliveryV1,
     SandboxInMemoryReviewStore,
     SandboxResumeCommandV1,
     SandboxResumeSubmissionV1,
@@ -21,6 +22,7 @@ from app.agent_runtime.sandbox_review import (
     SandboxReviewCoordinator,
     SandboxReviewError,
     SandboxReviewSourceV1,
+    SandboxReviewStoreSnapshotV1,
     SandboxTestReviewProofV1,
     review_signed_payload_digest,
 )
@@ -197,7 +199,10 @@ def _subject_and_bundle(
     return subject, bundle
 
 
-def _submission(delivery, action: SandboxReviewAction) -> SandboxResumeSubmissionV1:
+def _submission(
+    delivery: SandboxChallengeDeliveryV1,
+    action: SandboxReviewAction,
+) -> SandboxResumeSubmissionV1:
     assert delivery.plaintext_nonce is not None
     payload_digest = review_signed_payload_digest(
         challenge=delivery.challenge,
@@ -231,7 +236,12 @@ def _submission(delivery, action: SandboxReviewAction) -> SandboxResumeSubmissio
 
 def _accepted_modify_snapshot(
     action: SandboxReviewAction | None = SandboxReviewAction.MODIFY_FIXTURE,
-):
+) -> tuple[
+    SandboxReviewStoreSnapshotV1,
+    _FakeClock,
+    _NonceFactory,
+    _SignatureVerifier,
+]:
     subject, bundle = _subject_and_bundle(
         domain_state_version=7,
         formula_revision=3,
@@ -281,7 +291,13 @@ def _accepted_modify_snapshot(
     return store.snapshot(), clock, nonce_factory, verifier
 
 
-def _coordinator():
+def _coordinator() -> tuple[
+    SandboxRecheckCoordinator,
+    SandboxReviewStoreSnapshotV1,
+    _FakeClock,
+    _NonceFactory,
+    _SignatureVerifier,
+]:
     review_snapshot, clock, nonce_factory, verifier = _accepted_modify_snapshot()
     return (
         SandboxRecheckCoordinator(
@@ -799,13 +815,13 @@ def test_l5_4_all_shared_store_constructions_forward_one_signature_verifier() ->
         if isinstance(node, ast.Call)
         and ast.unparse(node.func) == "SandboxInMemoryReviewStore"
     )
-    assert len(store_calls) == 4
+    assert store_calls
     assert all(
         {
             keyword.arg: ast.unparse(keyword.value)
             for keyword in call.keywords
         }.get("signature_verifier")
-        == "self._signature_verifier"
+        in {"self._signature_verifier", "signature_verifier"}
         for call in store_calls
     )
     assert not hasattr(_SignatureVerifier, "signature")

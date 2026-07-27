@@ -16,15 +16,10 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_runtime.sandbox_recheck import (
+    SandboxAuthorizedRecordProjectionV1,
     SandboxRecheckCoordinator,
-    SandboxRecheckSnapshotV1,
-    SandboxRevisionRecordV1,
 )
-from app.agent_runtime.sandbox_review import (
-    SandboxReviewAction,
-    SandboxTestReviewEventV1,
-    canonical_review_bytes,
-)
+from app.agent_runtime.sandbox_review import canonical_review_bytes
 from app.agent_runtime.sandbox_safety import (
     MAX_FORMULA_ITEMS,
     MAX_ISSUES,
@@ -114,16 +109,30 @@ class SandboxMedicalRecordData(_StrictFrozenModel):
         return self
 
 
-def _trusted_snapshot(value: object) -> SandboxRecheckSnapshotV1 | None:
-    """Read a snapshot only through the exact L5 coordinator capability."""
+def _trusted_coordinator(value: object) -> SandboxRecheckCoordinator | None:
+    """Accept only the exact L5 coordinator capability type."""
+
+    return value if type(value) is SandboxRecheckCoordinator else None
+
+
+def _active_record_projection(
+    value: object,
+) -> SandboxAuthorizedRecordProjectionV1 | None:
+    """Acquire one narrow projection at the coordinator's live auth point."""
 
     try:
-        if type(value) is not SandboxRecheckCoordinator:
+        coordinator = _trusted_coordinator(value)
+        if coordinator is None:
             return None
-        snapshot = SandboxRecheckCoordinator.snapshot(value)
-        if not _model_graph_is_exact(snapshot):
+        projection = SandboxRecheckCoordinator.authorized_record_projection(
+            coordinator
+        )
+        if (
+            type(projection) is not SandboxAuthorizedRecordProjectionV1
+            or not _model_graph_is_exact(projection)
+        ):
             return None
-        return snapshot
+        return projection
     except Exception:
         return None
 
@@ -272,75 +281,30 @@ def _normalise_record(value: object) -> SandboxMedicalRecordData | None:
         return None
 
 
-def _confirmed_authority(
-    snapshot: SandboxRecheckSnapshotV1,
-) -> tuple[SandboxRevisionRecordV1, SandboxTestReviewEventV1] | None:
-    """Return the current revision and its unique applied CONFIRM event."""
-
-    revisions = snapshot.revisions
-    if not revisions:
-        return None
-    current = revisions[-1]
-    if (
-        current.status != "review_required"
-        or current.result is None
-        or current.result.decision is not SandboxSafetyDecision.ALLOW
-        or current.challenge_ref is None
-    ):
-        return None
-    challenges = tuple(
-        challenge
-        for challenge in snapshot.review_snapshot.challenges
-        if challenge.challenge_ref == current.challenge_ref
-        and challenge.state == "applied"
-    )
-    events = tuple(
-        event
-        for event in snapshot.review_snapshot.events
-        if event.challenge_ref == current.challenge_ref
-        and event.action is SandboxReviewAction.CONFIRM
-    )
-    if len(challenges) != 1 or len(events) != 1:
-        return None
-    event = events[0]
-    attempts = tuple(
-        attempt
-        for attempt in snapshot.review_snapshot.attempts
-        if attempt.resume_attempt_ref == event.resume_attempt_ref
-        and attempt.challenge_ref == current.challenge_ref
-        and attempt.action is SandboxReviewAction.CONFIRM
-        and attempt.state == "applied"
-    )
-    if len(attempts) != 1:
-        return None
-    return current, event
-
-
-def _build_record_from_snapshot(
-    snapshot: SandboxRecheckSnapshotV1,
+def _build_record_from_projection(
+    projection: SandboxAuthorizedRecordProjectionV1,
     *,
     namespace: str,
     session_id: str,
     thread_id: str,
     checkpoint_id: str,
 ) -> SandboxMedicalRecordData | None:
-    authority = _confirmed_authority(snapshot)
-    if authority is None:
-        return None
-    current, event = authority
     if (
-        current.namespace != namespace
-        or current.test_session_id != session_id
-        or current.thread_id != thread_id
-        or current.checkpoint_id != checkpoint_id
-        or current.result is None
+        any(
+            type(value) is not str
+            for value in (namespace, session_id, thread_id, checkpoint_id)
+        )
+        or projection.namespace != namespace
+        or projection.test_session_id != session_id
+        or projection.thread_id != thread_id
+        or projection.checkpoint_id != checkpoint_id
     ):
         return None
-    reviewed_formula = tuple(current.subject.formula_items)
-    safety_result = current.result
-    review_confirm_ref = event.resume_attempt_ref
-    revision_id = _revision_id(current.revision_ref)
-    assembled_at = event.applied_at
+    reviewed_formula = tuple(projection.subject.formula_items)
+    safety_result = projection.safety_result
+    review_confirm_ref = projection.review_confirm_ref
+    revision_id = _revision_id(projection.revision_ref)
+    assembled_at = projection.review_confirmed_at
     record_id = _record_id(
         session_id=session_id,
         revision_id=revision_id,
@@ -364,25 +328,19 @@ def _build_record_from_snapshot(
     )
 
 
-def _record_matches_snapshot(
+def _record_matches_projection(
     record: SandboxMedicalRecordData,
-    snapshot: SandboxRecheckSnapshotV1,
+    projection: SandboxAuthorizedRecordProjectionV1,
     *,
     narration: object = _NO_NARRATION,
 ) -> bool:
-    authority = _confirmed_authority(snapshot)
-    if authority is None:
-        return False
-    current, event = authority
-    if current.result is None:
-        return False
     expected = {
-        "session_id": current.test_session_id,
-        "revision_id": _revision_id(current.revision_ref),
-        "reviewed_formula": tuple(current.subject.formula_items),
-        "safety_result": current.result,
-        "review_confirm_ref": event.resume_attempt_ref,
-        "assembled_at": event.applied_at,
+        "session_id": projection.test_session_id,
+        "revision_id": _revision_id(projection.revision_ref),
+        "reviewed_formula": tuple(projection.subject.formula_items),
+        "safety_result": projection.safety_result,
+        "review_confirm_ref": projection.review_confirm_ref,
+        "assembled_at": projection.review_confirmed_at,
         "record_version": RECORD_SCHEMA_VERSION,
         "disclaimer": SANDBOX_RECORD_DISCLAIMER,
     }
@@ -432,11 +390,16 @@ class SandboxRecordAssembler:
         checkpoint_id: str,
     ) -> SandboxMedicalRecordData | None:
         try:
-            snapshot = _trusted_snapshot(recheck_coordinator)
-            if snapshot is None:
+            if any(
+                type(value) is not str
+                for value in (namespace, session_id, thread_id, checkpoint_id)
+            ):
                 return None
-            return SandboxRecordAssembler._build_from_snapshot(
-                snapshot,
+            projection = _active_record_projection(recheck_coordinator)
+            if projection is None:
+                return None
+            return SandboxRecordAssembler._build_from_projection(
+                projection,
                 namespace=namespace,
                 session_id=session_id,
                 thread_id=thread_id,
@@ -446,8 +409,8 @@ class SandboxRecordAssembler:
             return None
 
     @staticmethod
-    def _build_from_snapshot(
-        snapshot: SandboxRecheckSnapshotV1,
+    def _build_from_projection(
+        projection: SandboxAuthorizedRecordProjectionV1,
         *,
         namespace: str,
         session_id: str,
@@ -455,8 +418,8 @@ class SandboxRecordAssembler:
         checkpoint_id: str,
     ) -> SandboxMedicalRecordData | None:
         try:
-            return _build_record_from_snapshot(
-                snapshot,
+            return _build_record_from_projection(
+                projection,
                 namespace=namespace,
                 session_id=session_id,
                 thread_id=thread_id,
@@ -480,29 +443,29 @@ class SandboxRecordConsistencyVerifier:
     ) -> bool:
         try:
             normalised = _normalise_record(record)
-            snapshot = _trusted_snapshot(recheck_coordinator)
-            if normalised is None or snapshot is None:
+            projection = _active_record_projection(recheck_coordinator)
+            if normalised is None or projection is None:
                 return False
-            return SandboxRecordConsistencyVerifier._verify_snapshot(
+            return SandboxRecordConsistencyVerifier._verify_projection(
                 record,
-                snapshot,
+                projection,
                 narration=narration,
             )
         except Exception:
             return False
 
     @staticmethod
-    def _verify_snapshot(
+    def _verify_projection(
         record: object,
-        snapshot: SandboxRecheckSnapshotV1,
+        projection: SandboxAuthorizedRecordProjectionV1,
         *,
         narration: object = _NO_NARRATION,
     ) -> bool:
         try:
             normalised = _normalise_record(record)
-            return normalised is not None and _record_matches_snapshot(
+            return normalised is not None and _record_matches_projection(
                 normalised,
-                snapshot,
+                projection,
                 narration=narration,
             )
         except Exception:
@@ -578,15 +541,15 @@ def deserialize_record(payload: object) -> SandboxMedicalRecordData:
     return parsed
 
 
-def _put_record_with_snapshot(
+def _put_record_with_projection(
     store: SandboxRecordStore,
     record: object,
-    snapshot: SandboxRecheckSnapshotV1,
+    projection: SandboxAuthorizedRecordProjectionV1,
 ) -> None:
     normalised = _normalise_record(record)
     if (
         normalised is None
-        or not _record_matches_snapshot(normalised, snapshot)
+        or not _record_matches_projection(normalised, projection)
     ):
         raise SandboxRecordError()
     encoded = serialize_record(normalised)
@@ -611,10 +574,10 @@ class SandboxRecordStore:
         self._records: dict[str, bytes] = {}
 
     def put(self, record: object, *, recheck_coordinator: object) -> None:
-        snapshot = _trusted_snapshot(recheck_coordinator)
-        if snapshot is None:
+        projection = _active_record_projection(recheck_coordinator)
+        if projection is None:
             raise SandboxRecordError()
-        _put_record_with_snapshot(self, record, snapshot)
+        _put_record_with_projection(self, record, projection)
 
     def get(self, record_id: object) -> SandboxMedicalRecordData:
         encoded: bytes | None = None
@@ -711,7 +674,7 @@ class SandboxRecordPipeline:
         store: SandboxRecordStore | None = None,
     ) -> None:
         if (
-            _trusted_snapshot(recheck_coordinator) is None
+            _trusted_coordinator(recheck_coordinator) is None
             or (store is not None and type(store) is not SandboxRecordStore)
         ):
             raise SandboxRecordError()
@@ -738,13 +701,22 @@ class SandboxRecordPipeline:
                 type(self._assembler) is not SandboxRecordAssembler
                 or type(self._verifier) is not SandboxRecordConsistencyVerifier
                 or type(self._store) is not SandboxRecordStore
+                or any(
+                    type(value) is not str
+                    for value in (
+                        namespace,
+                        session_id,
+                        thread_id,
+                        checkpoint_id,
+                    )
+                )
             ):
                 raise SandboxRecordError()
-            snapshot = _trusted_snapshot(self._recheck_coordinator)
-            if snapshot is None:
+            projection = _active_record_projection(self._recheck_coordinator)
+            if projection is None:
                 raise SandboxRecordError()
-            record = SandboxRecordAssembler._build_from_snapshot(
-                snapshot,
+            record = SandboxRecordAssembler._build_from_projection(
+                projection,
                 namespace=namespace,
                 session_id=session_id,
                 thread_id=thread_id,
@@ -752,16 +724,16 @@ class SandboxRecordPipeline:
             )
             if (
                 record is None
-                or not SandboxRecordConsistencyVerifier._verify_snapshot(
+                or not SandboxRecordConsistencyVerifier._verify_projection(
                     record,
-                    snapshot,
+                    projection,
                 )
             ):
                 raise SandboxRecordError()
-            _put_record_with_snapshot(
+            _put_record_with_projection(
                 self._store,
                 record,
-                snapshot,
+                projection,
             )
             stored = SandboxRecordStore.get(self._store, record.record_id)
             serialized = serialize_record(stored)

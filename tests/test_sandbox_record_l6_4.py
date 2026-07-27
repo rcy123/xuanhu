@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from app.agent_runtime.sandbox_recheck import SandboxRecheckCoordinator
+from app.agent_runtime.sandbox_recheck import (
+    SandboxAuthorizedRecordProjectionV1,
+    SandboxRecheckCoordinator,
+)
 from app.agent_runtime.sandbox_record import (
     SandboxRecordConsistencyVerifier,
     SandboxRecordError,
@@ -153,7 +156,7 @@ def test_l6_4_pipeline_failure_short_circuits_before_store() -> None:
             checkpoint_id="wrong-checkpoint",
         )
 
-    assert store._records == {}  # type: ignore[attr-defined]
+    assert store._records == {}
 
 
 def test_l6_4_pipeline_rejects_raw_snapshot_at_composition_boundary() -> None:
@@ -187,7 +190,7 @@ def test_l6_4_pipeline_rejects_post_construction_store_substitution() -> None:
         pass
 
     with pytest.raises(AttributeError):
-        pipeline._store = _BypassStore()  # type: ignore[attr-defined]
+        pipeline._store = _BypassStore()
 
     object.__setattr__(pipeline, "_store", _BypassStore())
     with pytest.raises(SandboxRecordError):
@@ -199,24 +202,24 @@ def test_l6_4_pipeline_rejects_post_construction_store_substitution() -> None:
         )
 
 
-def test_l6_4_pipeline_uses_one_authority_snapshot(
+def test_l6_4_pipeline_uses_one_active_authority_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator = _confirm_review_required_state()
-    original_snapshot = SandboxRecheckCoordinator.snapshot
+    original_projection = SandboxRecheckCoordinator.authorized_record_projection
     calls = 0
 
-    def counted_snapshot(
+    def counted_projection(
         value: SandboxRecheckCoordinator,
-    ):
+    ) -> SandboxAuthorizedRecordProjectionV1:
         nonlocal calls
         calls += 1
-        return original_snapshot(value)
+        return original_projection(value)
 
     monkeypatch.setattr(
         SandboxRecheckCoordinator,
-        "snapshot",
-        counted_snapshot,
+        "authorized_record_projection",
+        counted_projection,
     )
     pipeline = SandboxRecordPipeline(recheck_coordinator=coordinator)
     calls = 0

@@ -7,7 +7,7 @@ import json
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -31,6 +31,7 @@ _CHALLENGE_TTL_SECONDS = 900
 _REVIEW_SCHEMA_VERSION = "sandbox-review-challenge.v2"
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+_RLOCK_TYPE = type(threading.RLock())
 _ReviewTestIdentifier = Annotated[
     str,
     Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN),
@@ -624,6 +625,94 @@ def _deep_model[ModelT: BaseModel](
     return model_type.model_validate_json(canonical_review_bytes(value), strict=True)
 
 
+def _model_graph_is_exact(value: object) -> bool:
+    """Reject hidden Pydantic state before canonical rebuilding can erase it."""
+
+    if isinstance(value, BaseModel):
+        fields = type(value).model_fields
+        return (
+            set(value.__dict__) == set(fields)
+            and value.__pydantic_extra__ is None
+            and value.__pydantic_private__ is None
+            and all(
+                _model_graph_is_exact(getattr(value, field_name))
+                for field_name in fields
+            )
+        )
+    if isinstance(value, tuple):
+        return type(value) is tuple and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    if isinstance(value, dict):
+        return type(value) is dict and all(
+            _model_graph_is_exact(key) and _model_graph_is_exact(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return type(value) is list and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    if isinstance(value, (set, frozenset)):
+        return type(value) in {set, frozenset} and all(
+            _model_graph_is_exact(item) for item in value
+        )
+    return isinstance(value, Enum) or type(value) in {
+        bool,
+        bytes,
+        float,
+        int,
+        str,
+        type(None),
+    }
+
+
+def _model_graphs_match(left: object, right: object) -> bool:
+    """Compare exact types and values after a strict canonical round trip."""
+
+    if isinstance(left, BaseModel) or isinstance(right, BaseModel):
+        if type(left) is not type(right) or not isinstance(left, BaseModel):
+            return False
+        if not isinstance(right, BaseModel):
+            return False
+        fields = type(left).model_fields
+        return (
+            _model_graph_is_exact(left)
+            and _model_graph_is_exact(right)
+            and all(
+                _model_graphs_match(
+                    getattr(left, field_name),
+                    getattr(right, field_name),
+                )
+                for field_name in fields
+            )
+        )
+    if isinstance(left, (tuple, list)) or isinstance(right, (tuple, list)):
+        return (
+            type(left) is type(right)
+            and isinstance(left, (tuple, list))
+            and isinstance(right, (tuple, list))
+            and len(left) == len(right)
+            and all(
+                _model_graphs_match(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            type(left) is dict
+            and type(right) is dict
+            and len(left) == len(right)
+            and all(
+                _model_graphs_match(left_key, right_key)
+                and _model_graphs_match(left_value, right_value)
+                for (left_key, left_value), (right_key, right_value) in zip(
+                    left.items(), right.items(), strict=True
+                )
+            )
+        )
+    return type(left) is type(right) and left == right
+
+
 def _fixed_stage_rejection() -> _StageResultV1:
     return _StageResultV1(status="resume_rejected")
 
@@ -1094,7 +1183,72 @@ class SandboxInMemoryReviewStore:
                 transitions=tuple(self._transitions),
                 current_authorities=tuple(self._current_authorities),
             )
-            return _deep_model(SandboxReviewStoreSnapshotV1, value)
+            if not _model_graph_is_exact(value):
+                raise SandboxReviewError()
+            candidate = _deep_model(SandboxReviewStoreSnapshotV1, value)
+            if not _model_graphs_match(value, candidate):
+                raise SandboxReviewError()
+            return candidate
+
+    def _sealed_snapshot(self) -> SandboxReviewStoreSnapshotV1:
+        """Capture only the store's exact, non-executable container graph."""
+
+        if type(self) is not SandboxInMemoryReviewStore or type(
+            self._lock
+        ) is not _RLOCK_TYPE:
+            raise SandboxReviewError()
+        with self._lock:
+            if (
+                type(self._operation_count) is not int
+                or type(self._sources) is not list
+                or type(self._challenges) is not list
+                or type(self._checkpoints) is not list
+                or type(self._attempts) is not list
+                or type(self._events) is not list
+                or type(self._transitions) is not list
+                or type(self._current_authorities) is not list
+                or any(type(item) is not _StoredSourceV1 for item in self._sources)
+                or any(
+                    type(item) is not SandboxReviewChallengeV1
+                    for item in self._challenges
+                )
+                or any(
+                    type(item) is not _CheckpointV1
+                    for item in self._checkpoints
+                )
+                or any(
+                    type(item) is not _SealedAttemptV1
+                    for item in self._attempts
+                )
+                or any(
+                    type(item) is not SandboxTestReviewEventV1
+                    for item in self._events
+                )
+                or any(
+                    type(item) is not _TransitionV1
+                    for item in self._transitions
+                )
+                or any(
+                    type(item) is not _CurrentAuthorityV1
+                    for item in self._current_authorities
+                )
+            ):
+                raise SandboxReviewError()
+            value = SandboxReviewStoreSnapshotV1(
+                sources=tuple(self._sources),
+                challenges=tuple(self._challenges),
+                checkpoints=tuple(self._checkpoints),
+                attempts=tuple(self._attempts),
+                events=tuple(self._events),
+                transitions=tuple(self._transitions),
+                current_authorities=tuple(self._current_authorities),
+            )
+            if not _model_graph_is_exact(value):
+                raise SandboxReviewError()
+            candidate = _deep_model(SandboxReviewStoreSnapshotV1, value)
+            if not _model_graphs_match(value, candidate):
+                raise SandboxReviewError()
+            return candidate
 
     def _recover_challenge(
         self,
@@ -1687,6 +1841,11 @@ class SandboxReviewCoordinator:
         interrupt_id: str,
     ) -> SandboxChallengeDeliveryV1:
         try:
+            if any(
+                type(value) is not str
+                for value in (namespace, thread_id, checkpoint_id, interrupt_id)
+            ):
+                raise SandboxReviewError()
             accepted = _deep_model(SandboxReviewSourceV1, source)
             if (
                 accepted.safety_result.decision is not SandboxSafetyDecision.ALLOW
@@ -1959,6 +2118,11 @@ class SandboxReviewCoordinator:
         thread_id: str,
         checkpoint_id: str,
     ) -> _EligibilityV1:
+        if any(
+            type(value) is not str
+            for value in (namespace, test_session_id, thread_id, checkpoint_id)
+        ):
+            return _EligibilityV1(status="blocked")
         try:
             snapshot = self._store.snapshot()
             markers = tuple(

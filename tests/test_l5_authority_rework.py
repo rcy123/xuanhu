@@ -95,7 +95,7 @@ def test_immutable_rule_bundle_registry_is_a_concrete_trust_root() -> None:
     assert not registry.recognize(rule_bundle=untrusted)
     assert not registry.authorize(rule_bundle=untrusted)
     with pytest.raises(AttributeError):
-        registry._authorized = frozenset({untrusted.rule_bundle_digest})  # type: ignore[misc]
+        registry._authorized = frozenset({untrusted.rule_bundle_digest})
 
 
 def _result_digest(

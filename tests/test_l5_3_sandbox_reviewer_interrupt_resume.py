@@ -5,6 +5,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Never
 
 import pytest
 from pydantic import ValidationError
@@ -97,8 +98,16 @@ class _NestedReviewErrorNonceFactory:
 
 
 class _NestedReviewErrorStore(SandboxInMemoryReviewStore):
-    def _recover_challenge(self, **kwargs: object) -> object:
-        del kwargs
+    def _recover_challenge(
+        self,
+        *,
+        namespace: str,
+        test_session_id: str,
+        thread_id: str,
+        checkpoint_id: str,
+        interrupt_id: str,
+    ) -> Never:
+        del namespace, test_session_id, thread_id, checkpoint_id, interrupt_id
         _raise_nested_review_error("nested-store-secret")
         raise AssertionError("unreachable")
 
@@ -1055,6 +1064,104 @@ def test_l5_3_resume_command_contains_only_resume_attempt_ref() -> None:
         )
     with pytest.raises(ValidationError):
         SandboxResumeCommandV1.model_validate({"resume_attempt_ref": 1})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("namespace", "test_session_id", "thread_id", "checkpoint_id"),
+)
+def test_l5_3_eligibility_rejects_hostile_scope_string_subclasses(
+    field: str,
+) -> None:
+    coordinator, *_ = _coordinator()
+    delivery = _issue(coordinator)
+    _stage_and_resume(coordinator, delivery, SandboxReviewAction.CONFIRM)
+
+    class _AlwaysEqualStr(str):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+        def __hash__(self) -> int:
+            return str.__hash__(self)
+
+    namespace: str = _NAMESPACE
+    test_session_id: str = delivery.challenge.test_session_id
+    thread_id: str = _THREAD_ID
+    checkpoint_id: str = _CHECKPOINT_ID
+    hostile = _AlwaysEqualStr("wrong-review-scope")
+    if field == "namespace":
+        namespace = hostile
+    elif field == "test_session_id":
+        test_session_id = hostile
+    elif field == "thread_id":
+        thread_id = hostile
+    else:
+        checkpoint_id = hostile
+
+    assert coordinator.eligibility(
+        namespace=namespace,
+        test_session_id=test_session_id,
+        thread_id=thread_id,
+        checkpoint_id=checkpoint_id,
+    ).status == "blocked"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("namespace", "thread_id", "checkpoint_id", "interrupt_id"),
+)
+def test_l5_3_challenge_issue_rejects_hostile_scope_string_subclasses(
+    field: str,
+) -> None:
+    coordinator, *_ = _coordinator()
+    source = _accepted_source()
+    coordinator.create_single_use_challenge(
+        source,
+        namespace=_NAMESPACE,
+        thread_id=_THREAD_ID,
+        checkpoint_id=_CHECKPOINT_ID,
+        interrupt_id=_INTERRUPT_ID,
+    )
+
+    class _AlwaysEqualStr(str):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+        def __hash__(self) -> int:
+            return str.__hash__(self)
+
+    namespace: str = _NAMESPACE
+    thread_id: str = _THREAD_ID
+    checkpoint_id: str = _CHECKPOINT_ID
+    interrupt_id: str = _INTERRUPT_ID
+    hostile = _AlwaysEqualStr("wrong-challenge-scope")
+    if field == "namespace":
+        namespace = hostile
+    elif field == "thread_id":
+        thread_id = hostile
+    elif field == "checkpoint_id":
+        checkpoint_id = hostile
+    else:
+        interrupt_id = hostile
+
+    with pytest.raises(SandboxReviewError):
+        coordinator.create_single_use_challenge(
+            source,
+            namespace=namespace,
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id,
+            interrupt_id=interrupt_id,
+        )
 
 
 def test_l5_3_test_identity_fields_are_exact_and_non_credentialing() -> None:
