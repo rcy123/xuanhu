@@ -18,9 +18,10 @@
 
 ## 当前任务
 
-`L4.5-11-0：回退后基线重置与方案校准` 第 1 轮验收未通过；`L4.5-11-0-R1` 文档限定返工已发布、待交付。
+L5-SBX、L6-SBX 已在 `45acf54` 完成权限与记录边界收敛并重新验收；旧 L7 已由 `21004b9` 全量撤回。唯一下一动作是从 `45acf54` 重新发布 L7-SBX bounded task；L5/L6/L7 产品轨道继续 NO-GO。
 
-当前任务书：[agent-refactor-l4-5-11-0-rework-1-task.md](../dev-handoff/agent-refactor-l4-5-11-0-rework-1-task.md)
+当前权威状态：[00-当前状态.md](项目管理/00-当前状态.md)
+本轮交付：[agent-refactor-l5-l6-authority-convergence-rework-1.md](../dev-handoff/agent-refactor-l5-l6-authority-convergence-rework-1.md)
 
 ## 历史流水
 
