@@ -685,7 +685,7 @@ class SandboxEvidenceRegistry:
 
     __slots__ = ("_lock", "_recognized", "_reauthorizable", "_epoch", "_authorizer", "_reentry_guard")
 
-    def __init__(self, authorizer: SandboxEvidenceAuthorizer | None = None) -> None:
+    def __init__(self, authorizer: SandboxEvidenceAuthorizer) -> None:
         self._lock = threading.RLock()
         self._recognized: dict[str, int] = {}  # digest -> epoch when recognized
         self._reauthorizable: set[str] = set()  # digests ever recognized
@@ -702,18 +702,26 @@ class SandboxEvidenceRegistry:
     def recognize(self, bundle_digest: str) -> bool:
         """Check whether *bundle_digest* is currently recognized.
 
-        If an authorizer is configured, it is called synchronously inside
-        this method.  A reentrant call (detected by the caller's reentry
-        guard) raises SandboxEvidenceError.
+        The injected authorizer is always consulted.  If it returns False
+        the digest is treated as unrecognised regardless of internal state.
+        A reentrant call (detected by the caller's reentry guard) raises
+        SandboxEvidenceError.
         """
         with self._lock:
-            if self._authorizer is not None and not self._authorizer.authorize(bundle_digest=bundle_digest):
+            if not self._authorizer.authorize(bundle_digest=bundle_digest):
                 return False
             return bundle_digest in self._recognized
 
     def add_recognized(self, bundle_digest: str) -> None:
-        """Add *bundle_digest* to the recognized set and increment epoch."""
+        """Add *bundle_digest* to the recognized set after authorizer approval.
+
+        The injected authorizer is always consulted.  If it returns False
+        the operation is rejected with SandboxEvidenceError.
+        The epoch is incremented on each successful state change.
+        """
         with self._lock:
+            if not self._authorizer.authorize(bundle_digest=bundle_digest):
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
             self._epoch += 1
             self._recognized[bundle_digest] = self._epoch
             self._reauthorizable.add(bundle_digest)
@@ -731,14 +739,19 @@ class SandboxEvidenceRegistry:
     def reauthorize(self, bundle_digest: str) -> bool:
         """Re-authorize a previously recognized digest.
 
+        The injected authorizer is always consulted again.  If it returns
+        False the operation is rejected with SandboxEvidenceError.
         Returns True if the digest was revoked and is now re-recognized.
-        Raises SandboxEvidenceError if the digest was never recognized.
+        Raises SandboxEvidenceError if the digest was never recognized
+        or the authorizer denies.
         Returns False (without raising) if the digest is already recognized.
         """
         with self._lock:
             if bundle_digest in self._recognized:
                 return False
             if bundle_digest not in self._reauthorizable:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
+            if not self._authorizer.authorize(bundle_digest=bundle_digest):
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
             self._epoch += 1
             self._recognized[bundle_digest] = self._epoch
@@ -864,16 +877,16 @@ class SandboxEvidenceStore:
 
     __slots__ = ("_lock", "_bundles", "_sealed", "_registry", "_reentry_guard")
 
-    def __init__(self, registry: SandboxEvidenceRegistry | None = None) -> None:
+    def __init__(self, registry: SandboxEvidenceRegistry) -> None:
         self._lock = threading.RLock()
         self._bundles: dict[str, bytes] = {}
         self._sealed = False
-        self._registry = registry  # None = bypass authority checks
+        self._registry = registry
         self._reentry_guard = 0
 
     @property
-    def registry(self) -> SandboxEvidenceRegistry | None:
-        """Expose the injected registry (None = no authority checks)."""
+    def registry(self) -> SandboxEvidenceRegistry:
+        """Expose the injected registry."""
         return self._registry
 
     def put(self, bundle: SandboxEvidenceBundleV1) -> None:
@@ -893,7 +906,7 @@ class SandboxEvidenceStore:
 
             self._reentry_guard += 1
             try:
-                if self._registry is not None and not self._registry.recognize(bundle.bundle_digest):
+                if not self._registry.recognize(bundle.bundle_digest):
                     raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
             finally:
                 self._reentry_guard -= 1
@@ -915,13 +928,12 @@ class SandboxEvidenceStore:
             if self._reentry_guard:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
 
-            if self._registry is not None:
-                self._reentry_guard += 1
-                try:
-                    if not self._registry.recognize(bundle_digest):
-                        return None
-                finally:
-                    self._reentry_guard -= 1
+            self._reentry_guard += 1
+            try:
+                if not self._registry.recognize(bundle_digest):
+                    return None
+            finally:
+                self._reentry_guard -= 1
 
             raw = self._bundles.get(bundle_digest)
             if raw is None:
@@ -939,13 +951,12 @@ class SandboxEvidenceStore:
                 try:
                     bundle = SandboxEvidenceBundleV1.model_validate_json(raw)
                     if bundle.retrieval_run == retrieval_run:
-                        if self._registry is not None:
-                            self._reentry_guard += 1
-                            try:
-                                if not self._registry.recognize(bundle.bundle_digest):
-                                    continue
-                            finally:
-                                self._reentry_guard -= 1
+                        self._reentry_guard += 1
+                        try:
+                            if not self._registry.recognize(bundle.bundle_digest):
+                                continue
+                        finally:
+                            self._reentry_guard -= 1
                         result.append(bundle)
                 except Exception:
                     continue
@@ -959,13 +970,12 @@ class SandboxEvidenceStore:
                 try:
                     bundle = SandboxEvidenceBundleV1.model_validate_json(raw)
                     if bundle.graph_run == graph_run:
-                        if self._registry is not None:
-                            self._reentry_guard += 1
-                            try:
-                                if not self._registry.recognize(bundle.bundle_digest):
-                                    continue
-                            finally:
-                                self._reentry_guard -= 1
+                        self._reentry_guard += 1
+                        try:
+                            if not self._registry.recognize(bundle.bundle_digest):
+                                continue
+                        finally:
+                            self._reentry_guard -= 1
                         result.append(bundle)
                 except Exception:
                     continue
@@ -991,27 +1001,21 @@ class SandboxEvidenceStore:
     def restore(
         cls,
         snapshot: SandboxEvidenceStoreSnapshotV1,
-        registry: SandboxEvidenceRegistry | None = None,
+        *,
+        registry: SandboxEvidenceRegistry,
     ) -> SandboxEvidenceStore:
         """Restore a store from a canonical snapshot.
 
         The snapshot digest is verified to ensure data integrity.
-        When a registry is provided the restored store uses it WITHOUT
-        auto-recognising restored digests (caller must pre-populate).
-        When no registry is provided, a default permissive registry is
-        created that auto-recognises all restored bundles (backward
-        compatibility).
+        The caller MUST provide a live registry.  The restored store
+        does NOT auto-recognise any bundles — the caller is responsible
+        for populating the registry with the appropriate digests.
         """
         _check_exact_type(snapshot, SandboxEvidenceStoreSnapshotV1)
         if snapshot.digest != hashlib.sha256(snapshot.data.encode("utf-8")).hexdigest():
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
 
         store = cls(registry=registry)
-        # When no external registry was provided, create a default one
-        # and auto-recognize all restored bundles (backward compatibility).
-        _auto_recognize = registry is None
-        if _auto_recognize:
-            store._registry = SandboxEvidenceRegistry()
         raw_bundles: list[dict[str, Any]] = json.loads(snapshot.data)
         for raw in raw_bundles:
             try:
@@ -1028,9 +1032,6 @@ class SandboxEvidenceStore:
             except Exception:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE") from None
             store._bundles[bundle.bundle_digest] = _canonical_store_bytes(bundle.model_dump(mode="json"))
-            if _auto_recognize:
-                assert store._registry is not None  # just set above
-                store._registry.add_recognized(bundle.bundle_digest)
         return store
 
 
@@ -1151,20 +1152,22 @@ class EvidencePipeline:
                     registry.add_recognized(bundle.bundle_digest)
                 self._store.put(bundle)
                 all_packets.extend(bundle.packets)
+
+            # Build the bundle map (inside reentry guard to prevent
+            # verifier callback from replacing store references)
+            bundle_map: dict[str, SandboxEvidenceBundleV1] = {b.bundle_digest: b for b in retrieval_result.bundles}
+
+            # Verify — now under reentry guard so reentrant pipeline.run
+            # during verifier callback is detected and rejected.
+            verifier_result = self._verifier.verify(
+                agent_kind=agent_kind,
+                bundles=bundle_map,
+                claims=(),
+                links=(),
+                fallback=fallback,
+            )
         finally:
             self._reentry_guard -= 1
-
-        # Build the bundle map
-        bundle_map: dict[str, SandboxEvidenceBundleV1] = {b.bundle_digest: b for b in retrieval_result.bundles}
-
-        # Verify
-        verifier_result = self._verifier.verify(
-            agent_kind=agent_kind,
-            bundles=bundle_map,
-            claims=(),
-            links=(),
-            fallback=fallback,
-        )
 
         # Build context projection
         all_bundles = tuple(retrieval_result.bundles)
