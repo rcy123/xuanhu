@@ -99,6 +99,13 @@ class _SignatureVerifier:
             and sandbox_test_signature == expected_signature
         )
 
+class _AcceptAllRuleBundleAuthorizer:
+    def recognize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return type(rule_bundle) is SandboxRuleBundleV1
+
+    def authorize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return type(rule_bundle) is SandboxRuleBundleV1
+
 
 def _subject_and_bundle(
     *,
@@ -240,7 +247,11 @@ def _accepted_modify_snapshot(
     )
     source = SandboxReviewSourceV1.build(
         safety_subject=subject,
+        safety_rule_bundle=bundle,
         safety_result=result,
+        safety_command_id="sandbox-recheck-old-command-001",
+        safety_run_id="sandbox-recheck-old-run-001",
+        safety_trace_id="sandbox-recheck-old-trace-001",
         explanation_result=None,
     )
     clock = _FakeClock()
@@ -252,6 +263,7 @@ def _accepted_modify_snapshot(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     delivery = review.create_single_use_challenge(
         source,
@@ -277,6 +289,7 @@ def _coordinator():
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         ),
         review_snapshot,
         clock,
@@ -605,9 +618,9 @@ def test_l5_4_initial_only_restore_rejects_coordinated_nonfixed_review_schema() 
     new_challenge_ref = _rederive_review_challenge_schema(
         changed["review_snapshot"],
         old_challenge_ref=old_challenge_ref,
-        schema_version="sandbox-review-challenge.v2",
+        schema_version="sandbox-review-challenge.v3",
     )
-    initial["review_schema_version"] = "sandbox-review-challenge.v2"
+    initial["review_schema_version"] = "sandbox-review-challenge.v3"
     initial["challenge_ref"] = new_challenge_ref
     initial_ref = _refresh_mapping_ref(
         initial,
@@ -625,6 +638,7 @@ def test_l5_4_initial_only_restore_rejects_coordinated_nonfixed_review_schema() 
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
 
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
@@ -666,6 +680,7 @@ def test_l5_4_restore_rejects_coordinated_invalid_private_proof_identifier(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
 
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
@@ -754,6 +769,7 @@ def test_l5_4_restore_rejects_coordinated_private_review_action_change(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
         assert restored.completion_eligibility(
             namespace=_NAMESPACE,
@@ -783,7 +799,7 @@ def test_l5_4_all_shared_store_constructions_forward_one_signature_verifier() ->
         if isinstance(node, ast.Call)
         and ast.unparse(node.func) == "SandboxInMemoryReviewStore"
     )
-    assert len(store_calls) == 3
+    assert len(store_calls) == 4
     assert all(
         {
             keyword.arg: ast.unparse(keyword.value)
@@ -833,6 +849,7 @@ def test_l5_4_signature_verified_restart_accepts_current_review_attempts(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
 
     assert verifier.calls == 2
@@ -904,6 +921,7 @@ def test_l5_4_initial_authority_requires_one_applied_modify_action(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
     assert raised.value.__cause__ is None
@@ -1010,10 +1028,10 @@ def test_l5_4_unknown_adapter_version_commits_failed_revision_and_stays_blocked(
         rule_revision=3,
     )
     candidate = candidate.model_copy(
-        update={"adapter_version": "sandbox-safety-adapter.v2"}
+        update={"adapter_version": "sandbox-safety-adapter.v3"}
     )
     bundle = bundle.model_copy(
-        update={"adapter_version": "sandbox-safety-adapter.v2"}
+        update={"adapter_version": "sandbox-safety-adapter.v3"}
     )
     outcome = coordinator.apply_revision(
         _revision_command(coordinator, candidate=candidate, bundle=bundle)
@@ -1174,6 +1192,7 @@ def test_l5_4_restart_preserves_pending_and_confirmed_current_review() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted.snapshot() == pending_snapshot
     assert nonce_factory.calls == 2
@@ -1192,6 +1211,7 @@ def test_l5_4_restart_preserves_pending_and_confirmed_current_review() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted_again.completion_eligibility(
         namespace=_NAMESPACE,
@@ -1228,10 +1248,10 @@ def test_l5_4_restart_preserves_terminal_blocked_states_and_receipts(
     )
     if mode == "unknown_adapter":
         candidate = candidate.model_copy(
-            update={"adapter_version": "sandbox-safety-adapter.v2"}
+            update={"adapter_version": "sandbox-safety-adapter.v3"}
         )
         bundle = bundle.model_copy(
-            update={"adapter_version": "sandbox-safety-adapter.v2"}
+            update={"adapter_version": "sandbox-safety-adapter.v3"}
         )
     elif mode == "review_setup":
         nonce_factory.value = b"invalid"
@@ -1247,6 +1267,7 @@ def test_l5_4_restart_preserves_terminal_blocked_states_and_receipts(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert outcome.status == expected_status
     assert restarted.snapshot() == snapshot
@@ -1335,6 +1356,7 @@ def test_l5_4_combined_snapshot_rejects_semantic_mismatches_chainlessly() -> Non
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
     assert raised.value.__cause__ is None
@@ -1387,6 +1409,7 @@ def test_l5_4_combined_snapshot_rejects_each_outer_integrity_mismatch(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1516,6 +1539,7 @@ def test_l5_4_restart_rejects_rederived_revision_authority_drift(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1530,10 +1554,10 @@ def test_l5_4_restart_rejects_self_consistent_current_child_schema_drift() -> No
     bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
     parent_schema = bad["revisions"][0]["review_schema_version"]
     child_schema = bad["revisions"][1]["review_schema_version"]
-    assert parent_schema == child_schema == "sandbox-review-challenge.v1"
+    assert parent_schema == child_schema == "sandbox-review-challenge.v2"
 
     _rederive_current_child_review_schema(
-        bad, schema_version="sandbox-review-challenge.v2"
+        bad, schema_version="sandbox-review-challenge.v3"
     )
     assert bad["revisions"][0]["review_schema_version"] == parent_schema
     assert bad["revisions"][1]["review_schema_version"] != parent_schema
@@ -1555,6 +1579,7 @@ def test_l5_4_restart_rejects_self_consistent_current_child_schema_drift() -> No
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
     assert raised.value.__cause__ is None
@@ -1574,6 +1599,7 @@ def test_l5_4_restart_preserves_one_schema_across_review_and_terminal_children()
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     staged = restarted.stage_current_review(
         _submission(review_required.delivery, SandboxReviewAction.MODIFY_FIXTURE)
@@ -1614,6 +1640,7 @@ def test_l5_4_restart_preserves_one_schema_across_review_and_terminal_children()
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     ).snapshot() == snapshot
 
 
@@ -1704,6 +1731,7 @@ def test_l5_4_source_build_failure_commits_fixed_review_setup_failure(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted.snapshot() == snapshot
     assert restarted.apply_revision(command).status == "replayed_or_conflict"
@@ -1721,10 +1749,10 @@ def test_l5_4_restore_reuses_full_live_command_prevalidation(drift: str) -> None
             dataset_version="shared-predicate.2",
         )
         candidate = candidate.model_copy(
-            update={"adapter_version": "sandbox-safety-adapter.v2"}
+            update={"adapter_version": "sandbox-safety-adapter.v3"}
         )
         bundle = bundle.model_copy(
-            update={"adapter_version": "sandbox-safety-adapter.v2"}
+            update={"adapter_version": "sandbox-safety-adapter.v3"}
         )
         coordinator.apply_revision(
             _revision_command(
@@ -1733,7 +1761,7 @@ def test_l5_4_restore_reuses_full_live_command_prevalidation(drift: str) -> None
         )
         bad = copy.deepcopy(coordinator.snapshot().model_dump(mode="python"))
         bad["revisions"][1]["rule_bundle"]["adapter_version"] = (
-            "sandbox-safety-adapter.v1"
+            "sandbox-safety-adapter.v2"
         )
     else:
         candidate, bundle = _subject_and_bundle(
@@ -1764,6 +1792,7 @@ def test_l5_4_restore_reuses_full_live_command_prevalidation(drift: str) -> None
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1776,6 +1805,7 @@ def test_l5_4_initial_modify_event_must_belong_to_exact_applied_challenge() -> N
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     ).snapshot()
     store = SandboxInMemoryReviewStore(
         snapshot=review_snapshot,
@@ -1786,6 +1816,7 @@ def test_l5_4_initial_modify_event_must_belong_to_exact_applied_challenge() -> N
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     pending = review.create_single_use_challenge(
         review_snapshot.sources[0].source,
@@ -1814,6 +1845,7 @@ def test_l5_4_initial_modify_event_must_belong_to_exact_applied_challenge() -> N
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1837,6 +1869,7 @@ def test_l5_4_terminal_status_rejects_retained_private_review_authority() -> Non
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1849,6 +1882,7 @@ def test_l5_4_only_initial_rejects_later_same_scope_current_challenge() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     ).snapshot()
     store = SandboxInMemoryReviewStore(
         snapshot=review_snapshot,
@@ -1859,6 +1893,7 @@ def test_l5_4_only_initial_rejects_later_same_scope_current_challenge() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     pending = review.create_single_use_challenge(
         review_snapshot.sources[0].source,
@@ -1883,6 +1918,7 @@ def test_l5_4_only_initial_rejects_later_same_scope_current_challenge() -> None:
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1916,6 +1952,7 @@ def test_l5_4_terminal_rejects_later_same_scope_current_challenge() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     pending = review.create_single_use_challenge(
         baseline.review_snapshot.sources[0].source,
@@ -1948,6 +1985,7 @@ def test_l5_4_terminal_rejects_later_same_scope_current_challenge() -> None:
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -1977,6 +2015,7 @@ def test_l5_4_outer_revision_chain_cannot_skip_same_scope_issue() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     skipped = review.create_single_use_challenge(
         initial_review_snapshot.sources[0].source,
@@ -2021,6 +2060,7 @@ def test_l5_4_outer_revision_chain_cannot_skip_same_scope_issue() -> None:
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -2048,6 +2088,7 @@ def test_l5_4_issue_projection_ignores_other_scope_interleaving() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     other_scope = review.create_single_use_challenge(
         current_source,
@@ -2082,6 +2123,7 @@ def test_l5_4_issue_projection_ignores_other_scope_interleaving() -> None:
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted.snapshot().review_snapshot == private_snapshot
 
@@ -2110,6 +2152,7 @@ def test_l5_4_completion_uses_exact_current_source_with_other_scope_history() ->
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     other_scope = review.create_single_use_challenge(
         current_source,
@@ -2142,6 +2185,7 @@ def test_l5_4_completion_uses_exact_current_source_with_other_scope_history() ->
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     staged = restarted.stage_current_review(
         _submission(exact_current, SandboxReviewAction.CONFIRM)
@@ -2194,9 +2238,14 @@ def _review_setup_failed_terminal_snapshot(monkeypatch: pytest.MonkeyPatch):
     terminal = snapshot.revisions[-1]
     assert terminal.status == "review_setup_failed"
     assert terminal.result is not None
+    assert terminal.rule_bundle is not None
     source = SandboxReviewSourceV1.build(
         safety_subject=terminal.subject,
+        safety_rule_bundle=terminal.rule_bundle,
         safety_result=terminal.result,
+        safety_command_id="sandbox-recheck-command-r5-terminal-source",
+        safety_run_id="sandbox-recheck-run-r5-terminal-source",
+        safety_trace_id="sandbox-recheck-trace-r5-terminal-source",
         explanation_result=None,
     )
     return snapshot, terminal, source, clock, nonce_factory, verifier
@@ -2217,6 +2266,7 @@ def test_l5_4_terminal_ignores_other_scope_same_subject_authority(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     other_scope = review.create_single_use_challenge(
         source,
@@ -2238,6 +2288,7 @@ def test_l5_4_terminal_ignores_other_scope_same_subject_authority(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     round_trip = restarted.snapshot()
     assert round_trip.review_snapshot == private_snapshot
@@ -2247,6 +2298,7 @@ def test_l5_4_terminal_ignores_other_scope_same_subject_authority(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     ).snapshot() == round_trip
 
 
@@ -2265,6 +2317,7 @@ def test_l5_4_terminal_rejects_same_revision_source_authority(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     same_revision = review.create_single_use_challenge(
         source,
@@ -2288,6 +2341,7 @@ def test_l5_4_terminal_rejects_same_revision_source_authority(
             clock=clock,
             nonce_factory=nonce_factory,
             signature_verifier=verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
     assert str(raised.value) == "SANDBOX_RECHECK_REJECTED"
     assert raised.value.__cause__ is None

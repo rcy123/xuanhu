@@ -20,6 +20,7 @@ from app.agent_runtime.sandbox_review import (
     SandboxReviewCoordinator,
     SandboxReviewSourceV1,
     SandboxReviewStoreSnapshotV1,
+    SandboxRuleBundleAuthorizer,
     SandboxSignatureVerifier,
 )
 from app.agent_runtime.sandbox_safety import (
@@ -31,6 +32,7 @@ from app.agent_runtime.sandbox_safety import (
     SandboxSafetyRuleAdapter,
     SandboxSafetySubjectV1,
     canonical_json_bytes,
+    reproduce_sandbox_safety_result,
 )
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -744,7 +746,7 @@ def _snapshot_results_are_reproducible(snapshot: SandboxRecheckSnapshotV1) -> bo
             return False
         run = snapshot.runs[index]
         try:
-            reproduced = SandboxSafetyRuleAdapter().evaluate(
+            reproduced = reproduce_sandbox_safety_result(
                 revision.subject,
                 bundle,
                 command_id=run.command_id,
@@ -828,6 +830,7 @@ class SandboxRecheckCoordinator:
         clock: Callable[[], int],
         nonce_factory: Callable[[], bytes],
         signature_verifier: SandboxSignatureVerifier,
+        rule_bundle_authorizer: SandboxRuleBundleAuthorizer,
         review_snapshot: object | None = None,
         snapshot: object | None = None,
     ) -> None:
@@ -835,8 +838,10 @@ class SandboxRecheckCoordinator:
         self._clock = clock
         self._nonce_factory = nonce_factory
         self._signature_verifier = signature_verifier
+        self._rule_bundle_authorizer = rule_bundle_authorizer
         restored: SandboxRecheckSnapshotV1 | None = None
         review_store: SandboxInMemoryReviewStore | None = None
+        recognized_bundle_digests: frozenset[str] | None = None
         with self._lock:
             with suppress(Exception):
                 if (review_snapshot is None) == (snapshot is None):
@@ -853,11 +858,20 @@ class SandboxRecheckCoordinator:
                     )
                 if not _snapshot_results_are_reproducible(restored):
                     raise SandboxRecheckError()
+                recognized_bundle_digests = (
+                    self._externally_recognized_bundle_digests(restored)
+                )
+                if recognized_bundle_digests is None:
+                    raise SandboxRecheckError()
                 review_store = SandboxInMemoryReviewStore(
                     snapshot=restored.review_snapshot,
                     signature_verifier=self._signature_verifier,
                 )
-            if restored is None or review_store is None:
+            if (
+                restored is None
+                or review_store is None
+                or recognized_bundle_digests is None
+            ):
                 raise SandboxRecheckError()
             self._revisions = list(restored.revisions)
             self._runs = list(restored.runs)
@@ -865,6 +879,7 @@ class SandboxRecheckCoordinator:
             self._receipts = list(restored.receipts)
             self._current_revision_ref = restored.current_revision_ref
             self._review_store = review_store
+            self._recognized_rule_bundle_digests = recognized_bundle_digests
             self._review = self._new_review_coordinator(review_store)
 
     @property
@@ -874,15 +889,29 @@ class SandboxRecheckCoordinator:
 
     def snapshot(self) -> SandboxRecheckSnapshotV1:
         with self._lock:
-            value = SandboxRecheckSnapshotV1(
-                revisions=tuple(self._revisions),
-                runs=tuple(self._runs),
-                invalidations=tuple(self._invalidations),
-                receipts=tuple(self._receipts),
-                current_revision_ref=self._current_revision_ref,
-                review_snapshot=self._review_store.snapshot(),
-            )
-            return _deep_model(SandboxRecheckSnapshotV1, value)
+            validated: SandboxRecheckSnapshotV1 | None = None
+            with suppress(Exception):
+                value = SandboxRecheckSnapshotV1(
+                    revisions=tuple(self._revisions),
+                    runs=tuple(self._runs),
+                    invalidations=tuple(self._invalidations),
+                    receipts=tuple(self._receipts),
+                    current_revision_ref=self._current_revision_ref,
+                    review_snapshot=self._review_store.snapshot(),
+                )
+                candidate = _deep_model(SandboxRecheckSnapshotV1, value)
+                if not _snapshot_results_are_reproducible(candidate):
+                    raise SandboxRecheckError()
+                if not self._all_snapshot_bundles_are_recognized(candidate):
+                    raise SandboxRecheckError()
+                SandboxInMemoryReviewStore(
+                    snapshot=candidate.review_snapshot,
+                    signature_verifier=self._signature_verifier,
+                )
+                validated = candidate
+            if validated is None:
+                raise SandboxRecheckError()
+            return validated
 
     def apply_revision(
         self, command_input: SandboxRevisionCommandV1
@@ -927,6 +956,8 @@ class SandboxRecheckCoordinator:
                 command, current
             ):
                 raise SandboxRecheckError()
+            if not self._rule_bundle_is_authorized(command.rule_bundle):
+                raise SandboxRecheckError()
 
             result: SandboxSafetyResultV1 | None = None
             status: Literal[
@@ -938,19 +969,31 @@ class SandboxRecheckCoordinator:
             evaluation_failed = False
             prewrite_rejection = False
             try:
-                result = SandboxSafetyRuleAdapter().evaluate(
+                evaluated = SandboxSafetyRuleAdapter().evaluate(
                     command.candidate_subject,
                     command.rule_bundle,
                     command_id=command.command_id,
                     run_id=command.run_id,
                     trace_id=command.trace_id,
                 )
+                result = _deep_model(SandboxSafetyResultV1, evaluated)
+                reproduced = reproduce_sandbox_safety_result(
+                    command.candidate_subject,
+                    command.rule_bundle,
+                    command_id=command.command_id,
+                    run_id=command.run_id,
+                    trace_id=command.trace_id,
+                )
+                if result != reproduced:
+                    result = None
+                    evaluation_failed = True
             except SandboxSafetyAdapterError as error:
                 if error.code in {
                     SandboxSafetyFailureCode.SCHEMA_INVALID,
                     SandboxSafetyFailureCode.DIGEST_MISMATCH,
                     SandboxSafetyFailureCode.LIMIT_EXCEEDED,
                     SandboxSafetyFailureCode.EVALUATOR_RESULT_INVALID,
+                    SandboxSafetyFailureCode.PROHIBITED_IDENTIFIER,
                 }:
                     prewrite_rejection = True
                 else:
@@ -969,7 +1012,11 @@ class SandboxRecheckCoordinator:
                 try:
                     source = SandboxReviewSourceV1.build(
                         safety_subject=command.candidate_subject,
+                        safety_rule_bundle=command.rule_bundle,
                         safety_result=result,
+                        safety_command_id=command.command_id,
+                        safety_run_id=command.run_id,
+                        safety_trace_id=command.trace_id,
                         explanation_result=None,
                     )
                     review_render_digest = source.review_render_digest
@@ -1069,18 +1116,34 @@ class SandboxRecheckCoordinator:
                 current_revision_ref=revision.revision_ref,
                 review_snapshot=published_review,
             )
-            if candidate_store is None:
-                candidate_store = SandboxInMemoryReviewStore(
-                    snapshot=candidate_snapshot.review_snapshot,
-                    signature_verifier=self._signature_verifier,
+            candidate_recognized_digests = frozenset(
+                (
+                    *self._recognized_rule_bundle_digests,
+                    command.rule_bundle.rule_bundle_digest,
                 )
+            )
+            if (
+                not _snapshot_results_are_reproducible(candidate_snapshot)
+                or not self._snapshot_bundle_digests(candidate_snapshot)
+                <= candidate_recognized_digests
+            ):
+                raise SandboxRecheckError()
+            candidate_store = SandboxInMemoryReviewStore(
+                snapshot=candidate_snapshot.review_snapshot,
+                signature_verifier=self._signature_verifier,
+            )
+            candidate_review = self._new_review_coordinator(
+                candidate_store,
+                recognized_rule_bundle_digests=candidate_recognized_digests,
+            )
             self._revisions.append(revision)
             self._runs.append(run)
             self._invalidations.append(invalidation)
             self._receipts.append(receipt)
             self._current_revision_ref = revision.revision_ref
             self._review_store = candidate_store
-            self._review = self._new_review_coordinator(candidate_store)
+            self._recognized_rule_bundle_digests = candidate_recognized_digests
+            self._review = candidate_review
             return SandboxModificationResultV1(
                 status=status,
                 current_revision_ref=revision.revision_ref,
@@ -1252,12 +1315,105 @@ class SandboxRecheckCoordinator:
         )
         return len(markers) == len(challenges) == len(events) == 1
 
+    def _rule_bundle_is_authorized(
+        self,
+        rule_bundle: SandboxRuleBundleV1,
+    ) -> bool:
+        try:
+            candidate = _deep_model(SandboxRuleBundleV1, rule_bundle)
+            return (
+                self._rule_bundle_authorizer.recognize(
+                    rule_bundle=candidate
+                )
+                is True
+                and self._rule_bundle_authorizer.authorize(
+                    rule_bundle=candidate
+                )
+                is True
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _snapshot_bundles(
+        snapshot: SandboxRecheckSnapshotV1,
+    ) -> tuple[SandboxRuleBundleV1, ...]:
+        return (
+            *(
+                source.source.safety_rule_bundle
+                for source in snapshot.review_snapshot.sources
+            ),
+            *(
+                revision.rule_bundle
+                for revision in snapshot.revisions
+                if revision.rule_bundle is not None
+            ),
+        )
+
+    @classmethod
+    def _snapshot_bundle_digests(
+        cls,
+        snapshot: SandboxRecheckSnapshotV1,
+    ) -> frozenset[str]:
+        bundles = cls._snapshot_bundles(snapshot)
+        if not bundles:
+            raise SandboxRecheckError()
+        return frozenset(
+            _deep_model(SandboxRuleBundleV1, bundle).rule_bundle_digest
+            for bundle in bundles
+        )
+
+    def _externally_recognized_bundle_digests(
+        self,
+        snapshot: SandboxRecheckSnapshotV1,
+    ) -> frozenset[str] | None:
+        try:
+            bundles = self._snapshot_bundles(snapshot)
+            if not bundles:
+                return None
+            recognized: set[str] = set()
+            for bundle in bundles:
+                candidate = _deep_model(SandboxRuleBundleV1, bundle)
+                if (
+                    self._rule_bundle_authorizer.recognize(
+                        rule_bundle=candidate
+                    )
+                    is not True
+                ):
+                    return None
+                recognized.add(candidate.rule_bundle_digest)
+            return frozenset(recognized)
+        except Exception:
+            return None
+
+    def _all_snapshot_bundles_are_recognized(
+        self,
+        snapshot: SandboxRecheckSnapshotV1,
+    ) -> bool:
+        try:
+            return (
+                self._snapshot_bundle_digests(snapshot)
+                <= self._recognized_rule_bundle_digests
+            )
+        except Exception:
+            return False
+
     def _new_review_coordinator(
-        self, store: SandboxInMemoryReviewStore
+        self,
+        store: SandboxInMemoryReviewStore,
+        *,
+        recognized_rule_bundle_digests: frozenset[str] | None = None,
     ) -> SandboxReviewCoordinator:
+        recognized = (
+            self._recognized_rule_bundle_digests
+            if recognized_rule_bundle_digests is None
+            else recognized_rule_bundle_digests
+        )
         return SandboxReviewCoordinator(
             store=store,
             clock=self._clock,
             nonce_factory=self._nonce_factory,
             signature_verifier=self._signature_verifier,
+            rule_bundle_authorizer=self._rule_bundle_authorizer,
+            _recognized_rule_bundle_digests=recognized,
         )

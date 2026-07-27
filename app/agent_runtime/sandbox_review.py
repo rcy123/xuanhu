@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol
@@ -17,16 +17,18 @@ from app.agent_runtime.sandbox_explanation import (
     canonical_explanation_bytes,
 )
 from app.agent_runtime.sandbox_safety import (
+    SandboxRuleBundleV1,
     SandboxSafetyDecision,
     SandboxSafetyResultV1,
     SandboxSafetySubjectV1,
     canonical_json_bytes,
     canonical_result_bytes,
+    reproduce_sandbox_safety_result,
 )
 
 MAX_RESUME_SUBMISSION_BYTES = 65_536
 _CHALLENGE_TTL_SECONDS = 900
-_REVIEW_SCHEMA_VERSION = "sandbox-review-challenge.v1"
+_REVIEW_SCHEMA_VERSION = "sandbox-review-challenge.v2"
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 _ReviewTestIdentifier = Annotated[
@@ -103,7 +105,11 @@ class SandboxReviewSourceV1(_StrictFrozenModel):
     """Accepted L5-1/L5-2 authority and its canonical bindings."""
 
     safety_subject: SandboxSafetySubjectV1
+    safety_rule_bundle: SandboxRuleBundleV1
     safety_result: SandboxSafetyResultV1
+    safety_command_id: _ReviewTestIdentifier
+    safety_run_id: _ReviewTestIdentifier
+    safety_trace_id: _ReviewTestIdentifier
     explanation_result: SandboxExplanationResultV1 | None
     input_digest: str = Field(pattern=_DIGEST_PATTERN)
     result_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -112,6 +118,13 @@ class SandboxReviewSourceV1(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def authority_is_bound(self) -> SandboxReviewSourceV1:
+        reproduced = reproduce_sandbox_safety_result(
+            self.safety_subject,
+            self.safety_rule_bundle,
+            command_id=self.safety_command_id,
+            run_id=self.safety_run_id,
+            trace_id=self.safety_trace_id,
+        )
         input_digest = _bytes_sha256(canonical_json_bytes(self.safety_subject))
         result_canonical_digest = _bytes_sha256(
             canonical_result_bytes(self.safety_result)
@@ -132,6 +145,7 @@ class SandboxReviewSourceV1(_StrictFrozenModel):
         if (
             input_digest != self.input_digest
             or input_digest != self.safety_result.decision_subject_digest
+            or reproduced != self.safety_result
             or self.safety_subject.adapter_version
             != self.safety_result.adapter_version
             or self.result_digest != self.safety_result.result_digest
@@ -152,10 +166,15 @@ class SandboxReviewSourceV1(_StrictFrozenModel):
         cls,
         *,
         safety_subject: SandboxSafetySubjectV1,
+        safety_rule_bundle: SandboxRuleBundleV1,
         safety_result: SandboxSafetyResultV1,
+        safety_command_id: str,
+        safety_run_id: str,
+        safety_trace_id: str,
         explanation_result: SandboxExplanationResultV1 | None = None,
     ) -> SandboxReviewSourceV1:
         subject = _deep_model(SandboxSafetySubjectV1, safety_subject)
+        rule_bundle = _deep_model(SandboxRuleBundleV1, safety_rule_bundle)
         result = _deep_model(SandboxSafetyResultV1, safety_result)
         explanation = (
             None
@@ -171,7 +190,11 @@ class SandboxReviewSourceV1(_StrictFrozenModel):
         )
         return cls(
             safety_subject=subject,
+            safety_rule_bundle=rule_bundle,
             safety_result=result,
+            safety_command_id=safety_command_id,
+            safety_run_id=safety_run_id,
+            safety_trace_id=safety_trace_id,
             explanation_result=explanation,
             input_digest=input_digest,
             result_digest=result.result_digest,
@@ -525,6 +548,74 @@ class SandboxSignatureVerifier(Protocol):
         sandbox_test_key_id: str,
         sandbox_test_signature: str,
     ) -> bool: ...
+
+
+class SandboxRuleBundleAuthorizer(Protocol):
+    """Trusted policy snapshot.
+
+    ``recognize`` establishes historical registry membership. ``authorize`` is
+    the live decision and is the operation's authorization linearization point.
+    A later revocation applies to later calls; it does not retroactively cancel
+    an operation for which ``authorize`` already returned ``True``.
+    """
+
+    def recognize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool: ...
+
+    def authorize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool: ...
+
+
+class SandboxImmutableRuleBundleRegistry:
+    """Immutable digest allowlist for trusted offline sandbox composition.
+
+    The supplied digests are trust anchors and must come from the trusted
+    application/bootstrap boundary, never from an untrusted request payload.
+    """
+
+    __slots__ = ("_authorized", "_recognized")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, name):
+            raise AttributeError("sandbox rule bundle registry is immutable")
+        object.__setattr__(self, name, value)
+
+    def __init__(
+        self,
+        *,
+        recognized_rule_bundle_digests: Sequence[str],
+        authorized_rule_bundle_digests: Sequence[str],
+    ) -> None:
+        recognized = self._validated_digests(
+            recognized_rule_bundle_digests
+        )
+        authorized = self._validated_digests(
+            authorized_rule_bundle_digests
+        )
+        if not authorized <= recognized:
+            raise ValueError("authorized bundles must be historically recognized")
+        self._recognized = recognized
+        self._authorized = authorized
+
+    @staticmethod
+    def _validated_digests(values: Sequence[str]) -> frozenset[str]:
+        bounded: list[str] = []
+        for value in values:
+            if (
+                len(bounded) >= 1024
+                or type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError("invalid sandbox rule bundle trust anchor")
+            bounded.append(value)
+        if len(bounded) != len(set(bounded)):
+            raise ValueError("duplicate sandbox rule bundle trust anchor")
+        return frozenset(bounded)
+
+    def recognize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return rule_bundle.rule_bundle_digest in self._recognized
+
+    def authorize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return rule_bundle.rule_bundle_digest in self._authorized
 
 
 def _deep_model[ModelT: BaseModel](
@@ -944,7 +1035,7 @@ def _snapshot_is_integral(snapshot: SandboxReviewStoreSnapshotV1) -> bool:
 
 
 class SandboxInMemoryReviewStore:
-    """Thread-safe, sandbox-only in-memory reference domain store."""
+    """Internal persistence primitive; coordinator methods are the safety API."""
 
     def __init__(
         self,
@@ -1005,7 +1096,7 @@ class SandboxInMemoryReviewStore:
             )
             return _deep_model(SandboxReviewStoreSnapshotV1, value)
 
-    def recover_challenge(
+    def _recover_challenge(
         self,
         *,
         namespace: str,
@@ -1029,7 +1120,7 @@ class SandboxInMemoryReviewStore:
                 _deep_model(SandboxReviewSourceV1, source.source),
             )
 
-    def issue(
+    def _issue(
         self,
         *,
         source: SandboxReviewSourceV1,
@@ -1118,7 +1209,7 @@ class SandboxInMemoryReviewStore:
             self._operation_count += 1
             return True
 
-    def stage(
+    def _stage(
         self,
         *,
         submission: SandboxResumeSubmissionV1,
@@ -1176,7 +1267,7 @@ class SandboxInMemoryReviewStore:
                 self._operation_count += 1
             return True
 
-    def apply(
+    def _apply(
         self, command: SandboxResumeCommandV1, *, now: int
     ) -> Literal["applied", "replayed_or_conflict", "resume_rejected"]:
         with self._lock:
@@ -1280,7 +1371,7 @@ class SandboxInMemoryReviewStore:
             self._operation_count += 1
             return "applied"
 
-    def eligibility(
+    def _eligibility(
         self,
         *,
         namespace: str,
@@ -1541,11 +1632,50 @@ class SandboxReviewCoordinator:
         clock: Callable[[], int],
         nonce_factory: Callable[[], bytes],
         signature_verifier: SandboxSignatureVerifier,
+        rule_bundle_authorizer: SandboxRuleBundleAuthorizer,
+        _recognized_rule_bundle_digests: frozenset[str] | None = None,
     ) -> None:
-        self._store = store
-        self._clock = clock
-        self._nonce_factory = nonce_factory
-        self._signature_verifier = signature_verifier
+        accepted = False
+        try:
+            snapshot = store.snapshot()
+            historical_bundles = tuple(
+                _deep_model(
+                    SandboxRuleBundleV1,
+                    source.source.safety_rule_bundle,
+                )
+                for source in snapshot.sources
+            )
+            recognized = (
+                all(
+                    bundle.rule_bundle_digest
+                    in _recognized_rule_bundle_digests
+                    for bundle in historical_bundles
+                )
+                if _recognized_rule_bundle_digests is not None
+                else all(
+                    rule_bundle_authorizer.recognize(
+                        rule_bundle=bundle,
+                    )
+                    is True
+                    for bundle in historical_bundles
+                )
+            )
+            if recognized:
+                self._store = store
+                self._clock = clock
+                self._nonce_factory = nonce_factory
+                self._signature_verifier = signature_verifier
+                self._rule_bundle_authorizer = rule_bundle_authorizer
+                self._recognition_lock = threading.RLock()
+                self._recognized_rule_bundle_digests = frozenset(
+                    bundle.rule_bundle_digest
+                    for bundle in historical_bundles
+                )
+                accepted = True
+        except Exception:
+            pass
+        if not accepted:
+            raise SandboxReviewError()
 
     def create_single_use_challenge(
         self,
@@ -1558,9 +1688,15 @@ class SandboxReviewCoordinator:
     ) -> SandboxChallengeDeliveryV1:
         try:
             accepted = _deep_model(SandboxReviewSourceV1, source)
-            if accepted.safety_result.decision is not SandboxSafetyDecision.ALLOW:
+            if (
+                accepted.safety_result.decision is not SandboxSafetyDecision.ALLOW
+                or not self._rule_bundle_is_authorized(
+                    accepted.safety_rule_bundle,
+                    allow_new=True,
+                )
+            ):
                 raise SandboxReviewError()
-            recovered = self._store.recover_challenge(
+            recovered = self._store._recover_challenge(
                 namespace=namespace,
                 test_session_id=accepted.safety_subject.test_session_id,
                 thread_id=thread_id,
@@ -1626,9 +1762,9 @@ class SandboxReviewCoordinator:
                 nonce_digest=_bytes_sha256(plaintext_nonce),
                 state="issued",
             )
-            created = self._store.issue(source=accepted, challenge=challenge)
+            created = self._store._issue(source=accepted, challenge=challenge)
             if not created:
-                recovered = self._store.recover_challenge(
+                recovered = self._store._recover_challenge(
                     namespace=namespace,
                     test_session_id=subject.test_session_id,
                     thread_id=thread_id,
@@ -1670,6 +1806,41 @@ class SandboxReviewCoordinator:
                 != challenge.nonce_digest
             ):
                 return _fixed_stage_rejection()
+            snapshot = self._store.snapshot()
+            stored_challenges = tuple(
+                stored
+                for stored in snapshot.challenges
+                if stored.challenge_ref == challenge.challenge_ref
+            )
+            checkpoints = tuple(
+                checkpoint
+                for checkpoint in snapshot.checkpoints
+                if checkpoint.challenge_ref == challenge.challenge_ref
+                and checkpoint.namespace == challenge.namespace
+                and checkpoint.test_session_id == challenge.test_session_id
+                and checkpoint.thread_id == challenge.thread_id
+                and checkpoint.checkpoint_id == challenge.checkpoint_id
+                and checkpoint.interrupt_id == challenge.interrupt_id
+            )
+            sources = (
+                ()
+                if len(checkpoints) != 1
+                else tuple(
+                    source
+                    for source in snapshot.sources
+                    if source.source_ref == checkpoints[0].source_ref
+                )
+            )
+            if (
+                len(stored_challenges) != 1
+                or stored_challenges[0] != challenge
+                or len(sources) != 1
+                or not self._rule_bundle_is_authorized(
+                    sources[0].source.safety_rule_bundle
+                )
+            ):
+                return _fixed_stage_rejection()
+            source_ref = sources[0].source_ref
             proof = submission.proof
             signed_payload_digest = review_signed_payload_digest(
                 challenge=challenge,
@@ -1698,19 +1869,6 @@ class SandboxReviewCoordinator:
                 )
             ):
                 return _fixed_stage_rejection()
-            snapshot = self._store.snapshot()
-            matching = tuple(
-                source
-                for source in snapshot.sources
-                if source.namespace == challenge.namespace
-                and source.test_session_id == challenge.test_session_id
-                and source.thread_id == challenge.thread_id
-                and source.checkpoint_id == challenge.checkpoint_id
-                and source.interrupt_id == challenge.interrupt_id
-            )
-            if len(matching) != 1:
-                return _fixed_stage_rejection()
-            source_ref = matching[0].source_ref
             provisional_attempt = _SealedAttemptV1.model_construct(
                 resume_attempt_ref="sandbox-attempt-" + "0" * 64,
                 challenge_ref=challenge.challenge_ref,
@@ -1753,7 +1911,7 @@ class SandboxReviewCoordinator:
                 sandbox_test_signature=proof.sandbox_test_signature,
                 state="sealed",
             )
-            if not self._store.stage(
+            if not self._store._stage(
                 submission=submission,
                 attempt=attempt,
                 now=self._now(),
@@ -1770,7 +1928,21 @@ class SandboxReviewCoordinator:
     def resume(self, command_input: SandboxResumeCommandV1) -> _ResumeResultV1:
         try:
             command = _deep_model(SandboxResumeCommandV1, command_input)
-            status = self._store.apply(command, now=self._now())
+            snapshot = self._store.snapshot()
+            attempts = tuple(
+                attempt
+                for attempt in snapshot.attempts
+                if attempt.resume_attempt_ref == command.resume_attempt_ref
+            )
+            if (
+                len(attempts) != 1
+                or not self._challenge_has_expected_source(
+                    attempts[0].challenge_ref,
+                    snapshot=snapshot,
+                )
+            ):
+                return _fixed_resume_rejection()
+            status = self._store._apply(command, now=self._now())
             if status == "applied":
                 return _ResumeResultV1(status="applied", command=command)
             if status == "replayed_or_conflict":
@@ -1788,7 +1960,24 @@ class SandboxReviewCoordinator:
         checkpoint_id: str,
     ) -> _EligibilityV1:
         try:
-            eligible = self._store.eligibility(
+            snapshot = self._store.snapshot()
+            markers = tuple(
+                marker
+                for marker in snapshot.current_authorities
+                if marker.namespace == namespace
+                and marker.test_session_id == test_session_id
+                and marker.thread_id == thread_id
+                and marker.checkpoint_id == checkpoint_id
+            )
+            if (
+                len(markers) != 1
+                or not self._challenge_has_expected_source(
+                    markers[0].challenge_ref,
+                    snapshot=snapshot,
+                )
+            ):
+                return _EligibilityV1(status="blocked")
+            eligible = self._store._eligibility(
                 namespace=namespace,
                 test_session_id=test_session_id,
                 thread_id=thread_id,
@@ -1797,6 +1986,68 @@ class SandboxReviewCoordinator:
             return _EligibilityV1(status="eligible" if eligible else "blocked")
         except Exception:
             return _EligibilityV1(status="blocked")
+
+    def _challenge_has_expected_source(
+        self,
+        challenge_ref: str,
+        *,
+        snapshot: SandboxReviewStoreSnapshotV1,
+    ) -> bool:
+        checkpoints = tuple(
+            checkpoint
+            for checkpoint in snapshot.checkpoints
+            if checkpoint.challenge_ref == challenge_ref
+        )
+        if len(checkpoints) != 1:
+            return False
+        sources = tuple(
+            source
+            for source in snapshot.sources
+            if source.source_ref == checkpoints[0].source_ref
+        )
+        return (
+            len(sources) == 1
+            and self._rule_bundle_is_authorized(
+                sources[0].source.safety_rule_bundle
+            )
+        )
+
+    def _rule_bundle_is_authorized(
+        self,
+        rule_bundle: SandboxRuleBundleV1,
+        *,
+        allow_new: bool = False,
+    ) -> bool:
+        try:
+            candidate = _deep_model(SandboxRuleBundleV1, rule_bundle)
+            digest = candidate.rule_bundle_digest
+            with self._recognition_lock:
+                recognized = digest in self._recognized_rule_bundle_digests
+                if (
+                    not recognized
+                    and (
+                        not allow_new
+                        or self._rule_bundle_authorizer.recognize(
+                            rule_bundle=candidate
+                        )
+                        is not True
+                    )
+                ):
+                    return False
+                if (
+                    self._rule_bundle_authorizer.authorize(
+                        rule_bundle=candidate
+                    )
+                    is not True
+                ):
+                    return False
+                if not recognized:
+                    self._recognized_rule_bundle_digests = frozenset(
+                        (*self._recognized_rule_bundle_digests, digest)
+                    )
+                return True
+        except Exception:
+            return False
 
     def _now(self) -> int:
         value = self._clock()

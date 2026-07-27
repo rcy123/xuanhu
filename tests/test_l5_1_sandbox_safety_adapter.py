@@ -456,7 +456,17 @@ def test_l5_1_evaluator_exception_is_chainless_and_contains_no_payload() -> None
 
 def test_l5_1_limit_plus_one_rejected_before_evaluator_call() -> None:
     assert MAX_FORMULA_ITEMS == 64
-    oversized_subject, oversized_bundle = _fixture(item_count=MAX_FORMULA_ITEMS + 1)
+    bounded_subject, oversized_bundle = _fixture(item_count=MAX_FORMULA_ITEMS)
+    subject_fields = {
+        field_name: getattr(bounded_subject, field_name)
+        for field_name in SandboxSafetySubjectV1.model_fields
+    }
+    oversized_subject = SandboxSafetySubjectV1.model_construct(
+        **{
+            **subject_fields,
+            "formula_items": _formula_items(MAX_FORMULA_ITEMS + 1),
+        }
+    )
     _assert_error(
         SandboxSafetyFailureCode.LIMIT_EXCEEDED,
         subject=oversized_subject,
@@ -492,7 +502,9 @@ def test_l5_1_no_settings_env_data_gateway_review_record_export_or_network_impor
         "hashlib",
         "json",
         "pydantic",
+        "re",
         "typing",
+        "unicodedata",
     }
     assert not any(
         name.startswith(("app.core", "app.db", "app.services", "app.repositories"))
@@ -627,7 +639,7 @@ def test_l5_1_inline_fixture_manifest_is_complete_strict_and_digest_bound() -> N
         canonical_json_bytes({"fixture_content": fixture_content, "manifest": manifest})
     ).hexdigest()
 
-    assert manifest.schema_version == "sandbox-synthetic-manifest.v1"
+    assert manifest.schema_version == "sandbox-synthetic-manifest.v2"
     assert manifest.dataset_name == subject.synthetic_dataset_name
     assert manifest.dataset_version == subject.synthetic_dataset_version
     assert manifest.admission_scope == "personal_learning_synthetic_only"
@@ -651,7 +663,7 @@ def test_l5_1_inline_fixture_manifest_is_complete_strict_and_digest_bound() -> N
     assert manifest.created_at == "2000-01-01T00:00:00Z"
     assert manifest.created_by_test_role == "sandbox_fixture_author"
     assert scan == SandboxIdentifierScanV1.passed()
-    assert scan.result == "passed_no_prohibited_identifiers"
+    assert scan.result == "passed_no_configured_identifier_pattern_matches"
     assert manifest.label_status == "not_clinically_adjudicated"
     assert subject.synthetic_manifest_digest == expected_manifest_digest
     assert subject.synthetic_dataset_digest == expected_dataset_digest

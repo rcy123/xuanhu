@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal, NoReturn
@@ -15,14 +17,19 @@ SANDBOX_RULE_BUNDLE_SCHEMA_VERSION = "sandbox-rule-bundle.v1"
 SANDBOX_EVALUATION_SCHEMA_VERSION = "sandbox-safety-evaluation.v1"
 SANDBOX_EVALUATION_CASE_SCHEMA_VERSION = "sandbox-evaluation-case.v1"
 SANDBOX_AUTHORITY_SCHEMA_VERSION = "sandbox-evaluator-authority.v1"
-SANDBOX_MANIFEST_SCHEMA_VERSION = "sandbox-synthetic-manifest.v1"
-SANDBOX_IDENTIFIER_SCAN_SCHEMA_VERSION = "sandbox-identifier-scan.v1"
+SANDBOX_MANIFEST_SCHEMA_VERSION = "sandbox-synthetic-manifest.v2"
+SANDBOX_IDENTIFIER_SCAN_SCHEMA_VERSION = "sandbox-identifier-scan.v2"
 SANDBOX_RESULT_SCHEMA_VERSION = "sandbox-safety-result.v1"
-SANDBOX_ADAPTER_VERSION = "sandbox-safety-adapter.v1"
+SANDBOX_ADAPTER_VERSION = "sandbox-safety-adapter.v2"
 
 MAX_FORMULA_ITEMS = 64
+MAX_PROFILE_FACTS = 64
 MAX_ISSUES = 256
 MAX_RULES = 256
+MAX_RULE_PARAMETERS = 256
+MAX_TOTAL_RULE_PARAMETERS = 1024
+MAX_EVALUATION_CASES = 64
+MAX_TOTAL_ISSUES = 1024
 MAX_CANONICAL_BYTES = 256 * 1024
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -53,6 +60,7 @@ class SandboxSafetyFailureCode(StrEnum):
     EVALUATOR_FAILED = "SANDBOX_SAFETY_EVALUATOR_FAILED"
     EVALUATOR_RESULT_INVALID = "SANDBOX_SAFETY_EVALUATOR_RESULT_INVALID"
     EVALUATOR_NONDETERMINISTIC = "SANDBOX_SAFETY_EVALUATOR_NONDETERMINISTIC"
+    PROHIBITED_IDENTIFIER = "SANDBOX_SAFETY_PROHIBITED_IDENTIFIER"
     INTERNAL_FAILURE = "SANDBOX_SAFETY_INTERNAL_FAILURE"
 
 
@@ -87,7 +95,9 @@ class SandboxRuleParameterV1(_StrictFrozenModel):
 class SandboxRuleV1(_StrictFrozenModel):
     rule_id: str = Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN)
     rule_revision: int = Field(ge=1)
-    parameters: tuple[SandboxRuleParameterV1, ...]
+    parameters: tuple[SandboxRuleParameterV1, ...] = Field(
+        max_length=MAX_RULE_PARAMETERS
+    )
 
     @model_validator(mode="after")
     def parameters_are_canonical(self) -> SandboxRuleV1:
@@ -98,27 +108,27 @@ class SandboxRuleV1(_StrictFrozenModel):
 
 
 class SandboxIdentifierScanV1(_StrictFrozenModel):
-    schema_version: Literal["sandbox-identifier-scan.v1"]
+    schema_version: Literal["sandbox-identifier-scan.v2"]
     tool: Literal["sandbox_static_identifier_scan"]
-    tool_version: Literal["1.0.0"]
-    ruleset_version: Literal["sandbox-prohibited-identifiers.v1"]
+    tool_version: Literal["2.0.0"]
+    ruleset_version: Literal["sandbox-prohibited-identifiers.v2"]
     scanned_at: Literal["2000-01-01T00:00:00Z"]
-    result: Literal["passed_no_prohibited_identifiers"]
+    result: Literal["passed_no_configured_identifier_pattern_matches"]
 
     @classmethod
     def passed(cls) -> SandboxIdentifierScanV1:
         return cls(
-            schema_version="sandbox-identifier-scan.v1",
+            schema_version="sandbox-identifier-scan.v2",
             tool="sandbox_static_identifier_scan",
-            tool_version="1.0.0",
-            ruleset_version="sandbox-prohibited-identifiers.v1",
+            tool_version="2.0.0",
+            ruleset_version="sandbox-prohibited-identifiers.v2",
             scanned_at="2000-01-01T00:00:00Z",
-            result="passed_no_prohibited_identifiers",
+            result="passed_no_configured_identifier_pattern_matches",
         )
 
 
 class SandboxSyntheticManifestV1(_StrictFrozenModel):
-    schema_version: Literal["sandbox-synthetic-manifest.v1"]
+    schema_version: Literal["sandbox-synthetic-manifest.v2"]
     dataset_name: str = Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN)
     dataset_version: str = Field(min_length=1, max_length=128, pattern=_IDENTIFIER_PATTERN)
     admission_scope: Literal["personal_learning_synthetic_only"]
@@ -149,10 +159,26 @@ class SandboxSyntheticManifestV1(_StrictFrozenModel):
         formula_items: Sequence[SandboxFormulaItemV1],
         profile_facts: Sequence[SandboxProfileFactV1],
     ) -> SandboxSyntheticManifestV1:
-        canonical_items = tuple(sorted(tuple(formula_items), key=lambda item: item.item_id))
-        canonical_facts = tuple(sorted(tuple(profile_facts), key=lambda fact: fact.fact_id))
+        canonical_items = tuple(
+            sorted(
+                _bounded_tuple(formula_items, MAX_FORMULA_ITEMS),
+                key=lambda item: item.item_id,
+            )
+        )
+        canonical_facts = tuple(
+            sorted(
+                _bounded_tuple(profile_facts, MAX_PROFILE_FACTS),
+                key=lambda fact: fact.fact_id,
+            )
+        )
+        if _fixture_has_configured_identifier_pattern(
+            canonical_items,
+            canonical_facts,
+            metadata_values=(dataset_name, dataset_version),
+        ):
+            raise ValueError("sandbox fixture contains a prohibited identifier") from None
         return cls(
-            schema_version="sandbox-synthetic-manifest.v1",
+            schema_version="sandbox-synthetic-manifest.v2",
             dataset_name=dataset_name,
             dataset_version=dataset_version,
             admission_scope="personal_learning_synthetic_only",
@@ -236,8 +262,18 @@ class SandboxEvaluationCaseV1(_StrictFrozenModel):
         manifest: SandboxSyntheticManifestV1,
         evaluation: SandboxSafetyEvaluationV1,
     ) -> SandboxEvaluationCaseV1:
-        canonical_items = tuple(sorted(tuple(formula_items), key=lambda item: item.item_id))
-        canonical_facts = tuple(sorted(tuple(profile_facts), key=lambda fact: fact.fact_id))
+        canonical_items = tuple(
+            sorted(
+                _bounded_tuple(formula_items, MAX_FORMULA_ITEMS),
+                key=lambda item: item.item_id,
+            )
+        )
+        canonical_facts = tuple(
+            sorted(
+                _bounded_tuple(profile_facts, MAX_PROFILE_FACTS),
+                key=lambda fact: fact.fact_id,
+            )
+        )
         return cls(
             case_id=case_id,
             formula_content_digest=_canonical_sha256(canonical_items),
@@ -275,6 +311,11 @@ class SandboxEvaluatorAuthorityV1(_StrictFrozenModel):
             raise ValueError("authority cases must be unique and sorted")
         if len(bindings) != len(set(bindings)):
             raise ValueError("authority subject bindings must be unique")
+        if (
+            sum(len(case.evaluation.issues) for case in self.cases)
+            > MAX_TOTAL_ISSUES
+        ):
+            raise ValueError("authority contains too many total issues")
         return self
 
     @classmethod
@@ -283,7 +324,17 @@ class SandboxEvaluatorAuthorityV1(_StrictFrozenModel):
         *,
         cases: Sequence[SandboxEvaluationCaseV1],
     ) -> SandboxEvaluatorAuthorityV1:
-        canonical_cases = tuple(sorted(tuple(cases), key=lambda case: case.case_id))
+        canonical_cases = tuple(
+            sorted(
+                _bounded_tuple(cases, MAX_EVALUATION_CASES),
+                key=lambda case: case.case_id,
+            )
+        )
+        if (
+            sum(len(case.evaluation.issues) for case in canonical_cases)
+            > MAX_TOTAL_ISSUES
+        ):
+            raise ValueError("authority contains too many total issues")
         return cls(
             cases=canonical_cases,
             authority_digest=_canonical_sha256(
@@ -320,6 +371,11 @@ class SandboxRuleBundleV1(_StrictFrozenModel):
             for issue in case.evaluation.issues
         ):
             raise ValueError("authority issue references unknown rule")
+        if (
+            sum(len(rule.parameters) for rule in self.rules)
+            > MAX_TOTAL_RULE_PARAMETERS
+        ):
+            raise ValueError("rule bundle contains too many total parameters")
         return self
 
     @classmethod
@@ -330,7 +386,17 @@ class SandboxRuleBundleV1(_StrictFrozenModel):
         rules: Sequence[SandboxRuleV1],
         evaluator_authority: SandboxEvaluatorAuthorityV1,
     ) -> SandboxRuleBundleV1:
-        canonical_rules = tuple(sorted(tuple(rules), key=lambda rule: rule.rule_id))
+        canonical_rules = tuple(
+            sorted(
+                _bounded_tuple(rules, MAX_RULES),
+                key=lambda rule: rule.rule_id,
+            )
+        )
+        if (
+            sum(len(rule.parameters) for rule in canonical_rules)
+            > MAX_TOTAL_RULE_PARAMETERS
+        ):
+            raise ValueError("rule bundle contains too many total parameters")
         body = _rule_bundle_body(
             sandbox_schema_version=SANDBOX_RULE_BUNDLE_SCHEMA_VERSION,
             adapter_version=SANDBOX_ADAPTER_VERSION,
@@ -401,8 +467,18 @@ class SandboxSafetySubjectV1(_StrictFrozenModel):
         evaluator_authority_digest: str,
         synthetic_manifest: SandboxSyntheticManifestV1,
     ) -> SandboxSafetySubjectV1:
-        canonical_items = tuple(sorted(tuple(formula_items), key=lambda item: item.item_id))
-        canonical_facts = tuple(sorted(tuple(profile_facts), key=lambda fact: fact.fact_id))
+        canonical_items = tuple(
+            sorted(
+                _bounded_tuple(formula_items, MAX_FORMULA_ITEMS),
+                key=lambda item: item.item_id,
+            )
+        )
+        canonical_facts = tuple(
+            sorted(
+                _bounded_tuple(profile_facts, MAX_PROFILE_FACTS),
+                key=lambda fact: fact.fact_id,
+            )
+        )
         return cls(
             test_session_id=test_session_id,
             domain_state_version=domain_state_version,
@@ -518,6 +594,308 @@ def _fixture_content_digest(
     return _canonical_sha256(_fixture_content(formula_items, profile_facts))
 
 
+_DIRECT_IDENTIFIER_PATTERNS = (
+    re.compile(r"(?<!\d)(?:\+?86[ .-]?)?1[3-9]\d(?:[ .-]?\d){8}(?!\d)"),
+    re.compile(r"(?<![\dXx])\d(?:[ .-]?\d){16}[ .-]?[\dXx](?![\dXx])"),
+    re.compile(r"(?<!\d)0\d{2,3}[ .-]?\d{7,8}(?!\d)"),
+)
+_IDENTITY_KEY_FORMS = frozenset(
+    {
+        "address",
+        "contactdetails",
+        "contactnumber",
+        "contactphone",
+        "email",
+        "encounterno",
+        "encounternumber",
+        "familyname",
+        "firstname",
+        "fullname",
+        "givenname",
+        "hospitalno",
+        "hospitalnumber",
+        "homeaddress",
+        "idcard",
+        "idnumber",
+        "identitycard",
+        "identitynumber",
+        "inpatientno",
+        "inpatientnumber",
+        "lastname",
+        "medicalrecordno",
+        "medicalrecordnumber",
+        "mobile",
+        "mobileno",
+        "mobilenumber",
+        "mrn",
+        "name",
+        "nationalid",
+        "outpatientno",
+        "outpatientnumber",
+        "patientname",
+        "phone",
+        "phoneno",
+        "phonenumber",
+        "surname",
+        "telephone",
+        "visitno",
+        "visitnumber",
+    }
+)
+_IDENTITY_KEY_FORMS_WITHOUT_GENERIC_NAME = _IDENTITY_KEY_FORMS - {"name"}
+_IDENTITY_KEY_CJK_MARKERS = (
+    "住址",
+    "地址",
+    "家庭住址",
+    "姓名",
+    "名字",
+    "全名",
+    "电话",
+    "手机",
+    "手机号",
+    "手机号码",
+    "身份证",
+    "身份证号",
+    "证件号",
+    "病历号",
+    "就诊号",
+    "挂号号",
+    "门诊号",
+    "住院号",
+    "联系电话",
+    "联系方式",
+    "邮箱",
+)
+_IDENTITY_KEY_ENGLISH_ANCHORS = (
+    "address",
+    "contact",
+    "email",
+    "encounter",
+    "family",
+    "first",
+    "full",
+    "given",
+    "hospital",
+    "id",
+    "identity",
+    "inpatient",
+    "last",
+    "medical",
+    "mobile",
+    "mrn",
+    "name",
+    "national",
+    "outpatient",
+    "patient",
+    "phone",
+    "record",
+    "surname",
+    "telephone",
+    "visit",
+)
+_EMAIL_LOCAL_PUNCTUATION = frozenset(".!#$%&'*+/=?^_`{|}~-")
+
+
+def _is_identifier_ignorable(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        unicodedata.category(character) == "Cf"
+        or codepoint == 0x034F
+        or 0x115F <= codepoint <= 0x1160
+        or 0x17B4 <= codepoint <= 0x17B5
+        or 0x180B <= codepoint <= 0x180F
+        or codepoint == 0x3164
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or codepoint == 0xFFA0
+        or 0xFFF0 <= codepoint <= 0xFFF8
+        or 0xE0100 <= codepoint <= 0xE01EF
+    )
+
+
+def _normalized_identifier_text(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKC", value)
+        if not _is_identifier_ignorable(character)
+    )
+
+
+def _normalized_contains_identity_key(normalized: str) -> bool:
+    normalized = normalized.casefold()
+    if normalized in _IDENTITY_KEY_CJK_MARKERS:
+        return True
+    if not any(anchor in normalized for anchor in _IDENTITY_KEY_ENGLISH_ANCHORS):
+        return False
+    tokens = tuple(
+        token
+        for token in re.split(
+            r"[^a-z0-9]+",
+            normalized,
+        )
+        if token
+    )
+    if tokens == ("name",):
+        return True
+    return "".join(tokens) in _IDENTITY_KEY_FORMS_WITHOUT_GENERIC_NAME
+
+
+def _normalized_contains_direct_identifier(normalized: str) -> bool:
+    return (
+        any(
+            pattern.search(normalized) is not None
+            for pattern in _DIRECT_IDENTIFIER_PATTERNS
+        )
+        or _contains_email_identifier(normalized)
+    )
+
+
+def _contains_identity_key(value: str) -> bool:
+    return _normalized_contains_identity_key(_normalized_identifier_text(value))
+
+
+def _contains_direct_identifier(value: str) -> bool:
+    return _normalized_contains_direct_identifier(_normalized_identifier_text(value))
+
+
+def _contains_email_identifier(value: str) -> bool:
+    if "@" not in value:
+        return False
+    segments = value.split("@")
+    for local_segment, domain_segment in zip(segments, segments[1:], strict=False):
+        local_start = len(local_segment)
+        while local_start > 0:
+            character = local_segment[local_start - 1]
+            if not (
+                character.isalnum()
+                or character in _EMAIL_LOCAL_PUNCTUATION
+            ):
+                break
+            local_start -= 1
+        domain_end = 0
+        while domain_end < len(domain_segment):
+            character = domain_segment[domain_end]
+            if not (character.isalnum() or character in ".-"):
+                break
+            domain_end += 1
+        local = local_segment[local_start:].strip(".")
+        domain = domain_segment[:domain_end].strip(".")
+        labels = domain.split(".")
+        if (
+            local
+            and len(labels) >= 2
+            and all(
+                label
+                and label[0].isalnum()
+                and label[-1].isalnum()
+                and all(
+                    character.isalnum() or character == "-"
+                    for character in label
+                )
+                for label in labels
+            )
+        ):
+            return True
+    return False
+
+
+def _bounded_tuple[T](values: Sequence[T], limit: int) -> tuple[T, ...]:
+    bounded: list[T] = []
+    for value in values:
+        if len(bounded) >= limit:
+            raise ValueError("sandbox fixture exceeds configured item limit")
+        bounded.append(value)
+    return tuple(bounded)
+
+
+def _fixture_has_configured_identifier_pattern(
+    formula_items: tuple[SandboxFormulaItemV1, ...],
+    profile_facts: tuple[SandboxProfileFactV1, ...],
+    *,
+    metadata_values: tuple[str, ...] = (),
+    identity_key_values: tuple[str, ...] = (),
+) -> bool:
+    formula_values = tuple(
+        value
+        for item in formula_items
+        for value in (item.item_id, item.component, item.unit)
+    )
+    profile_values = tuple(
+        value
+        for fact in profile_facts
+        for value in (fact.fact_id, fact.name, fact.value)
+    )
+    structured_identity_keys = (
+        *formula_values,
+        *(
+            value
+            for fact in profile_facts
+            for value in (fact.fact_id, fact.name)
+        ),
+        *identity_key_values,
+    )
+    return (
+        any(
+            _contains_direct_identifier(value)
+            for value in (*formula_values, *profile_values, *metadata_values)
+        )
+        or any(
+            _contains_identity_key(value)
+            for value in structured_identity_keys
+        )
+    )
+
+
+def _package_has_configured_identifier_pattern(
+    subject: SandboxSafetySubjectV1,
+    bundle: SandboxRuleBundleV1,
+) -> bool:
+    metadata_values = (
+        subject.test_session_id,
+        subject.formula_artifact_id,
+        subject.profile_artifact_id,
+        subject.graph_version,
+        subject.rule_bundle_version,
+        subject.synthetic_dataset_name,
+        subject.synthetic_dataset_version,
+        bundle.rule_bundle_version,
+        *(
+            value
+            for rule in bundle.rules
+            for value in (
+                rule.rule_id,
+                *(
+                    text
+                    for parameter in rule.parameters
+                    for text in (parameter.name, parameter.value)
+                ),
+            )
+        ),
+        *(
+            value
+            for case in bundle.evaluator_authority.cases
+            for value in (
+                case.case_id,
+                *(
+                    text
+                    for issue in case.evaluation.issues
+                    for text in (issue.issue_id, issue.rule_id)
+                ),
+            )
+        ),
+    )
+    identity_key_values = tuple(
+        parameter.name
+        for rule in bundle.rules
+        for parameter in rule.parameters
+    )
+    return _fixture_has_configured_identifier_pattern(
+        subject.formula_items,
+        subject.profile_facts,
+        metadata_values=metadata_values,
+        identity_key_values=identity_key_values,
+    )
+
+
 def _synthetic_dataset_digest(
     formula_items: tuple[SandboxFormulaItemV1, ...],
     profile_facts: tuple[SandboxProfileFactV1, ...],
@@ -610,6 +988,37 @@ def _parse_model[ModelT: BaseModel](model_type: type[ModelT], value: object) -> 
     return parsed
 
 
+def _input_exceeds_resource_budget(value: object) -> bool:
+    """Bound untrusted wire/model graphs before Pydantic parsing or dumping."""
+
+    budget = MAX_CANONICAL_BYTES
+    stack: list[object] = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, BaseModel):
+            fields = type(current).model_fields
+            stack.extend(getattr(current, field_name) for field_name in fields)
+            budget -= 64 + 8 * len(fields)
+        elif isinstance(current, dict):
+            budget -= 16 * len(current)
+            stack.extend(current.keys())
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            budget -= 8 * len(current)
+            stack.extend(current)
+        elif isinstance(current, str):
+            if len(current) > budget:
+                return True
+            budget -= len(current.encode("utf-8")) + 2
+        elif isinstance(current, (bytes, bytearray)):
+            budget -= len(current)
+        else:
+            budget -= 32
+        if budget < 0:
+            return True
+    return False
+
+
 def _raise_error(code: SandboxSafetyFailureCode) -> NoReturn:
     raise SandboxSafetyAdapterError(code) from None
 
@@ -654,6 +1063,10 @@ class SandboxSafetyRuleAdapter:
         run_id: str,
         trace_id: str,
     ) -> SandboxSafetyResultV1:
+        if _input_exceeds_resource_budget(
+            subject_input
+        ) or _input_exceeds_resource_budget(bundle_input):
+            _raise_error(SandboxSafetyFailureCode.LIMIT_EXCEEDED)
         subject = _parse_model(SandboxSafetySubjectV1, subject_input)
         bundle = _parse_model(SandboxRuleBundleV1, bundle_input)
         if subject is None or bundle is None:
@@ -680,12 +1093,24 @@ class SandboxSafetyRuleAdapter:
 
         if (
             len(subject.formula_items) > MAX_FORMULA_ITEMS
+            or len(subject.profile_facts) > MAX_PROFILE_FACTS
             or len(bundle.rules) > MAX_RULES
+            or len(authority.cases) > MAX_EVALUATION_CASES
+            or any(
+                len(rule.parameters) > MAX_RULE_PARAMETERS
+                for rule in bundle.rules
+            )
+            or sum(len(rule.parameters) for rule in bundle.rules)
+            > MAX_TOTAL_RULE_PARAMETERS
             or any(len(case.evaluation.issues) > MAX_ISSUES for case in authority.cases)
+            or sum(len(case.evaluation.issues) for case in authority.cases)
+            > MAX_TOTAL_ISSUES
             or len(canonical_json_bytes(subject)) > MAX_CANONICAL_BYTES
             or len(canonical_json_bytes(bundle)) > MAX_CANONICAL_BYTES
         ):
             _raise_error(SandboxSafetyFailureCode.LIMIT_EXCEEDED)
+        if _package_has_configured_identifier_pattern(subject, bundle):
+            _raise_error(SandboxSafetyFailureCode.PROHIBITED_IDENTIFIER)
 
         expected_formula_digest = _canonical_sha256(subject.formula_items)
         expected_profile_digest = _canonical_sha256(subject.profile_facts)
@@ -728,6 +1153,15 @@ class SandboxSafetyRuleAdapter:
         )
         if run_envelope is None:
             _raise_error(SandboxSafetyFailureCode.SCHEMA_INVALID)
+        if any(
+            _contains_direct_identifier(value)
+            for value in (
+                run_envelope.command_id,
+                run_envelope.run_id,
+                run_envelope.trace_id,
+            )
+        ):
+            _raise_error(SandboxSafetyFailureCode.PROHIBITED_IDENTIFIER)
         run_envelope_digest = _canonical_sha256(run_envelope)
 
         matching_cases = tuple(
@@ -757,3 +1191,31 @@ class SandboxSafetyRuleAdapter:
         if len(canonical_result_bytes(result)) > MAX_CANONICAL_BYTES:
             _raise_error(SandboxSafetyFailureCode.LIMIT_EXCEEDED)
         return result
+
+
+def reproduce_sandbox_safety_result(
+    subject: object,
+    bundle: object,
+    *,
+    command_id: str,
+    run_id: str,
+    trace_id: str,
+) -> SandboxSafetyResultV1:
+    """Replay the pure evaluator for downstream authority validation."""
+
+    unexpected_failure = False
+    try:
+        return SandboxSafetyRuleAdapter()._evaluate(
+            subject,
+            bundle,
+            command_id=command_id,
+            run_id=run_id,
+            trace_id=trace_id,
+        )
+    except SandboxSafetyAdapterError:
+        raise
+    except Exception:
+        unexpected_failure = True
+    if unexpected_failure:
+        _raise_error(SandboxSafetyFailureCode.INTERNAL_FAILURE)
+    raise AssertionError("unreachable")

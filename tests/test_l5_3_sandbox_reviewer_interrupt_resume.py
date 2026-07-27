@@ -97,7 +97,7 @@ class _NestedReviewErrorNonceFactory:
 
 
 class _NestedReviewErrorStore(SandboxInMemoryReviewStore):
-    def recover_challenge(self, **kwargs: object) -> object:
+    def _recover_challenge(self, **kwargs: object) -> object:
         del kwargs
         _raise_nested_review_error("nested-store-secret")
         raise AssertionError("unreachable")
@@ -138,6 +138,14 @@ class _FakeSignatureVerifier:
             and sandbox_test_key_id == _KEY_ID
             and sandbox_test_signature == expected_signature
         )
+
+
+class _AcceptAllRuleBundleAuthorizer:
+    def recognize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return type(rule_bundle) is SandboxRuleBundleV1
+
+    def authorize(self, *, rule_bundle: SandboxRuleBundleV1) -> bool:
+        return type(rule_bundle) is SandboxRuleBundleV1
 
 
 class _ExplanationPort:
@@ -258,7 +266,11 @@ def _accepted_source(
     assert isinstance(explanation, SandboxExplanationResultV1)
     return SandboxReviewSourceV1.build(
         safety_subject=subject,
+        safety_rule_bundle=bundle,
         safety_result=result,
+        safety_command_id="sandbox-review-command-001",
+        safety_run_id="sandbox-review-run-001",
+        safety_trace_id="sandbox-review-trace-001",
         explanation_result=explanation,
     )
 
@@ -288,6 +300,7 @@ def _coordinator(
             clock=actual_clock,
             nonce_factory=actual_nonce_factory,
             signature_verifier=actual_verifier,
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         ),
         actual_store,
         actual_clock,
@@ -679,7 +692,7 @@ def test_l5_3_restore_rejects_coordinated_nonfixed_review_schema(
     old_challenge_ref = changed["challenges"][0]["challenge_ref"]
     new_challenge_ref = _rederive_review_snapshot_schema(
         changed,
-        schema_version="sandbox-review-challenge.v2",
+        schema_version="sandbox-review-challenge.v3",
     )
     assert new_challenge_ref != old_challenge_ref
     assert old_challenge_ref.encode() not in canonical_review_bytes(changed)
@@ -1021,6 +1034,7 @@ def test_l5_3_valid_confirm_and_reject_apply_exactly_once_with_all_bindings(
         clock=_FakeClock(),
         nonce_factory=_FakeNonceFactory(),
         signature_verifier=_FakeSignatureVerifier(),
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted_store.snapshot() == snapshot
     assert restarted.eligibility(
@@ -1073,6 +1087,7 @@ def test_l5_3_plaintext_nonce_is_returned_once_and_never_persisted_or_rendered()
         clock=_FakeClock(),
         nonce_factory=nonce_factory,
         signature_verifier=_FakeSignatureVerifier(),
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     ).create_single_use_challenge(
         _accepted_source(),
         namespace=_NAMESPACE,
@@ -1308,6 +1323,7 @@ def test_l5_3_fake_restart_recovers_exact_checkpoint_without_reissuing_challenge
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=_FakeSignatureVerifier(),
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     recovered = _issue(restarted)
     assert recovered.challenge == delivery.challenge
@@ -1442,6 +1458,7 @@ def test_l5_3_restart_snapshot_rejects_coordinated_attempt_and_event_action_chan
             clock=_FakeClock(),
             nonce_factory=_FakeNonceFactory(),
             signature_verifier=_FakeSignatureVerifier(),
+            rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
         )
         assert restored.eligibility(
             namespace=_NAMESPACE,
@@ -1572,6 +1589,7 @@ def test_l5_3_signature_verified_restart_accepts_sealed_and_applied_attempts(
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=verifier,
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
 
     assert verifier.calls == 1
@@ -1774,6 +1792,7 @@ def test_l5_3_new_current_authority_blocks_prior_checkpoint_eligibility() -> Non
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=_FakeSignatureVerifier(),
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     assert restarted.eligibility(
         namespace=_NAMESPACE,
@@ -1815,6 +1834,7 @@ def test_l5_3_reused_checkpoint_id_resolves_current_interrupt_eligibility() -> N
         clock=clock,
         nonce_factory=nonce_factory,
         signature_verifier=_FakeSignatureVerifier(),
+        rule_bundle_authorizer=_AcceptAllRuleBundleAuthorizer(),
     )
     restart_status = restarted.eligibility(
         namespace=_NAMESPACE,
