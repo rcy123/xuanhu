@@ -545,3 +545,16 @@ self._verify_callback_context(_ctx)
 - ✅ 无死锁、无限递归或 matcher/例外表扩张
 - ✅ 未修改 PM/task 记录、其他源码、配置、依赖或 lockfile
 - ✅ 未提交（仅工作树变更）
+
+---
+
+## PM 验收修正：R1/R2 identity-only candidate 未通过（2026-07-28）
+
+`d8c10e344269d3821c7819ad93bfce7f51b11621` 固定了本节所述候选，但 PM 不接受“R2 密封已完成”的结论：
+
+- `_recognized`、`_reauthorizable`、`_bundles` 的 capture 仅保存容器 identity 与 `len()`，没有 exact content digest；
+- same-size `clear+refill`、`delete+insert`、same-key value replace 均能保持 identity/length 并绕过；
+- 新增 16 项测试只覆盖对象替换和 clear-to-zero，没有覆盖同尺寸 mutation；
+- 本轮只报告两文件组合 `212 passed`，没有执行任务书规定的十文件 L5/L6/L7 组合门禁。
+
+验收记录：`ACC-20260728-060`。决策：`DEC-20260728-057`。当前 verdict 为 **REWORK**；后续由 [L7-SBX-FRESH-R2](agent-refactor-l7-sbx-fresh-rework-2-task.md) 以 callback-free canonical protected-state seal 做 bounded architecture convergence。此前所有绿测保留为候选证据，但不构成 L7-SBX acceptance。

@@ -1,6 +1,6 @@
 # L7-SBX-FRESH-R1 Authority 与状态完整性限定返工任务书
 
-> 状态：已发布 / 返工中
+> 状态：已交付 / 验收未通过 / 由 R2 收敛
 > 发布日期：2026-07-27
 > 返工基线：`aa651c280af6db748f1968168e98bdf76defe9cd`
 > 失败实现：`ca9caa766018541ac60184a9aed524702ca83a8c`
@@ -93,3 +93,9 @@ git diff --check
 - `ca9caa7` 保留为第一次失败交付，不重写或删除。
 - R1 通过前 `L7-SBX-FRESH` 保持 rework，L7 为未完成。
 - L7-PROD、真实 RAG/DB/Runtime、临床/公开/商业/机构使用继续 NO-GO。
+
+## 9. 追加验收结论（2026-07-28）
+
+R1 候选 `d8c10e3` 不被接受，见 `ACC-20260728-060`。其 callback capture 只保存 `_recognized`、`_reauthorizable`、`_bundles` 的对象 identity 与长度，不能检测 same-size clear+refill、delete+insert 或 same-key value replacement；两个 `get_bundles_for_*` per-bundle authority callback 也没有完整 store 级 seal。
+
+相同 authority finding 已达到架构收敛触发条件。本任务由 [L7-SBX-FRESH-R2](agent-refactor-l7-sbx-fresh-rework-2-task.md) supersede；R2 只允许一个 callback-free canonical protected-state seal，不再接受长度检查或例外表扩张。
