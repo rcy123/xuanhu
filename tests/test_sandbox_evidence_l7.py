@@ -4071,3 +4071,636 @@ class TestR2NoPartialSuccess:
             reg.add_recognized("b" * 64)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set()
+
+
+# ===================================================================
+# 18. R2 Callback exception paths — finally-style verification (RED)
+# ===================================================================
+
+
+class TestR2CallbackExceptionPaths:
+    """P0: Callback that mutates state THEN raises must be caught.
+
+    Every untrusted callback must be wrapped in try/finally so that
+    post-callback verify/restore/poison runs even when the callback
+    raises a non-integrity exception after mutating protected state.
+    """
+
+    _TAG = "TestR2CallbackExceptionPaths"
+
+    def test_authorizer_add_recognized_mutates_then_raises(self) -> None:
+        """Authorizer mutates _recognized then raises RuntimeError."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        hook_called = threading.Event()
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if not hook_called.is_set():
+                    hook_called.set()
+                    return True
+                invoked.set()
+                reg._recognized.clear()
+                reg._recognized[DZ] = 999
+                msg = "MUTATED_THEN_RAISED"
+                raise RuntimeError(msg)
+
+        reg = RegistryCls(authorizer=_MA())
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        # Instance must be poisoned
+        with pytest.raises(SandboxEvidenceError):
+            reg.add_recognized(DA)
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_authorizer_recognize_mutates_then_raises(self) -> None:
+        """Authorizer mutates _recognized then raises RuntimeError."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    reg._recognized.clear()
+                    reg._recognized[DZ] = 1
+                    msg = "INTENTIONAL_RAISE"
+                    raise RuntimeError(msg)
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.recognize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_authorizer_reauthorize_mutates_then_raises(self) -> None:
+        """Authorizer mutates _reauthorizable then raises RuntimeError."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    reg._reauthorizable.clear()
+                    reg._reauthorizable.add(DZ)
+                    msg = "INTENTIONAL_RAISE"
+                    raise RuntimeError(msg)
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        reg.revoke(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_verifier_pipeline_run_mutates_then_raises(self) -> None:
+        """Verifier mutates store._bundles then raises RuntimeError."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store._bundles[bundle.bundle_digest] = b"EVIL_BYTES"
+                msg = "INTENTIONAL_RAISE"
+                raise RuntimeError(msg)
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_verifier_verify_claims_mutates_then_raises(self) -> None:
+        """Verifier mutates registry then raises in verify_claims."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store.registry._recognized.clear()
+                msg = "INTENTIONAL_RAISE"
+                raise RuntimeError(msg)
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.verify_claims(
+                agent_kind=AgentKind.SYNDROME,
+                claims=(),
+                links=(),
+                fallback=FallbackPolicy.RAG_SUPPORTED,
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_verifier_no_rag_mutates_then_raises(self) -> None:
+        """Verifier mutates epoch then raises in MODEL_KNOWLEDGE_ONLY path."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store.registry._epoch = 999
+                msg = "INTENTIONAL_RAISE"
+                raise RuntimeError(msg)
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME,
+                query="",
+                graph_run=_GRAPH_RUN,
+                graph_trace=_GRAPH_TRACE,
+                fallback=FallbackPolicy.MODEL_KNOWLEDGE_ONLY,
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+
+# ===================================================================
+# 19. R2 Malicious __lt__ / __hash__ hooks during sorted() (RED)
+# ===================================================================
+
+
+class TestR2MaliciousKeyLt:
+    """P0: sorted() must not call __lt__ on untrusted element subclasses.
+
+    _encode_canonical_field must validate exact element types BEFORE
+    calling sorted(), so that __lt__ hooks on malicious key/item
+    subclasses cannot execute during canonical encoding.
+    """
+
+    _TAG = "TestR2MaliciousKeyLt"
+
+    def test_malicious_dict_key_lt_not_invoked(self) -> None:
+        """Evil __lt__ on str subclass dict key must not be triggered."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        lt_hook = threading.Event()
+
+        class EvilKey(str):
+            def __lt__(self, other: object) -> bool:
+                lt_hook.set()
+                return str.__lt__(self, str(other))
+
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        EK = EvilKey("z" * 64)
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    reg._recognized[EK] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError):
+            reg.add_recognized("b" * 64)
+        assert not lt_hook.is_set(), "R2 RED: __lt__ was triggered on dict key"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_malicious_set_member_lt_not_invoked(self) -> None:
+        """Evil __lt__ on set member str subclass must not be triggered."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        lt_hook = threading.Event()
+
+        class EvilItem(str):
+            def __lt__(self, other: object) -> bool:
+                lt_hook.set()
+                return str.__lt__(self, str(other))
+
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        EI = EvilItem("z" * 64)
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    reg._reauthorizable.add(EI)
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        reg.revoke(DA)
+        with pytest.raises(SandboxEvidenceError):
+            reg.reauthorize(DA)
+        assert not lt_hook.is_set(), "R2 RED: __lt__ was triggered on set member"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+
+# ===================================================================
+# 20. R2 Encoding distinctness — domain-separated, type-tagged (RED)
+# ===================================================================
+
+
+class TestR2EncodingDistinctness:
+    """P0: Canonical encoding must be injective for all protected states.
+
+    States with delimiter/canonical byte patterns at different positions
+    must not collide.  Type tags and length prefixes are required to
+    prevent structural ambiguity.
+    """
+
+    _TAG = "TestR2EncodingDistinctness"
+
+    @staticmethod
+    def _compute_digest(**fields: object) -> str:
+        """Compute canonical seal digest for given fields."""
+        from app.agent_runtime.sandbox_evidence import _StateSeal  # type: ignore[attr-defined]
+
+        s = _StateSeal()
+        return s.capture(**fields)
+
+    def test_dict_pipe_in_key(self) -> None:
+        """Dict with '|' in key distinct from field separator."""
+
+        d1 = self._compute_digest(_r={"a|b": 1})
+        d2 = self._compute_digest(_r={"a": 1, "b": 1})
+        assert d1 != d2, "R2 RED: digest collision with '|' in key"
+
+    def test_dict_pipe_in_value_bytes(self) -> None:
+        """Bytes value with '||' produces distinct digest."""
+
+        d1 = self._compute_digest(_b={"k": b"a||b"})
+        d2 = self._compute_digest(_b={"k": b"a|"})
+        assert d1 != d2, "R2 RED: digest collision with '|' in bytes value"
+
+    def test_dict_separator_characters_in_key(self) -> None:
+        """Keys containing separator chars produce distinct digests."""
+
+        d1 = self._compute_digest(_r={"a:b": 1, "c,d": 2})
+        d2 = self._compute_digest(_r={"a": 1, "b": 1, "c": 1, "d": 1})
+        assert d1 != d2, "R2 RED: digest collision with ':,' in keys"
+
+    def test_set_pipe_in_item(self) -> None:
+        """Set item containing '|' distinct from multiple items."""
+
+        d1 = self._compute_digest(_s={"a|b", "c"})
+        d2 = self._compute_digest(_s={"a", "b", "c"})
+        assert d1 != d2, "R2 RED: digest collision with '|' in set item"
+
+    def test_int_bool_distinct(self) -> None:
+        """Same byte pattern as int vs bool produces distinct digests."""
+
+        d_int = self._compute_digest(_x=42)
+        d_true = self._compute_digest(_x=True)
+        d_false = self._compute_digest(_x=False)
+        assert d_int != d_true, "R2 RED: int/bool digest collision"
+        assert d_true != d_false, "R2 RED: True/False digest collision"
+
+    def test_empty_containers_distinct(self) -> None:
+        """Empty dict vs empty set vs int 0 produce distinct digests."""
+
+        d0 = self._compute_digest(_x=0)
+        dd = self._compute_digest(_x={})
+        ds = self._compute_digest(_x=set())
+        assert d0 != dd, "R2 RED: int 0 vs empty dict collision"
+        assert dd != ds, "R2 RED: empty dict vs empty set collision"
+
+    def test_bytes_vs_int_value_distinct(self) -> None:
+        """Dict[str,bytes] vs Dict[str,int] with same key/value patterns distinct."""
+
+        d_bytes = self._compute_digest(_r={"a": b"\x00\x01\x02"})
+        d_int = self._compute_digest(_r={"a": 0x000102})
+        assert d_bytes != d_int, "R2 RED: bytes vs int digest collision"
+
+
+# ===================================================================
+# 21. R2 Poison after identity/state drift
+# ===================================================================
+
+
+class TestR2PoisonAfterDrift:
+    """P0: After identity or state drift detection, instance must be poisoned.
+
+    Once poisoned, every public authority-bearing operation must raise
+    SANDBOX_EVIDENCE_UNAVAILABLE.  This applies to Registry, Store, and
+    Pipeline operations including registry.epoch/revoke/reauthorize.
+    """
+
+    _TAG = "TestR2PoisonAfterDrift"
+
+    def test_poison_after_authorizer_replaces_lock(self) -> None:
+        """Registry identity drift from lock replacement must poison."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._lock = threading.RLock()
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("a" * 64)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set()
+        # After poison: all operations must fail
+        with pytest.raises(SandboxEvidenceError) as exc2:
+            reg.add_recognized("a" * 64)
+        assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
+
+    def test_poison_after_verifier_replaces_store(self) -> None:
+        """Pipeline identity drift from store replacement must poison."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        store2 = SandboxEvidenceStore(registry=reg)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                pipeline._store = store2
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set()
+        # After poison: pipeline must fail
+        with pytest.raises(SandboxEvidenceError) as exc2:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME, query="test2", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
+            )
+        assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
+
+    def test_poison_after_registry_epoch_drift(self) -> None:
+        """Authorizer epoch drift must poison subsequent registry operations."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._epoch = 0
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("a" * 64)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set()
+        with pytest.raises(SandboxEvidenceError) as exc2:
+            reg.revoke("a" * 64)
+        assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
+
+    def test_poison_after_store_bundles_mutation(self) -> None:
+        """Store state drift must poison store and registry operations."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store._bundles[bundle.bundle_digest] = b"EVIL"
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set()
+        # Store must be poisoned
+        with pytest.raises(SandboxEvidenceError) as exc2:
+            store.get(bundle.bundle_digest)
+        assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
+
+    def test_epoch_property_works_during_poison(self) -> None:
+        """Registry.epoch property (read-only) works even when poisoned."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                invoked.set()
+                reg._lock = threading.RLock()
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        with pytest.raises(SandboxEvidenceError):
+            reg.add_recognized("a" * 64)
+        # Epoch property must not raise (read-only)
+        ep = reg.epoch
+        assert isinstance(ep, int)
+        assert invoked.is_set()
+
+
+# ===================================================================
+# 22. R2 Exact error code + no-RAG reentry coverage
+# ===================================================================
+
+
+class TestR2ExactErrorCodeAndReentry:
+    """P0: Store error classification + no-RAG/verify_claims reentry."""
+
+    _TAG = "TestR2ExactErrorCodeAndReentry"
+
+    def test_store_put_exact_integrity_code(self) -> None:
+        """Store put must use exact INTEGRITY_FAILURE code (not substring)."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store._bundles[bundle.bundle_digest] = b"EVIL"
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(
+                agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
+            )
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_no_rag_reentry_during_verifier_callback(self) -> None:
+        """Reentrant no-RAG pipeline.run during verifier callback must raise."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        entered = threading.Event()
+        reentry_caught = threading.Event()
+
+        class _RV:
+            _depth = 0
+
+            def verify(self, **kwargs: object) -> object:
+                type(self)._depth += 1
+                if type(self)._depth > 3:
+                    return m.ClaimVerifierResult.MODEL_KNOWLEDGE_ONLY
+                entered.set()
+                try:
+                    pipeline.run(
+                        agent_kind=AgentKind.SYNDROME,
+                        query="",
+                        graph_run=_GRAPH_RUN,
+                        graph_trace=_GRAPH_TRACE,
+                        fallback=FallbackPolicy.MODEL_KNOWLEDGE_ONLY,
+                    )
+                except SandboxEvidenceError:
+                    reentry_caught.set()
+                return m.ClaimVerifierResult.MODEL_KNOWLEDGE_ONLY
+
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_RV()
+        )
+        pipeline.run(
+            agent_kind=AgentKind.SYNDROME,
+            query="",
+            graph_run=_GRAPH_RUN,
+            graph_trace=_GRAPH_TRACE,
+            fallback=FallbackPolicy.MODEL_KNOWLEDGE_ONLY,
+        )
+        assert entered.is_set(), "verifier was not called"
+        assert reentry_caught.is_set(), (
+            "R2 RED: reentrant no-RAG was NOT rejected"
+        )
+
+    def test_verify_claims_reentry_during_verifier_callback(self) -> None:
+        """Reentrant pipeline.run during verify_claims must raise."""
+
+        import app.agent_runtime.sandbox_evidence as m
+
+        entered = threading.Event()
+        reentry_caught = threading.Event()
+
+        class _RV:
+            _depth = 0
+
+            def verify(self, **kwargs: object) -> object:
+                type(self)._depth += 1
+                if type(self)._depth > 3:
+                    return m.ClaimVerifierResult.RAG_SUPPORTED
+                entered.set()
+                try:
+                    pipeline.run(
+                        agent_kind=AgentKind.SYNDROME,
+                        query="reentry",
+                        graph_run=_GRAPH_RUN,
+                        graph_trace=_GRAPH_TRACE,
+                    )
+                except SandboxEvidenceError:
+                    reentry_caught.set()
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_RV()
+        )
+        pipeline.verify_claims(
+            agent_kind=AgentKind.SYNDROME,
+            claims=(),
+            links=(),
+            fallback=FallbackPolicy.RAG_SUPPORTED,
+        )
+        assert entered.is_set(), "verifier was not called"
+        assert reentry_caught.is_set(), (
+            "R2 RED: reentrant pipeline.run during verify_claims was NOT rejected"
+        )
