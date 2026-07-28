@@ -558,3 +558,111 @@ self._verify_callback_context(_ctx)
 - 本轮只报告两文件组合 `212 passed`，没有执行任务书规定的十文件 L5/L6/L7 组合门禁。
 
 验收记录：`ACC-20260728-060`。决策：`DEC-20260728-057`。当前 verdict 为 **REWORK**；后续由 [L7-SBX-FRESH-R2](agent-refactor-l7-sbx-fresh-rework-2-task.md) 以 callback-free canonical protected-state seal 做 bounded architecture convergence。此前所有绿测保留为候选证据，但不构成 L7-SBX acceptance。
+
+---
+
+## R2 返工交付 — Callback-free canonical protected-state seal（2026-07-28）
+
+> **基线**：`3a8ef59`
+> **R1 硬化 HEAD**：`d8c10e3`（被 PM 拒绝：`ACC-20260728-060`）
+> **R2 硬化基线**：`3a8ef59` → R2 hardening diff
+> **返工焦点**：以单一共享 `_StateSeal` 原语代替 identity+len-only 密封，检测 same-size 内容突变（clear+refill、delete+insert、same-key value replace）
+
+### RED 验证记录（18 项新增测试失败）
+
+在 `3a8ef59` 生产代码上执行 19 项新增 R2 硬化测试，18 项 FAIL（DID NOT RAISE / 错误错误码），1 项因误检通过：
+
+| # | 测试 | RED 原因 |
+|---|---|---|
+| 1-8 | `TestR2CanonicalRegistrySeal`（8 项） | `_recognized`/`_reauthorizable` 的 clear+refill、delete+insert、value replace — **DID NOT RAISE** |
+| 9-12 | `TestR2CanonicalStoreSeal`（4 项） | `_bundles` 的 clear+refill、delete+insert、value replace、nested registry — **DID NOT RAISE** |
+| 13-14 | `TestR2CanonicalGetBundlesSeal`（2 项） | per-bundle 突变 — **DID NOT RAISE** |
+| 15-16 | `TestR2MaliciousHookExactType`（2 项） | 容器子类 — 错误错误码 |
+| 17-18 | `TestR2NoPartialSuccess`（2 项） | 漂移后无部分成功 — **DID NOT RAISE** |
+
+### GREEN 验证记录
+
+```text
+$ UV_OFFLINE=1 uv run pytest tests/test_sandbox_evidence_l7.py -q
+============================ 163 passed in 12.40s =============================
+```
+
+76 原始 + 35 R1 + 17 R1 硬化 + 16 R2 identity + 19 R2 same-size = **163 passed**。
+
+### 门禁结果汇总
+
+| 门禁 | 结果 |
+|---|---|
+| L7 专项（163 项） | ✅ 163 passed |
+| L5/L6/L7 十文件组合（501 项） | ✅ 501 passed |
+| 非集成全量（2488 项） | ✅ 2126 passed, 362 deselected |
+| scoped ruff check | ✅ All checks passed |
+| scoped ruff format --check | ✅ 2 files already formatted |
+| scoped mypy `app/agent_runtime/sandbox_evidence.py` | ✅ Success |
+| full mypy `app scripts` (160 files) | ✅ Success: no issues found |
+| `uv lock --check` | ✅ Resolved 84 packages |
+| `git diff --check` | ✅ 无空白问题 |
+| `ruff check .`（全仓） | ✅ All checks passed |
+| `ruff format --check .`（全仓） | ⚠️ 129 files would be reformatted（全为既有债务，不在 allowlist 内） |
+
+### R2 硬化实现清单
+
+#### `_StateSeal` — 单一共享回调安全密封原语
+
+新增类型/模块位于 `_check_exact_type` 之后：
+
+| 组件 | 说明 |
+|---|---|
+| `_canonical_encode_int(v)` | 非 str()/repr() 的确定性 int 编码（int.to_bytes + 符号前缀） |
+| `_encode_canonical_field(h, name, value)` | 字段级确定性 SHA-256 编码；只处理 exact built-in 类型（dict/set/int/bool）；dict 需要 str/int 或 str/bytes 值类型；从不调用 __str__、__repr__、__eq__、__hash__、property 或 Pydantic 序列化器 |
+| `_StateSeal` | capture(…)/verify(…)/restore(target)/digest 四方法的单例密封原语；capture 保存 trusted 浅拷贝供恢复；verify 重新计算摘要并与 capture 时比较；restore 恢复 pre-state + 设置 `_poisoned=True` |
+| `_STATE_SEAL_SCHEMA = b"se.v2\|"` | 域分隔 versioned schema — 任何变更使所有历史摘要无效 |
+
+#### Registry / Store / Pipeline 集成
+
+| 类 | 变更 | 覆盖路径 |
+|---|---|---|
+| `SandboxEvidenceRegistry` | 添加 `_poisoned`；`_capture`/`_verify` 改用 `_StateSeal` 捕获 `_recognized`、`_reauthorizable`、`_epoch`、`_reentry_guard` | recognize()、add_recognized()、reauthorize() |
+| `SandboxEvidenceStore` | 添加 `_poisoned`；`_capture`/`_verify` 改用 `_StateSeal` 捕获 `_bundles`、`_sealed`、`_reentry_guard`；put()/get() 新增 store 级 seal 围绕 `registry.recognize()`；get_bundles_for_* 新增 per-bundle store 级 seal | put()、get()、get_bundles_for_retrieval_run()、get_bundles_for_graph_run() |
+| `EvidencePipeline` | 添加 `_poisoned`；`_capture`/`_verify` 改用 `_StateSeal` 捕获 store bundles + registry 递归 | run() RAG path、run() no-RAG path、verify_claims() |
+
+#### 漂移恢复与中毒
+
+- 只在 `SANDBOX_EVIDENCE_INTEGRITY_FAILURE` 时触发恢复+中毒；`AUTHORITY_REJECTED`（重入等）不中毒
+- `restore()` 恢复 pre-state 浅拷贝 + 设置 `_poisoned=True`
+- 所有公共方法入口检查 `_poisoned` → `SANDBOX_EVIDENCE_UNAVAILABLE`
+- `except Exception: continue` 修正为优先匹配 `SandboxEvidenceError` 再 `except Exception`
+
+### 已验证的攻击面
+
+| 攻击向量 | 密封机制 |
+|---|---|
+| `_recognized` same-size clear+refill | `_StateSeal` digest 变化 → INTEGRITY_FAILURE |
+| `_recognized` same-size delete+insert | 同上 |
+| `_recognized` same-key value replace | 同上 |
+| `_reauthorizable` same-size clear+refill | 同上 |
+| `_reauthorizable` same-size delete+insert | 同上 |
+| `_bundles` same-size clear+refill | 同上（store/pipeline 级） |
+| `_bundles` same-size delete+insert | 同上 |
+| `_bundles` same-key bytes replace | 同上 |
+| Nested registry via pipeline verifier | 递归 `_StateSeal` 链 |
+| get_bundles_for_* per-bundle authorizer mutation | 新增 per-bundle store 级 seal |
+| dict/set subclass 容器替换 | `type(x) is` exact-type 检查在 `_encode_canonical_field` 和 `_StateSeal.capture` |
+| `__str__`/`__repr__` hook 调用 | digest 从不调用 str()/repr()，仅使用 int.to_bytes / bytes |
+| 部分成功 + 污染消耗 | restore → poison → `_poisoned` 入口检查 |
+| Slot 属性替换 | `is` 身份检查保留（lock、authorizer、verifier、registry、store） |
+
+### 停止条件检查
+
+- ✅ 仅修改 allowlist 内 3 个文件（`sandbox_evidence.py` + `test_sandbox_evidence_l7.py` + 本 handoff）
+- ✅ RED-first：18 项测试在 `3a8ef59` 上全部 FAIL
+- ✅ GREEN 实现后全部 163 项测试 PASS
+- ✅ 回调真实执行断言（`threading.Event` + `_R2CallCounter.should_mutate`）
+- ✅ same-size 突变族全覆盖（三个容器的 clear+refill / delete+insert / value replace）
+- ✅ 完整 operation × callback 矩阵（recognize、add_recognized、reauthorize、put、get、get_bundles_for_*、pipeline.run、verify_claims）
+- ✅ 无网络/DB/模型/真实数据/`.env`/stash/`.claude/` 访问
+- ✅ 无死锁、无限递归或 matcher/例外表扩张
+- ✅ `_poisoned` 中毒后统一拒绝，无残留可消耗状态
+- ✅ 未提交（仅工作树变更）
+- ✅ 无新建 store/registry 模拟同实例 mutation
+- ✅ 无 `len()` 回退，全部使用 canonical state digest

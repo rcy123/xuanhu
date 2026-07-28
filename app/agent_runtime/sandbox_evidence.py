@@ -683,7 +683,7 @@ class SandboxEvidenceRegistry:
     The epoch increments on every state transition and cannot be reverted.
     """
 
-    __slots__ = ("_lock", "_recognized", "_reauthorizable", "_epoch", "_authorizer", "_reentry_guard")
+    __slots__ = ("_lock", "_recognized", "_reauthorizable", "_epoch", "_authorizer", "_reentry_guard", "_poisoned")
 
     def __init__(self, authorizer: SandboxEvidenceAuthorizer) -> None:
         self._lock = threading.RLock()
@@ -692,46 +692,56 @@ class SandboxEvidenceRegistry:
         self._epoch = 0
         self._authorizer = authorizer
         self._reentry_guard = 0
+        self._poisoned = False
 
-    # -- Callback identity/state-drift sealing ---------------------------------
+    # -- Callback canonical state seal (R2: _StateSeal) ------------------------
 
     def _capture_callback_context(self) -> dict[str, Any]:
         """Capture identity/state snapshot before an untrusted authorizer callback."""
+        seal = _StateSeal()
+        seal.capture(
+            _recognized=self._recognized,
+            _reauthorizable=self._reauthorizable,
+            _epoch=self._epoch,
+            _reentry_guard=self._reentry_guard,
+        )
         return {
-            "lock": self._lock,
-            "authorizer": self._authorizer,
-            "recognized": self._recognized,
-            "recognized_len": len(self._recognized),
-            "reauthorizable": self._reauthorizable,
-            "reauthorizable_len": len(self._reauthorizable),
-            "epoch": self._epoch,
+            "_lock": self._lock,
+            "_authorizer": self._authorizer,
+            "_recognized": self._recognized,
+            "_reauthorizable": self._reauthorizable,
+            "_seal": seal,
         }
 
     def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
         """Verify post-callback state matches pre-callback snapshot.
 
-        On identity or state mismatch, restore safe invariants where possible
+        On identity or state drift, restore safe invariants where possible
         and raise fail-closed with ``SandboxEvidenceError``.
         """
-        if self._lock is not ctx["lock"]:
-            self._lock = ctx["lock"]
+        if self._lock is not ctx["_lock"]:
+            self._lock = ctx["_lock"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._authorizer is not ctx["authorizer"]:
-            self._authorizer = ctx["authorizer"]
+        if self._authorizer is not ctx["_authorizer"]:
+            self._authorizer = ctx["_authorizer"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._recognized is not ctx["recognized"]:
-            self._recognized = ctx["recognized"]
+        if self._recognized is not ctx["_recognized"]:
+            self._recognized = ctx["_recognized"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if len(self._recognized) != ctx["recognized_len"]:
+        if self._reauthorizable is not ctx["_reauthorizable"]:
+            self._reauthorizable = ctx["_reauthorizable"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._reauthorizable is not ctx["reauthorizable"]:
-            self._reauthorizable = ctx["reauthorizable"]
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if len(self._reauthorizable) != ctx["reauthorizable_len"]:
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._epoch != ctx["epoch"]:
-            self._epoch = ctx["epoch"]
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        # Canonical state seal — catches same-size mutations
+        try:
+            ctx["_seal"].verify(
+                _recognized=self._recognized,
+                _reauthorizable=self._reauthorizable,
+                _epoch=self._epoch,
+                _reentry_guard=self._reentry_guard,
+            )
+        except SandboxEvidenceError:
+            ctx["_seal"].restore(self)
+            raise
 
     @property
     def epoch(self) -> int:
@@ -748,6 +758,8 @@ class SandboxEvidenceRegistry:
         SandboxEvidenceError.
         """
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             ctx = self._capture_callback_context()
             auth_result = self._authorizer.authorize(bundle_digest=bundle_digest)
             self._verify_callback_context(ctx)
@@ -763,6 +775,8 @@ class SandboxEvidenceRegistry:
         The epoch is incremented on each successful state change.
         """
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             ctx = self._capture_callback_context()
             if not self._authorizer.authorize(bundle_digest=bundle_digest):
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
@@ -792,6 +806,8 @@ class SandboxEvidenceRegistry:
         Returns False (without raising) if the digest is already recognized.
         """
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             if bundle_digest in self._recognized:
                 return False
             if bundle_digest not in self._reauthorizable:
@@ -922,7 +938,7 @@ class SandboxEvidenceStore:
     - Optional live registry for authorization (when *registry* is provided)
     """
 
-    __slots__ = ("_lock", "_bundles", "_sealed", "_registry", "_reentry_guard")
+    __slots__ = ("_lock", "_bundles", "_sealed", "_registry", "_reentry_guard", "_poisoned")
 
     def __init__(self, registry: SandboxEvidenceRegistry) -> None:
         self._lock = threading.RLock()
@@ -930,26 +946,31 @@ class SandboxEvidenceStore:
         self._sealed = False
         self._registry = registry
         self._reentry_guard = 0
+        self._poisoned = False
 
     @property
     def registry(self) -> SandboxEvidenceRegistry:
         """Expose the injected registry."""
         return self._registry
 
-    # -- Callback identity/state-drift sealing ---------------------------------
+    # -- Callback canonical state seal (R2: _StateSeal) ------------------------
 
     def _capture_callback_context(self) -> dict[str, Any]:
         """Capture identity/state snapshot for pipeline-level callback sealing."""
+        seal = _StateSeal()
+        seal.capture(
+            _bundles=self._bundles,
+            _sealed=self._sealed,
+            _reentry_guard=self._reentry_guard,
+        )
         ctx: dict[str, Any] = {
-            "lock": self._lock,
-            "registry": self._registry,
-            "bundles": self._bundles,
-            "bundles_len": len(self._bundles),
-            "sealed": self._sealed,
-            "reentry_guard": self._reentry_guard,
+            "_lock": self._lock,
+            "_registry": self._registry,
+            "_bundles": self._bundles,
+            "_seal": seal,
         }
         if self._registry is not None:
-            ctx["registry_ctx"] = self._registry._capture_callback_context()
+            ctx["_registry_ctx"] = self._registry._capture_callback_context()
         return ctx
 
     def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
@@ -958,25 +979,27 @@ class SandboxEvidenceStore:
         On identity or state drift, restore safe invariants where possible
         and raise fail-closed with ``SandboxEvidenceError``.
         """
-        if self._lock is not ctx["lock"]:
-            self._lock = ctx["lock"]
+        if self._lock is not ctx["_lock"]:
+            self._lock = ctx["_lock"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._registry is not ctx["registry"]:
-            self._registry = ctx["registry"]
+        if self._registry is not ctx["_registry"]:
+            self._registry = ctx["_registry"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._bundles is not ctx["bundles"]:
-            self._bundles = ctx["bundles"]
+        if self._bundles is not ctx["_bundles"]:
+            self._bundles = ctx["_bundles"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if len(self._bundles) != ctx["bundles_len"]:
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._sealed != ctx["sealed"]:
-            self._sealed = ctx["sealed"]
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._reentry_guard != ctx["reentry_guard"]:
-            self._reentry_guard = ctx["reentry_guard"]
-            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        # Canonical state seal — catches same-size mutations
+        try:
+            ctx["_seal"].verify(
+                _bundles=self._bundles,
+                _sealed=self._sealed,
+                _reentry_guard=self._reentry_guard,
+            )
+        except SandboxEvidenceError:
+            ctx["_seal"].restore(self)
+            raise
         if self._registry is not None:
-            reg_ctx = ctx.get("registry_ctx")
+            reg_ctx = ctx.get("_registry_ctx")
             if reg_ctx is not None:
                 self._registry._verify_callback_context(reg_ctx)
 
@@ -989,6 +1012,8 @@ class SandboxEvidenceStore:
         recognized before storing.
         """
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             if self._reentry_guard:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
             if self._sealed:
@@ -997,8 +1022,24 @@ class SandboxEvidenceStore:
 
             self._reentry_guard += 1
             try:
-                if not self._registry.recognize(bundle.bundle_digest):
+                _store_seal = _StateSeal()
+                _store_seal.capture(
+                    _bundles=self._bundles,
+                    _sealed=self._sealed,
+                    _reentry_guard=self._reentry_guard,
+                )
+                _auth_result = self._registry.recognize(bundle.bundle_digest)
+                _store_seal.verify(
+                    _bundles=self._bundles,
+                    _sealed=self._sealed,
+                    _reentry_guard=self._reentry_guard,
+                )
+                if not _auth_result:
                     raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
+            except SandboxEvidenceError as _se:
+                if "INTEGRITY_FAILURE" in str(_se):
+                    _store_seal.restore(self)
+                raise
             finally:
                 self._reentry_guard -= 1
 
@@ -1016,13 +1057,31 @@ class SandboxEvidenceStore:
     def get(self, bundle_digest: str) -> SandboxEvidenceBundleV1 | None:
         """Retrieve a bundle by its digest, or None if missing/unauthorized."""
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             if self._reentry_guard:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
 
             self._reentry_guard += 1
             try:
-                if not self._registry.recognize(bundle_digest):
+                _store_seal = _StateSeal()
+                _store_seal.capture(
+                    _bundles=self._bundles,
+                    _sealed=self._sealed,
+                    _reentry_guard=self._reentry_guard,
+                )
+                _recognized = self._registry.recognize(bundle_digest)
+                _store_seal.verify(
+                    _bundles=self._bundles,
+                    _sealed=self._sealed,
+                    _reentry_guard=self._reentry_guard,
+                )
+                if not _recognized:
                     return None
+            except SandboxEvidenceError as _se:
+                if "INTEGRITY_FAILURE" in str(_se):
+                    _store_seal.restore(self)
+                raise
             finally:
                 self._reentry_guard -= 1
 
@@ -1037,18 +1096,38 @@ class SandboxEvidenceStore:
     def get_bundles_for_retrieval_run(self, retrieval_run: str) -> tuple[SandboxEvidenceBundleV1, ...]:
         """Return all bundles visible for the given retrieval run."""
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             result: list[SandboxEvidenceBundleV1] = []
             for raw in self._bundles.values():
                 try:
                     bundle = SandboxEvidenceBundleV1.model_validate_json(raw)
                     if bundle.retrieval_run == retrieval_run:
                         self._reentry_guard += 1
+                        _seal = _StateSeal()
+                        _seal.capture(
+                            _bundles=self._bundles,
+                            _sealed=self._sealed,
+                            _reentry_guard=self._reentry_guard,
+                        )
                         try:
-                            if not self._registry.recognize(bundle.bundle_digest):
-                                continue
+                            _ok = self._registry.recognize(bundle.bundle_digest)
+                            _seal.verify(
+                                _bundles=self._bundles,
+                                _sealed=self._sealed,
+                                _reentry_guard=self._reentry_guard,
+                            )
+                        except SandboxEvidenceError:
+                            _seal.restore(self)
+                            raise
                         finally:
                             self._reentry_guard -= 1
-                        result.append(bundle)
+                        if _ok:
+                            result.append(bundle)
+                except SandboxEvidenceError as _se:
+                    if "INTEGRITY_FAILURE" in str(_se):
+                        raise
+                    # Reentry / authority errors from registry callback don't poison
                 except Exception:
                     continue
             return tuple(result)
@@ -1056,18 +1135,37 @@ class SandboxEvidenceStore:
     def get_bundles_for_graph_run(self, graph_run: str) -> tuple[SandboxEvidenceBundleV1, ...]:
         """Return all bundles visible for the given graph run."""
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             result: list[SandboxEvidenceBundleV1] = []
             for raw in self._bundles.values():
                 try:
                     bundle = SandboxEvidenceBundleV1.model_validate_json(raw)
                     if bundle.graph_run == graph_run:
                         self._reentry_guard += 1
+                        _seal = _StateSeal()
+                        _seal.capture(
+                            _bundles=self._bundles,
+                            _sealed=self._sealed,
+                            _reentry_guard=self._reentry_guard,
+                        )
                         try:
-                            if not self._registry.recognize(bundle.bundle_digest):
-                                continue
+                            _ok = self._registry.recognize(bundle.bundle_digest)
+                            _seal.verify(
+                                _bundles=self._bundles,
+                                _sealed=self._sealed,
+                                _reentry_guard=self._reentry_guard,
+                            )
+                        except SandboxEvidenceError:
+                            _seal.restore(self)
+                            raise
                         finally:
                             self._reentry_guard -= 1
-                        result.append(bundle)
+                        if _ok:
+                            result.append(bundle)
+                except SandboxEvidenceError as _se:
+                    if "INTEGRITY_FAILURE" in str(_se):
+                        raise
                 except Exception:
                     continue
             return tuple(result)
@@ -1075,6 +1173,8 @@ class SandboxEvidenceStore:
     def snapshot(self) -> SandboxEvidenceStoreSnapshotV1:
         """Create a canonical snapshot of the current store state."""
         with self._lock:
+            if self._poisoned:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             if self._reentry_guard:
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
             raw = json.dumps(
@@ -1133,6 +1233,138 @@ def _check_exact_type(value: object, expected: type) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _StateSeal — single shared canonical state seal for callback boundaries
+# ---------------------------------------------------------------------------
+
+# Schema version for canonical state domains — any change breaks all prior digests
+_STATE_SEAL_SCHEMA = b"se.v2|"
+
+
+def _canonical_encode_int(v: int) -> bytes:
+    """Deterministic byte encoding of exact int (never bool) for digest.
+
+    Safe for exact built-in int.  Never calls str(), repr(), or external
+    methods.  Only called after type(v) is int and type(v) is not bool
+    has been confirmed.
+    """
+    if v >= 0:
+        return b"+" + v.to_bytes(max((v.bit_length() + 7) // 8, 1), "big", signed=False)
+    neg = -v
+    return b"-" + neg.to_bytes(max((neg.bit_length() + 7) // 8, 1), "big", signed=False)
+
+
+def _encode_canonical_field(h: hashlib._Hash, name: str, value: object) -> None:
+    """Append one field's canonical form to *h*.
+
+    Only exact built-in types are accepted.  Never calls __str__, __repr__,
+    __eq__, __hash__, properties, Pydantic serializers/validators, or
+    external callbacks.
+    """
+    _check_exact_type(name, str)
+    h.update(name.encode("utf-8"))
+    h.update(b"=")
+    if type(value) is dict:
+        # Must be dict[str, int] or dict[str, bytes]
+        h.update(b"{")
+        for k in sorted(value):
+            v = value[k]
+            _check_exact_type(k, str)
+            h.update(k.encode("utf-8"))
+            h.update(b":")
+            if type(v) is int:
+                h.update(_canonical_encode_int(v))
+            elif type(v) is bytes:
+                h.update(v)
+            else:
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_SCHEMA_INVALID")
+            h.update(b",")
+        h.update(b"}")
+    elif type(value) is set:
+        # Must be set[str]
+        h.update(b"(")
+        for item in sorted(value):
+            _check_exact_type(item, str)
+            h.update(item.encode("utf-8"))
+            h.update(b",")
+        h.update(b")")
+    elif type(value) is bool:
+        h.update(b"T" if value else b"F")
+    elif type(value) is int:
+        h.update(_canonical_encode_int(value))
+    else:
+        raise SandboxEvidenceError("SANDBOX_EVIDENCE_SCHEMA_INVALID")
+
+
+class _StateSeal:
+    """Single shared canonical state seal for callback boundary protection.
+
+    Captures type-checked exact state, computes deterministic SHA-256 digest,
+    and verifies no drift after untrusted callback.  On drift, restores saved
+    pre-callback state and raises.
+
+    This is THE shared primitive used uniformly by Registry, Store, and
+    Pipeline.  No class maintains its own ad-hoc length/exception table.
+
+    The seal operates only on exact built-in types (dict, set, int, bool, str,
+    bytes).  Never calls __str__, __repr__, __eq__, __hash__, properties,
+    Pydantic serializers/validators, or any authorizer/verifier method.
+    """
+
+    __slots__ = ("_pre", "_digest")
+
+    def __init__(self) -> None:
+        self._pre: dict[str, object] = {}
+        self._digest: str = ""
+
+    def capture(self, **fields: object) -> str:
+        """Capture pre-callback state, save trusted copies, compute digest.
+
+        Returns the hex digest.
+        """
+        h = hashlib.sha256(_STATE_SEAL_SCHEMA)
+        self._pre = {}
+        for name in sorted(fields):
+            h.update(b"|")
+            value = fields[name]
+            if type(value) is dict:
+                self._pre[str(name)] = dict(value)
+            elif type(value) is set:
+                self._pre[str(name)] = set(value)
+            else:
+                self._pre[str(name)] = value  # immutable
+            _encode_canonical_field(h, name, value)
+        self._digest = h.hexdigest()
+        return self._digest
+
+    def verify(self, **fields: object) -> str:
+        """Verify current state matches captured digest.
+
+        Returns current digest on match.
+        Raises SandboxEvidenceError on mismatch.
+        """
+        h = hashlib.sha256(_STATE_SEAL_SCHEMA)
+        for name in sorted(fields):
+            h.update(b"|")
+            _encode_canonical_field(h, name, fields[name])
+        cur = h.hexdigest()
+        if cur != self._digest:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
+        return cur
+
+    def restore(self, target: object) -> None:
+        """Restore pre-capture state copies on *target* and poison."""
+        for name_str, pre_val in self._pre.items():
+            if hasattr(target, name_str):
+                setattr(target, name_str, pre_val)
+        if hasattr(target, "_poisoned"):
+            target._poisoned = True
+
+    @property
+    def digest(self) -> str:
+        return self._digest
+
+
+# ---------------------------------------------------------------------------
 # EvidencePipeline — retrieve → store → verify → context projection
 # ---------------------------------------------------------------------------
 
@@ -1153,6 +1385,7 @@ class EvidencePipeline:
         "_lock",
         "_registry",
         "_reentry_guard",
+        "_poisoned",
     )
 
     def __init__(
@@ -1176,28 +1409,34 @@ class EvidencePipeline:
         self._lock = threading.RLock()
         self._registry = registry  # None = use store's registry (if any)
         self._reentry_guard = 0
+        self._poisoned = False
 
     def _get_active_registry(self) -> SandboxEvidenceRegistry | None:
         """Resolve the effective registry — pipeline-level or store-level."""
         return self._registry if self._registry is not None else self._store.registry
 
-    # -- Callback identity/state-drift sealing ---------------------------------
+    # -- Callback canonical state seal (R2: _StateSeal) ------------------------
 
     def _capture_callback_context(self) -> dict[str, Any]:
         """Capture identity/state snapshot before an untrusted verifier callback."""
+        store_seal = _StateSeal()
+        store_seal.capture(
+            _bundles=self._store._bundles,
+            _sealed=self._store._sealed,
+            _reentry_guard=self._store._reentry_guard,
+        )
         ctx: dict[str, Any] = {
-            "store": self._store,
-            "verifier": self._verifier,
-            "registry": self._registry,
-            "lock": self._lock,
-            "reentry_guard": self._reentry_guard,
+            "_store": self._store,
+            "_verifier": self._verifier,
+            "_registry": self._registry,
+            "_lock": self._lock,
+            "_reentry_guard": self._reentry_guard,
+            "_store_seal": store_seal,
         }
-        # Capture store and registry internals for deep state-drift detection
-        try:
-            store_ctx = self._store._capture_callback_context()
-            ctx["store_ctx"] = store_ctx
-        except AttributeError:
-            pass
+        # Capture registry internals for deep state-drift detection
+        reg = self._get_active_registry()
+        if reg is not None:
+            ctx["_registry_ctx"] = reg._capture_callback_context()
         return ctx
 
     def _verify_callback_context(self, ctx: dict[str, Any]) -> None:
@@ -1206,22 +1445,38 @@ class EvidencePipeline:
         On identity or state mismatch, restore safe invariants where possible
         and raise fail-closed with ``SandboxEvidenceError``.
         """
-        if self._store is not ctx["store"]:
+        if self._store is not ctx["_store"]:
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._verifier is not ctx["verifier"]:
+        if self._verifier is not ctx["_verifier"]:
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._registry is not ctx["registry"]:
+        if self._registry is not ctx["_registry"]:
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._lock is not ctx["lock"]:
-            self._lock = ctx["lock"]
+        if self._lock is not ctx["_lock"]:
+            self._lock = ctx["_lock"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        if self._reentry_guard != ctx["reentry_guard"]:
-            self._reentry_guard = ctx["reentry_guard"]
+        if self._reentry_guard != ctx["_reentry_guard"]:
+            self._reentry_guard = ctx["_reentry_guard"]
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
-        # Delegate to store-level verification
-        store_ctx = ctx.get("store_ctx")
-        if store_ctx is not None:
-            self._store._verify_callback_context(store_ctx)
+        # Store-level canonical state seal
+        try:
+            ctx["_store_seal"].verify(
+                _bundles=self._store._bundles,
+                _sealed=self._store._sealed,
+                _reentry_guard=self._store._reentry_guard,
+            )
+        except SandboxEvidenceError:
+            ctx["_store_seal"].restore(self._store)
+            raise
+        # Registry delegation
+        reg_ctx = ctx.get("_registry_ctx")
+        if reg_ctx is not None:
+            reg = self._get_active_registry()
+            if reg is not None:
+                    try:
+                        reg._verify_callback_context(reg_ctx)
+                    except SandboxEvidenceError:
+                        self._poisoned = True
+                        raise
 
     def run(
         self,
@@ -1237,6 +1492,8 @@ class EvidencePipeline:
         For no-RAG and hard-block fallbacks, retrieval is skipped and
         references are empty.
         """
+        if self._poisoned:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
         if self._reentry_guard:
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
 
@@ -1348,6 +1605,8 @@ class EvidencePipeline:
         fallback: FallbackPolicy = FallbackPolicy.RAG_SUPPORTED,
     ) -> ClaimVerifierResult:
         """Verify claim-to-evidence links independently of retrieval."""
+        if self._poisoned:
+            raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
         if self._reentry_guard:
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_AUTHORITY_REJECTED")
         if len(claims) > _CLAIM_LINK_LIMIT:

@@ -3482,3 +3482,592 @@ class TestR2AuthorizerIdentitySealing:
             f"R2 RED: expected INTEGRITY_FAILURE code, got {exc_info.value}"
         )
         assert invoked.is_set(), "R2 RED: authorizer callback was not invoked"
+
+
+# ===================================================================
+# 17. R2 Canonical State - same-size mutation family tests (RED)
+# ===================================================================
+
+
+class _R2CallCounter:
+    """Test helper for call counting and invocation flagging."""
+
+    def __init__(self, invoked: threading.Event) -> None:
+        self.calls = 0
+        self.invoked = invoked
+
+    def should_mutate(self, threshold: int = 2) -> bool:
+        self.calls += 1
+        return self.calls == threshold
+
+
+class TestR2CanonicalRegistrySeal:
+    """P0: Registry same-size content mutation via authorizer callback."""
+
+    _TAG = "TestR2CanonicalRegistrySeal"
+
+    def test_recognize_recognized_clear_refill(self) -> None:
+        """Authorizer clears _recognized and refills with same N items."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    reg._recognized.clear()
+                    reg._recognized[DZ] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.recognize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_recognize_recognized_delete_insert(self) -> None:
+        """Authorizer deletes key A and inserts key Z (same-size)."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    if DA in reg._recognized:
+                        del reg._recognized[DA]
+                    reg._recognized[DZ] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.recognize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_recognize_recognized_value_replace(self) -> None:
+        """Authorizer replaces value for same key (same-size)."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    if DA in reg._recognized:
+                        reg._recognized[DA] = 999
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.recognize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_add_recognized_recognized_clear_refill(self) -> None:
+        """Authorizer clears and refills _recognized during add_recognized."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DB = "b" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    reg._recognized.clear()
+                    reg._recognized[DZ] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized(DB)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_add_recognized_recognized_delete_insert(self) -> None:
+        """Authorizer deletes key A and inserts key Z during add_recognized."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DB = "b" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    if DA in reg._recognized:
+                        del reg._recognized[DA]
+                    reg._recognized[DZ] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized(DB)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_add_recognized_recognized_value_replace(self) -> None:
+        """Authorizer replaces value for same key during add_recognized."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DB = "b" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    if DA in reg._recognized:
+                        reg._recognized[DA] = 999
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized(DB)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_reauthorize_reauthorizable_clear_refill(self) -> None:
+        """Authorizer clears _reauthorizable and refills with same N items."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    reg._reauthorizable.clear()
+                    reg._reauthorizable.add(DZ)
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        reg.revoke(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_reauthorize_reauthorizable_delete_insert(self) -> None:
+        """Authorizer deletes one and inserts different item in _reauthorizable."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    reg._reauthorizable.discard(DA)
+                    reg._reauthorizable.add(DZ)
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        reg.revoke(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize(DA)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+
+class TestR2CanonicalStoreSeal:
+    """P0: Store same-size content mutation via pipeline verifier callback."""
+
+    _TAG = "TestR2CanonicalStoreSeal"
+
+    @staticmethod
+    def _make_store_and_registry() -> tuple:
+
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        return store, reg
+
+    def test_verifier_bundles_clear_refill_in_pipeline_run(self) -> None:
+        """Verifier clears _bundles and refills with same keys/values."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                snap = dict(store._bundles)
+                store._bundles.clear()
+                import hashlib as _hl
+
+                for k in snap:
+                    ek = _hl.sha256((k + "_EVIL").encode()).hexdigest()
+                    store._bundles[ek] = b"EVIL_" + snap[k]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_verifier_bundles_delete_insert_in_pipeline_run(self) -> None:
+        """Verifier deletes one bundle key and inserts different key."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+        b1 = _fake_bundle(query="q1", retrieval_run=_RETRIEVAL_RUN)
+        b2 = _fake_bundle(
+            query="q2",
+            retrieval_run=_RETRIEVAL_RUN,
+            packets=(_fake_packet(evidence_id="ev-2", retrieval_run=_RETRIEVAL_RUN),),
+        )
+        reg.add_recognized(b1.bundle_digest)
+        store.put(b1)
+        reg.add_recognized(b2.bundle_digest)
+        store.put(b2)
+        cap = store._bundles[b2.bundle_digest]
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                del store._bundles[b1.bundle_digest]
+                store._bundles[hashlib.sha256(b"f").hexdigest()] = cap
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_verifier_bundles_value_replace_in_pipeline_run(self) -> None:
+        """Verifier replaces raw bytes for an existing bundle key."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store._bundles[bundle.bundle_digest] = b"TAMPERED_BUNDLE_BYTES"
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_verifier_nested_registry_recognized_mutation(self) -> None:
+        """Verifier mutates store.registry._recognized via same-size clear+refill."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        store, reg = self._make_store_and_registry()
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                snap = dict(store.registry._recognized)
+                store.registry._recognized.clear()
+                for k in snap:
+                    store.registry._recognized["_EVIL_" + k] = snap[k]
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+
+class TestR2CanonicalGetBundlesSeal:
+    """P0: get_bundles_for_* paths with per-bundle authorizer mutation."""
+
+    _TAG = "TestR2CanonicalGetBundlesSeal"
+
+    @staticmethod
+    def _make_store_bundles() -> tuple:
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        reg = RegistryCls(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        b1 = _fake_bundle(query="q1", retrieval_run=_RETRIEVAL_RUN, graph_run=_GRAPH_RUN)
+        b2 = _fake_bundle(
+            query="q2",
+            retrieval_run=_RETRIEVAL_RUN,
+            graph_run=_GRAPH_RUN,
+            packets=(_fake_packet(evidence_id="ev-2", retrieval_run=_RETRIEVAL_RUN, graph_run=_GRAPH_RUN),),
+        )
+        reg.add_recognized(b1.bundle_digest)
+        store.put(b1)
+        reg.add_recognized(b2.bundle_digest)
+        store.put(b2)
+        return store, reg
+
+    def test_get_bundles_for_retrieval_run_authorizer_mutation(self) -> None:
+        """Authorizer mutates store._bundles during per-bundle recognize."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        store, reg0 = self._make_store_bundles()
+        counter = _R2CallCounter(invoked)
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    for k in list(store._bundles):
+                        store._bundles[k] = b"tampered_value"
+                return True
+
+        reg2 = RegistryCls(authorizer=_MA())
+        for d in list(reg0._reauthorizable):
+            reg2._reauthorizable.add(d)
+        store._registry = reg2
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            store.get_bundles_for_retrieval_run(_RETRIEVAL_RUN)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorize not invoked"
+
+    def test_get_bundles_for_graph_run_authorizer_mutation(self) -> None:
+        """Authorizer mutates store._bundles during per-bundle recognize."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        store, reg0 = self._make_store_bundles()
+        counter = _R2CallCounter(invoked)
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    for k in list(store._bundles):
+                        store._bundles[k] = b"tampered_graph"
+                return True
+
+        reg2 = RegistryCls(authorizer=_MA())
+        for d in list(reg0._reauthorizable):
+            reg2._reauthorizable.add(d)
+        store._registry = reg2
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            store.get_bundles_for_graph_run(_GRAPH_RUN)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorize not invoked"
+
+
+class TestR2MaliciousHookExactType:
+    """Malicious hook non-execution and exact-type enforcement."""
+
+    _TAG = "TestR2MaliciousHookExactType"
+
+    def test_malicious_str_repr_not_invoked_in_registry_seal(self) -> None:
+        """str subclass must not trigger __str__/__repr__ hooks in seal."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        str_hook = threading.Event()
+        repr_hook = threading.Event()
+
+        class EvilStr(str):
+            def __str__(self) -> str:
+                str_hook.set()
+                return "evil"
+
+            def __repr__(self) -> str:
+                repr_hook.set()
+                return "evil"
+
+        class _EvilAuthorizer:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                reg._recognized[EvilStr("z" * 64)] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())
+        with pytest.raises(SandboxEvidenceError):
+            reg.add_recognized("a" * 64)
+        assert not str_hook.is_set(), "R2 RED: __str__ triggered"
+        assert not repr_hook.is_set(), "R2 RED: __repr__ triggered"
+
+    def test_dict_subclass_rejected_in_registry_seal(self) -> None:
+        """dict subclass used as _recognized must be rejected."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+
+        class EvilDict(dict):
+            pass
+
+        class _EvilAuthorizer:
+            def __init__(self):
+                self._calls = 0
+
+            def authorize(self, *, bundle_digest: str) -> bool:
+                self._calls += 1
+                if self._calls == 2:
+                    invoked.set()
+                    reg._recognized = EvilDict({"z" * 64: 1})
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())
+        reg.add_recognized("a" * 64)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("b" * 64)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+    def test_set_subclass_rejected_in_registry_seal(self) -> None:
+        """set subclass used as _reauthorizable must be rejected."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+
+        class EvilSet(set):
+            pass
+
+        class _EvilAuthorizer:
+            def __init__(self):
+                self._calls = 0
+
+            def authorize(self, *, bundle_digest: str) -> bool:
+                self._calls += 1
+                if self._calls == 2:
+                    invoked.set()
+                    reg._reauthorizable = EvilSet(["z" * 64])
+                return True
+
+        reg = RegistryCls(authorizer=_EvilAuthorizer())
+        reg.add_recognized("a" * 64)
+        reg.revoke("a" * 64)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.reauthorize("a" * 64)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: authorizer not invoked"
+
+
+class TestR2NoPartialSuccess:
+    """P0: Drift failure leaves no partial success."""
+
+    _TAG = "TestR2NoPartialSuccess"
+
+    def test_no_partial_success_after_bundles_mutation(self) -> None:
+        """pipeline.run must not return bundles/context after drift."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        invoked = threading.Event()
+        reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
+        store = SandboxEvidenceStore(registry=reg)
+        bundle = _fake_bundle(query="original", retrieval_run=_RETRIEVAL_RUN)
+        reg.add_recognized(bundle.bundle_digest)
+        store.put(bundle)
+
+        class _MV:
+            def verify(self, **kwargs: object) -> object:
+                invoked.set()
+                store._bundles[bundle.bundle_digest] = b"TAMPERED"
+                return m.ClaimVerifierResult.RAG_SUPPORTED
+
+        pipeline = EvidencePipeline(
+            store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
+        )
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set(), "R2 RED: verifier not invoked"
+
+    def test_no_partial_success_after_registry_mutation(self) -> None:
+        """Registry operation must not after drift."""
+        import app.agent_runtime.sandbox_evidence as m
+
+        RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
+        assert RegistryCls is not None
+        invoked = threading.Event()
+        counter = _R2CallCounter(invoked)
+        DA = "a" * 64
+        DZ = "z" * 64
+
+        class _MA:
+            def authorize(self, *, bundle_digest: str) -> bool:
+                if counter.should_mutate(2):
+                    counter.invoked.set()
+                    reg._recognized.clear()
+                    reg._recognized[DZ] = 1
+                return True
+
+        reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized(DA)
+        with pytest.raises(SandboxEvidenceError) as exc_info:
+            reg.add_recognized("b" * 64)
+        assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
+        assert invoked.is_set()
