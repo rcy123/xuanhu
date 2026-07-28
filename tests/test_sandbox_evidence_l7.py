@@ -3498,7 +3498,10 @@ class _R2CallCounter:
 
     def should_mutate(self, threshold: int = 2) -> bool:
         self.calls += 1
-        return self.calls == threshold
+        if self.calls == threshold:
+            self.invoked.set()
+            return True
+        return False
 
 
 class TestR2CanonicalRegistrySeal:
@@ -4112,6 +4115,8 @@ class TestR2CallbackExceptionPaths:
                 raise RuntimeError(msg)
 
         reg = RegistryCls(authorizer=_MA())
+        # First call primes the hook_called Event
+        reg.add_recognized("c" * 64)
         with pytest.raises(SandboxEvidenceError) as exc_info:
             reg.add_recognized(DA)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
@@ -4135,6 +4140,7 @@ class TestR2CallbackExceptionPaths:
         class _MA:
             def authorize(self, *, bundle_digest: str) -> bool:
                 if counter.should_mutate(2):
+                    counter.invoked.set()
                     reg._recognized.clear()
                     reg._recognized[DZ] = 1
                     msg = "INTENTIONAL_RAISE"
@@ -4163,6 +4169,7 @@ class TestR2CallbackExceptionPaths:
         class _MA:
             def authorize(self, *, bundle_digest: str) -> bool:
                 if counter.should_mutate(2):
+                    counter.invoked.set()
                     reg._reauthorizable.clear()
                     reg._reauthorizable.add(DZ)
                     msg = "INTENTIONAL_RAISE"
@@ -4179,8 +4186,6 @@ class TestR2CallbackExceptionPaths:
 
     def test_verifier_pipeline_run_mutates_then_raises(self) -> None:
         """Verifier mutates store._bundles then raises RuntimeError."""
-
-        import app.agent_runtime.sandbox_evidence as m
 
         invoked = threading.Event()
         reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
@@ -4200,16 +4205,12 @@ class TestR2CallbackExceptionPaths:
             store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
         )
         with pytest.raises(SandboxEvidenceError) as exc_info:
-            pipeline.run(
-                agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
-            )
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set(), "R2 RED: verifier not invoked"
 
     def test_verifier_verify_claims_mutates_then_raises(self) -> None:
         """Verifier mutates registry then raises in verify_claims."""
-
-        import app.agent_runtime.sandbox_evidence as m
 
         invoked = threading.Event()
         reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
@@ -4240,8 +4241,6 @@ class TestR2CallbackExceptionPaths:
 
     def test_verifier_no_rag_mutates_then_raises(self) -> None:
         """Verifier mutates epoch then raises in MODEL_KNOWLEDGE_ONLY path."""
-
-        import app.agent_runtime.sandbox_evidence as m
 
         invoked = threading.Event()
         reg = SandboxEvidenceRegistry(authorizer=_PermissiveAuthorizer())
@@ -4306,6 +4305,7 @@ class TestR2MaliciousKeyLt:
         class _MA:
             def authorize(self, *, bundle_digest: str) -> bool:
                 if counter.should_mutate(2):
+                    counter.invoked.set()
                     reg._recognized[EK] = 1
                 return True
 
@@ -4338,6 +4338,7 @@ class TestR2MaliciousKeyLt:
         class _MA:
             def authorize(self, *, bundle_digest: str) -> bool:
                 if counter.should_mutate(2):
+                    counter.invoked.set()
                     reg._reauthorizable.add(EI)
                 return True
 
@@ -4487,16 +4488,12 @@ class TestR2PoisonAfterDrift:
             store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
         )
         with pytest.raises(SandboxEvidenceError) as exc_info:
-            pipeline.run(
-                agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
-            )
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="fatigue", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set()
         # After poison: pipeline must fail
         with pytest.raises(SandboxEvidenceError) as exc2:
-            pipeline.run(
-                agent_kind=AgentKind.SYNDROME, query="test2", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
-            )
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="test2", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
         assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
 
     def test_poison_after_registry_epoch_drift(self) -> None:
@@ -4507,20 +4504,25 @@ class TestR2PoisonAfterDrift:
         RegistryCls = getattr(m, "SandboxEvidenceRegistry", None)
         assert RegistryCls is not None
         invoked = threading.Event()
+        hook_called = threading.Event()
 
         class _MA:
             def authorize(self, *, bundle_digest: str) -> bool:
+                if not hook_called.is_set():
+                    hook_called.set()
+                    return True
                 invoked.set()
                 reg._epoch = 0
                 return True
 
         reg = RegistryCls(authorizer=_MA())
+        reg.add_recognized("c" * 64)
         with pytest.raises(SandboxEvidenceError) as exc_info:
             reg.add_recognized("a" * 64)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set()
         with pytest.raises(SandboxEvidenceError) as exc2:
-            reg.revoke("a" * 64)
+            reg.revoke("c" * 64)
         assert str(exc2.value) == "SANDBOX_EVIDENCE_UNAVAILABLE"
 
     def test_poison_after_store_bundles_mutation(self) -> None:
@@ -4545,9 +4547,7 @@ class TestR2PoisonAfterDrift:
             store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
         )
         with pytest.raises(SandboxEvidenceError) as exc_info:
-            pipeline.run(
-                agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
-            )
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set()
         # Store must be poisoned
@@ -4611,9 +4611,7 @@ class TestR2ExactErrorCodeAndReentry:
             store=store, syndrome_node=SyndromeRetrievalNode(), formula_node=FormulaRetrievalNode(), verifier=_MV()
         )
         with pytest.raises(SandboxEvidenceError) as exc_info:
-            pipeline.run(
-                agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE
-            )
+            pipeline.run(agent_kind=AgentKind.SYNDROME, query="test", graph_run=_GRAPH_RUN, graph_trace=_GRAPH_TRACE)
         assert str(exc_info.value) == "SANDBOX_EVIDENCE_INTEGRITY_FAILURE"
         assert invoked.is_set(), "R2 RED: verifier not invoked"
 
@@ -4658,9 +4656,7 @@ class TestR2ExactErrorCodeAndReentry:
             fallback=FallbackPolicy.MODEL_KNOWLEDGE_ONLY,
         )
         assert entered.is_set(), "verifier was not called"
-        assert reentry_caught.is_set(), (
-            "R2 RED: reentrant no-RAG was NOT rejected"
-        )
+        assert reentry_caught.is_set(), "R2 RED: reentrant no-RAG was NOT rejected"
 
     def test_verify_claims_reentry_during_verifier_callback(self) -> None:
         """Reentrant pipeline.run during verify_claims must raise."""
@@ -4701,6 +4697,4 @@ class TestR2ExactErrorCodeAndReentry:
             fallback=FallbackPolicy.RAG_SUPPORTED,
         )
         assert entered.is_set(), "verifier was not called"
-        assert reentry_caught.is_set(), (
-            "R2 RED: reentrant pipeline.run during verify_claims was NOT rejected"
-        )
+        assert reentry_caught.is_set(), "R2 RED: reentrant pipeline.run during verify_claims was NOT rejected"

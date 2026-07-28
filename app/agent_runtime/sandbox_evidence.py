@@ -749,10 +749,11 @@ class SandboxEvidenceRegistry:
 
     @property
     def epoch(self) -> int:
-        """Current monotonic epoch — increments on each state change."""
+        """Current monotonic epoch — increments on each state change.
+
+        Read-only diagnostic property — always readable even when poisoned.
+        """
         with self._lock:
-            if self._poisoned:
-                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE")
             return self._epoch
 
     def recognize(self, bundle_digest: str) -> bool:
@@ -770,7 +771,11 @@ class SandboxEvidenceRegistry:
             try:
                 auth_result = self._authorizer.authorize(bundle_digest=bundle_digest)
             except Exception:
-                self._verify_callback_context(ctx)
+                try:
+                    self._verify_callback_context(ctx)
+                except SandboxEvidenceError as _se:
+                    _se.__context__ = None
+                    raise _se
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
             self._verify_callback_context(ctx)
             if not auth_result:
@@ -791,7 +796,11 @@ class SandboxEvidenceRegistry:
             try:
                 auth_ok = self._authorizer.authorize(bundle_digest=bundle_digest)
             except Exception:
-                self._verify_callback_context(ctx)
+                try:
+                    self._verify_callback_context(ctx)
+                except SandboxEvidenceError as _se:
+                    _se.__context__ = None
+                    raise _se
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
             self._verify_callback_context(ctx)
             if not auth_ok:
@@ -833,7 +842,11 @@ class SandboxEvidenceRegistry:
             try:
                 auth_ok = self._authorizer.authorize(bundle_digest=bundle_digest)
             except Exception:
-                self._verify_callback_context(ctx)
+                try:
+                    self._verify_callback_context(ctx)
+                except SandboxEvidenceError as _se:
+                    _se.__context__ = None
+                    raise _se
                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
             self._verify_callback_context(ctx)
             if not auth_ok:
@@ -1056,10 +1069,18 @@ class SandboxEvidenceStore:
                 try:
                     _auth_result = self._registry.recognize(bundle.bundle_digest)
                 except SandboxEvidenceError:
-                    _store_seal_verify_or_restore(_store_seal, self)
+                    try:
+                        _store_seal_verify_or_restore(_store_seal, self)
+                    except SandboxEvidenceError as _se:
+                        _se.__context__ = None
+                        raise _se
                     raise
                 except Exception:
-                    _store_seal_verify_or_restore(_store_seal, self)
+                    try:
+                        _store_seal_verify_or_restore(_store_seal, self)
+                    except SandboxEvidenceError as _se:
+                        _se.__context__ = None
+                        raise _se
                     raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
                 _store_seal_verify_or_restore(_store_seal, self)
                 if not _auth_result:
@@ -1097,10 +1118,18 @@ class SandboxEvidenceStore:
                 try:
                     _recognized = self._registry.recognize(bundle_digest)
                 except SandboxEvidenceError:
-                    _store_seal_verify_or_restore(_store_seal, self)
+                    try:
+                        _store_seal_verify_or_restore(_store_seal, self)
+                    except SandboxEvidenceError as _se:
+                        _se.__context__ = None
+                        raise _se
                     raise
                 except Exception:
-                    _store_seal_verify_or_restore(_store_seal, self)
+                    try:
+                        _store_seal_verify_or_restore(_store_seal, self)
+                    except SandboxEvidenceError as _se:
+                        _se.__context__ = None
+                        raise _se
                     raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
                 _store_seal_verify_or_restore(_store_seal, self)
                 if not _recognized:
@@ -1137,10 +1166,18 @@ class SandboxEvidenceStore:
                             try:
                                 _ok = self._registry.recognize(bundle.bundle_digest)
                             except SandboxEvidenceError:
-                                _store_seal_verify_or_restore(_seal, self)
+                                try:
+                                    _store_seal_verify_or_restore(_seal, self)
+                                except SandboxEvidenceError as _se:
+                                    _se.__context__ = None
+                                    raise _se
                                 raise
                             except Exception:
-                                _store_seal_verify_or_restore(_seal, self)
+                                try:
+                                    _store_seal_verify_or_restore(_seal, self)
+                                except SandboxEvidenceError as _se:
+                                    _se.__context__ = None
+                                    raise _se
                                 raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
                             _store_seal_verify_or_restore(_seal, self)
                         finally:
@@ -1173,20 +1210,27 @@ class SandboxEvidenceStore:
                         )
                         try:
                             _ok = self._registry.recognize(bundle.bundle_digest)
-                            _seal.verify(
-                                _bundles=self._bundles,
-                                _sealed=self._sealed,
-                                _reentry_guard=self._reentry_guard,
-                            )
+                            _store_seal_verify_or_restore(_seal, self)
                         except SandboxEvidenceError:
-                            _seal.restore(self)
+                            try:
+                                _store_seal_verify_or_restore(_seal, self)
+                            except SandboxEvidenceError as _se:
+                                _se.__context__ = None
+                                raise _se
                             raise
+                        except Exception:
+                            try:
+                                _store_seal_verify_or_restore(_seal, self)
+                            except SandboxEvidenceError as _se:
+                                _se.__context__ = None
+                                raise _se
+                            raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
                         finally:
                             self._reentry_guard -= 1
                         if _ok:
                             result.append(bundle)
                 except SandboxEvidenceError as _se:
-                    if "INTEGRITY_FAILURE" in str(_se):
+                    if _is_integrity_error(_se):
                         raise
                 except Exception:
                     continue
@@ -1353,6 +1397,7 @@ def _encode_canonical_field(h: hashlib._Hash, name: str, value: object) -> None:
         h.update(_canonical_encode_int(value))
     else:
         raise SandboxEvidenceError("SANDBOX_EVIDENCE_SCHEMA_INVALID")
+
 
 def _store_seal_verify_or_restore(seal: _StateSeal, store: SandboxEvidenceStore) -> None:
     """Verify store-level seal and restore+poison on mismatch.
@@ -1522,16 +1567,24 @@ class EvidencePipeline:
         and raise fail-closed with ``SandboxEvidenceError``.
         """
         if self._store is not ctx["_store"]:
+            self._store = ctx["_store"]
+            self._poisoned = True
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
         if self._verifier is not ctx["_verifier"]:
+            self._verifier = ctx["_verifier"]
+            self._poisoned = True
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
         if self._registry is not ctx["_registry"]:
+            self._registry = ctx["_registry"]
+            self._poisoned = True
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
         if self._lock is not ctx["_lock"]:
             self._lock = ctx["_lock"]
+            self._poisoned = True
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
         if self._reentry_guard != ctx["_reentry_guard"]:
             self._reentry_guard = ctx["_reentry_guard"]
+            self._poisoned = True
             raise SandboxEvidenceError("SANDBOX_EVIDENCE_INTEGRITY_FAILURE")
         # Store-level canonical state seal
         try:
@@ -1548,11 +1601,11 @@ class EvidencePipeline:
         if reg_ctx is not None:
             reg = self._get_active_registry()
             if reg is not None:
-                    try:
-                        reg._verify_callback_context(reg_ctx)
-                    except SandboxEvidenceError:
-                        self._poisoned = True
-                        raise
+                try:
+                    reg._verify_callback_context(reg_ctx)
+                except SandboxEvidenceError:
+                    self._poisoned = True
+                    raise
 
     def run(
         self,
@@ -1580,16 +1633,28 @@ class EvidencePipeline:
             )
 
         if fallback is FallbackPolicy.MODEL_KNOWLEDGE_ONLY:
-            with self._lock:
-                _ctx = self._capture_callback_context()
-                result = self._verifier.verify(
-                    agent_kind=agent_kind,
-                    bundles={},
-                    claims=(),
-                    links=(),
-                    fallback=fallback,
-                )
-                self._verify_callback_context(_ctx)
+            self._reentry_guard += 1
+            try:
+                with self._lock:
+                    _ctx = self._capture_callback_context()
+                    try:
+                        result = self._verifier.verify(
+                            agent_kind=agent_kind,
+                            bundles={},
+                            claims=(),
+                            links=(),
+                            fallback=fallback,
+                        )
+                    except Exception:
+                        try:
+                            self._verify_callback_context(_ctx)
+                        except SandboxEvidenceError as _se:
+                            _se.__context__ = None
+                            raise _se
+                        raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
+                    self._verify_callback_context(_ctx)
+            finally:
+                self._reentry_guard -= 1
             return EvidencePipelineResult(
                 result=result,
                 fallback=fallback,
@@ -1627,15 +1692,24 @@ class EvidencePipeline:
 
             # Capture pre-callback state for identity/state-drift sealing
             _ctx = self._capture_callback_context()
-            # Verify — now under reentry guard so reentrant pipeline.run
-            # during verifier callback is detected and rejected.
-            verifier_result = self._verifier.verify(
-                agent_kind=agent_kind,
-                bundles=bundle_map,
-                claims=(),
-                links=(),
-                fallback=fallback,
-            )
+            try:
+                # Verify — now under reentry guard so reentrant pipeline.run
+                # during verifier callback is detected and rejected.
+                verifier_result = self._verifier.verify(
+                    agent_kind=agent_kind,
+                    bundles=bundle_map,
+                    claims=(),
+                    links=(),
+                    fallback=fallback,
+                )
+            except Exception:
+                # Verifier callback raised — always verify integrity
+                try:
+                    self._verify_callback_context(_ctx)
+                except SandboxEvidenceError as _se:
+                    _se.__context__ = None
+                    raise _se
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
             # Verify identity/state unchanged after untrusted callback
             self._verify_callback_context(_ctx)
         finally:
@@ -1700,14 +1774,26 @@ class EvidencePipeline:
                     bundle_map[link.bundle_digest] = cached
 
         # Capture pre-callback state for identity/state-drift sealing
-        _ctx = self._capture_callback_context()
-        result = self._verifier.verify(
-            agent_kind=agent_kind,
-            bundles=bundle_map,
-            claims=claims,
-            links=links,
-            fallback=fallback,
-        )
-        # Verify identity/state unchanged after untrusted callback
-        self._verify_callback_context(_ctx)
+        self._reentry_guard += 1
+        try:
+            _ctx = self._capture_callback_context()
+            try:
+                result = self._verifier.verify(
+                    agent_kind=agent_kind,
+                    bundles=bundle_map,
+                    claims=claims,
+                    links=links,
+                    fallback=fallback,
+                )
+            except Exception:
+                try:
+                    self._verify_callback_context(_ctx)
+                except SandboxEvidenceError as _se:
+                    _se.__context__ = None
+                    raise _se
+                raise SandboxEvidenceError("SANDBOX_EVIDENCE_UNAVAILABLE") from None
+            # Verify identity/state unchanged after untrusted callback
+            self._verify_callback_context(_ctx)
+        finally:
+            self._reentry_guard -= 1
         return result
