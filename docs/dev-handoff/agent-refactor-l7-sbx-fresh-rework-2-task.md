@@ -1,6 +1,6 @@
 # L7-SBX-FRESH-R2 Authority 回调内容密封架构收敛任务书
 
-> 状态：已发布 / 待实现
+> 状态：已完成 / accepted
 > 发布日期：2026-07-28
 > 实现基线：`d8c10e344269d3821c7819ad93bfce7f51b11621`
 > 失败验收：`ACC-20260728-060`
@@ -10,6 +10,8 @@
 > 原任务：[L7-SBX-FRESH](agent-refactor-l7-sbx-fresh-task.md)
 > 上一返工：[L7-SBX-FRESH-R1](agent-refactor-l7-sbx-fresh-rework-1-task.md)
 > 交付文档：[agent-refactor-l7-sbx-fresh.md](agent-refactor-l7-sbx-fresh.md)
+> 最终实现：`da604d75a758f1b8941e849735453472208aff6f`
+> 最终验收：`ACC-20260728-061`
 
 ## 1. 触发原因
 

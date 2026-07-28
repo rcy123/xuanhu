@@ -1033,3 +1033,23 @@ $ UV_OFFLINE=1 uv run pytest tests/test_sandbox_evidence_l7.py -q
 - `_verify_callback_context` 在 `_StateSeal.restore()` 前使用 `is` 身份检查捕获容器替换；但容器原地同尺寸 content 替换依赖 seal digest 检测，确保 injective
 - `exception.__context__` 清除为可变操作（`_se.__context__ = None`），在 Python 3.12+ 中稳定
 - L7-PROD、真实 RAG/corpus、Milvus/DB/embedding/model gateway、产品 Runtime/HTTP、真实数据、临床、患者服务继续 **NO-GO**
+
+---
+
+## PM 最终验收（2026-07-28）
+
+> 验收：`ACC-20260728-061`
+> 决策：`DEC-20260728-058`
+> accepted 代码：`da604d75a758f1b8941e849735453472208aff6f`
+> 结论：**ACCEPT / L7-SBX engineering complete**
+
+最终证据：
+
+- L7 专项：`186 passed`；
+- 十文件 L5/L6/L7 组合：`524 passed`；
+- 非 integration：`2149 passed, 362 deselected`；
+- PM R2 对抗矩阵：`42 passed`；
+- scoped Ruff check/format、source mypy、lock、diff：全部通过；
+- 独立 terminal Claude Code exact-HEAD Review：`ACCEPT`，P0/P1/P2/P3=`0/0/0/0`，10 项合同矩阵全 PASS。
+
+验收只覆盖 fixed-synthetic、offline unit/in-memory reference composition。`AR-B-037`、`R-L7-AUTHORITY-001`、`R-L7-SEAL-001` 在 SBX 范围关闭。L7-PROD、真实 RAG/corpus、Milvus/DB/model gateway、产品 Runtime/HTTP、真实数据、临床、患者服务及公开/商业/机构使用继续 NO-GO。L8 未获授权，不自动发布。
