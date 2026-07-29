@@ -24,6 +24,7 @@ from app.agent_runtime.reducer import (
     reduce_domain_state,
 )
 from app.agent_runtime.verifiers import VerificationContext
+from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
@@ -36,6 +37,8 @@ from app.models.domain import (
     OutboxEvent,
     SafetyProfile,
 )
+from app.models.review import DoctorReview, MedicalRecord
+from app.models.safety import SafetyRuleRun
 from app.schemas.domain import ArtifactRevisionSchema, GateResultSchema, ObservationSchema, SafetyProfileSchema
 
 DOMAIN_STATE_COMMITTED = "domain.state_committed.v1"
@@ -182,6 +185,76 @@ class ConsultMessageSpec(BaseModel):
     trace_id: str | None = Field(default=None, max_length=64)
 
 
+class SafetyRuleRunSpec(BaseModel):
+    """Atomic compatibility projection for one authoritative safety artifact."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    safety_rule_run_id: UUID
+    session_id: UUID
+    agent_run_id: UUID | None = None
+    formula_source: str = Field(pattern=r"^(agent_output|doctor_override)$")
+    passed: bool
+    issues: list[dict[str, object]]
+    formula_snapshot: dict[str, object]
+    normalized_formula: dict[str, object] | None
+    patient_snapshot: dict[str, object]
+    rule_version: str = Field(min_length=1, max_length=64)
+    trace_id: str | None = Field(default=None, max_length=64)
+
+
+class DoctorReviewSpec(BaseModel):
+    """Atomic compatibility projection for a persisted review submission."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    review_id: UUID
+    session_id: UUID
+    agent_run_id: UUID | None = None
+    safety_rule_run_id: UUID
+    action: str = Field(pattern=r"^(confirm|modify|reject|request_more_info)$")
+    original_formula: dict[str, object] | None = None
+    formula_override: dict[str, object] | None = None
+    feedback: str | None = Field(default=None, max_length=2000)
+    reviewed_by: str | None = Field(default=None, max_length=128)
+
+
+class MedicalRecordSpec(BaseModel):
+    """Atomic compatibility projection for one authoritative record artifact."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    record_id: UUID
+    session_id: UUID
+    version: int = Field(ge=1)
+    record_text: str = Field(min_length=1, max_length=100_000)
+    record_json: dict[str, object]
+    doctor_review_id: UUID
+    disclaimer: str = Field(min_length=1, max_length=2000)
+    edited_by_doctor: bool = False
+    diff_from_previous: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def generated_record_is_not_doctor_edited(self) -> MedicalRecordSpec:
+        if self.edited_by_doctor or self.diff_from_previous is not None:
+            raise ValueError("generated record projection cannot claim a doctor edit")
+        return self
+
+
+class AuditEventSpec(BaseModel):
+    """Atomic audit projection for product Domain transitions."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: UUID
+    session_id: UUID
+    event_type: str = Field(min_length=1, max_length=64)
+    actor_type: str = Field(pattern=r"^(doctor|agent|system)$")
+    actor_id: str | None = Field(default=None, max_length=128)
+    payload: dict[str, object]
+    trace_id: str | None = Field(default=None, max_length=64)
+
+
 class OutboxMessage(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -238,6 +311,17 @@ class DomainRepository(Protocol):
         context: VerificationContext,
         *,
         graph_version: str,
+        gate_results: Sequence[GateResultSchema] = (),
+        graph_steps: Sequence[GraphStepSpec] = (),
+        artifact_payloads: Sequence[ArtifactPayloadSpec] = (),
+        consult_messages: Sequence[ConsultMessageSpec] = (),
+        safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
+        doctor_reviews: Sequence[DoctorReviewSpec] = (),
+        medical_records: Sequence[MedicalRecordSpec] = (),
+        audit_events: Sequence[AuditEventSpec] = (),
+        session_updates: dict[str, object] | None = None,
+        outbox_event_type: str = DOMAIN_STATE_COMMITTED,
+        outbox_payload: dict[str, object] | None = None,
     ) -> CommitResult: ...
 
 
@@ -433,6 +517,10 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         graph_steps: Sequence[GraphStepSpec] = (),
         artifact_payloads: Sequence[ArtifactPayloadSpec] = (),
         consult_messages: Sequence[ConsultMessageSpec] = (),
+        safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
+        doctor_reviews: Sequence[DoctorReviewSpec] = (),
+        medical_records: Sequence[MedicalRecordSpec] = (),
+        audit_events: Sequence[AuditEventSpec] = (),
         session_updates: dict[str, object] | None = None,
         outbox_event_type: str = DOMAIN_STATE_COMMITTED,
         outbox_payload: dict[str, object] | None = None,
@@ -479,7 +567,21 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                     )
                     session.add(graph_run)
                     await session.flush([graph_run])
+                elif (
+                    graph_run.session_id != delta.session_id
+                    or graph_run.graph_version != graph_version
+                    or graph_run.input_state_version != delta.expected_state_version
+                ):
+                    raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
                 await self._persist_state(session, state, next_state, delta, artifact_payloads=artifact_payloads)
+                await self._persist_product_projections(
+                    session,
+                    delta,
+                    safety_rule_runs=safety_rule_runs,
+                    doctor_reviews=doctor_reviews,
+                    medical_records=medical_records,
+                    audit_events=audit_events,
+                )
                 locked.state_version = next_state.state_version
                 graph_run.status = "completed"
                 graph_run.completed_at = func.now()
@@ -880,6 +982,141 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 )
 
     @staticmethod
+    async def _persist_product_projections(
+        session: AsyncSession,
+        delta: DomainDelta,
+        *,
+        safety_rule_runs: Sequence[SafetyRuleRunSpec],
+        doctor_reviews: Sequence[DoctorReviewSpec],
+        medical_records: Sequence[MedicalRecordSpec],
+        audit_events: Sequence[AuditEventSpec],
+    ) -> None:
+        """Persist compatibility projections inside the Domain transaction."""
+
+        safety_ids = {item.safety_rule_run_id for item in safety_rule_runs}
+        if len(safety_ids) != len(safety_rule_runs):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        review_ids = {item.review_id for item in doctor_reviews}
+        if len(review_ids) != len(doctor_reviews):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        record_ids = {item.record_id for item in medical_records}
+        if len(record_ids) != len(medical_records):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        if (
+            any(safety_item.session_id != delta.session_id for safety_item in safety_rule_runs)
+            or any(review_item.session_id != delta.session_id for review_item in doctor_reviews)
+            or any(record_item.session_id != delta.session_id for record_item in medical_records)
+            or any(audit_item.session_id != delta.session_id for audit_item in audit_events)
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+        for safety_item in safety_rule_runs:
+            existing_safety = await session.get(SafetyRuleRun, safety_item.safety_rule_run_id)
+            safety_values: dict[str, object] = {
+                "session_id": safety_item.session_id,
+                "agent_run_id": safety_item.agent_run_id,
+                "formula_source": safety_item.formula_source,
+                "passed": safety_item.passed,
+                "issues": safety_item.issues,
+                "formula_snapshot": safety_item.formula_snapshot,
+                "normalized_formula": safety_item.normalized_formula,
+                "patient_snapshot": safety_item.patient_snapshot,
+                "rule_version": safety_item.rule_version,
+                "trace_id": safety_item.trace_id,
+            }
+            if existing_safety is None:
+                session.add(SafetyRuleRun(id=safety_item.safety_rule_run_id, **safety_values))
+                continue
+            if any(
+                getattr(existing_safety, name) != value
+                for name, value in safety_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        event_ids = {item.event_id for item in audit_events}
+        if len(event_ids) != len(audit_events):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        for audit_item in audit_events:
+            existing_audit = await session.get(AuditEvent, audit_item.event_id)
+            audit_values: dict[str, object] = {
+                "session_id": audit_item.session_id,
+                "event_type": audit_item.event_type,
+                "actor_type": audit_item.actor_type,
+                "actor_id": audit_item.actor_id,
+                "payload": audit_item.payload,
+                "trace_id": audit_item.trace_id,
+            }
+            if existing_audit is None:
+                session.add(AuditEvent(id=audit_item.event_id, **audit_values))
+                continue
+            if any(
+                getattr(existing_audit, name) != value
+                for name, value in audit_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        for review_item in doctor_reviews:
+            if review_item.safety_rule_run_id not in safety_ids:
+                safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
+                if safety_exists is None or safety_exists.session_id != delta.session_id:
+                    raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+            existing_review = await session.get(DoctorReview, review_item.review_id)
+            review_values: dict[str, object] = {
+                "session_id": review_item.session_id,
+                "agent_run_id": review_item.agent_run_id,
+                "safety_rule_run_id": review_item.safety_rule_run_id,
+                "action": review_item.action,
+                "original_formula": review_item.original_formula,
+                "formula_override": review_item.formula_override,
+                "feedback": review_item.feedback,
+                "reviewed_by": review_item.reviewed_by,
+            }
+            if existing_review is None:
+                session.add(DoctorReview(id=review_item.review_id, **review_values))
+                continue
+            if any(
+                getattr(existing_review, name) != value
+                for name, value in review_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        for record_item in medical_records:
+            review = await session.get(DoctorReview, record_item.doctor_review_id)
+            if (
+                review is None
+                or review.session_id != delta.session_id
+                or review.action not in {"confirm", "modify"}
+            ):
+                raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+            version_owner = await session.scalar(
+                select(MedicalRecord).where(
+                    MedicalRecord.session_id == record_item.session_id,
+                    MedicalRecord.version == record_item.version,
+                )
+            )
+            if version_owner is not None and version_owner.id != record_item.record_id:
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+            existing_record = await session.get(MedicalRecord, record_item.record_id)
+            record_values: dict[str, object] = {
+                "session_id": record_item.session_id,
+                "version": record_item.version,
+                "record_text": record_item.record_text,
+                "record_json": record_item.record_json,
+                "diff_from_previous": record_item.diff_from_previous,
+                "doctor_review_id": record_item.doctor_review_id,
+                "disclaimer": record_item.disclaimer,
+                "edited_by_doctor": record_item.edited_by_doctor,
+            }
+            if existing_record is None:
+                session.add(MedicalRecord(id=record_item.record_id, **record_values))
+                continue
+            if any(
+                getattr(existing_record, name) != value
+                for name, value in record_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+    @staticmethod
     def _observation_schema(row: Observation) -> ObservationSchema:
         return ObservationSchema.model_validate(
             {
@@ -1074,6 +1311,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         allowed = {
             "current_stage",
             "status",
+            "pending_review",
             "recovery_status",
             "blocked_reason",
             "blocked_at",

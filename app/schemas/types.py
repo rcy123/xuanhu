@@ -30,6 +30,7 @@ class ReviewAction(StrEnum):
     CONFIRM = "confirm"
     MODIFY = "modify"
     REJECT = "reject"
+    REQUEST_MORE_INFO = "request_more_info"
 
 
 class Severity(StrEnum):

@@ -125,9 +125,14 @@ async def _create_session(
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """辅助：创建会话并返回 data。"""
+    request_payload = dict(payload or {})
+    # This module primarily verifies the historical Legacy recovery contract.
+    # Keep those cases independent from the process rollout default; the one
+    # LangGraph dispatch case opts in explicitly below.
+    request_payload.setdefault("agent_runtime", "legacy")
     response = await client.post(
         "/api/v1/consult/sessions",
-        json=payload or {},
+        json=request_payload,
         headers=headers if headers is not None else {"X-Doctor-Id": _TEST_DOCTOR_ID},
     )
     assert response.status_code == 201, response.text
@@ -286,13 +291,13 @@ async def test_recover_invalid_uuid_format(client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_langgraph_recover_fails_closed_before_legacy_and_preserves_session(
+async def test_langgraph_recover_without_checkpoint_fails_closed_before_legacy(
     client: AsyncClient,
     db: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     enable_public_langgraph: None,
 ) -> None:
-    """LangGraph 恢复不触碰 Legacy service/锁/Redis，也不修改 PG 会话。"""
+    """缺失 checkpoint 时不触碰 Legacy service/锁/Redis，也不修改 PG。"""
     created = await _create_session(
         client,
         {
@@ -312,6 +317,10 @@ async def test_langgraph_recover_fails_closed_before_legacy_and_preserves_sessio
         select(AuditEvent.id).where(AuditEvent.session_id == uuid.UUID(session_id))
     )
     before_audit_ids = set(before_audit.scalars().all())
+    # Request-local AsyncPostgresSaver.setup() uses CREATE INDEX
+    # CONCURRENTLY.  End this test observer transaction before exercising the
+    # public request so it cannot block checkpoint setup on its own virtualxid.
+    await db.rollback()
 
     legacy_calls: list[str] = []
     lock_calls: list[str] = []
@@ -349,9 +358,9 @@ async def test_langgraph_recover_fails_closed_before_legacy_and_preserves_sessio
         headers={"X-Request-Id": "trace-langgraph-recovery-fail-closed"},
     )
 
-    assert response.status_code == 501
+    assert response.status_code == 409
     body = response.json()
-    assert body["code"] == "LANGGRAPH_RECOVERY_NOT_IMPLEMENTED"
+    assert body["code"] == "STATE_RECOVERY_REQUIRED"
     assert body["retryable"] is False
     assert body["stage"] is None
     assert body["trace_id"] == "trace-langgraph-recovery-fail-closed"

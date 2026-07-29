@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import SessionNotFoundError, ValidationError
 from app.core.redis import get_redis
 from app.models.consult import ConsultSession
-from app.schemas.events import EventAppendResult, SessionEvent, SupportedEventType
+from app.schemas.events import (
+    SESSION_EVENT_SCHEMA_VERSION,
+    EventAppendResult,
+    SessionEvent,
+    SupportedEventType,
+)
 
 logger = logging.getLogger("xuanhu.events")
 
@@ -222,6 +227,7 @@ class EventService:
         payload = dict(payload)
         payload.setdefault("session_id", session_id)
         payload.setdefault("timestamp", _now_iso())
+        payload["schema_version"] = SESSION_EVENT_SCHEMA_VERSION
         _validate_event_payload(event_type, payload)
 
         redis = await self._get_redis()
@@ -263,6 +269,7 @@ class EventService:
         payload = dict(payload)
         payload.setdefault("session_id", session_id)
         payload.setdefault("timestamp", _now_iso())
+        payload["schema_version"] = SESSION_EVENT_SCHEMA_VERSION
         _validate_event_payload(event_type, payload)
 
         redis = await self._get_redis()
@@ -363,7 +370,10 @@ class EventService:
         return SessionEvent(
             event_id=f"heartbeat-{uuid.uuid4()}",
             event_type="heartbeat",
-            payload={"timestamp": _now_iso()},
+            payload={
+                "timestamp": _now_iso(),
+                "schema_version": SESSION_EVENT_SCHEMA_VERSION,
+            },
         )
 
     def resync_event(self, session_id: str, reason: str) -> SessionEvent:
@@ -371,7 +381,12 @@ class EventService:
         return SessionEvent(
             event_id=f"resync-{uuid.uuid4()}",
             event_type="resync",
-            payload={"session_id": session_id, "reason": reason, "timestamp": _now_iso()},
+            payload={
+                "session_id": session_id,
+                "reason": reason,
+                "timestamp": _now_iso(),
+                "schema_version": SESSION_EVENT_SCHEMA_VERSION,
+            },
         )
 
     def format_sse_event(self, event: SessionEvent) -> str:

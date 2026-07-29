@@ -37,7 +37,13 @@ def _set_test_defaults() -> None:
     os.environ["DB_URL"] = "postgresql://unit:unit@127.0.0.1:1/xuanhu_unit_test"
     os.environ["REDIS_URL"] = "redis://:unit@127.0.0.1:1/15"
     os.environ["OUTBOX_PUBLISHER_ENABLED"] = "false"
+    # Runtime rollout is part of the test boundary too.  Never let a local
+    # shell or settings file silently turn historical Legacy API fixtures into
+    # public LangGraph requests; individual tests opt in explicitly.
+    os.environ["AGENT_RUNTIME_VERSION"] = "legacy"
+    os.environ["AGENT_RUNTIME_ROLLOUT_PHASE"] = "legacy"
     os.environ["XUANHU_LANGGRAPH_PUBLIC_ENABLED"] = "false"
+    os.environ["XUANHU_LANGGRAPH_PRODUCT_READY"] = "false"
     os.environ.setdefault("MODEL_GATEWAY_BASE_URL", "http://localhost:8080/v1")
     os.environ.setdefault("MODEL_GATEWAY_API_KEY", "sk-test-placeholder")
     os.environ.setdefault("CHAT_MODEL", "test-chat-model")

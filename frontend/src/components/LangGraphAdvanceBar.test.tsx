@@ -61,7 +61,138 @@ describe('LangGraphAdvanceBar', () => {
   it('keeps advance disabled until authoritative gates are ready', () => {
     render(<LangGraphAdvanceBar detail={detail(false)} onAdvanced={() => {}} />)
     expect(screen.getByTestId('langgraph-advance-button')).toBeDisabled()
+    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('needs_input')
   })
+
+  it('renders triage_hold and manual_required from persisted authority', () => {
+    const triage = detail(false)
+    triage.read_model.gates = [
+      {
+        gate_id: 'triage-gate',
+        gate_name: 'triage',
+        policy_version: 'triage-policy.v1',
+        input_state_version: 1,
+        decision: 'blocked',
+        details: { disposition: 'emergency_referral' },
+      },
+    ]
+    const { rerender } = render(
+      <LangGraphAdvanceBar detail={triage} onAdvanced={() => {}} />,
+    )
+    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('triage_hold')
+
+    rerender(
+      <LangGraphAdvanceBar
+        detail={{ ...detail(), recovery_status: 'manual_required' }}
+        onAdvanced={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('manual_required')
+  })
+
+  it('recovers a blocked LangGraph control cursor with a stable public key', async () => {
+    const blocked = detail()
+    blocked.current_stage = 'blocked'
+    blocked.status = 'blocked'
+    blocked.recovery_status = 'manual_required'
+    blocked.blocked_reason = 'safety_rule_blocked'
+    const recover = vi.spyOn(api, 'recoverSession').mockResolvedValue({
+      session_id: blocked.session_id,
+      current_stage: 'safety',
+      status: 'active',
+      recovery_status: 'normal',
+      action: 'retry_current_stage',
+      updated_at: '2026-07-28T00:00:00Z',
+    })
+    const onRecovered = vi.fn()
+
+    render(
+      <LangGraphAdvanceBar
+        detail={blocked}
+        onAdvanced={() => {}}
+        onRecovered={onRecovered}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('langgraph-recover-button'))
+
+    await waitFor(() => expect(onRecovered).toHaveBeenCalledOnce())
+    expect(recover).toHaveBeenCalledWith(
+      blocked.session_id,
+      { action: 'retry_current_stage' },
+      { idempotencyKey: 'advance-idem-1' },
+    )
+    expect(screen.getByTestId('langgraph-recovery-required')).toHaveTextContent(
+      '不会切换到 Legacy',
+    )
+  })
+
+  it('does not offer runtime recovery for a triage hold', () => {
+    const triage = detail(false)
+    triage.current_stage = 'blocked'
+    triage.status = 'blocked'
+    triage.recovery_status = 'manual_required'
+    triage.blocked_reason = 'triage_hold:emergency_referral'
+    triage.read_model.gates = [
+      {
+        gate_id: 'triage-gate',
+        gate_name: 'triage',
+        policy_version: 'triage-policy.v1',
+        input_state_version: 1,
+        decision: 'blocked',
+        details: { disposition: 'emergency_referral' },
+      },
+    ]
+
+    render(<LangGraphAdvanceBar detail={triage} onAdvanced={() => {}} />)
+    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('triage_hold')
+    expect(screen.queryByTestId('langgraph-recover-button')).not.toBeInTheDocument()
+  })
+
+  it('restores the review-required status from the read model', () => {
+    const review = detail()
+    review.current_stage = 'safety'
+    review.read_model.review_required = true
+    render(<LangGraphAdvanceBar detail={review} onAdvanced={() => {}} />)
+    expect(screen.getByTestId('langgraph-review-restored')).toHaveTextContent(
+      '医师复核要求已从权威 Read Model 恢复',
+    )
+  })
+
+  it('exposes explicit Safety and Record product actions', () => {
+    const safety = detail()
+    safety.current_stage = 'safety'
+    const { rerender } = render(
+      <LangGraphAdvanceBar detail={safety} onAdvanced={() => {}} />,
+    )
+    expect(screen.getByTestId('langgraph-advance-button')).toHaveTextContent('执行安全审核')
+
+    rerender(
+      <LangGraphAdvanceBar
+        detail={{ ...safety, current_stage: 'record', state_version: 5 }}
+        onAdvanced={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('langgraph-advance-button')).toHaveTextContent('生成病历')
+  })
+
+  it.each(['safety', 'record'] as const)(
+    'disables the %s product action while recovery is required',
+    (stage) => {
+      const recoveryRequired = detail()
+      recoveryRequired.current_stage = stage
+      recoveryRequired.recovery_status = 'manual_required'
+
+      render(
+        <LangGraphAdvanceBar
+          detail={recoveryRequired}
+          onAdvanced={() => {}}
+        />,
+      )
+
+      expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('manual_required')
+      expect(screen.getByTestId('langgraph-advance-button')).toBeDisabled()
+    },
+  )
 
   it('renders the authoritative revision and refreshes non-sensitive unresolved items on rerender', () => {
     const initial = detail(false)

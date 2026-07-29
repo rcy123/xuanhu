@@ -24,6 +24,7 @@ from app.safety.datasets import (
     is_toxic_or_strong_herb,
 )
 from app.safety.engine import (
+    SafetyRuleEngine,
     _check_allergy,
     _check_combination_incompatibilities,
     _check_dose_limits,
@@ -186,6 +187,83 @@ class TestNormalizeComposition:
         normalizer = _build_normalizer([])
         result = _normalize_composition([], normalizer)
         assert result == []
+
+    def test_conflicting_alias_is_order_independent_and_fails_closed(self):
+        first = _build_normalizer(
+            [
+                _make_herb("canonical-a", aliases=["shared-alias"]),
+                _make_herb("canonical-b", aliases=["shared-alias"]),
+            ]
+        )
+        reversed_order = _build_normalizer(
+            [
+                _make_herb("canonical-b", aliases=["shared-alias"]),
+                _make_herb("canonical-a", aliases=["shared-alias"]),
+            ]
+        )
+
+        assert first.normalize("shared-alias") == "shared-alias"
+        assert reversed_order.normalize("shared-alias") == "shared-alias"
+
+    def test_canonical_name_wins_over_an_alias_with_the_same_text(self):
+        normalizer = _build_normalizer(
+            [
+                _make_herb("canonical-a", aliases=["canonical-b"]),
+                _make_herb("canonical-b"),
+            ]
+        )
+
+        assert normalizer.normalize("canonical-b") == "canonical-b"
+
+
+class _FakeScalarResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[Any]:
+        return self._rows
+
+
+class _FakeExecuteResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def scalars(self) -> _FakeScalarResult:
+        return _FakeScalarResult(self._rows)
+
+
+class _CapturingDb:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+        self.statement: object | None = None
+
+    async def execute(self, statement: object) -> _FakeExecuteResult:
+        self.statement = statement
+        return _FakeExecuteResult(self.rows)
+
+
+class TestDeterministicAuthorityLoading:
+    @pytest.mark.asyncio
+    async def test_herb_query_excludes_soft_deleted_rows_with_stable_order(self):
+        db = _CapturingDb([])
+        engine = SafetyRuleEngine(db)  # type: ignore[arg-type]
+
+        assert await engine._load_herb_records() == {}
+        sql = str(db.statement)
+        assert "herbs.deleted_at IS NULL" in sql
+        assert "ORDER BY herbs.name, herbs.id" in sql
+
+    @pytest.mark.asyncio
+    async def test_conflicting_unit_alias_is_omitted_regardless_of_row_order(self):
+        first = _make_unit("unit-a", aliases=["shared"], to_grams=1)
+        second = _make_unit("unit-b", aliases=["shared"], to_grams=2)
+
+        for rows in ([first, second], [second, first]):
+            db = _CapturingDb(rows)
+            engine = SafetyRuleEngine(db)  # type: ignore[arg-type]
+            table = await engine._load_unit_table()
+            assert set(table) == {"unit-a", "unit-b"}
+            assert "ORDER BY dosage_units.unit_name, dosage_units.id" in str(db.statement)
 
 
 # ---------------------------------------------------------------------------

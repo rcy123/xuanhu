@@ -82,6 +82,7 @@ class SessionService:
         *,
         doctor_id: str | None,
         trace_id: str,
+        require_runtime_audit: bool = False,
     ) -> SessionCreateResponse:
         """创建新问诊会话并写入 session.created 审计事件。"""
         patient_info_dict = request.patient_info.model_dump()
@@ -93,7 +94,7 @@ class SessionService:
         # per-session selection remains the separately guarded development /
         # canary path.  Keeping this check inside the idempotent handler means
         # a persisted replay remains stable after a later deployment switch.
-        if request.agent_runtime is None:
+        if request.agent_runtime is None or require_runtime_audit:
             try:
                 await RuntimeSwitchAuditService(
                     PostgresRuntimeSwitchAuditRepository(self._db)
@@ -152,6 +153,7 @@ class SessionService:
             session_id=str(session.id),
             current_stage=session.current_stage,
             status=session.status,
+            agent_runtime=cast(Literal["legacy", "langgraph"], session.agent_runtime),
             patient_info=PatientInfo.model_validate(session.patient_info),
             created_at=session.created_at,
         )
@@ -195,6 +197,7 @@ class SessionService:
                 chief_complaint=s.chief_complaint,
                 current_stage=s.current_stage,
                 status=s.status,
+                agent_runtime=cast(Literal["legacy", "langgraph"], s.agent_runtime),
                 pending_review=s.pending_review,
                 created_by=s.created_by,
                 created_at=s.created_at,

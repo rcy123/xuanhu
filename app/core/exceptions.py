@@ -67,6 +67,24 @@ class RuntimeSwitchAuditMismatchError(XuanhuError):
     retryable = True
 
 
+class RuntimeRolloutNotReadyError(XuanhuError):
+    """The requested L9 rollout phase is inconsistent or not authorized."""
+
+    code = "RUNTIME_ROLLOUT_NOT_READY"
+    message = "Agent 运行时切流阶段尚未就绪"
+    status_code = 503
+    retryable = True
+
+
+class LegacyRuntimeCreationDisabledError(XuanhuError):
+    """Full LangGraph cutover no longer accepts new Legacy sessions."""
+
+    code = "LEGACY_RUNTIME_CREATION_DISABLED"
+    message = "全量切流后不再允许新建 Legacy 会话"
+    status_code = 409
+    retryable = False
+
+
 class ModelRunAuditIntegrityError(RuntimeError):
     """Base class for fail-closed model-run audit integrity violations."""
 

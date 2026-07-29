@@ -219,7 +219,14 @@ def _install_fake_advance_graph(
     monkeypatch: pytest.MonkeyPatch,
     db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    async def fake_invoke_reasoning_graph(*, session_id: str, command_key: str, run_id: uuid.UUID) -> None:
+    async def fake_invoke_reasoning_graph(
+        *,
+        session_id: str,
+        command_key: str,
+        run_id: uuid.UUID,
+        command: XuanhuCommand,
+    ) -> None:
+        assert command is XuanhuCommand.ADVANCE
         sid = uuid.UUID(session_id)
         async with db_factory() as db, db.begin():
             claim = await db.scalar(

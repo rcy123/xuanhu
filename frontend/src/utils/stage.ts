@@ -3,7 +3,7 @@
  * 与 UI 设计文档 §3.3 阶段映射表对齐。
  */
 
-import type { Stage } from '@/types/api'
+import type { AgentRuntime, Stage } from '@/types/api'
 
 export interface StageMeta {
   /** UI 显示文本 */
@@ -18,6 +18,7 @@ const STAGE_META: Record<Stage, StageMeta> = {
   inquiry: { label: '问诊', step: 0 },
   sufficiency: { label: '完备性', step: 1 },
   syndrome: { label: '辨证', step: 2 },
+  formula: { label: '方药草案' },
   prescription: { label: '开方', step: 3 },
   modification: { label: '加减方', step: 4 },
   safety: { label: '安全审核', step: 5 },
@@ -36,7 +37,7 @@ export function stageLabel(stage: Stage): string {
 }
 
 /** 步骤条节点（7 个 Agent 节点，与 UI §3.3 对齐）。 */
-export const STEP_NODES: { stage: Stage; label: string }[] = [
+export const LEGACY_STEP_NODES: { stage: Stage; label: string }[] = [
   { stage: 'inquiry', label: '问诊' },
   { stage: 'sufficiency', label: '完备性' },
   { stage: 'syndrome', label: '辨证' },
@@ -45,3 +46,34 @@ export const STEP_NODES: { stage: Stage; label: string }[] = [
   { stage: 'safety', label: '安全审核' },
   { stage: 'review', label: '医师确认' },
 ]
+
+/** LangGraph v2 以确定性 Gate 和合并后的 Formula Draft 表达主流程。 */
+export const LANGGRAPH_STEP_NODES: { stage: Stage; label: string }[] = [
+  { stage: 'inquiry', label: '问诊与门禁' },
+  { stage: 'syndrome', label: '辨证草案' },
+  { stage: 'formula', label: '方药草案' },
+  { stage: 'safety', label: '安全审核' },
+  { stage: 'review', label: '医师复核' },
+  { stage: 'record', label: '病历' },
+]
+
+/** Backward-compatible export retained for Legacy-only callers/tests. */
+export const STEP_NODES = LEGACY_STEP_NODES
+
+export function stepNodesForRuntime(
+  runtime: AgentRuntime,
+): { stage: Stage; label: string }[] {
+  return runtime === 'langgraph' ? LANGGRAPH_STEP_NODES : LEGACY_STEP_NODES
+}
+
+export function stageStepIndex(stage: Stage, runtime: AgentRuntime): number | undefined {
+  if (runtime === 'legacy') return stageMeta(stage).step
+  const aliases: Partial<Record<Stage, Stage>> = {
+    sufficiency: 'inquiry',
+    prescription: 'formula',
+    modification: 'formula',
+  }
+  const normalized = aliases[stage] ?? stage
+  const index = LANGGRAPH_STEP_NODES.findIndex((node) => node.stage === normalized)
+  return index >= 0 ? index : undefined
+}

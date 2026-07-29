@@ -8,12 +8,19 @@
 import type { AgentName, SessionDetail, Stage } from '@/types/api'
 
 const AGENT_TO_STAGE: Partial<Record<AgentName, Stage>> = {
+  intake: 'inquiry',
   inquiry: 'inquiry',
+  question_composer: 'inquiry',
   sufficiency: 'sufficiency',
+  reasoning: 'syndrome',
+  reasoning_subgraph: 'syndrome',
   syndrome: 'syndrome',
+  syndrome_draft: 'syndrome',
+  formula_draft: 'formula',
   prescription: 'prescription',
   modification: 'modification',
   safety: 'safety',
+  record: 'record',
 }
 
 /**
@@ -22,6 +29,57 @@ const AGENT_TO_STAGE: Partial<Record<AgentName, Stage>> = {
  */
 export function agentNameToStage(name: string): Stage | null {
   return AGENT_TO_STAGE[name as AgentName] ?? null
+}
+
+export type LangGraphDisposition =
+  | 'ready'
+  | 'needs_input'
+  | 'triage_hold'
+  | 'manual_required'
+
+/**
+ * Adapt persisted gate/read-model data to the four stable UI dispositions.
+ * The client never promotes a failed/missing gate to ready.
+ */
+export function langGraphDisposition(detail: SessionDetail): LangGraphDisposition | null {
+  if (detail.agent_runtime !== 'langgraph') return null
+
+  const triage = detail.read_model.gates.find((gate) => gate.gate_name === 'triage')
+  const completeness = detail.read_model.gates.find((gate) => gate.gate_name === 'completeness')
+  const triageDisposition = triage?.details?.disposition
+  const completenessDisposition = completeness?.details?.disposition
+
+  if (triageDisposition === 'emergency_referral') return 'triage_hold'
+  if (triageDisposition === 'manual_review') return 'manual_required'
+  if (
+    detail.recovery_status !== 'normal'
+    || detail.status === 'blocked'
+    || detail.status === 'terminated'
+    || detail.read_model.graph.status === 'failed'
+    || detail.read_model.graph.status === 'cancelled'
+    || completenessDisposition === 'conflict'
+    || completenessDisposition === 'stagnated'
+  ) {
+    return 'manual_required'
+  }
+  if (
+    triage?.decision === 'blocked'
+    || detail.read_model.unresolved.some((item) => item.source === 'triage')
+  ) {
+    return 'triage_hold'
+  }
+  if (
+    triage?.decision === 'passed'
+    && triageDisposition === 'continue'
+    && completeness?.decision === 'passed'
+    && completenessDisposition === 'ready'
+    && !detail.read_model.unresolved.some(
+      (item) => item.source === 'triage' || item.source === 'completeness',
+    )
+  ) {
+    return 'ready'
+  }
+  return 'needs_input'
 }
 
 /** Only a persisted, current LangGraph completeness gate may enable advance. */
@@ -33,13 +91,5 @@ export function canAdvanceLangGraph(detail: SessionDetail): boolean {
   ) {
     return false
   }
-  const triage = detail.read_model.gates.find((gate) => gate.gate_name === 'triage')
-  const completeness = detail.read_model.gates.find((gate) => gate.gate_name === 'completeness')
-  return Boolean(
-    triage?.decision === 'passed'
-      && triage.details?.disposition === 'continue'
-      && completeness?.decision === 'passed'
-      && completeness.details?.disposition === 'ready'
-      && !detail.read_model.unresolved.some((item) => item.source === 'triage'),
-  )
+  return langGraphDisposition(detail) === 'ready'
 }

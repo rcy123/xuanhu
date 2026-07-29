@@ -13,13 +13,14 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.lifecycle import SharedLangGraphRuntime
 from app.core.exceptions import (
-    LangGraphRecoveryNotImplementedError,
     SessionNotFoundError,
     StateRecoveryRequiredError,
 )
 from app.models.consult import ConsultSession
 from app.schemas.recovery import RecoveryRequest, RecoveryResponse
+from app.services.langgraph_recovery import LangGraphRecoveryService
 from app.services.recovery import RecoveryService
 
 
@@ -28,6 +29,7 @@ class RecoveryDispatcher:
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
+        self._resolved_runtime: tuple[str, str] | None = None
 
     async def recover(
         self,
@@ -36,16 +38,25 @@ class RecoveryDispatcher:
         *,
         doctor_id: str | None,
         trace_id: str,
+        idempotency_key: str = "",
+        shared_runtime: SharedLangGraphRuntime | None = None,
+        allow_request_local_runtime: bool = False,
     ) -> RecoveryResponse:
-        """只读解析运行时后分流；LangGraph 分支稳定地拒绝恢复。"""
-        runtime = await self._get_runtime(session_id)
+        """只读解析运行时后分流到完全隔离的恢复实现。"""
+        runtime = (
+            self._resolved_runtime[1]
+            if self._resolved_runtime is not None and self._resolved_runtime[0] == session_id
+            else await self.get_runtime(session_id)
+        )
         if runtime == "langgraph":
-            raise LangGraphRecoveryNotImplementedError(
-                detail=(
-                    f"session_id={session_id} agent_runtime=langgraph；"
-                    "未调用 Legacy recovery"
-                ),
-                retryable=False,
+            return await LangGraphRecoveryService(self._db).recover(
+                session_id,
+                request,
+                doctor_id=doctor_id,
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                shared_runtime=shared_runtime,
+                allow_request_local_runtime=allow_request_local_runtime,
             )
         if runtime != "legacy":
             # 防御数据库约束失效或历史脏数据：任何未显式支持的 runtime
@@ -64,7 +75,7 @@ class RecoveryDispatcher:
             trace_id=trace_id,
         )
 
-    async def _get_runtime(self, session_id: str) -> str:
+    async def get_runtime(self, session_id: str) -> str:
         """仅从 PostgreSQL 读取权威 runtime，不获取锁、不修改会话。"""
         try:
             sid = uuid.UUID(session_id)
@@ -83,4 +94,5 @@ class RecoveryDispatcher:
                 detail=f"session_id={session_id} 在数据库中未找到",
                 retryable=False,
             )
+        self._resolved_runtime = (session_id, runtime)
         return runtime

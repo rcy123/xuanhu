@@ -10,6 +10,7 @@ import {
   CheckOutlined,
   EditOutlined,
   CloseOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons'
 import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
 import type { ApiRequestError } from '@/api/errors'
@@ -25,6 +26,7 @@ export interface ReviewActionsBarProps {
   onConfirm: () => void
   onModify: () => void
   onReject: () => void
+  onRequestMoreInfo?: () => void
   onRetry: () => void
 }
 
@@ -37,6 +39,7 @@ export function ReviewActionsBar({
   onConfirm,
   onModify,
   onReject,
+  onRequestMoreInfo,
   onRetry,
 }: ReviewActionsBarProps) {
   // 仅 review 阶段且 pending_review 为 true 时显示
@@ -53,6 +56,18 @@ export function ReviewActionsBar({
       cancelText: '取消',
       okButtonProps: { disabled: submitting },
       onOk: onConfirm,
+    })
+  }
+
+  const handleRequestMoreInfoClick = () => {
+    if (!onRequestMoreInfo) return
+    Modal.confirm({
+      title: '退回补充问诊',
+      content: '当前处方及其下游安全结果将失效，会话将返回问诊阶段。确认继续吗？',
+      okText: '确认退回',
+      cancelText: '取消',
+      okButtonProps: { disabled: submitting },
+      onOk: onRequestMoreInfo,
     })
   }
 
@@ -83,6 +98,16 @@ export function ReviewActionsBar({
             ⚠ 请仔细审核以上处方内容
           </div>
           <Space size="middle">
+            {detail.agent_runtime === 'langgraph' && onRequestMoreInfo ? (
+              <Button
+                icon={<QuestionCircleOutlined />}
+                onClick={handleRequestMoreInfoClick}
+                loading={submitting}
+                data-testid="review-request-more-info-btn"
+              >
+                补充问诊
+              </Button>
+            ) : null}
             <Button
               icon={<CloseOutlined />}
               danger

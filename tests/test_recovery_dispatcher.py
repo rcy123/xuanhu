@@ -14,6 +14,7 @@ from sqlalchemy.sql import Select
 from app.db.session import get_db
 from app.main import app
 from app.schemas.recovery import RecoveryRequest, RecoveryResponse
+from app.services.langgraph_recovery import LangGraphRecoveryService
 from app.services.recovery import RecoveryService
 from app.services.session_lock import SessionLock
 
@@ -32,11 +33,18 @@ class _ReadOnlySession:
     def __init__(self, runtime: str | None) -> None:
         self.runtime = runtime
         self.statements: list[Any] = []
+        self.rolled_back = False
 
     async def execute(self, statement: Any) -> _ScalarResult:
         assert isinstance(statement, Select), "runtime 分流只能执行只读 SELECT"
         self.statements.append(statement)
         return _ScalarResult(self.runtime)
+
+    def in_transaction(self) -> bool:
+        return not self.rolled_back
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
 
 async def _post_recover(
@@ -60,15 +68,16 @@ async def _post_recover(
 
 
 @pytest.mark.asyncio
-async def test_langgraph_api_fails_closed_without_legacy_or_mutation(
+async def test_langgraph_api_dispatches_to_product_recovery_without_legacy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LangGraph 只读 runtime 后直接返回稳定的不可重试错误。"""
+    """LangGraph 只读 runtime 后仅调用产品恢复服务。"""
     session_id = str(uuid.uuid4())
     db = _ReadOnlySession("langgraph")
     legacy_calls: list[str] = []
     lock_calls: list[str] = []
     redis_calls: list[str] = []
+    product_calls: list[str] = []
 
     async def _forbid_legacy_recover(
         self: RecoveryService,
@@ -91,25 +100,49 @@ async def test_langgraph_api_fails_closed_without_legacy_or_mutation(
         redis_calls.append("called")
         raise AssertionError("LangGraph 请求不得访问 Legacy Redis")
 
+    async def _product_recover(
+        self: LangGraphRecoveryService,
+        requested_session_id: str,
+        request: RecoveryRequest,
+        *,
+        doctor_id: str | None,
+        trace_id: str,
+        idempotency_key: str,
+        shared_runtime: Any | None,
+        allow_request_local_runtime: bool,
+    ) -> RecoveryResponse:
+        del self, doctor_id, trace_id, idempotency_key, shared_runtime
+        assert allow_request_local_runtime is True
+        product_calls.append(requested_session_id)
+        return RecoveryResponse(
+            session_id=requested_session_id,
+            current_stage="safety",
+            status="active",
+            recovery_status="normal",
+            action=request.action,
+            updated_at=datetime.now(UTC),
+        )
+
     monkeypatch.setattr(RecoveryService, "recover", _forbid_legacy_recover)
     monkeypatch.setattr(SessionLock, "acquire", _forbid_lock)
     monkeypatch.setattr(SessionLock, "release", _forbid_lock)
     monkeypatch.setattr("app.services.session_lock.get_redis", _forbid_redis)
+    monkeypatch.setattr(LangGraphRecoveryService, "recover", _product_recover)
+    fallback_was_set = hasattr(app.state, "allow_request_local_langgraph_test_runtime")
+    fallback_previous = getattr(app.state, "allow_request_local_langgraph_test_runtime", None)
+    app.state.allow_request_local_langgraph_test_runtime = True
+    try:
+        response = await _post_recover(db, session_id)
+    finally:
+        if fallback_was_set:
+            app.state.allow_request_local_langgraph_test_runtime = fallback_previous
+        else:
+            delattr(app.state, "allow_request_local_langgraph_test_runtime")
 
-    response = await _post_recover(db, session_id)
-
-    assert response.status_code == 501
-    assert response.json() == {
-        "code": "LANGGRAPH_RECOVERY_NOT_IMPLEMENTED",
-        "message": "LangGraph 会话恢复尚未实现",
-        "detail": (
-            f"session_id={session_id} agent_runtime=langgraph；未调用 Legacy recovery"
-        ),
-        "retryable": False,
-        "stage": None,
-        "trace_id": "runtime-dispatch-test",
-    }
+    assert response.status_code == 200
+    assert response.json()["data"]["current_stage"] == "safety"
     assert len(db.statements) == 1
+    assert product_calls == [session_id]
     assert legacy_calls == []
     assert lock_calls == []
     assert redis_calls == []

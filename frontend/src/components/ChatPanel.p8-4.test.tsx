@@ -5,7 +5,8 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
+import { Modal } from 'antd'
 import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
@@ -126,6 +127,54 @@ describe('ChatPanel P8-4 集成', () => {
     expect(screen.queryByTestId('review-modify-btn')).not.toBeInTheDocument()
     // 否决按钮仍可显示
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
+  })
+
+  it('LangGraph 补充问诊动作调用 request_more_info', async () => {
+    const reviewSpy = vi.spyOn(api, 'reviewPrescription').mockResolvedValue({
+      session_id: 's1',
+      action: 'request_more_info',
+      current_stage: 'inquiry',
+      status: 'active',
+      pending_review: false,
+      review_id: 'review-1',
+      state_version: 6,
+      updated_at: '2026-07-04T10:30:00+08:00',
+    })
+    const confirmSpy = vi.spyOn(Modal, 'confirm').mockImplementation(({ onOk }) => {
+      onOk?.()
+      return { destroy: vi.fn(), update: vi.fn() } as ReturnType<typeof Modal.confirm>
+    })
+    const detail = makeDetail({
+      agent_runtime: 'langgraph',
+      read_model: emptySessionReadModel('langgraph', 5),
+      current_stage: 'review',
+      pending_review: true,
+      state_version: 5,
+      safety_review: { passed: true, issues: [] },
+      modified_formula: {
+        name: '待确认方',
+        composition: [{ herb: '麻黄', dose: 6, unit: 'g' }],
+      },
+    })
+
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail })}
+        messagesHook={makeMessagesHook()}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('review-request-more-info-btn'))
+
+    await waitFor(() => {
+      expect(reviewSpy).toHaveBeenCalledWith(
+        's1',
+        { action: 'request_more_info' },
+        { stateVersion: 5 },
+      )
+    })
+    confirmSpy.mockRestore()
+    reviewSpy.mockRestore()
   })
 
   it('record 阶段显示 RecordPanel 生成中', () => {

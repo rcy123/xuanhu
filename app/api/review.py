@@ -3,18 +3,23 @@
 实现 P7-1 接口：
 - POST /api/v1/consult/sessions/{session_id}/review
 
-支持 confirm / modify / reject 三条路径。
+支持 confirm / modify / reject / request_more_info 四条路径。
 本模块不实现病历生成、病历编辑或导出。
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.lifecycle import (
+    SharedLangGraphRuntime,
+    allow_request_local_runtime_fallback,
+)
 from app.api.request_context import (
     WriteRequestContext,
     execute_model_write,
@@ -26,6 +31,7 @@ from app.core.exceptions import (
     InvalidReviewActionError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
+    ModelGatewayUnavailableError,
     SafetyAcceptRiskUnsupportedError,
     SafetyReviewBlockedError,
     SessionBusyError,
@@ -36,9 +42,11 @@ from app.core.exceptions import (
     ValidationError as XuanhuValidationError,
 )
 from app.db.session import get_db
+from app.models.consult import ConsultSession
 from app.schemas.common import success_response
 from app.schemas.review import ReviewRequest
 from app.services.http_idempotency import session_http_scope
+from app.services.langgraph_review import LangGraphReviewService
 from app.services.review import ReviewService
 
 router = APIRouter(prefix="/api/v1/consult", tags=["review"])
@@ -85,18 +93,77 @@ async def review_prescription(
     state_version: int | None = Depends(_state_version),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
-    """医师确认/修改/否决处方。
+    """医师确认、修改、否决处方或要求补充信息。
 
-    支持三种 action：
+    支持四种 action：
     - confirm：确认安全审核通过的处方，推进到 record 阶段
     - modify：修改处方，系统执行二次安全审核后推进到 record
-    - reject：否决处方，回退到 prescription 阶段
+    - reject：否决处方，回退到 syndrome 阶段
+    - request_more_info：要求补充信息，回退到 inquiry 阶段
 
-    每次确认均写入 doctor_reviews 和 audit_events(doctor.reviewed)。
+    每次提交均写入 doctor_reviews 和 audit_events(doctor.reviewed)。
     """
-    del request
     trace_id = context.trace_id
-    service = ReviewService(db)
+    try:
+        parsed_session_id = uuid.UUID(session_id)
+    except ValueError:
+        raise SessionNotFoundError(detail=f"session_id={session_id} not found", retryable=False) from None
+    preflight = await db.get(ConsultSession, parsed_session_id)
+    if preflight is None:
+        raise SessionNotFoundError(detail=f"session_id={session_id} not found", retryable=False)
+    is_langgraph = preflight.agent_runtime == "langgraph"
+    runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
+    shared_runtime: SharedLangGraphRuntime | None = (
+        runtime_state.runtime
+        if runtime_state is not None and runtime_state.status == "ready"
+        else None
+    )
+    test_runtime_fallback = allow_request_local_runtime_fallback(
+        runtime_state,
+        test_fallback_enabled=bool(
+            getattr(request.app.state, "allow_request_local_langgraph_test_runtime", False)
+        ),
+    )
+    legacy_service = ReviewService(db)
+    langgraph_service = LangGraphReviewService(db)
+
+    async def run_review() -> Any:
+        if is_langgraph:
+            if shared_runtime is None and not test_runtime_fallback:
+                raise ModelGatewayUnavailableError(
+                    "shared LangGraph runtime is unavailable",
+                    retryable=True,
+                )
+            return await langgraph_service.review(
+                session_id,
+                body,
+                doctor_id=doctor_id,
+                trace_id=trace_id,
+                x_state_version=state_version,
+                idempotency_key=context.idempotency_key,
+                shared_runtime=shared_runtime,
+                allow_request_local_runtime=test_runtime_fallback,
+            )
+        return await legacy_service.review(
+            session_id,
+            body,
+            doctor_id=doctor_id,
+            trace_id=trace_id,
+            x_state_version=state_version,
+        )
+
+    async def resolve_durable_outcome() -> dict[str, Any] | None:
+        if not is_langgraph:
+            return None
+        return await langgraph_service.resolve_durable_outcome(
+            session_id,
+            body,
+            doctor_id=doctor_id,
+            idempotency_key=context.idempotency_key,
+            shared_runtime=shared_runtime,
+            allow_request_local_runtime=test_runtime_fallback,
+        )
+
     scope = session_http_scope(session_id)
     result = await execute_model_write(
         db,
@@ -111,13 +178,8 @@ async def review_prescription(
         },
         success_status=200,
         success_message="ok",
-        handler=lambda: service.review(
-            session_id,
-            body,
-            doctor_id=doctor_id,
-            trace_id=trace_id,
-            x_state_version=state_version,
-        ),
+        handler=run_review,
+        durable_outcome_resolver=resolve_durable_outcome,
     )
     return JSONResponse(
         status_code=result.status_code,

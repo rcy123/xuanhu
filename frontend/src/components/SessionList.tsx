@@ -77,9 +77,18 @@ function SessionItem({
         </Text>
       </div>
       <div style={{ marginTop: 2 }}>
-        <Text type="secondary" style={{ fontSize: 11 }}>
-          {formatTime(session.updated_at)}
-        </Text>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            {formatTime(session.updated_at)}
+          </Text>
+          <Tag
+            color={session.agent_runtime === 'langgraph' ? 'geekblue' : 'default'}
+            style={{ margin: 0, fontSize: 10, lineHeight: '16px' }}
+            data-testid={`runtime-${session.session_id}`}
+          >
+            {session.agent_runtime === 'langgraph' ? 'LangGraph v2' : 'Legacy'}
+          </Tag>
+        </div>
       </div>
     </div>
   )

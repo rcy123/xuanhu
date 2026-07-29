@@ -3,12 +3,19 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { STEP_NODES, stageLabel, stageMeta } from '@/utils/stage'
+import {
+  LANGGRAPH_STEP_NODES,
+  STEP_NODES,
+  stageLabel,
+  stageMeta,
+  stageStepIndex,
+} from '@/utils/stage'
 
 describe('stage utils', () => {
   it('stageLabel 返回 UI 显示文本', () => {
     expect(stageLabel('inquiry')).toBe('问诊')
     expect(stageLabel('safety')).toBe('安全审核')
+    expect(stageLabel('formula')).toBe('方药草案')
     expect(stageLabel('done')).toBe('病历已生成')
     expect(stageLabel('blocked')).toBe('阻塞')
   })
@@ -23,5 +30,18 @@ describe('stage utils', () => {
     expect(STEP_NODES).toHaveLength(7)
     expect(STEP_NODES[0]).toEqual({ stage: 'inquiry', label: '问诊' })
     expect(STEP_NODES[6]).toEqual({ stage: 'review', label: '医师确认' })
+  })
+
+  it('LangGraph 合并旧开方/加减节点并加入 Formula 与病历节点', () => {
+    expect(LANGGRAPH_STEP_NODES.map((node) => node.stage)).toEqual([
+      'inquiry',
+      'syndrome',
+      'formula',
+      'safety',
+      'review',
+      'record',
+    ])
+    expect(stageStepIndex('prescription', 'langgraph')).toBe(2)
+    expect(stageStepIndex('modification', 'langgraph')).toBe(2)
   })
 })

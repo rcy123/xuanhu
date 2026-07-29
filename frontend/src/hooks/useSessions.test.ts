@@ -13,6 +13,7 @@ function makeItem(id: string): SessionListItem {
     patient_info: {},
     current_stage: 'inquiry',
     status: 'active',
+    agent_runtime: 'legacy',
     pending_review: false,
     created_at: '',
     updated_at: '',
@@ -41,6 +42,7 @@ describe('useSessions', () => {
         session_id: 's-new',
         current_stage: 'inquiry',
         status: 'active',
+        agent_runtime: 'langgraph',
         patient_info: {},
         created_at: '',
       })

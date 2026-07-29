@@ -96,6 +96,7 @@ async def execute_model_write(
     success_status: int,
     success_message: str,
     handler: Callable[[], Awaitable[BaseModel]],
+    durable_outcome_resolver: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
 ) -> HttpCommandResult:
     """Execute and persist a Pydantic-returning public write operation."""
 
@@ -113,6 +114,7 @@ async def execute_model_write(
         success_status=success_status,
         success_message=success_message,
         handler=dump_model,
+        durable_outcome_resolver=durable_outcome_resolver,
     )
 
 

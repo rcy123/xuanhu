@@ -20,6 +20,8 @@ def _settings(monkeypatch: pytest.MonkeyPatch, value: str | None) -> Settings:
     }
     for key, item in required.items():
         monkeypatch.setenv(key, item)
+    monkeypatch.delenv("AGENT_RUNTIME_ROLLOUT_PHASE", raising=False)
+    monkeypatch.delenv("XUANHU_LANGGRAPH_PRODUCT_READY", raising=False)
     if value is None:
         monkeypatch.delenv("AGENT_RUNTIME_VERSION", raising=False)
     else:
@@ -67,3 +69,42 @@ def test_langgraph_public_rollout_uses_explicit_xuanhu_env(
     monkeypatch.setenv("XUANHU_LANGGRAPH_PUBLIC_ENABLED", "true")
     settings = _settings(monkeypatch, None)
     assert settings.langgraph_public_enabled is True
+
+
+def test_l9_rollout_authorities_default_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(monkeypatch, None)
+    assert settings.agent_runtime_rollout_phase == "legacy"
+    assert settings.langgraph_product_ready is False
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "legacy",
+        "development",
+        "automated_test",
+        "internal",
+        "canary",
+        "full",
+        "rollback",
+    ],
+)
+def test_l9_rollout_phase_accepts_only_named_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    settings = _settings(monkeypatch, None)
+    monkeypatch.setenv("AGENT_RUNTIME_ROLLOUT_PHASE", phase)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.agent_runtime_rollout_phase == phase
+
+
+def test_l9_rollout_phase_rejects_ambiguous_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings(monkeypatch, None)
+    monkeypatch.setenv("AGENT_RUNTIME_ROLLOUT_PHASE", "all-users")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]

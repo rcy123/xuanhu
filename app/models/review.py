@@ -53,7 +53,7 @@ class DoctorReview(Base, UUIDPrimaryKeyMixin):
 
     __table_args__ = (
         CheckConstraint(
-            "action IN ('confirm','modify','reject')",
+            "action IN ('confirm','modify','reject','request_more_info')",
             name="chk_doctor_reviews_action",
         ),
         Index("idx_doctor_reviews_session_created", "session_id", created_at.desc()),

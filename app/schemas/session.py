@@ -50,6 +50,7 @@ class SessionListItem(BaseModel):
     chief_complaint: str | None
     current_stage: str
     status: str
+    agent_runtime: Literal["legacy", "langgraph"]
     pending_review: bool
     created_by: str | None
     created_at: datetime
@@ -70,6 +71,7 @@ class SessionCreateResponse(BaseModel):
     session_id: str
     current_stage: str
     status: str
+    agent_runtime: Literal["legacy", "langgraph"]
     patient_info: PatientInfo
     created_at: datetime
 

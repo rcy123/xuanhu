@@ -64,7 +64,16 @@ async def test_initial_legacy_default_is_valid_without_fabricating_a_switch() ->
         "configured_runtime": "legacy",
         "audited_runtime": "legacy",
         "audit_present": False,
+        "last_switch_at": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_status_exposes_the_authoritative_switch_timestamp() -> None:
+    record = _record()
+    status = await RuntimeSwitchAuditService(_MemoryRepository([record])).status("langgraph")
+
+    assert status.last_switch_at == record.timestamp
 
 
 @pytest.mark.asyncio

@@ -3,16 +3,18 @@ import { sessionTag } from './sessionTag'
 import type { SessionListItem } from '@/types/api'
 
 function make(over: Partial<SessionListItem> = {}): SessionListItem {
-  return {
+  const result: SessionListItem = {
     session_id: 's',
     patient_info: {},
     current_stage: 'inquiry',
     status: 'active',
+    agent_runtime: 'legacy',
     pending_review: false,
     created_at: '',
     updated_at: '',
     ...over,
   }
+  return result
 }
 
 describe('sessionTag', () => {
@@ -24,6 +26,12 @@ describe('sessionTag', () => {
 
   it('辨证阶段 → 辨证中/信息色', () => {
     const t = sessionTag(make({ current_stage: 'syndrome' }))
+    expect(t.label).toBe('辨证中')
+    expect(t.color).toBe('#6b7d8a')
+  })
+
+  it('LangGraph formula 阶段 → 辨证中/信息色', () => {
+    const t = sessionTag(make({ current_stage: 'formula', agent_runtime: 'langgraph' }))
     expect(t.label).toBe('辨证中')
     expect(t.color).toBe('#6b7d8a')
   })

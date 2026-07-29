@@ -67,6 +67,7 @@ class RuntimeSwitchAuditStatus(BaseModel):
     configured_runtime: RuntimeName
     audited_runtime: RuntimeName
     audit_present: bool
+    last_switch_at: datetime | None
 
 
 class RuntimeSwitchAuditRepository(Protocol):
@@ -165,6 +166,7 @@ class RuntimeSwitchAuditService:
             configured_runtime=configured_runtime,
             audited_runtime=audited_runtime,
             audit_present=latest is not None,
+            last_switch_at=latest.timestamp if latest is not None else None,
         )
 
     async def ensure_configured_runtime(self, configured_runtime: RuntimeName) -> None:

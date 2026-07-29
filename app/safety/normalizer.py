@@ -37,6 +37,8 @@ class HerbNormalizer:
 
     def __init__(self, providers: Iterable[HerbAliasProvider] | None = None) -> None:
         self._alias_to_standard: dict[str, str] = {}
+        self._standard_names: set[str] = set()
+        self._alias_candidates: dict[str, set[str]] = {}
         if providers is not None:
             for p in providers:
                 self.register(p)
@@ -44,10 +46,25 @@ class HerbNormalizer:
     def register(self, provider: HerbAliasProvider) -> None:
         """登记一个药名及其别名。"""
         standard = provider.standard_name
-        self._alias_to_standard[standard] = standard
+        self._standard_names.add(standard)
+        self._refresh(standard)
         for alias in provider.aliases:
             if isinstance(alias, str) and alias:
-                self._alias_to_standard[alias] = standard
+                self._alias_candidates.setdefault(alias, set()).add(standard)
+                self._refresh(alias)
+
+    def _refresh(self, name: str) -> None:
+        """Map canonical names and only unambiguous aliases."""
+
+        if name in self._standard_names:
+            self._alias_to_standard[name] = name
+            return
+        candidates = self._alias_candidates.get(name, set())
+        if len(candidates) == 1:
+            self._alias_to_standard[name] = next(iter(candidates))
+            return
+        # Fail closed instead of selecting whichever conflicting row came last.
+        self._alias_to_standard.pop(name, None)
 
     def normalize(self, herb_name: str) -> str:
         """将药名标准化。无法识别时返回原名（保守策略）。"""

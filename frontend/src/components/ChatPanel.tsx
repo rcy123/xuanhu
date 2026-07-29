@@ -27,6 +27,7 @@ import { FormulaEditModal } from './FormulaEditModal'
 import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
+import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
@@ -307,6 +308,25 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     setRejectModalOpen(true)
   }, [])
 
+  const handleRequestMoreInfo = useCallback(() => {
+    if (!sessionId || !detail) return
+    setReviewSubmitting(true)
+    setReviewError(null)
+    reviewPrescription(
+      sessionId,
+      { action: 'request_more_info' },
+      { stateVersion: detail.state_version },
+    )
+      .then(() => {
+        setReviewSubmitting(false)
+        void refreshDetail()
+      })
+      .catch((err: unknown) => {
+        setReviewSubmitting(false)
+        if (err instanceof ApiRequestError) setReviewError(err)
+      })
+  }, [sessionId, detail, refreshDetail])
+
   const handleRejectSubmit = useCallback(
     (feedback: string) => {
       if (!sessionId || !detail) return
@@ -398,8 +418,16 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     [sessionId],
   )
 
-  // 待确认处方：优先 SSE payload，其次 detail.modified_formula
-  const effectivePendingFormula = pendingReviewFormula ?? detail?.modified_formula ?? null
+  // 待确认处方：优先 SSE；LangGraph 刷新后只从完整性校验通过的 Read Model 恢复。
+  const restoredPendingFormula =
+    detail?.agent_runtime === 'langgraph'
+      ? pendingFormulaFromReadModel(detail.read_model)
+      : null
+  const effectivePendingFormula =
+    pendingReviewFormula
+    ?? restoredPendingFormula
+    ?? detail?.modified_formula
+    ?? null
 
   if (!sessionId) {
     return (
@@ -471,13 +499,15 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
         <div style={{ padding: 'var(--xh-space-l) var(--xh-space-l) 0' }}>
           <StepBar
             currentStage={detail?.current_stage ?? null}
+            agentRuntime={detail?.agent_runtime}
+            readModel={detail?.read_model}
             agentRuns={streamHook.agentRuns}
           />
         </div>
         {detail ? <PatientBar detail={detail} /> : null}
         <StageResultsPanel
           detail={detail}
-          pendingReviewFormula={pendingReviewFormula}
+          pendingReviewFormula={effectivePendingFormula}
           blockedIssues={blockedIssues}
           rollbackTarget={rollbackTarget}
         />
@@ -485,6 +515,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           <LangGraphAdvanceBar
             detail={detail}
             onAdvanced={async () => {
+              await refreshDetail()
+              if (sessionId) await loadMessages(sessionId)
+            }}
+            onRecovered={async () => {
               await refreshDetail()
               if (sessionId) await loadMessages(sessionId)
             }}
@@ -501,6 +535,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
             onConfirm={handleConfirm}
             onModify={handleModify}
             onReject={handleReject}
+            onRequestMoreInfo={handleRequestMoreInfo}
             onRetry={handleReviewRetry}
           />
         ) : null}

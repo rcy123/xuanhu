@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 
 from app.agent_runtime.config import validate_checkpoint_config
 from app.agent_runtime.errors import (
@@ -142,6 +143,61 @@ class GraphRunner:
             # 在 except 块外抛出，避免 __cause__/__context__ 持有底层异常文本。
             raise execution_error
         raise AssertionError("GraphRunner.ainvoke reached an unreachable state")
+
+    async def aresume(
+        self,
+        *,
+        session_id: str,
+        graph_version: str,
+        resume: dict[str, str],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resume the current interrupt without accepting a replacement state.
+
+        The caller supplies only stable string references.  Checkpoint identity
+        is revalidated against the explicit session and graph version before a
+        ``Command(resume=...)`` reaches LangGraph.
+        """
+
+        validate_checkpoint_config(
+            config,
+            {"session_id": session_id, "graph_version": graph_version},
+        )
+        if not resume or any(not isinstance(key, str) or not isinstance(value, str) for key, value in resume.items()):
+            raise GraphRunnerError(
+                "Graph resume payload must contain string references",
+                code="RUNNER_RESUME_REF_INVALID",
+            )
+
+        timeout_ctx = (
+            asyncio.timeout(self._timeout_seconds)
+            if self._timeout_seconds and self._timeout_seconds > 0
+            else _NullTimeout()
+        )
+        execution_error: GraphRunnerError | None = None
+        try:
+            async with timeout_ctx:
+                result = await self._graph.ainvoke(Command(resume=resume), config=config)  # type: ignore[call-overload]
+                return dict(result) if result is not None else {}
+        except TimeoutError as exc:
+            raise GraphRunnerTimeoutError(
+                timeout_seconds=self._timeout_seconds or 0,
+            ) from exc
+        except asyncio.CancelledError:
+            raise
+        except CheckpointConfigMismatchError:
+            raise
+        except GraphRunnerError:
+            raise
+        except Exception:
+            execution_error = GraphRunnerError(
+                "Graph execution failed",
+                code="RUNNER_EXECUTION_FAILED",
+            )
+
+        if execution_error is not None:
+            raise execution_error
+        raise AssertionError("GraphRunner.aresume reached an unreachable state")
 
     async def astream_events(
         self,

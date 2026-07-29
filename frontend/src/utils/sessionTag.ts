@@ -16,6 +16,7 @@ const STAGE_LABEL: Record<string, string> = {
   inquiry: '问诊中',
   sufficiency: '完备性',
   syndrome: '辨证中',
+  formula: '方药草案',
   prescription: '开方中',
   modification: '加减中',
   safety: '安全审核',
@@ -45,6 +46,7 @@ export function sessionTag(session: SessionListItem): TagInfo {
     case 'sufficiency':
       return { label: '问诊中', color: '#3d5a4b' } // 墨绿
     case 'syndrome':
+    case 'formula':
     case 'prescription':
     case 'modification':
     case 'safety':

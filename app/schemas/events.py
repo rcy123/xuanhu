@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+SESSION_EVENT_SCHEMA_VERSION: Literal["session-event.v2"] = "session-event.v2"
+
 SupportedEventType = Literal[
     "stage.changed",
     "message.created",
@@ -60,6 +62,17 @@ class HeartbeatPayload(BaseModel):
     """心跳 payload。"""
 
     timestamp: datetime
+
+
+__all__ = [
+    "SESSION_EVENT_SCHEMA_VERSION",
+    "SUPPORTED_EVENT_TYPES",
+    "EventAppendResult",
+    "HeartbeatPayload",
+    "ResyncPayload",
+    "SessionEvent",
+    "SupportedEventType",
+]
 
 
 class ResyncPayload(BaseModel):

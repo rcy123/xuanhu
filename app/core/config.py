@@ -163,6 +163,24 @@ class Settings(BaseSettings):
         validation_alias="XUANHU_LANGGRAPH_PUBLIC_ENABLED",
         description="允许公共会话创建 API 新建 LangGraph 会话；默认关闭并失败封闭",
     )
+    agent_runtime_rollout_phase: Literal[
+        "legacy",
+        "development",
+        "automated_test",
+        "internal",
+        "canary",
+        "full",
+        "rollback",
+    ] = Field(
+        default="legacy",
+        validation_alias="AGENT_RUNTIME_ROLLOUT_PHASE",
+        description="L9 新会话切流阶段；full/rollback 启用额外失败封闭约束",
+    )
+    langgraph_product_ready: bool = Field(
+        default=False,
+        validation_alias="XUANHU_LANGGRAPH_PRODUCT_READY",
+        description="L5-PROD～L8-PROD 与发布门禁已完成的显式授权；默认 false",
+    )
     agent_max_retries: int = Field(default=2, ge=0, description="Agent 最大重试次数")
     safety_rollback_limit: int = Field(default=3, ge=1, description="安全审核回退次数上限")
     enable_streaming: bool = Field(default=False, description="是否启用 SSE 流式输出")

@@ -241,8 +241,15 @@ async def test_advance_route_consumes_public_key_across_different_traces(
     _install_passthrough_executor(monkeypatch)
 
     async def fake_load(db: object, session_id: str) -> SimpleNamespace:
-        del db, session_id
-        return SimpleNamespace(agent_runtime="langgraph")
+        del db
+        return SimpleNamespace(
+            id=uuid.UUID(session_id),
+            agent_runtime="langgraph",
+            recovery_status="normal",
+        )
+
+    async def no_durable_replay(**_kwargs: object) -> None:
+        return None
 
     async def fake_advance(db: object, session: object, **kwargs: Any) -> dict[str, Any]:
         del db, session
@@ -250,6 +257,7 @@ async def test_advance_route_consumes_public_key_across_different_traces(
         return {"session_id": kwargs["session_id"], "current_stage": "review", "state_version": 2}
 
     monkeypatch.setattr("app.api.advance._load_session_for_advance", fake_load)
+    monkeypatch.setattr("app.api.advance._repair_durable_advance_claim", no_durable_replay)
     monkeypatch.setattr("app.api.advance._run_langgraph_advance", fake_advance)
     session_id = str(uuid.uuid4())
     transport = ASGITransport(app=app)

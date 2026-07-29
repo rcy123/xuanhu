@@ -91,6 +91,8 @@ export const ErrorCode = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   AGENT_SCHEMA_INVALID: 'AGENT_SCHEMA_INVALID',
   AGENT_TRIGGER_FAILED: 'AGENT_TRIGGER_FAILED',
+  RUNTIME_ROLLOUT_NOT_READY: 'RUNTIME_ROLLOUT_NOT_READY',
+  LEGACY_RUNTIME_CREATION_DISABLED: 'LEGACY_RUNTIME_CREATION_DISABLED',
 } as const
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
@@ -119,6 +121,7 @@ export type Stage =
   | 'inquiry'
   | 'sufficiency'
   | 'syndrome'
+  | 'formula'
   | 'prescription'
   | 'modification'
   | 'safety'
@@ -158,9 +161,16 @@ export type MessageRole = 'doctor' | 'patient_proxy' | 'agent'
 /** Agent 名称。 */
 export type AgentName =
   | 'supervisor'
+  | 'intake'
   | 'inquiry'
+  | 'question_composer'
   | 'sufficiency'
+  | 'reasoning'
+  | 'reasoning_subgraph'
   | 'syndrome'
+  | 'syndrome_draft'
+  | 'formula_draft'
+  | 'domain_commit'
   | 'prescription'
   | 'modification'
   | 'safety'
@@ -174,7 +184,7 @@ export type RecoveryAction =
   | 'terminate'
 
 /** 医师确认动作。 */
-export type ReviewAction = 'confirm' | 'modify' | 'reject'
+export type ReviewAction = 'confirm' | 'modify' | 'reject' | 'request_more_info'
 
 /** 安全问题严重度。 */
 export type Severity = 'info' | 'warning' | 'high' | 'blocker'
@@ -238,6 +248,7 @@ export interface SessionCreateData {
   session_id: string
   current_stage: Stage
   status: SessionStatus
+  agent_runtime: AgentRuntime
   patient_info: PatientInfo
   created_at: string
 }
@@ -323,6 +334,7 @@ export interface SessionListItem {
   chief_complaint?: string | null
   current_stage: Stage
   status: SessionStatus
+  agent_runtime: AgentRuntime
   pending_review: boolean
   created_by?: string | null
   created_at: string
@@ -510,7 +522,7 @@ export interface ReviewRequest {
   action: ReviewAction
   /** action=modify 时必填。 */
   formula_override?: FormulaOverride | null
-  /** 建议在 reject 时填写。 */
+  /** 建议在 reject/request_more_info 时填写。 */
   feedback?: string | null
 }
 
@@ -571,6 +583,11 @@ export interface SessionEvent<T = Record<string, unknown>> {
   event_id: string
   event_type: EventType
   payload: T & {
+    /**
+     * L9 v2 producer contract. Optional on the client during rolling deploys so
+     * an already-open tab can still drain events emitted by an older instance.
+     */
+    schema_version?: 'session-event.v2'
     session_id?: string
     timestamp?: string
   }

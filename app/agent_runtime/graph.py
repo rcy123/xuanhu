@@ -13,14 +13,16 @@ command_router
   │ (conditional edge: route_after_router)
   ├─ message  ──► intake_placeholder     ──► END
   ├─ advance  ──► reasoning_subgraph_v1  ──► END
-  ├─ review   ──► review_placeholder     ──► END
-  ├─ recover  ──► recovery_placeholder   ──► END
+  ├─ review   ──► review_placeholder*    ──► END
+  ├─ recover  ──► recovery_placeholder*  ──► END
   ├─ empty    ──► blocked_terminal       ──► END
   └─ unknown  ──► manual_terminal        ──► END
 ```
 
-L1-2 边界：
-- review/recover 等尚未实现节点只写入 ``route`` 标记，不执行业务逻辑。
+兼容边界：
+- ``review_placeholder`` 保留历史节点名，但在 L5-PROD 起承载真实
+  Safety/Review interrupt；这样已完成的 v1 checkpoint 无需改写 namespace。
+- ``recovery_placeholder`` 同样保留历史节点名，并承载产品 Recovery 子图。
 - message/advance 已接入 IntakeSubgraph、ReasoningSubgraph。
 - 不接入 AsyncPostgresSaver（留给 L1-3），测试使用 InMemorySaver。
 - 不实现 GraphRunner/stream（留给 L1-4）。
@@ -47,13 +49,13 @@ from app.agent_runtime.commands import (
 )
 from app.agent_runtime.intake_subgraph import IntakeExecutor, build_intake_subgraph
 from app.agent_runtime.reasoning_subgraph import ReasoningExecutor, build_reasoning_subgraph
+from app.agent_runtime.recovery_node import RecoveryExecutor, build_recovery_subgraph
+from app.agent_runtime.review_node import ReviewExecutor, build_review_subgraph
 from app.agent_runtime.routing import command_router, route_after_router
 from app.agent_runtime.state import XuanhuGraphState
 
 # 占位节点列表（不含 command_router 和终端节点）。
 _PLACEHOLDER_NODES: tuple[str, ...] = (
-    NODE_REVIEW_PLACEHOLDER,
-    NODE_RECOVERY_PLACEHOLDER,
     NODE_BLOCKED_TERMINAL,
     NODE_MANUAL_TERMINAL,
 )
@@ -91,6 +93,8 @@ def build_main_graph(
     *,
     intake_executor: IntakeExecutor | None = None,
     reasoning_executor: ReasoningExecutor | None = None,
+    review_executor: ReviewExecutor | None = None,
+    recovery_executor: RecoveryExecutor | None = None,
 ) -> CompiledStateGraph[XuanhuGraphState, None, XuanhuGraphState, XuanhuGraphState]:
     """构造最小 MainGraph。
 
@@ -113,6 +117,10 @@ def build_main_graph(
     graph.add_node(NODE_INTAKE_SUBGRAPH_V1, intake_node)
     reasoning_node: Any = build_reasoning_subgraph(reasoning_executor=reasoning_executor)
     graph.add_node(NODE_REASONING_SUBGRAPH_V1, reasoning_node)
+    review_node: Any = build_review_subgraph(review_executor=review_executor)
+    graph.add_node(NODE_REVIEW_PLACEHOLDER, review_node)
+    recovery_node: Any = build_recovery_subgraph(recovery_executor=recovery_executor)
+    graph.add_node(NODE_RECOVERY_PLACEHOLDER, recovery_node)
 
     # 注册占位节点（每个占位节点有独立的闭包函数）
     # LangGraph add_node 的类型签名使用 Never 作为输入类型参数，
@@ -140,6 +148,8 @@ def build_main_graph(
     # 所有占位节点 -> END
     graph.add_edge(NODE_INTAKE_SUBGRAPH_V1, END)
     graph.add_edge(NODE_REASONING_SUBGRAPH_V1, END)
+    graph.add_edge(NODE_REVIEW_PLACEHOLDER, END)
+    graph.add_edge(NODE_RECOVERY_PLACEHOLDER, END)
     for node_name in _PLACEHOLDER_NODES:
         graph.add_edge(node_name, END)
 

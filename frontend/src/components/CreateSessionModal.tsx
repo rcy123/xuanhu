@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react'
-import { Modal, Form, Input, Select, InputNumber, Typography } from 'antd'
+import { Alert, Modal, Form, Input, Select, InputNumber, Typography } from 'antd'
 import type { SessionCreateRequest } from '@/types/api'
 
 const { Text } = Typography
@@ -23,13 +23,11 @@ interface FormValues {
   patient_name?: string
   gender?: 'male' | 'female' | 'unknown'
   age?: number | null
-  agent_runtime?: 'legacy' | 'langgraph'
 }
 
 export function CreateSessionModal({ open, creating, onClose, onSubmit }: CreateSessionModalProps) {
   const [form] = Form.useForm()
   const [error, setError] = useState<string | null>(null)
-  const langGraphUiEnabled = import.meta.env.VITE_LANGGRAPH_UI_ENABLED === 'true'
 
   const handleFinish = async (values: FormValues) => {
     try {
@@ -41,8 +39,6 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
           gender: values.gender ?? 'unknown',
           age: values.age ?? null,
         },
-        agent_runtime:
-          langGraphUiEnabled && values.agent_runtime === 'langgraph' ? 'langgraph' : 'legacy',
       }
       await onSubmit(body)
       form.resetFields()
@@ -73,9 +69,16 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
         form={form}
         layout="vertical"
         style={{ marginTop: 16 }}
-        initialValues={{ agent_runtime: 'legacy' }}
         onFinish={handleFinish}
       >
+        <Alert
+          type="info"
+          showIcon
+          message="运行时由后端发布配置决定"
+          description="新会话不在浏览器中强制指定运行时；后端会使用已审计的默认配置，既有会话仍保持创建时的运行时身份。"
+          style={{ marginBottom: 16 }}
+          data-testid="runtime-managed-notice"
+        />
         <Form.Item
           name="chief_complaint"
           label="主诉"
@@ -104,18 +107,6 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
         <Form.Item name="age" label="年龄">
           <InputNumber min={0} max={130} placeholder="选填" style={{ width: '100%' }} />
         </Form.Item>
-        {langGraphUiEnabled ? (
-          <Form.Item
-            name="agent_runtime"
-            label="问诊运行时（非临床 / 限量灰度）"
-            extra="LangGraph 仅用于非临床验证与限量灰度；遇到阻断时不会回退到 Legacy。"
-          >
-            <Select data-testid="agent-runtime-select">
-              <Select.Option value="legacy">Legacy（默认稳定版）</Select.Option>
-              <Select.Option value="langgraph">LangGraph（非临床 · 限量灰度）</Select.Option>
-            </Select>
-          </Form.Item>
-        ) : null}
         {error ? (
           <Text type="danger" style={{ fontSize: 12 }}>
             {error}

@@ -199,6 +199,35 @@ describe('ReviewActionsBar', () => {
     expect(onReject).toHaveBeenCalled()
   })
 
+  it('LangGraph 会话可退回补充问诊', () => {
+    const onRequestMoreInfo = vi.fn()
+    const confirmSpy = vi.spyOn(Modal, 'confirm').mockImplementation(({ onOk }) => {
+      onOk?.()
+      return { destroy: vi.fn(), update: vi.fn() } as ReturnType<typeof Modal.confirm>
+    })
+    render(
+      <ReviewActionsBar
+        detail={makeDetail({
+          agent_runtime: 'langgraph',
+          read_model: emptySessionReadModel('langgraph', 5),
+        })}
+        pendingReviewFormula={makeFormula()}
+        submitting={false}
+        error={null}
+        onConfirm={vi.fn()}
+        onModify={vi.fn()}
+        onReject={vi.fn()}
+        onRequestMoreInfo={onRequestMoreInfo}
+        onRetry={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('review-request-more-info-btn'))
+    expect(confirmSpy).toHaveBeenCalled()
+    expect(onRequestMoreInfo).toHaveBeenCalled()
+    confirmSpy.mockRestore()
+  })
+
   it('submitting 时按钮 loading', () => {
     render(
       <ReviewActionsBar

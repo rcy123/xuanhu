@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from app.core.exceptions import ValidationError
+from app.schemas.events import SESSION_EVENT_SCHEMA_VERSION
 from app.services.events import EventService, session_event_stream_key
 
 
@@ -111,7 +112,25 @@ async def test_append_session_event_writes_stream_entry() -> None:
     payload = json.loads(redis.last_xadd["fields"]["payload"])
     assert payload["session_id"] == "sid-001"
     assert payload["from_stage"] == "inquiry"
+    assert payload["schema_version"] == SESSION_EVENT_SCHEMA_VERSION
     assert "timestamp" in payload
+
+
+@pytest.mark.asyncio
+async def test_append_session_event_overwrites_untrusted_schema_version() -> None:
+    """Producer, rather than a caller payload, owns the public event version."""
+    redis = FakeRedis()
+    service = EventService(redis)  # type: ignore[arg-type]
+
+    await service.append_session_event(
+        "sid-schema",
+        "agent.started",
+        {"agent_name": "intake", "schema_version": "attacker.v999"},
+    )
+
+    assert redis.last_xadd is not None
+    payload = json.loads(redis.last_xadd["fields"]["payload"])
+    assert payload["schema_version"] == SESSION_EVENT_SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
@@ -182,6 +201,7 @@ def test_heartbeat_event_has_timestamp() -> None:
     assert event.event_type == "heartbeat"
     assert event.event_id.startswith("heartbeat-")
     assert "timestamp" in event.payload
+    assert event.payload["schema_version"] == SESSION_EVENT_SCHEMA_VERSION
 
 
 @pytest.mark.asyncio

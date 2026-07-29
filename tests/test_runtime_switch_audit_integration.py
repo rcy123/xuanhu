@@ -59,11 +59,13 @@ async def test_runtime_switch_audit_round_trip_is_global_allowlisted_and_idempot
 
     stored, replayed = await service.record_switch(record, configured_runtime="langgraph")
     await db.commit()
+    status = await service.status("langgraph")
     replays = [await service.record_switch(record, configured_runtime="langgraph") for _ in range(6)]
 
     rows = (await db.scalars(select(AuditEvent).where(AuditEvent.event_type == RUNTIME_SWITCH_EVENT))).all()
     assert stored == record
     assert replayed is False
+    assert status.last_switch_at == record.timestamp
     assert all(replay == record and was_replayed for replay, was_replayed in replays)
     assert len(rows) == 1
     row = rows[0]

@@ -8,13 +8,15 @@
 
 import { Steps } from 'antd'
 import { LoadingOutlined, CheckCircleFilled, CloseCircleFilled } from '@ant-design/icons'
-import type { Stage } from '@/types/api'
-import { STEP_NODES, stageMeta } from '@/utils/stage'
+import type { AgentRuntime, SessionReadModel, Stage } from '@/types/api'
+import { stageStepIndex, stepNodesForRuntime } from '@/utils/stage'
 import { agentNameToStage } from '@/utils/agent'
 import type { AgentRunState } from '@/hooks/useSessionStream'
 
 interface StepBarProps {
   currentStage: Stage | null
+  agentRuntime?: AgentRuntime
+  readModel?: SessionReadModel
   /** per-agent 运行状态（key = agent_name e.g. "syndrome", "safety"）。 */
   agentRuns?: Record<string, AgentRunState>
 }
@@ -34,12 +36,18 @@ function resolveAgentStatus(
   return result
 }
 
-export function StepBar({ currentStage, agentRuns }: StepBarProps) {
-  const step = currentStage ? stageMeta(currentStage).step : undefined
+export function StepBar({
+  currentStage,
+  agentRuntime = 'legacy',
+  readModel,
+  agentRuns,
+}: StepBarProps) {
+  const nodes = stepNodesForRuntime(agentRuntime)
+  const step = currentStage ? stageStepIndex(currentStage, agentRuntime) : undefined
   let current = step ?? 0
   let overallStatus: 'process' | 'finish' | 'error' = 'process'
   if (currentStage === 'done') {
-    current = STEP_NODES.length
+    current = nodes.length
     overallStatus = 'finish'
   } else if (currentStage === 'blocked') {
     current = step ?? 0
@@ -48,7 +56,8 @@ export function StepBar({ currentStage, agentRuns }: StepBarProps) {
 
   const agentStatus = resolveAgentStatus(agentRuns)
 
-  const items = STEP_NODES.map((n) => {
+  const artifactTypes = new Set(readModel?.artifacts.map((item) => item.artifact_type) ?? [])
+  const items = nodes.map((n) => {
     const status = agentStatus[n.stage]
     let icon: React.ReactNode | undefined
     if (status === 'running') {
@@ -60,11 +69,22 @@ export function StepBar({ currentStage, agentRuns }: StepBarProps) {
     }
     // 已完成阶段（index < current）用默认 ✓ 图标
     // 仅在当前或未来阶段显示 agent 状态图标
-    const idx = STEP_NODES.findIndex((x) => x.stage === n.stage)
+    const idx = nodes.findIndex((x) => x.stage === n.stage)
     const showAgentIcon = idx >= current && icon !== undefined
+    let description: string | undefined
+    if (agentRuntime === 'langgraph') {
+      if (status === 'running') description = '运行中'
+      else if (status === 'failed') description = '执行失败'
+      else if (
+        (n.stage === 'syndrome' && artifactTypes.has('syndrome_draft'))
+        || (n.stage === 'formula' && artifactTypes.has('formula_draft'))
+      ) description = '已持久化'
+      else if (n.stage === 'review' && readModel?.review_required) description = '等待硬门禁'
+    }
 
     return {
       title: n.label,
+      description,
       icon: showAgentIcon ? icon : undefined,
     }
   })
@@ -72,6 +92,7 @@ export function StepBar({ currentStage, agentRuns }: StepBarProps) {
   return (
     <div
       data-testid="step-bar"
+      data-runtime={agentRuntime}
       style={{
         background: 'var(--xh-bg-card)',
         border: '1px solid var(--xh-border)',

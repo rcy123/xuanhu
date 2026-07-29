@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, String, func, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,6 +30,7 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
         server_default=func.now(),
     )
 
@@ -49,8 +50,13 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin):
             "event_type",
             "trace_id",
             unique=True,
-            postgresql_where=text(
-                "event_type = 'runtime.switched' AND trace_id IS NOT NULL"
-            ),
+            postgresql_where=text("event_type = 'runtime.switched' AND trace_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_audit_events_rollout_phase_deployment",
+            "event_type",
+            "trace_id",
+            unique=True,
+            postgresql_where=text("event_type = 'runtime.rollout_phase_changed' AND trace_id IS NOT NULL"),
         ),
     )

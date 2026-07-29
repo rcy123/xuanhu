@@ -18,11 +18,12 @@ import hashlib
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
+from sqlalchemy import null as sql_null
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.checkpoint import postgres_checkpointer
@@ -48,8 +49,9 @@ from app.core.exceptions import (
     PendingDoctorReviewError,
     SessionBusyError,
     SessionNotFoundError,
+    StateRecoveryRequiredError,
 )
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
 from app.models.domain import GateResult, GraphRun, IntakeCommandClaim, OutboxEvent
@@ -122,6 +124,7 @@ def _precheck_stage(session: ConsultSession, force: bool) -> None:
     - inquiry 阶段且未 force：要求 sufficiency_report.sufficient=true，
       否则 INSUFFICIENT_INQUIRY
     """
+    _require_normal_recovery(session)
     stage = session.current_stage
     if stage == "review":
         raise PendingDoctorReviewError(
@@ -148,6 +151,18 @@ def _precheck_stage(session: ConsultSession, force: bool) -> None:
             )
 
 
+def _require_normal_recovery(session: ConsultSession) -> None:
+    recovery_status = getattr(session, "recovery_status", "normal")
+    if recovery_status != "normal":
+        raise StateRecoveryRequiredError(
+            detail=(
+                f"session_id={session.id} recovery_status={recovery_status} "
+                "must be recovered before advance"
+            ),
+            retryable=False,
+        )
+
+
 def _advance_command_key(idempotency_key: str | None) -> str:
     """Derive a durable command key independently from the attempt trace."""
 
@@ -159,6 +174,84 @@ def _advance_command_key(idempotency_key: str | None) -> str:
 def _advance_payload_digest(force: bool) -> str:
     payload = {"command": "advance", "force": force}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+async def _read_durable_advance_response(
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+) -> dict[str, Any] | None:
+    """Resolve an already-persisted command outcome without mutating claims."""
+
+    factory = get_session_factory()
+    async with factory() as db:
+        claim = await db.scalar(
+            select(IntakeCommandClaim).where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_key,
+            )
+        )
+        if claim is None:
+            return None
+        if claim.payload_digest != payload_digest:
+            raise IdempotencyConflictError(
+                message="相同幂等键不能复用不同 advance 命令",
+                detail=(
+                    f"session_id={session_id} command_id={command_key} "
+                    "payload_digest_mismatch"
+                ),
+                retryable=False,
+            )
+        if claim.status == "completed" and isinstance(claim.response_payload, dict):
+            return dict(claim.response_payload)
+
+    from app.agent_runtime.repository import RepositoryError, RepositoryErrorCode
+    from app.services.langgraph_record import resolve_committed_record_advance
+
+    try:
+        return await resolve_committed_record_advance(
+            session_id=session_id,
+            command_id=command_key,
+            payload_digest=payload_digest,
+        )
+    except RepositoryError as exc:
+        if exc.code is RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED:
+            raise IdempotencyConflictError(
+                message="相同幂等键不能复用不同 advance 命令",
+                detail=(
+                    f"session_id={session_id} command_id={command_key} "
+                    "payload_digest_mismatch"
+                ),
+                retryable=False,
+            ) from exc
+        raise
+
+
+async def _repair_durable_advance_claim(
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+) -> dict[str, Any] | None:
+    """Repair the internal claim only after a complete durable outcome exists."""
+
+    response = await _read_durable_advance_response(
+        session_id=session_id,
+        command_key=command_key,
+        payload_digest=payload_digest,
+    )
+    if response is None:
+        return None
+    from app.services.langgraph_review import _complete_advance_claim
+
+    await _complete_advance_claim(
+        session_id=session_id,
+        command_id=command_key,
+        response=response,
+        state_version=int(response["state_version"]),
+    )
+    return response
 
 
 def _advance_claim_is_stale(claim: IntakeCommandClaim) -> bool:
@@ -179,10 +272,16 @@ def _safe_ref(prefix: str, value: str) -> str:
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
-async def _invoke_reasoning_graph(*, session_id: str, command_key: str, run_id: uuid.UUID) -> None:
+async def _invoke_reasoning_graph(
+    *,
+    session_id: str,
+    command_key: str,
+    run_id: uuid.UUID,
+    command: XuanhuCommand = XuanhuCommand.ADVANCE,
+) -> None:
     graph_state = default_state(
         session_id=session_id,
-        command=XuanhuCommand.ADVANCE.value,
+        command=command.value,
         command_id=command_key,
         graph_version=DEFAULT_GRAPH_VERSION,
         run_id=str(run_id),
@@ -200,12 +299,13 @@ async def _invoke_shared_reasoning_graph(
     session_id: str,
     command_key: str,
     run_id: uuid.UUID,
+    command: XuanhuCommand = XuanhuCommand.ADVANCE,
 ) -> None:
     """Invoke the lifespan-owned compiled graph without setup/recompile."""
 
     graph_state = default_state(
         session_id=session_id,
-        command=XuanhuCommand.ADVANCE.value,
+        command=command.value,
         command_id=command_key,
         graph_version=DEFAULT_GRAPH_VERSION,
         run_id=str(run_id),
@@ -372,10 +472,17 @@ async def _run_langgraph_advance(
     allow_request_local_runtime: bool = False,
 ) -> dict[str, Any]:
     _require_langgraph_runtime(shared_runtime, allow_request_local_runtime)
-    del session
     sid = uuid.UUID(session_id)
     command_key = _advance_command_key(idempotency_key)
     payload_digest = _advance_payload_digest(force)
+    _require_normal_recovery(session)
+    durable = await _repair_durable_advance_claim(
+        session_id=sid,
+        command_key=command_key,
+        payload_digest=payload_digest,
+    )
+    if durable is not None:
+        return durable
     run_id: uuid.UUID | None = None
     lock = SessionLock(db, session_id, trace_id)
     try:
@@ -439,6 +546,7 @@ async def _run_langgraph_advance(
             locked = await db.get(ConsultSession, sid, with_for_update=True)
             if locked is None:
                 raise SessionNotFoundError(detail=f"session_id={session_id} not found", retryable=False)
+            _require_normal_recovery(locked)
             if state_version is not None and state_version != locked.state_version:
                 raise InvalidStateVersionError(
                     detail=(
@@ -459,6 +567,7 @@ async def _run_langgraph_advance(
                 )
 
             from_stage = locked.current_stage
+            graph_command = XuanhuCommand.ADVANCE
             gate_id: uuid.UUID | None = None
             gate_state_version: int | None = None
             if locked.current_stage == "inquiry":
@@ -496,6 +605,8 @@ async def _run_langgraph_advance(
                     "trace_id": trace_id,
                 }
                 locked.state_snapshot = snapshot
+            elif locked.current_stage in {"safety", "record"}:
+                graph_command = XuanhuCommand.REVIEW
             elif locked.current_stage != "syndrome":
                 raise InvalidStageTransitionError(
                     message=f"当前阶段 {locked.current_stage} 不可推进",
@@ -578,7 +689,7 @@ async def _run_langgraph_advance(
                 existing.status = "running"
                 existing.input_state_version = input_version
                 existing.output_state_version = None
-                existing.response_payload = None
+                existing.response_payload = cast(Any, sql_null())
                 existing.error_code = None
                 existing.intermediate_payload = intermediate_payload
                 existing.updated_at = func.now()
@@ -601,12 +712,14 @@ async def _run_langgraph_advance(
                 session_id=session_id,
                 command_key=command_key,
                 run_id=run_id,
+                command=graph_command,
             )
         elif allow_request_local_runtime:
             await _invoke_reasoning_graph(
                 session_id=session_id,
                 command_key=command_key,
                 run_id=run_id,
+                command=graph_command,
             )
         else:
             raise LangGraphRuntimeUnavailableError
@@ -673,10 +786,21 @@ async def advance_session(
     trace_id = context.trace_id
 
     preflight_session = await _load_session_for_advance(db, session_id)
+    preflight_session_id = uuid.UUID(session_id)
+    durable_preflight: dict[str, Any] | None = None
     if getattr(preflight_session, "agent_runtime", "legacy") == "langgraph":
+        _require_normal_recovery(preflight_session)
+        preflight_command_key = _advance_command_key(context.idempotency_key)
+        preflight_payload_digest = _advance_payload_digest(body.force)
+        durable_preflight = await _repair_durable_advance_claim(
+            session_id=preflight_session_id,
+            command_key=preflight_command_key,
+            payload_digest=preflight_payload_digest,
+        )
         # Do not persist a retryable runtime-startup failure as the terminal
         # outcome for this HTTP idempotency key.
-        _require_langgraph_runtime(shared_runtime, test_runtime_fallback)
+        if durable_preflight is None:
+            _require_langgraph_runtime(shared_runtime, test_runtime_fallback)
 
     async def run_advance() -> dict[str, Any]:
         session = await _load_session_for_advance(db, session_id)
@@ -720,6 +844,18 @@ async def advance_session(
         }
 
     scope = session_http_scope(session_id)
+
+    async def resolve_durable_outcome() -> dict[str, Any] | None:
+        if durable_preflight is not None:
+            return durable_preflight
+        if getattr(preflight_session, "agent_runtime", "legacy") != "langgraph":
+            return None
+        return await _read_durable_advance_response(
+            session_id=preflight_session_id,
+            command_key=_advance_command_key(context.idempotency_key),
+            payload_digest=_advance_payload_digest(body.force),
+        )
+
     result = await HttpCommandExecutor(db).execute(
         operation="session.advance.v1",
         scope_key=scope,
@@ -734,6 +870,7 @@ async def advance_session(
         success_status=200,
         success_message="ok",
         handler=run_advance,
+        durable_outcome_resolver=resolve_durable_outcome,
     )
     return JSONResponse(
         status_code=result.status_code,

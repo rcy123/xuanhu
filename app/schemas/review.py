@@ -2,7 +2,7 @@
 
 与接口设计文档 §4.4 保持一致：
 - POST /api/v1/consult/sessions/{session_id}/review
-- 支持 confirm / modify / reject 三条路径
+- 支持 confirm / modify / reject / request_more_info 四条路径
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-ReviewAction = Literal["confirm", "modify", "reject"]
+ReviewAction = Literal["confirm", "modify", "reject", "request_more_info"]
 
 
 class HerbOverrideItem(BaseModel):
@@ -45,7 +45,7 @@ class ReviewRequest(BaseModel):
 
     - ``action=confirm``：仅传 action。
     - ``action=modify``：必填 ``formula_override``，可选 ``feedback``。
-    - ``action=reject``：建议填 ``feedback``。
+    - ``action=reject`` 或 ``request_more_info``：建议填 ``feedback``。
     """
 
     action: ReviewAction = Field(..., description="医师确认动作")

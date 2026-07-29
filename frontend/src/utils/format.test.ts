@@ -3,16 +3,18 @@ import { formatTime, patientSummary } from './format'
 import type { SessionListItem } from '@/types/api'
 
 function makeSession(over: Partial<SessionListItem> = {}): SessionListItem {
-  return {
+  const result: SessionListItem = {
     session_id: 's-1',
     patient_info: {},
     current_stage: 'inquiry',
     status: 'active',
+    agent_runtime: 'legacy',
     pending_review: false,
     created_at: '2026-07-03T10:30:00+08:00',
     updated_at: '2026-07-03T10:35:00+08:00',
     ...over,
   }
+  return result
 }
 
 describe('formatTime', () => {

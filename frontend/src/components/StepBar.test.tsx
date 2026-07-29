@@ -56,4 +56,50 @@ describe('StepBar', () => {
     render(<StepBar currentStage="inquiry" />)
     expect(screen.getByTestId('step-bar')).toBeInTheDocument()
   })
+
+  it('LangGraph 使用合并后的 Formula 节点并展示持久化状态', () => {
+    render(
+      <StepBar
+        currentStage="safety"
+        agentRuntime="langgraph"
+        readModel={{
+          schema_version: 'session-read-model.v1',
+          agent_runtime: 'langgraph',
+          graph: { revision: 4, status: 'completed' },
+          gates: [],
+          artifacts: [
+            {
+              artifact_id: 'formula-1',
+              artifact_type: 'formula_draft',
+              revision: 1,
+              input_state_version: 3,
+              status: 'current',
+              produced_by_run_id: 'run-1',
+              payload_schema_version: 'formula-artifact-payload.v1',
+              content_digest: '0'.repeat(64),
+              decision: 'completed',
+              evidence_mode: 'model_knowledge_only',
+              review_required: true,
+              unresolved: [],
+              verification_gate: {
+                gate_id: 'gate-1',
+                gate_name: 'formula_consistency',
+                policy_version: 'formula-consistency-policy.v1',
+                input_state_version: 3,
+                decision: 'passed',
+              },
+              output: {},
+            },
+          ],
+          review_required: true,
+          unresolved: [],
+        }}
+      />,
+    )
+    expect(screen.getByTestId('step-bar')).toHaveAttribute('data-runtime', 'langgraph')
+    expect(screen.getByText('方药草案')).toBeInTheDocument()
+    expect(screen.queryByText('加减方')).not.toBeInTheDocument()
+    expect(screen.getByText('已持久化')).toBeInTheDocument()
+    expect(screen.getByText('等待硬门禁')).toBeInTheDocument()
+  })
 })

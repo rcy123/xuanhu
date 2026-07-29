@@ -14,17 +14,19 @@ function wrap(node: React.ReactNode) {
 }
 
 function makeSession(id: string, over: Partial<SessionListItem> = {}): SessionListItem {
-  return {
+  const result: SessionListItem = {
     session_id: id,
     patient_info: { name: '李明', gender: 'male', age: 35 },
     chief_complaint: '头痛',
     current_stage: 'inquiry',
     status: 'active',
+    agent_runtime: 'legacy',
     pending_review: false,
     created_at: '2026-07-03T10:30:00+08:00',
     updated_at: '2026-07-03T10:35:00+08:00',
     ...over,
   }
+  return result
 }
 
 describe('SessionList', () => {
@@ -44,6 +46,22 @@ describe('SessionList', () => {
     const items = screen.getAllByText('李明 · 男 · 35岁')
     expect(items.length).toBe(2)
     expect(screen.getAllByText('07-03 10:35').length).toBe(2)
+    expect(screen.getAllByText('Legacy').length).toBe(2)
+  })
+
+  it('标记 LangGraph v2 会话运行时', () => {
+    wrap(
+      <SessionList
+        sessions={[makeSession('s-lg', { agent_runtime: 'langgraph' })]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        onSelect={() => {}}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('runtime-s-lg')).toHaveTextContent('LangGraph v2')
   })
 
   it('点击列表项触发 onSelect', () => {

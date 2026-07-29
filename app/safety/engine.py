@@ -108,110 +108,7 @@ class SafetyRuleEngine:
             SafetyRuleResult，包含 ``passed`` / ``issues`` / ``warnings`` /
             ``normalized_formula`` / ``rule_version`` / ``execution_order``。
         """
-        execution_order: list[str] = []
-
-        # 1. 加载数据
-        herb_records = await self._load_herb_records()
-        unit_table = await self._load_unit_table()
-
-        # 2. 构建标准化器
-        normalizer = HerbNormalizer(_HerbAliasAdapter(h) for h in herb_records.values())
-
-        # 3. 药名标准化
-        execution_order.append("normalize")
-        normalized = _normalize_composition(formula.composition, normalizer)
-
-        # 4. 剂量单位换算
-        execution_order.append("convert_dose")
-        unit_issues, unit_warnings, converted = _convert_all_doses(
-            normalized, unit_table, herb_records, normalizer
-        )
-
-        all_issues: list[SafetyIssue] = list(unit_issues)
-        all_warnings: list[str] = list(unit_warnings)
-
-        # 标准化后的处方（用于返回）
-        normalized_formula = FormulaResult(
-            name=formula.name,
-            composition=converted,
-            source=formula.source,
-            rationale=formula.rationale,
-            citations=formula.citations,
-        )
-
-        # 标准化后的药名集合（用于规则检查）
-        herb_names = [h.herb for h in converted]
-
-        # 4.5 未知药名检查（§1.1 保守假设：无法确定安全时按不安全处理）
-        execution_order.append("unknown_herb")
-        unknown_issues = _check_unknown_herbs(herb_names, herb_records, normalizer)
-        all_issues.extend(unknown_issues)
-
-        # 5. 十八反
-        execution_order.append("eighteen_incompatibilities")
-        eighteen_issues = _check_eighteen_incompatibilities(herb_names, normalizer)
-        all_issues.extend(eighteen_issues)
-
-        # 6. 十九畏
-        execution_order.append("nineteen_fears")
-        nineteen_issues = _check_nineteen_fears(herb_names, normalizer)
-        all_issues.extend(nineteen_issues)
-
-        # 7. 妊娠禁忌
-        execution_order.append("pregnancy")
-        pregnancy_issues = _check_pregnancy(herb_names, patient_info, herb_records, normalizer)
-        all_issues.extend(pregnancy_issues)
-
-        # 8. 配伍禁忌
-        execution_order.append("combination")
-        combination_issues = _check_combination_incompatibilities(
-            herb_names,
-            herb_records,
-            normalizer,
-            eighteen_issues,
-            nineteen_issues,
-        )
-        all_issues.extend(combination_issues)
-
-        # 9. 剂量上限
-        execution_order.append("dose_limit")
-        dose_issues = _check_dose_limits(
-            converted,
-            normalizer,
-            herb_records,
-            unit_table,
-        )
-        all_issues.extend(dose_issues)
-
-        # 10. 过敏
-        execution_order.append("allergy")
-        allergy_issues = _check_allergy(
-            herb_names,
-            patient_info.allergies,
-            normalizer,
-            herb_records,
-        )
-        all_issues.extend(allergy_issues)
-
-        # 11. 去重 + 排序
-        execution_order.append("deduplicate")
-        execution_order.append("sort")
-        all_issues = _deduplicate(all_issues)
-        all_issues = _sort_issues(all_issues)
-
-        # 12. 判定 passed
-        passed = _determine_passed(all_issues)
-
-        result = SafetyRuleResult(
-            passed=passed,
-            issues=all_issues,
-            normalized_formula=normalized_formula,
-            warnings=all_warnings,
-            rule_version=SAFETY_RULE_VERSION,
-            execution_order=execution_order,
-        )
-
-        # 13. 写入 safety_rule_runs
+        result = await self.evaluate(formula, patient_info)
         await self._write_safety_rule_run(
             session_id=session_id,
             trace_id=trace_id,
@@ -223,6 +120,77 @@ class SafetyRuleEngine:
         )
 
         return result
+
+    async def evaluate(
+        self,
+        formula: FormulaResult,
+        patient_info: PatientInfo,
+    ) -> SafetyRuleResult:
+        """Evaluate every deterministic rule without writing a run row.
+
+        Product LangGraph flows use this pure persistence boundary so the
+        result, Domain artifact, gate, compatibility projection and session
+        transition can be committed atomically by the Domain Repository.
+        Legacy ``check()`` keeps its existing evaluate-and-persist behaviour.
+        """
+
+        execution_order: list[str] = []
+        herb_records = await self._load_herb_records()
+        unit_table = await self._load_unit_table()
+        normalizer = HerbNormalizer(_HerbAliasAdapter(h) for h in herb_records.values())
+
+        execution_order.append("normalize")
+        normalized = _normalize_composition(formula.composition, normalizer)
+        execution_order.append("convert_dose")
+        unit_issues, unit_warnings, converted = _convert_all_doses(
+            normalized, unit_table, herb_records, normalizer
+        )
+        all_issues: list[SafetyIssue] = list(unit_issues)
+        all_warnings: list[str] = list(unit_warnings)
+        normalized_formula = FormulaResult(
+            name=formula.name,
+            composition=converted,
+            source=formula.source,
+            rationale=formula.rationale,
+            citations=formula.citations,
+        )
+        herb_names = [item.herb for item in converted]
+
+        execution_order.append("unknown_herb")
+        all_issues.extend(_check_unknown_herbs(herb_names, herb_records, normalizer))
+        execution_order.append("eighteen_incompatibilities")
+        eighteen_issues = _check_eighteen_incompatibilities(herb_names, normalizer)
+        all_issues.extend(eighteen_issues)
+        execution_order.append("nineteen_fears")
+        nineteen_issues = _check_nineteen_fears(herb_names, normalizer)
+        all_issues.extend(nineteen_issues)
+        execution_order.append("pregnancy")
+        all_issues.extend(_check_pregnancy(herb_names, patient_info, herb_records, normalizer))
+        execution_order.append("combination")
+        all_issues.extend(
+            _check_combination_incompatibilities(
+                herb_names,
+                herb_records,
+                normalizer,
+                eighteen_issues,
+                nineteen_issues,
+            )
+        )
+        execution_order.append("dose_limit")
+        all_issues.extend(_check_dose_limits(converted, normalizer, herb_records, unit_table))
+        execution_order.append("allergy")
+        all_issues.extend(_check_allergy(herb_names, patient_info.allergies, normalizer, herb_records))
+        execution_order.extend(("deduplicate", "sort"))
+        all_issues = _sort_issues(_deduplicate(all_issues))
+
+        return SafetyRuleResult(
+            passed=_determine_passed(all_issues),
+            issues=all_issues,
+            normalized_formula=normalized_formula,
+            warnings=all_warnings,
+            rule_version=SAFETY_RULE_VERSION,
+            execution_order=execution_order,
+        )
 
     async def persist_result(
         self,
@@ -255,22 +223,29 @@ class SafetyRuleEngine:
     # ------------------------------------------------------------------
 
     async def _load_herb_records(self) -> dict[str, Herb]:
-        result = await self._db.execute(select(Herb))
-        records: dict[str, Herb] = {}
-        for h in result.scalars().all():
-            records[h.name] = h
-        return records
+        result = await self._db.execute(
+            select(Herb)
+            .where(Herb.deleted_at.is_(None))
+            .order_by(Herb.name, Herb.id)
+        )
+        return {herb.name: herb for herb in result.scalars().all()}
 
     async def _load_unit_table(self) -> dict[str, DosageUnit]:
         result = await self._db.execute(
-            select(DosageUnit).where(DosageUnit.enabled.is_(True))
+            select(DosageUnit)
+            .where(DosageUnit.enabled.is_(True))
+            .order_by(DosageUnit.unit_name, DosageUnit.id)
         )
-        table: dict[str, DosageUnit] = {}
-        for du in result.scalars().all():
-            table[du.unit_name] = du
+        units = result.scalars().all()
+        table = {unit.unit_name: unit for unit in units}
+        alias_candidates: dict[str, dict[str, DosageUnit]] = {}
+        for du in units:
             for alias in (du.aliases or []):
                 if isinstance(alias, str) and alias:
-                    table[alias] = du
+                    alias_candidates.setdefault(alias, {})[du.unit_name] = du
+        for alias, candidates in alias_candidates.items():
+            if alias not in table and len(candidates) == 1:
+                table[alias] = next(iter(candidates.values()))
         return table
 
     # ------------------------------------------------------------------

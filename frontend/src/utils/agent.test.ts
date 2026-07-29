@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionDetail } from '@/types/api'
-import { agentNameToStage, canAdvanceLangGraph } from './agent'
+import {
+  agentNameToStage,
+  canAdvanceLangGraph,
+  langGraphDisposition,
+} from './agent'
 
 function langGraphDetail(): SessionDetail {
   return {
@@ -49,6 +53,9 @@ describe('agentNameToStage', () => {
     expect(agentNameToStage('inquiry')).toBe('inquiry')
     expect(agentNameToStage('sufficiency')).toBe('sufficiency')
     expect(agentNameToStage('syndrome')).toBe('syndrome')
+    expect(agentNameToStage('reasoning')).toBe('syndrome')
+    expect(agentNameToStage('syndrome_draft')).toBe('syndrome')
+    expect(agentNameToStage('formula_draft')).toBe('formula')
     expect(agentNameToStage('prescription')).toBe('prescription')
     expect(agentNameToStage('modification')).toBe('modification')
     expect(agentNameToStage('safety')).toBe('safety')
@@ -56,7 +63,6 @@ describe('agentNameToStage', () => {
 
   it('未知 agent 返回 null', () => {
     expect(agentNameToStage('supervisor')).toBeNull()
-    expect(agentNameToStage('record')).toBeNull()
     expect(agentNameToStage('unknown')).toBeNull()
   })
 })
@@ -69,5 +75,32 @@ describe('canAdvanceLangGraph', () => {
       ...langGraphDetail(),
       read_model: { ...langGraphDetail().read_model, gates: [] },
     })).toBe(false)
+  })
+})
+
+describe('langGraphDisposition', () => {
+  it('maps authoritative gate outcomes to the stable v2 dispositions', () => {
+    expect(langGraphDisposition(langGraphDetail())).toBe('ready')
+
+    const needsInput = langGraphDetail()
+    needsInput.read_model.gates[1] = {
+      ...needsInput.read_model.gates[1],
+      decision: 'failed',
+      details: { disposition: 'incomplete' },
+    }
+    expect(langGraphDisposition(needsInput)).toBe('needs_input')
+
+    const triageHold = langGraphDetail()
+    triageHold.read_model.gates[0] = {
+      ...triageHold.read_model.gates[0],
+      decision: 'blocked',
+      details: { disposition: 'emergency_referral' },
+    }
+    expect(langGraphDisposition(triageHold)).toBe('triage_hold')
+
+    expect(langGraphDisposition({
+      ...langGraphDetail(),
+      recovery_status: 'manual_required',
+    })).toBe('manual_required')
   })
 })

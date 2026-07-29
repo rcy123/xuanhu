@@ -176,6 +176,7 @@ async def test_create_session_success(client: AsyncClient, db: AsyncSession) -> 
     data = body["data"]
     assert data["current_stage"] == "inquiry"
     assert data["status"] == "active"
+    assert data["agent_runtime"] == "legacy"
     assert data["patient_info"]["patient_ref"] == f"{_TEST_PATIENT_REF_PREFIX}TEST001"
 
     # 数据库验证
@@ -419,6 +420,7 @@ async def test_list_sessions_pagination_and_sort(client: AsyncClient, db: AsyncS
 
     # 默认排序为 created_at:desc，第一条应为最新创建的 s2
     assert data["items"][0]["session_id"] == s2["session_id"]
+    assert data["items"][0]["agent_runtime"] == "legacy"
 
 
 async def test_list_sessions_status_filter(client: AsyncClient, db: AsyncSession) -> None:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from sqlalchemy import null as sql_null
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -79,6 +80,7 @@ class HttpCommandExecutor:
         success_status: int,
         success_message: str,
         handler: Callable[[], Awaitable[dict[str, Any]]],
+        durable_outcome_resolver: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> HttpCommandResult:
         """Execute a public write exactly once for a claimed logical command."""
 
@@ -100,6 +102,9 @@ class HttpCommandExecutor:
             idempotency_mode="public" if is_idempotent else "non_idempotent",
             key_digest=key_digest,
             request_digest=request_digest,
+            success_status=success_status,
+            success_message=success_message,
+            durable_outcome_resolver=durable_outcome_resolver,
         )
         if isinstance(decision, HttpCommandResult):
             return decision
@@ -161,6 +166,9 @@ class HttpCommandExecutor:
         idempotency_mode: str,
         key_digest: str,
         request_digest: str,
+        success_status: int,
+        success_message: str,
+        durable_outcome_resolver: Callable[[], Awaitable[dict[str, Any] | None]] | None,
     ) -> _OwnerClaim | HttpCommandResult:
         owner = _OwnerClaim(uuid.uuid4(), uuid.uuid4())
         inserted = await self._try_insert(
@@ -198,7 +206,13 @@ class HttpCommandExecutor:
                 )
 
         self._validate_digest(existing, request_digest)
-        return await self._resolve_existing(existing.id, request_digest)
+        return await self._resolve_existing(
+            existing.id,
+            request_digest,
+            success_status=success_status,
+            success_message=success_message,
+            durable_outcome_resolver=durable_outcome_resolver,
+        )
 
     async def _try_insert(
         self,
@@ -279,6 +293,10 @@ class HttpCommandExecutor:
         self,
         claim_id: uuid.UUID,
         request_digest: str,
+        *,
+        success_status: int,
+        success_message: str,
+        durable_outcome_resolver: Callable[[], Awaitable[dict[str, Any] | None]] | None,
     ) -> HttpCommandResult:
         deadline = asyncio.get_running_loop().time() + HTTP_COMMAND_WAIT_SECONDS
         while True:
@@ -293,6 +311,23 @@ class HttpCommandExecutor:
             resolved = _resolved_claim(claim)
             if resolved is not None:
                 return resolved
+            may_repair_from_durable = (
+                claim.status in {"ambiguous", "failed"}
+                or (claim.status == "running" and _lease_expired(claim))
+            )
+            if durable_outcome_resolver is not None and may_repair_from_durable:
+                durable_data = await durable_outcome_resolver()
+                if durable_data is not None:
+                    repaired = await self._repair_durable_success(
+                        claim_id,
+                        request_digest=request_digest,
+                        data=durable_data,
+                        status_code=success_status,
+                        message=success_message,
+                    )
+                    if repaired is not None:
+                        return repaired
+                    continue
             if claim.status == "failed":
                 raise HttpCommandReplayError(dict(claim.error_payload or {}))
             if claim.status == "ambiguous":
@@ -316,6 +351,45 @@ class HttpCommandExecutor:
                     retryable=True,
                 )
             await asyncio.sleep(0.1)
+
+    async def _repair_durable_success(
+        self,
+        claim_id: uuid.UUID,
+        *,
+        request_digest: str,
+        data: dict[str, Any],
+        status_code: int,
+        message: str,
+    ) -> HttpCommandResult | None:
+        """Publish a verified business outcome over an abandoned HTTP claim."""
+
+        async with self._factory() as db, db.begin():
+            claim = await db.get(HttpCommandClaim, claim_id, with_for_update=True)
+            if claim is None:
+                return None
+            self._validate_digest(claim, request_digest)
+            resolved = _resolved_claim(claim)
+            if resolved is not None:
+                return resolved
+            repairable = (
+                claim.status in {"ambiguous", "failed"}
+                or (claim.status == "running" and _lease_expired(claim))
+            )
+            if not repairable:
+                return None
+            claim.status = "completed"
+            claim.http_status = status_code
+            claim.response_payload = {"data": data, "message": message}
+            claim.error_payload = cast(Any, sql_null())
+            claim.lease_expires_at = None
+            claim.completed_at = datetime.now(UTC)
+            claim.updated_at = datetime.now(UTC)
+        return HttpCommandResult(
+            data=data,
+            status_code=status_code,
+            message=message,
+            replayed=True,
+        )
 
     async def _expire_claim(self, claim_id: uuid.UUID) -> bool:
         async with self._factory() as db, db.begin():
@@ -366,7 +440,7 @@ class HttpCommandExecutor:
             claim.status = "completed"
             claim.http_status = status_code
             claim.response_payload = {"data": data, "message": message}
-            claim.error_payload = None
+            claim.error_payload = cast(Any, sql_null())
             claim.lease_expires_at = None
             claim.completed_at = datetime.now(UTC)
             claim.updated_at = datetime.now(UTC)
@@ -383,7 +457,7 @@ class HttpCommandExecutor:
             claim.status = "failed"
             claim.http_status = int(error_payload.get("status_code") or 500)
             claim.error_payload = error_payload
-            claim.response_payload = None
+            claim.response_payload = cast(Any, sql_null())
             claim.lease_expires_at = None
             claim.completed_at = datetime.now(UTC)
             claim.updated_at = datetime.now(UTC)
