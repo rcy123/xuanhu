@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -628,18 +629,40 @@ class TestValidateTheoryCase:
         deid_blockers = [b for b in blockers if "deidentified" in b.get("field", "") or "脱敏" in b.get("message", "")]
         assert len(deid_blockers) == 0
 
-    def test_case_with_real_name_flagged(self):
-        """包含疑似真实姓名的医案应标记 blocker。"""
+    def test_generic_patient_phrasing_is_not_treated_as_a_name(self):
+        """临床叙述中的通用“患者”措辞不应被误判为姓名。"""
         item = _sample_case_ok()
-        item["content"] = "患者张伟，男，35岁，主诉头痛。"
+        item["content"] = "患者：男，35岁。患者家属诉头痛，患者忌食寒凉。"
         item["metadata"]["deidentified"] = True
         issues = validate_theory_case(item, 0)
         blockers = [x for x in issues if x["level"] == "blocker"]
-        # 如果 deidentified 为 True 但内容包含真实姓名，仍应检查
-        # 注意：当前实现的 PII 检查基于正则，可能不会捕获所有情况
-        # 但 deidentified=True 时应通过
-        deid_blockers = [b for b in blockers if "deidentified" in b.get("field", "") or "脱敏" in b.get("message", "")]
-        assert len(deid_blockers) == 0  # deidentified=True
+        assert blockers == []
+
+    @pytest.mark.parametrize(
+        ("content", "expected_code", "secret"),
+        [
+            ("患者姓名：张伟，主诉头痛。", "labeled_name", "张伟"),
+            ("联系电话：13800138000，主诉头痛。", "mobile_phone", "13800138000"),
+            ("身份证号：110101199001011234，主诉头痛。", "national_id", "110101199001011234"),
+            ("病历号：ABC-123，主诉头痛。", "record_identifier", "ABC-123"),
+        ],
+    )
+    def test_explicit_direct_identifier_is_blocked_without_echoing_value(
+        self,
+        content,
+        expected_code,
+        secret,
+    ):
+        item = _sample_case_ok()
+        item["content"] = content
+        item["metadata"]["deidentified"] = True
+
+        issues = validate_theory_case(item, 0)
+        blockers = [x for x in issues if x["level"] == "blocker"]
+
+        assert len(blockers) == 1
+        assert blockers[0]["indicator_counts"][expected_code] >= 1
+        assert secret not in json.dumps(blockers, ensure_ascii=False)
 
 
 # ===================================================================

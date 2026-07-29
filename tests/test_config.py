@@ -88,6 +88,7 @@ def test_load_with_defaults(monkeypatch) -> None:
     """未设置的可选字段应使用默认值。"""
     for key, value in REQUIRED_ENV.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MILVUS_COLLECTION", raising=False)
 
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
@@ -97,12 +98,24 @@ def test_load_with_defaults(monkeypatch) -> None:
     assert settings.api_port == 8000
     assert settings.milvus_host == "localhost"
     assert settings.milvus_port == 19530
+    assert settings.milvus_collection == "xuanhu_knowledge_v3"
     assert settings.model_gateway_timeout_seconds == 60
     assert settings.model_gateway_max_retries == 2
     assert settings.model_gateway_route_profile == "default"
     assert settings.rag_top_k_vector == 12
     assert settings.agent_max_retries == 2
     assert settings.event_dedupe_ttl_seconds == 86_400
+
+
+def test_milvus_collection_environment_override(monkeypatch) -> None:
+    """显式运行时配置应覆盖代码默认 collection。"""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MILVUS_COLLECTION", "runtime_override")
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.milvus_collection == "runtime_override"
 
 
 # ---------------------------------------------------------------------------

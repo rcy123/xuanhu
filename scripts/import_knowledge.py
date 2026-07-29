@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -44,6 +45,24 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VALID_PREGNANCY = {"forbidden", "caution", "none"}
 VALID_CONVERSION_TYPE = {"standard", "fixed", "herb_specific", "unsupported"}
 VALID_ENTRY_TYPE = {"theory", "case"}
+
+CASE_PII_PATTERNS: dict[str, re.Pattern[str]] = {
+    "national_id": re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
+    "mobile_phone": re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
+    "email": re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b"),
+    "labeled_name": re.compile(r"(?:患者姓名|姓名)\s*[:：=]\s*[^\s，,；;。]{2,20}"),
+    "labeled_address": re.compile(
+        r"(?:家庭住址|现住址|住址|家庭地址)\s*[:：=]\s*[^；;。\n]{4,100}"
+    ),
+    "labeled_phone": re.compile(
+        r"(?:联系电话|联系方式|手机号|手机|电话)\s*[:：=]\s*[0-9+\-\s]{7,25}"
+    ),
+    "record_identifier": re.compile(
+        r"(?:病历|病案|病例|住院|门诊|就诊|档案|挂号|患者)(?:号|编号)"
+        r"\s*(?:(?:[:：=＃#]|为|是)\s*)?"
+        r"(?!\[REDACTED_RECORD_ID\])[A-Za-z0-9][A-Za-z0-9._/\-]{2,}"
+    ),
+}
 
 LIANG_GRAMS = 30.0
 QIAN_GRAMS = 3.0
@@ -480,29 +499,23 @@ def _check_case_deidentification(item: dict[str, Any], index: int) -> list[dict[
         issues.append({
             "level": "blocker", "field": "metadata.deidentified", "index": index,
             "message": "医案缺少 deidentified 标记，疑似未脱敏",
-            "title": title,
         })
 
-    # PII 检测：姓名、身份证号、手机号、具体地址
-    pii_indicators: list[str] = []
-    if "患者：" in content and any(
-        c in content for c in ["，", "。", "男", "女"]
-    ):
-        # 检查是否仅包含 "患者X" 这种模式（模拟数据模式）
-        import re
-        # 检查是否有看起来像真实姓名的模式（非患者A/B/C/D/E模式）
-        name_matches = re.findall(r"患者([^，。A-Za-z]+)", content)
-        for nm in name_matches:
-            nm = nm.strip()
-            if len(nm) >= 2 and nm not in ("A", "B", "C", "D", "E") and not nm[0].isascii():
-                pii_indicators.append(f"疑似真实姓名: '{nm}'")
+    # 只匹配结构化、可信度较高的直接标识符，避免把“患者：男”、
+    # “患者家属诉”等临床叙述误判为姓名。问题报告仅包含规则与计数，
+    # 不回显匹配值或原文。
+    scan_text = f"{title}\n{content}"
+    indicator_counts = {
+        code: len(list(pattern.finditer(scan_text)))
+        for code, pattern in CASE_PII_PATTERNS.items()
+        if pattern.search(scan_text)
+    }
 
-    if pii_indicators:
+    if indicator_counts:
         issues.append({
             "level": "blocker", "field": "content", "index": index,
-            "message": "疑似真实患者信息: " + "; ".join(pii_indicators),
-            "title": title,
-            "indicators": pii_indicators,
+            "message": "疑似直接患者标识符（仅报告类型与计数）",
+            "indicator_counts": indicator_counts,
         })
 
     return issues

@@ -25,6 +25,7 @@ from scripts.evaluate_rag import (
     _normalize_text,
     generate_json_report,
     generate_markdown_report,
+    judge_forbidden_title_hit,
     judge_source_type_hit,
     judge_title_hit,
     judge_topic_hit,
@@ -40,7 +41,7 @@ from scripts.evaluate_rag import (
 
 def _make_ev(**kwargs: Any) -> Any:
     """创建一个与 Evidence 兼容的假对象。"""
-    defaults = {
+    defaults: dict[str, Any] = {
         "evidence_id": "ev-test-001",
         "source_type": "herb",
         "source_id": "src-001",
@@ -208,6 +209,62 @@ class TestValidateEvalQuery:
         }
         errors = validate_eval_query(q, 1)
         assert any("must_hit_titles" in e for e in errors)
+
+    def test_must_hit_titles_rejects_empty_title(self) -> None:
+        q = {
+            "query": "测试",
+            "expected_topics": ["测试"],
+            "expected_source_types": ["herb"],
+            "must_hit_titles": [""],
+        }
+        errors = validate_eval_query(q, 1)
+        assert any("must_hit_titles" in e and "非空字符串" in e for e in errors)
+
+    def test_negative_case_with_forbidden_fields_is_valid(self) -> None:
+        q = {
+            "query": "涌泉穴在哪里",
+            "expected_topics": [],
+            "expected_source_types": [],
+            "forbidden_topics": ["涌泉"],
+            "forbidden_titles": ["涌泉"],
+            "negative_case": True,
+        }
+        errors = validate_eval_query(q, 1)
+        assert errors == []
+
+    @pytest.mark.parametrize("field_name", ["forbidden_topics", "forbidden_titles"])
+    def test_forbidden_fields_must_be_lists(self, field_name: str) -> None:
+        q = {
+            "query": "测试",
+            "expected_topics": [],
+            "expected_source_types": [],
+            field_name: "不是列表",
+            "negative_case": True,
+        }
+        errors = validate_eval_query(q, 1)
+        assert any(field_name in e and "必须是 list" in e for e in errors)
+
+    @pytest.mark.parametrize("field_name", ["forbidden_topics", "forbidden_titles"])
+    def test_forbidden_fields_reject_empty_values(self, field_name: str) -> None:
+        q = {
+            "query": "测试",
+            "expected_topics": [],
+            "expected_source_types": [],
+            field_name: [""],
+            "negative_case": True,
+        }
+        errors = validate_eval_query(q, 1)
+        assert any(field_name in e and "非空字符串" in e for e in errors)
+
+    def test_positive_query_cannot_use_forbidden_fields(self) -> None:
+        q = {
+            "query": "半夏的功效",
+            "expected_topics": ["半夏"],
+            "expected_source_types": ["herb"],
+            "forbidden_topics": ["半夏"],
+        }
+        errors = validate_eval_query(q, 1)
+        assert any("仅适用于 negative_case" in e for e in errors)
 
 
 class TestValidateEvalQueries:
@@ -421,6 +478,20 @@ class TestJudgeTitleHit:
         assert judge_title_hit([ev1, ev2], ["二陈汤", "参苓白术散"])
 
 
+class TestJudgeForbiddenTitleHit:
+    """forbidden_titles 命中判定。"""
+
+    def test_forbidden_title_hit(self) -> None:
+        hit, matched = judge_forbidden_title_hit([_make_ev(title="经穴：涌泉")], ["涌泉"])
+        assert hit
+        assert matched == ["涌泉"]
+
+    def test_forbidden_title_miss(self) -> None:
+        hit, matched = judge_forbidden_title_hit([_make_ev(title="足三里")], ["涌泉"])
+        assert not hit
+        assert matched == []
+
+
 # ---------------------------------------------------------------------------
 # FakeRetriever 测试
 # ---------------------------------------------------------------------------
@@ -468,6 +539,27 @@ class TestFakeRetriever:
 
 class TestRunEvaluation:
     """评估流程测试。"""
+
+    async def test_primary_sources_follow_positive_expectation(self) -> None:
+        fake = FakeRetriever(always_empty=True)
+        queries: list[dict[str, Any]] = [
+            {
+                "query": "太冲穴在哪里",
+                "expected_topics": ["太冲"],
+                "expected_source_types": ["acupoint"],
+            },
+            {
+                "query": "涌泉穴在哪里",
+                "expected_topics": [],
+                "expected_source_types": [],
+                "negative_case": True,
+            },
+        ]
+        await run_evaluation(queries, retriever=fake, top_k=8)
+        assert fake.call_log[0]["primary_sources"] == ["acupoint"]
+        assert fake.call_log[0]["allow_cross_source"] is False
+        assert fake.call_log[1]["primary_sources"] == sorted(VALID_SOURCE_TYPES)
+        assert fake.call_log[1]["allow_cross_source"] is True
 
     async def test_normal_query_passes(self) -> None:
         fake = FakeRetriever(responses={
@@ -552,6 +644,44 @@ class TestRunEvaluation:
         # negative_case: 有结果但无 topic/source 命中 → pass
         assert r.passed
 
+    async def test_negative_case_forbidden_topic_hit_fails(self) -> None:
+        fake = FakeRetriever(responses={
+            "川贝母的功效": [
+                _make_ev(title="止咳药材", content_snippet="川贝母清热润肺、化痰止咳。"),
+            ],
+        })
+        queries: list[dict[str, Any]] = [{
+            "query": "川贝母的功效",
+            "expected_topics": [],
+            "expected_source_types": [],
+            "forbidden_topics": ["川贝母"],
+            "negative_case": True,
+            "category": "无结果场景",
+        }]
+        result = (await run_evaluation(queries, retriever=fake)).query_results[0]
+        assert result.forbidden_topic_hit
+        assert result.forbidden_topics_matched == ["川贝母"]
+        assert not result.passed
+
+    async def test_negative_case_forbidden_title_hit_fails(self) -> None:
+        fake = FakeRetriever(responses={
+            "涌泉穴在哪里": [
+                _make_ev(title="涌泉穴", source_type="acupoint"),
+            ],
+        })
+        queries: list[dict[str, Any]] = [{
+            "query": "涌泉穴在哪里",
+            "expected_topics": [],
+            "expected_source_types": [],
+            "forbidden_titles": ["涌泉"],
+            "negative_case": True,
+            "category": "无结果场景",
+        }]
+        result = (await run_evaluation(queries, retriever=fake)).query_results[0]
+        assert result.forbidden_title_hit
+        assert result.forbidden_titles_matched == ["涌泉"]
+        assert not result.passed
+
     async def test_error_handling(self) -> None:
         fake = FakeRetriever(always_raise=RuntimeError("模拟异常"))
         queries = [{
@@ -574,7 +704,7 @@ class TestRunEvaluation:
                 _make_ev(title="结果B", source_type="formula", content_snippet="柴胡"),
             ],
         })
-        queries = [
+        queries: list[dict[str, Any]] = [
             {
                 "query": "q1", "expected_topics": ["脾虚"],
                 "expected_source_types": ["herb"], "category": "测试", "notes": "",
@@ -631,7 +761,8 @@ class TestRunEvaluation:
         assert r.topic_hit
         assert r.source_type_hit
         assert not r.title_hit  # must_hit_titles 未命中
-        # 但仍然 passed（title_hit 不决定 pass，只记录）
+        assert not r.passed
+        assert report.low_recall_queries == [r]
 
     async def test_top_k_truncation(self) -> None:
         """验证 top 摘要截断到 top_k。"""
@@ -842,8 +973,9 @@ class TestJsonReport:
                 QueryEvalResult(
                     index=1, query="q1", category="测试", notes="",
                     expected_topics=["test"], expected_source_types=["herb"],
+                    must_hit_titles=["结果1"],
                     total_returned=1, has_results=True,
-                    topic_hit=True, source_type_hit=True, passed=True,
+                    topic_hit=True, source_type_hit=True, title_hit=True, passed=True,
                 ),
             ],
         )
@@ -852,6 +984,8 @@ class TestJsonReport:
         assert data["metrics"]["pass_rate"] == 1.0
         assert len(data["query_results"]) == 1
         assert data["query_results"][0]["passed"] is True
+        assert data["query_results"][0]["must_hit_titles"] == ["结果1"]
+        assert data["query_results"][0]["title_hit"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +1033,7 @@ class TestFullPipeline:
     async def test_full_pipeline_with_fake_retriever(self) -> None:
         """端到端测试：从 JSON 文件到报告。"""
         # 构造临时评估集
-        queries = [
+        queries: list[dict[str, Any]] = [
             {
                 "query": "脾虚湿困用什么方？",
                 "expected_topics": ["脾虚", "参苓白术散"],

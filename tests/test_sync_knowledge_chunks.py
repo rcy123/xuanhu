@@ -13,17 +13,21 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from scripts.sync_knowledge_chunks import (
+    EMBED_BATCH_SIZE,
     MAX_ERROR_SUMMARY_LENGTH,
     ChunkBuilder,
     ConsistencyResult,
     VectorSyncer,
     VectorSyncStats,
+    _build_parser,
     _sanitize_error,
+    _validate_reindex_args,
     check_consistency,
     check_consistency_with_retry,
     compute_content_hash,
@@ -363,6 +367,34 @@ class TestVectorSyncer:
         ok = await syncer.ensure_collection()
         assert ok is False
 
+    async def test_reindex_all_accepts_confirmed_empty_collection(self, syncer, mock_milvus):
+        """全量重建可复用能够明确确认为空的 collection。"""
+        mock_milvus.get_collection_stats.return_value = {"row_count": "0"}
+
+        ok = await syncer.ensure_collection(require_empty=True)
+
+        assert ok is True
+        mock_milvus.get_collection_stats.assert_called_once_with(collection_name="xuanhu_knowledge")
+
+    async def test_reindex_all_rejects_nonempty_collection(self, syncer, mock_milvus):
+        """全量重建拒绝写入已有数据的 collection。"""
+        mock_milvus.get_collection_stats.return_value = {"row_count": 2}
+
+        ok = await syncer.ensure_collection(require_empty=True)
+
+        assert ok is False
+        mock_milvus.describe_collection.assert_not_called()
+        mock_milvus.insert.assert_not_called()
+
+    async def test_reindex_all_fails_closed_when_collection_size_is_unknown(self, syncer, mock_milvus):
+        """无法确认 row_count 时拒绝全量重建。"""
+        mock_milvus.get_collection_stats.return_value = {}
+
+        ok = await syncer.ensure_collection(require_empty=True)
+
+        assert ok is False
+        mock_milvus.insert.assert_not_called()
+
     @patch("app.core.gateway.ModelGatewayClient")
     async def test_sync_pending_batch_success(self, mock_gateway_cls, syncer, mock_milvus):
         """成功同步 pending chunk。"""
@@ -384,6 +416,27 @@ class TestVectorSyncer:
         assert stats.chunks_embedded == 1
         assert stats.chunks_failed == 0
         assert stats.vectors_inserted == 1
+
+    @patch("app.core.gateway.ModelGatewayClient")
+    async def test_embedding_requests_respect_provider_batch_limit(
+        self,
+        mock_gateway_cls,
+        syncer,
+    ):
+        """text-embedding-v4 的每次请求不得超过提供方规定的 10 条。"""
+        mock_client = AsyncMock()
+
+        async def embed_batch(texts, **_kwargs):
+            return [[0.1] * 768 for _ in texts]
+
+        mock_client.embed = AsyncMock(side_effect=embed_batch)
+        mock_gateway_cls.return_value = mock_client
+
+        embeddings = await syncer._embed_batch([f"text-{index}" for index in range(21)])
+
+        assert EMBED_BATCH_SIZE == 10
+        assert len(embeddings) == 21
+        assert [len(call.args[0]) for call in mock_client.embed.await_args_list] == [10, 10, 1]
 
     @patch("app.core.gateway.ModelGatewayClient")
     async def test_sync_pending_batch_dry_run(self, mock_gateway_cls, syncer, mock_milvus):
@@ -455,6 +508,146 @@ class TestVectorSyncer:
         stats = await syncer.sync_pending_batch([])
         assert stats.chunks_pending == 0
         assert stats.chunks_embedded == 0
+
+    @patch("app.core.gateway.ModelGatewayClient")
+    async def test_reindex_batch_does_not_update_pg_status(
+        self,
+        mock_gateway_cls,
+        syncer,
+        mock_milvus,
+    ):
+        """全量重建成功写入向量，但不改写 PG embedding 状态。"""
+        mock_client = AsyncMock()
+        mock_client.embed = AsyncMock(return_value=[[0.1] * 768])
+        mock_gateway_cls.return_value = mock_client
+        mark_done = AsyncMock()
+        mark_failed = AsyncMock()
+        syncer._mark_chunks_done = mark_done
+        syncer._mark_chunks_failed = mark_failed
+        chunks = [{
+            "id": uuid.uuid4(),
+            "source_type": "herb",
+            "source_id": str(uuid.uuid4()),
+            "title": "人参",
+            "content": "人参，味甘微寒。",
+            "content_hash": compute_content_hash("herb", "s1", "人参，味甘微寒。"),
+        }]
+
+        stats = await syncer.sync_pending_batch(chunks, update_pg_status=False)
+
+        assert stats.chunks_embedded == 1
+        mock_milvus.insert.assert_called_once()
+        mark_done.assert_not_awaited()
+        mark_failed.assert_not_awaited()
+
+    @patch("app.core.gateway.ModelGatewayClient")
+    async def test_reindex_embedding_failure_does_not_mark_pg_failed(
+        self,
+        mock_gateway_cls,
+        syncer,
+    ):
+        """全量重建的 embedding 失败也不改变原 PG 状态。"""
+        mock_client = AsyncMock()
+        mock_client.embed = AsyncMock(side_effect=RuntimeError("embedding unavailable"))
+        mock_gateway_cls.return_value = mock_client
+        mark_failed = AsyncMock()
+        syncer._mark_chunks_failed = mark_failed
+        chunks = [{
+            "id": uuid.uuid4(),
+            "source_type": "herb",
+            "source_id": str(uuid.uuid4()),
+            "title": "人参",
+            "content": "人参，味甘微寒。",
+            "content_hash": compute_content_hash("herb", "s1", "人参，味甘微寒。"),
+        }]
+
+        stats = await syncer.sync_pending_batch(chunks, update_pg_status=False)
+
+        assert stats.chunks_failed == 1
+        mark_failed.assert_not_awaited()
+
+    async def test_reindex_query_selects_all_active_statuses(self, syncer, mock_session_factory):
+        """全量重建查询 pending/done/failed，并关闭 PG 状态回写。"""
+        session = mock_session_factory.return_value.__aenter__.return_value
+        chunks = [
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                source_type="herb",
+                source_id=uuid.uuid4(),
+                title="人参",
+                content="pending",
+                content_hash="a" * 64,
+            ),
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                source_type="herb",
+                source_id=uuid.uuid4(),
+                title="黄芪",
+                content="done",
+                content_hash="b" * 64,
+            ),
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                source_type="herb",
+                source_id=uuid.uuid4(),
+                title="白术",
+                content="failed",
+                content_hash="c" * 64,
+            ),
+        ]
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = chunks
+        session.execute.return_value = result
+        sync_batch = AsyncMock(return_value=VectorSyncStats(source_type="batch", chunks_pending=3))
+        syncer.sync_pending_batch = sync_batch
+
+        await syncer._sync_for_type("herb", reindex_all=True)
+
+        stmt = session.execute.await_args.args[0]
+        assert ["pending", "done", "failed"] in list(stmt.compile().params.values())
+        selected = sync_batch.await_args.args[0]
+        assert len(selected) == 3
+        assert sync_batch.await_args.kwargs["update_pg_status"] is False
+
+    async def test_finalize_reindex_promotes_pending_and_failed(self, syncer, mock_session_factory):
+        """一致性通过后的单次事务收口 pending/failed 状态。"""
+        session = mock_session_factory.return_value.__aenter__.return_value
+        execute_result = MagicMock(rowcount=2)
+        session.execute.return_value = execute_result
+
+        count = await syncer.finalize_reindex_statuses()
+
+        assert count == 2
+        session.commit.assert_awaited_once()
+        statement = session.execute.await_args.args[0]
+        compiled = statement.compile()
+        assert ["pending", "failed"] in list(compiled.params.values())
+        assert "done" in compiled.params.values()
+
+    async def test_default_query_remains_pending_only(self, syncer, mock_session_factory):
+        """未启用全量重建时仍只查询 pending，并保留 PG 状态回写。"""
+        session = mock_session_factory.return_value.__aenter__.return_value
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                source_type="herb",
+                source_id=uuid.uuid4(),
+                title="人参",
+                content="pending",
+                content_hash="a" * 64,
+            ),
+        ]
+        session.execute.return_value = result
+        sync_batch = AsyncMock(return_value=VectorSyncStats(source_type="batch", chunks_pending=1))
+        syncer.sync_pending_batch = sync_batch
+
+        await syncer._sync_for_type("herb")
+
+        stmt = session.execute.await_args.args[0]
+        assert "pending" in stmt.compile().params.values()
+        assert ["pending", "done", "failed"] not in list(stmt.compile().params.values())
+        assert sync_batch.await_args.kwargs["update_pg_status"] is True
 
     @patch("app.core.gateway.ModelGatewayClient")
     async def test_delete_old_vectors_before_insert(self, mock_gateway_cls, syncer, mock_milvus):
@@ -923,7 +1116,7 @@ class TestEmbeddingGatewayConfig:
         mock_settings.embedding_model = "test-emb"
         mock_settings.embedding_dim = 768
         mock_settings.milvus_collection = "test"
-        mock_settings.embedding_gateway_base_url = "https://embed.example.com/v1"
+        mock_settings.embedding_gateway_base_url = "https://embed.example.com/v1/embeddings/"
         mock_settings.embedding_gateway_api_key = "sk-embed-key"
         mock_settings.embedding_gateway_timeout_seconds = 0
         mock_settings.embedding_gateway_max_retries = 3
@@ -1097,6 +1290,91 @@ class TestConsistencyRetry:
 
 class TestCLIExitCodes:
     """验证 CLI 在异常情况下返回非 0 退出码。"""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--reindex-all", "--target-collection", "xuanhu_reindex_v2"],
+            ["--build-chunks", "--reindex-all", "--target-collection", "xuanhu_reindex_v2"],
+            ["--sync-vectors", "--reindex-all"],
+            ["--sync-vectors", "--reindex-all", "--target-collection", "xuanhu_reindex_v2"],
+            ["--sync-vectors", "--target-collection", "xuanhu_reindex_v2"],
+            ["--all", "--reindex-all", "--target-collection", "xuanhu_reindex_v2", "--limit", "1"],
+            ["--all", "--reindex-all", "--target-collection", "xuanhu_reindex_v2", "--dry-run"],
+        ],
+    )
+    def test_reindex_cli_rejects_unsafe_combinations(self, argv):
+        parser = _build_parser()
+        args = parser.parse_args(argv)
+
+        with pytest.raises(SystemExit):
+            _validate_reindex_args(parser, args)
+
+    @patch("scripts.sync_knowledge_chunks.check_consistency_with_retry")
+    @patch("scripts.sync_knowledge_chunks.ChunkBuilder")
+    @patch("scripts.sync_knowledge_chunks.get_session_factory")
+    @patch("scripts.sync_knowledge_chunks.VectorSyncer")
+    @patch("scripts.sync_knowledge_chunks._create_milvus_client")
+    @patch("scripts.sync_knowledge_chunks._get_settings_safe")
+    async def test_reindex_cli_wires_explicit_empty_target(
+        self,
+        mock_settings,
+        mock_milvus,
+        mock_syncer_cls,
+        mock_session_factory,
+        mock_builder_cls,
+        mock_consistency,
+    ):
+        """CLI 将显式目标、安全空集检查和全量查询模式接入同步器。"""
+        mock_settings.return_value = MagicMock(
+            milvus_collection="xuanhu_knowledge",
+            milvus_host="localhost",
+            milvus_port=19530,
+        )
+        mock_milvus.return_value = MagicMock()
+        syncer = AsyncMock()
+        syncer.ensure_collection.return_value = True
+        syncer.sync_all.return_value = {}
+        syncer.finalize_reindex_statuses.return_value = 2
+        mock_syncer_cls.return_value = syncer
+        builder = AsyncMock()
+        builder.build_all.return_value = {}
+        mock_builder_cls.return_value = builder
+        mock_consistency.return_value = ConsistencyResult(
+            pg_done_chunks=2,
+            milvus_vectors=2,
+            matched=2,
+        )
+
+        from scripts.sync_knowledge_chunks import _main
+
+        with patch(
+            "sys.argv",
+            [
+                "sync_knowledge_chunks.py",
+                "--all",
+                "--reindex-all",
+                "--target-collection",
+                "xuanhu_reindex_v2",
+            ],
+        ):
+            rc = await _main()
+
+        assert rc == 0
+        mock_syncer_cls.assert_called_once_with(
+            mock_session_factory.return_value,
+            mock_milvus.return_value,
+            collection_name="xuanhu_reindex_v2",
+        )
+        syncer.ensure_collection.assert_awaited_once_with(require_empty=True)
+        syncer.sync_all.assert_awaited_once_with(
+            source_type=None,
+            limit=None,
+            dry_run=False,
+            reindex_all=True,
+        )
+        syncer.finalize_reindex_statuses.assert_awaited_once_with()
+        assert mock_consistency.await_count == 2
 
     @patch("scripts.sync_knowledge_chunks.get_session_factory")
     @patch("scripts.sync_knowledge_chunks._create_milvus_client")

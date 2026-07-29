@@ -16,7 +16,8 @@
 - 使用 app.rag.RAGRetriever 执行检索
 - 对每条 query 记录 top-k Evidence 详情
 - 通过关键词模糊匹配判定 topic 和 source_type 命中
-- 对 negative_case query 判定"无结果"为 pass
+- 对 negative_case query 判定 forbidden_topics / forbidden_titles 均未命中为 pass
+- must_hit_titles 非空时作为正向 query 的强制通过条件
 """
 
 from __future__ import annotations
@@ -78,6 +79,8 @@ class QueryEvalResult:
     expected_topics: list[str] = field(default_factory=list)
     expected_source_types: list[str] = field(default_factory=list)
     must_hit_titles: list[str] = field(default_factory=list)
+    forbidden_topics: list[str] = field(default_factory=list)
+    forbidden_titles: list[str] = field(default_factory=list)
     negative_case: bool = False
 
     # 检索结果
@@ -90,10 +93,14 @@ class QueryEvalResult:
     topic_hit: bool = False
     source_type_hit: bool = False
     title_hit: bool = False  # must_hit_titles 命中
+    forbidden_topic_hit: bool = False
+    forbidden_title_hit: bool = False
     topics_matched: list[str] = field(default_factory=list)
     source_types_matched: list[str] = field(default_factory=list)
+    forbidden_topics_matched: list[str] = field(default_factory=list)
+    forbidden_titles_matched: list[str] = field(default_factory=list)
 
-    # 综合判定（对 negative_case：无结果 = pass）
+    # 综合判定（negative_case：禁止项均未命中 = pass）
     passed: bool = False
 
 
@@ -205,6 +212,25 @@ def judge_title_hit(
             if _normalize_text(required) in _normalize_text(ev_title):
                 return True
     return False
+
+
+def judge_forbidden_title_hit(
+    evidences: list[Any],
+    forbidden_titles: list[str],
+) -> tuple[bool, list[str]]:
+    """判定 top-k Evidence 是否命中任一禁止标题。"""
+
+    if not forbidden_titles:
+        return False, []
+
+    matched: list[str] = []
+    for ev in evidences:
+        ev_title = _normalize_text(getattr(ev, "title", ""))
+        for forbidden in forbidden_titles:
+            normalized_forbidden = _normalize_text(forbidden)
+            if normalized_forbidden and normalized_forbidden in ev_title and forbidden not in matched:
+                matched.append(forbidden)
+    return len(matched) > 0, matched
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +351,8 @@ async def run_evaluation(
         expected_topics = q.get("expected_topics", [])
         expected_source_types = q.get("expected_source_types", [])
         must_hit_titles = q.get("must_hit_titles", [])
+        forbidden_topics = q.get("forbidden_topics", [])
+        forbidden_titles = q.get("forbidden_titles", [])
         negative_case = q.get("negative_case", False)
         notes = q.get("notes", "")
         category = q.get("category", "未分类")
@@ -337,16 +365,27 @@ async def run_evaluation(
             expected_topics=expected_topics,
             expected_source_types=expected_source_types,
             must_hit_titles=must_hit_titles,
+            forbidden_topics=forbidden_topics,
+            forbidden_titles=forbidden_titles,
             negative_case=negative_case,
         )
 
         # 执行检索
         try:
-            # 对于评估，使用 allow_cross_source=True 覆盖所有知识类型
+            # 正向 query 将期望类型作为主来源以获得对应检索权重；
+            # negative_case 或无类型期望时覆盖全部知识类型。
+            primary_sources = (
+                expected_source_types
+                if not negative_case and expected_source_types
+                else sorted(VALID_SOURCE_TYPES)
+            )
+            # 单一来源验收模拟路由器已经明确选库的场景，避免全库候选截断
+            # 在来源优先级生效前挤掉目标类型；多来源和负向查询仍覆盖全库。
+            allow_cross_source = negative_case or len(primary_sources) != 1
             evidences = await retriever.retrieve(
                 query=query_text,
-                primary_sources=list(VALID_SOURCE_TYPES),
-                allow_cross_source=True,
+                primary_sources=primary_sources,
+                allow_cross_source=allow_cross_source,
                 top_k=top_k,
             )
         except Exception as exc:
@@ -386,11 +425,19 @@ async def run_evaluation(
             expected_source_types,
         )
         result.title_hit = judge_title_hit(evidences[:top_k], must_hit_titles)
+        result.forbidden_topic_hit, result.forbidden_topics_matched = judge_topic_hit(
+            evidences[:top_k],
+            forbidden_topics,
+        )
+        result.forbidden_title_hit, result.forbidden_titles_matched = judge_forbidden_title_hit(
+            evidences[:top_k],
+            forbidden_titles,
+        )
 
         # 综合 pass/fail 判定
         if negative_case:
-            # 无结果场景：无结果 = pass；有结果但无 topic 命中也 = pass
-            result.passed = not result.has_results or (not result.topic_hit and not result.source_type_hit)
+            # 负向场景允许向量检索返回无关结果，但任一明确禁止 topic/title 命中即失败。
+            result.passed = not result.forbidden_topic_hit and not result.forbidden_title_hit
         else:
             # 正常场景：topic 命中 or source_type 命中即可 pass（宽松判定）
             # 如果两者都有期望，则两者都需命中
@@ -405,6 +452,9 @@ async def run_evaluation(
             else:
                 # 无期望的 query（不应该出现）
                 result.passed = True
+
+            if must_hit_titles:
+                result.passed = result.passed and result.title_hit
 
         report.query_results.append(result)
 
@@ -516,6 +566,9 @@ def generate_markdown_report(report: EvalReport) -> str:
         lines.append(
             f"- **期望 source_type**: {', '.join(r.expected_source_types) if r.expected_source_types else '(无 — negative_case)'}"
         )
+        if r.negative_case:
+            lines.append(f"- **禁止 topic**: {', '.join(r.forbidden_topics) if r.forbidden_topics else '(未配置)'}")
+            lines.append(f"- **禁止 title**: {', '.join(r.forbidden_titles) if r.forbidden_titles else '(未配置)'}")
         lines.append(f"- **negative_case**: {r.negative_case}")
         lines.append(f"- **备注**: {r.notes}")
         lines.append("")
@@ -535,6 +588,17 @@ def generate_markdown_report(report: EvalReport) -> str:
         )
         if r.must_hit_titles:
             lines.append(f"- **title_hit (must_hit_titles)**: {r.title_hit}")
+        if r.negative_case:
+            lines.append(
+                "- **forbidden_topic_hit**: "
+                f"{r.forbidden_topic_hit}（匹配: "
+                f"{', '.join(r.forbidden_topics_matched) if r.forbidden_topics_matched else '无'}）"
+            )
+            lines.append(
+                "- **forbidden_title_hit**: "
+                f"{r.forbidden_title_hit}（匹配: "
+                f"{', '.join(r.forbidden_titles_matched) if r.forbidden_titles_matched else '无'}）"
+            )
         lines.append("")
 
         lines.append("**Top Evidence 摘要**:")
@@ -649,6 +713,15 @@ def generate_json_report(report: EvalReport) -> dict[str, Any]:
                 "topics_matched": r.topics_matched,
                 "source_type_hit": r.source_type_hit,
                 "source_types_matched": r.source_types_matched,
+                "must_hit_titles": r.must_hit_titles,
+                "title_hit": r.title_hit,
+                "negative_case": r.negative_case,
+                "forbidden_topics": r.forbidden_topics,
+                "forbidden_titles": r.forbidden_titles,
+                "forbidden_topic_hit": r.forbidden_topic_hit,
+                "forbidden_title_hit": r.forbidden_title_hit,
+                "forbidden_topics_matched": r.forbidden_topics_matched,
+                "forbidden_titles_matched": r.forbidden_titles_matched,
                 "passed": r.passed,
                 "error": r.error,
             }
@@ -852,6 +925,27 @@ def validate_eval_query(q: dict[str, Any], index: int) -> list[str]:
     must_hit = q.get("must_hit_titles", [])
     if not isinstance(must_hit, list):
         errors.append(f"{prefix}: 'must_hit_titles' 必须是 list")
+    else:
+        for title in must_hit:
+            if not isinstance(title, str) or not title.strip():
+                errors.append(f"{prefix}: 'must_hit_titles' 中的元素必须是非空字符串")
+
+    # forbidden_* 为兼容扩展字段：旧 query 可省略，negative_case 可显式声明禁止命中项。
+    forbidden_topics = q.get("forbidden_topics", [])
+    forbidden_titles = q.get("forbidden_titles", [])
+    for field_name, values in (
+        ("forbidden_topics", forbidden_topics),
+        ("forbidden_titles", forbidden_titles),
+    ):
+        if not isinstance(values, list):
+            errors.append(f"{prefix}: '{field_name}' 必须是 list")
+            continue
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"{prefix}: '{field_name}' 中的元素必须是非空字符串")
+
+    if not negative and (forbidden_topics or forbidden_titles):
+        errors.append(f"{prefix}: forbidden_topics/forbidden_titles 仅适用于 negative_case")
 
     return errors
 

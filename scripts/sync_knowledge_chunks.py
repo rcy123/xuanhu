@@ -4,6 +4,7 @@
 
     uv run python -m scripts.sync_knowledge_chunks --build-chunks
     uv run python -m scripts.sync_knowledge_chunks --sync-vectors
+    uv run python -m scripts.sync_knowledge_chunks --all --reindex-all --target-collection xuanhu_knowledge_v2
     uv run python -m scripts.sync_knowledge_chunks --all
     uv run python -m scripts.sync_knowledge_chunks --all --source-type herbs --limit 5
     uv run python -m scripts.sync_knowledge_chunks --all --dry-run
@@ -32,9 +33,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import String, cast, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.embedding_gateway import build_embedding_gateway_settings
 from app.db.session import get_session_factory
 
 # ---------------------------------------------------------------------------
@@ -49,7 +51,8 @@ CHUNK_SIZE_MIN = 500
 CHUNK_SIZE_MAX = 800
 CHUNK_OVERLAP_MIN = 50
 CHUNK_OVERLAP_MAX = 100
-EMBED_BATCH_SIZE = 16
+# text-embedding-v4 的同步 API 单次最多接受 10 条文本。
+EMBED_BATCH_SIZE = 10
 
 # 一致性检查重试配置
 CONSISTENCY_RETRY_MAX = 3
@@ -515,7 +518,7 @@ class ChunkBuilder:
 
 
 class VectorSyncer:
-    """将 pending chunk 向量化并写入 Milvus。"""
+    """将 chunk 向量化并写入指定 Milvus collection。"""
 
     def __init__(
         self,
@@ -524,27 +527,34 @@ class VectorSyncer:
         *,
         embedding_model: str | None = None,
         embedding_dim: int | None = None,
+        collection_name: str | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._milvus = milvus_client
         self._settings = _get_settings_safe()
         self._embedding_model = embedding_model or self._settings.embedding_model
         self._embedding_dim = embedding_dim or self._settings.embedding_dim
+        self._collection_name = collection_name or self._settings.milvus_collection
 
     # ------------------------------------------------------------------
     # 公开入口
     # ------------------------------------------------------------------
 
-    async def ensure_collection(self) -> bool:
+    async def ensure_collection(self, *, require_empty: bool = False) -> bool:
         """创建或验证 Milvus collection。
 
         若 collection 已存在则验证维度一致；否则按 EMBEDDING_DIM 创建。
+        ``require_empty=True`` 时对已有 collection 额外执行 fail-closed 空集检查，
+        用于安全的全量重建，避免覆盖已有向量。
         返回 True 表示 collection 可用。
         """
-        collection_name = self._settings.milvus_collection
+        collection_name = self._collection_name
         dim = self._embedding_dim
 
         if self._milvus.has_collection(collection_name):
+            if require_empty and not self._existing_collection_is_empty():
+                return False
+
             # 验证已有 collection 维度
             try:
                 desc = self._milvus.describe_collection(collection_name)
@@ -652,14 +662,41 @@ class VectorSyncer:
             logger.exception("创建 Milvus collection 失败: %s", collection_name)
             return False
 
+    def _existing_collection_is_empty(self) -> bool:
+        """Fail closed：仅在能够确认目标 collection 行数为零时返回 True。"""
+        collection_name = self._collection_name
+        try:
+            stats = self._milvus.get_collection_stats(collection_name=collection_name)
+            row_count = int(stats["row_count"])
+        except (KeyError, TypeError, ValueError):
+            logger.exception("无法确认全量重建目标 collection 是否为空: %s", collection_name)
+            return False
+        except Exception:
+            logger.exception("读取全量重建目标 collection 统计失败: %s", collection_name)
+            return False
+
+        if row_count != 0:
+            logger.error(
+                "拒绝全量重建到非空 collection: collection=%s, row_count=%d",
+                collection_name,
+                row_count,
+            )
+            return False
+        return True
+
     async def sync_all(
         self,
         *,
         source_type: str | None = None,
         limit: int | None = None,
         dry_run: bool = False,
+        reindex_all: bool = False,
     ) -> dict[str, VectorSyncStats]:
-        """同步所有 pending chunk 到 Milvus。
+        """同步 chunk 到 Milvus。
+
+        默认只同步 active pending chunk；``reindex_all=True`` 时选择 active
+        pending + done + failed chunk，且在 collection 一致性通过前不更新
+        PostgreSQL embedding 状态。
 
         Returns:
             dict[source_type, VectorSyncStats]
@@ -668,7 +705,12 @@ class VectorSyncer:
         stats: dict[str, VectorSyncStats] = {}
 
         for st in types:
-            stats[st] = await self._sync_for_type(st, limit=limit, dry_run=dry_run)
+            stats[st] = await self._sync_for_type(
+                st,
+                limit=limit,
+                dry_run=dry_run,
+                reindex_all=reindex_all,
+            )
 
         return stats
 
@@ -677,6 +719,7 @@ class VectorSyncer:
         chunks: list[dict[str, Any]],
         *,
         dry_run: bool = False,
+        update_pg_status: bool = True,
     ) -> VectorSyncStats:
         """同步一批 chunk（供测试和批量处理使用）。
 
@@ -685,6 +728,7 @@ class VectorSyncer:
         Args:
             chunks: 包含 id, source_type, source_id, title, content, content_hash 的 chunk 列表。
             dry_run: 仅统计不写入。
+            update_pg_status: 是否按同步结果更新 PostgreSQL embedding 状态。
 
         Returns:
             VectorSyncStats
@@ -708,7 +752,7 @@ class VectorSyncer:
             embeddings = await self._embed_batch(texts, dry_run=dry_run)
         except Exception as exc:
             stats.errors.append(_sanitize_error(exc))
-            if not dry_run:
+            if not dry_run and update_pg_status:
                 await self._mark_chunks_failed([c["id"] for c in chunks], _sanitize_error(exc))
             stats.chunks_failed = len(chunks)
             return stats
@@ -716,7 +760,13 @@ class VectorSyncer:
         # 逐个分组处理
         for (_st, _sid), group_chunks in groups.items():
             try:
-                group_stats = await self._sync_group(group_chunks, embeddings, texts, dry_run=dry_run)
+                group_stats = await self._sync_group(
+                    group_chunks,
+                    embeddings,
+                    texts,
+                    dry_run=dry_run,
+                    update_pg_status=update_pg_status,
+                )
                 stats.chunks_embedded += group_stats.chunks_embedded
                 stats.chunks_failed += group_stats.chunks_failed
                 stats.vectors_inserted += group_stats.vectors_inserted
@@ -747,28 +797,34 @@ class VectorSyncer:
         *,
         limit: int | None = None,
         dry_run: bool = False,
+        reindex_all: bool = False,
     ) -> VectorSyncStats:
-        """读取 pending chunk 并同步到 Milvus。"""
+        """读取选定状态的 active chunk 并同步到 Milvus。"""
         from app.models.knowledge import KnowledgeChunk
 
         stats = VectorSyncStats(source_type=source_type)
 
         async with self._session_factory() as session:
-            stmt = (
-                select(KnowledgeChunk)
-                .where(KnowledgeChunk.source_type == source_type)
-                .where(KnowledgeChunk.embedding_status == "pending")
-                .where(KnowledgeChunk.deleted_at.is_(None))
-                .order_by(KnowledgeChunk.created_at)
-            )
+            stmt = select(KnowledgeChunk).where(KnowledgeChunk.source_type == source_type)
+            if reindex_all:
+                stmt = stmt.where(
+                    KnowledgeChunk.embedding_status.in_(("pending", "done", "failed"))
+                )
+            else:
+                stmt = stmt.where(KnowledgeChunk.embedding_status == "pending")
+            stmt = stmt.where(KnowledgeChunk.deleted_at.is_(None)).order_by(KnowledgeChunk.created_at)
             if limit is not None:
                 stmt = stmt.limit(limit)
 
             result = await session.execute(stmt)
-            pending_chunks = result.scalars().all()
+            selected_chunks = result.scalars().all()
 
-            if not pending_chunks:
-                logger.info("source_type=%s: 无 pending chunk", source_type)
+            if not selected_chunks:
+                logger.info(
+                    "source_type=%s: 无%s chunk",
+                    source_type,
+                    " active pending/done/failed" if reindex_all else " pending",
+                )
                 return stats
 
             chunk_dicts = [
@@ -780,10 +836,14 @@ class VectorSyncer:
                     "content": c.content,
                     "content_hash": c.content_hash,
                 }
-                for c in pending_chunks
+                for c in selected_chunks
             ]
 
-            batch_stats = await self.sync_pending_batch(chunk_dicts, dry_run=dry_run)
+            batch_stats = await self.sync_pending_batch(
+                chunk_dicts,
+                dry_run=dry_run,
+                update_pg_status=not reindex_all,
+            )
             stats.chunks_pending = batch_stats.chunks_pending
             stats.chunks_embedded = batch_stats.chunks_embedded
             stats.chunks_failed = batch_stats.chunks_failed
@@ -800,6 +860,7 @@ class VectorSyncer:
         all_texts: list[str],
         *,
         dry_run: bool = False,
+        update_pg_status: bool = True,
     ) -> VectorSyncStats:
         """同步一组（同一 source_type + source_id）chunk。
 
@@ -810,7 +871,7 @@ class VectorSyncer:
         if not chunks:
             return stats
 
-        collection_name = self._settings.milvus_collection
+        collection_name = self._collection_name
 
         # 建立 content → embedding 映射
         content_to_embedding: dict[str, list[float]] = {}
@@ -881,11 +942,11 @@ class VectorSyncer:
                 chunk_ids_ok = []
 
         # 3. 更新 PG 状态
-        if chunk_ids_ok and not dry_run:
+        if chunk_ids_ok and not dry_run and update_pg_status:
             await self._mark_chunks_done(chunk_ids_ok)
         stats.chunks_embedded = len(chunk_ids_ok)
 
-        if chunk_ids_fail and not dry_run:
+        if chunk_ids_fail and not dry_run and update_pg_status:
             await self._mark_chunks_failed(
                 chunk_ids_fail,
                 "; ".join(stats.errors[-3:]) if stats.errors else "Milvus 写入失败",
@@ -912,35 +973,14 @@ class VectorSyncer:
         if dry_run:
             return [[0.0] * self._embedding_dim for _ in texts]
 
-        from types import SimpleNamespace
-
         from app.core.gateway import ModelGatewayClient
 
         # 读取 embedding 专用网关配置（Settings 已处理 .env + shell 环境变量优先级）
         settings = self._settings
-        embedding_gateway_url = settings.embedding_gateway_base_url or ""
-        embedding_gateway_key = settings.embedding_gateway_api_key or ""
+        gateway_settings = build_embedding_gateway_settings(settings)
 
-        if embedding_gateway_url and embedding_gateway_key:
-            # 使用 embedding 专用网关 — 构造轻量 settings 代理，不修改全局单例
-            gateway_settings = SimpleNamespace(
-                model_gateway_base_url=embedding_gateway_url.rstrip("/"),
-                model_gateway_api_key=embedding_gateway_key,
-                model_gateway_timeout_seconds=(
-                    settings.embedding_gateway_timeout_seconds
-                    if settings.embedding_gateway_timeout_seconds > 0
-                    else settings.model_gateway_timeout_seconds
-                ),
-                model_gateway_max_retries=(
-                    settings.embedding_gateway_max_retries
-                    if settings.embedding_gateway_max_retries > 0
-                    else settings.model_gateway_max_retries
-                ),
-                model_gateway_route_profile=settings.model_gateway_route_profile,
-                chat_model=settings.chat_model,
-                embedding_model=settings.embedding_model,
-                embedding_dim=settings.embedding_dim,
-            )
+        if gateway_settings is not settings:
+            # 使用 embedding 专用网关 — 轻量 settings 代理不会修改全局单例
             client = ModelGatewayClient(settings=gateway_settings)
         else:
             client = ModelGatewayClient()
@@ -1003,6 +1043,32 @@ class VectorSyncer:
                 await session.execute(stmt)
             await session.commit()
 
+    async def finalize_reindex_statuses(self) -> int:
+        """Promote active pending/failed chunks only after reindex consistency passes.
+
+        A full reindex writes to a new collection without touching PostgreSQL
+        statuses.  This final transaction makes newly indexed chunks visible to
+        the PostgreSQL full-text fallback and records the exact embedding model.
+        """
+        from app.models.knowledge import KnowledgeChunk
+
+        async with self._session_factory() as session:
+            now = datetime.now(UTC).replace(tzinfo=None)
+            stmt = (
+                update(KnowledgeChunk)
+                .where(KnowledgeChunk.deleted_at.is_(None))
+                .where(KnowledgeChunk.embedding_status.in_(("pending", "failed")))
+                .values(
+                    embedding_status="done",
+                    embedding_model=self._embedding_model,
+                    vector_id=cast(KnowledgeChunk.id, String),
+                    embedded_at=now,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(result.rowcount or 0)
+
 
 # ===================================================================
 # 一致性检查
@@ -1012,11 +1078,15 @@ class VectorSyncer:
 async def check_consistency(
     session_factory: Any,
     milvus_client: Any,
+    *,
+    collection_name: str | None = None,
+    reindex_all: bool = False,
 ) -> ConsistencyResult:
     """检查 PG knowledge_chunks 与 Milvus 的一致性。
 
-    - PG 中 embedding_status='done' 的 active chunk 必须在 Milvus 存在对应 vector_id。
-    - Milvus 中不应存在 PG 已删除或不是 done 状态的 orphan 向量。
+    - 默认要求 PG active done chunk 与 Milvus 对应。
+    - 全量重建时要求 PG 所有 active chunk 与目标 collection 对应。
+    - Milvus 中不应存在不在对应 PG 选择集内的 orphan 向量。
 
     Returns:
         ConsistencyResult
@@ -1024,16 +1094,19 @@ async def check_consistency(
     from app.models.knowledge import KnowledgeChunk
 
     settings = _get_settings_safe()
-    collection_name = settings.milvus_collection
+    selected_collection = collection_name or settings.milvus_collection
     result = ConsistencyResult()
 
-    # 1. 获取 PG 中所有 done chunk
+    # 1. 获取 PG 中所有目标 chunk
     async with session_factory() as session:
-        stmt = (
-            select(KnowledgeChunk.vector_id, KnowledgeChunk.id, KnowledgeChunk.source_type)
-            .where(KnowledgeChunk.embedding_status == "done")
-            .where(KnowledgeChunk.deleted_at.is_(None))
-        )
+        stmt = select(KnowledgeChunk.vector_id, KnowledgeChunk.id, KnowledgeChunk.source_type)
+        if reindex_all:
+            stmt = stmt.where(
+                KnowledgeChunk.embedding_status.in_(("pending", "done", "failed"))
+            )
+        else:
+            stmt = stmt.where(KnowledgeChunk.embedding_status == "done")
+        stmt = stmt.where(KnowledgeChunk.deleted_at.is_(None))
         rows = await session.execute(stmt)
         pg_done: dict[str, dict[str, Any]] = {}
         for row in rows.all():
@@ -1046,8 +1119,8 @@ async def check_consistency(
         result.pg_done_chunks = len(pg_done)
 
     # 2. 查询 Milvus 中所有向量
-    if not milvus_client.has_collection(collection_name):
-        result.errors.append(f"Milvus collection 不存在: {collection_name}")
+    if not milvus_client.has_collection(selected_collection):
+        result.errors.append(f"Milvus collection 不存在: {selected_collection}")
         return result
 
     try:
@@ -1057,7 +1130,7 @@ async def check_consistency(
         page_size = 1000
         while True:
             query_result = milvus_client.query(
-                collection_name=collection_name,
+                collection_name=selected_collection,
                 filter="vector_id != ''",
                 output_fields=["vector_id", "chunk_id", "source_type"],
                 offset=offset,
@@ -1096,6 +1169,8 @@ async def check_consistency_with_retry(
     *,
     max_retries: int = CONSISTENCY_RETRY_MAX,
     retry_delay: float = CONSISTENCY_RETRY_DELAY_SECONDS,
+    collection_name: str | None = None,
+    reindex_all: bool = False,
 ) -> ConsistencyResult:
     """带重试的 PG ↔ Milvus 一致性检查。
 
@@ -1107,18 +1182,20 @@ async def check_consistency_with_retry(
         milvus_client: Milvus 客户端。
         max_retries: 最大重试次数（首次尝试 + N 次重试）。
         retry_delay: 重试间隔（秒）。
+        collection_name: 显式目标 collection；默认使用 Settings。
+        reindex_all: 是否按 active pending + done 口径检查。
 
     Returns:
         ConsistencyResult — 首次一致或最终重试结果。
     """
     settings = _get_settings_safe()
-    collection_name = settings.milvus_collection
+    selected_collection = collection_name or settings.milvus_collection
 
     for attempt in range(max_retries + 1):
         if attempt > 0:
             # 重试前 flush collection 确保数据可见
             with contextlib.suppress(Exception):
-                milvus_client.flush(collection_name=collection_name)
+                milvus_client.flush(collection_name=selected_collection)
             logger.info(
                 "一致性检查重试 %d/%d（等待 %.1f 秒）...",
                 attempt,
@@ -1127,7 +1204,15 @@ async def check_consistency_with_retry(
             )
             await asyncio.sleep(retry_delay)
 
-        result = await check_consistency(session_factory, milvus_client)
+        if collection_name is None and not reindex_all:
+            result = await check_consistency(session_factory, milvus_client)
+        else:
+            result = await check_consistency(
+                session_factory,
+                milvus_client,
+                collection_name=selected_collection,
+                reindex_all=reindex_all,
+            )
 
         if result.is_consistent:
             if attempt > 0:
@@ -1235,7 +1320,37 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅统计不写入",
     )
+    parser.add_argument(
+        "--reindex-all",
+        action="store_true",
+        help="将所有 active chunk 重建到显式的新/空 collection，通过一致性检查后再更新 PG 状态",
+    )
+    parser.add_argument(
+        "--target-collection",
+        type=str,
+        default=None,
+        help="--reindex-all 的显式目标 Milvus collection",
+    )
     return parser
+
+
+def _validate_reindex_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """校验全量重建参数，避免隐式选择或覆盖 collection。"""
+    if not args.reindex_all:
+        if args.target_collection is not None:
+            parser.error("--target-collection 只能与 --reindex-all 一起使用")
+        return
+
+    if not args.all:
+        parser.error("--reindex-all 必须与 --all 一起使用，以强制执行一致性检查和状态收口")
+    if args.target_collection is None or not args.target_collection.strip():
+        parser.error("--reindex-all 必须显式指定 --target-collection")
+    if args.source_type is not None or args.limit is not None:
+        parser.error("--reindex-all 必须处理全部 active chunk，不能与 --source-type 或 --limit 一起使用")
+    if args.dry_run:
+        parser.error("--reindex-all 不支持 --dry-run；dry-run 不得隐式创建 collection")
+
+    args.target_collection = args.target_collection.strip()
 
 
 def _normalize_source_type(raw: str | None) -> str | None:
@@ -1332,6 +1447,7 @@ async def _main() -> int:
     """主流程，返回退出码（0=成功, 1=失败）。"""
     parser = _build_parser()
     args = parser.parse_args()
+    _validate_reindex_args(parser, args)
 
     # 默认执行 --all
     if not any([args.build_chunks, args.sync_vectors, args.all, args.check_consistency]):
@@ -1374,21 +1490,41 @@ async def _main() -> int:
                 milvus_client = _create_milvus_client()
 
             print(
-                f"\n[sync-vectors] 开始向量同步 (source_type={source_type}, limit={args.limit}, dry_run={args.dry_run})"
+                "\n[sync-vectors] 开始向量同步 "
+                f"(source_type={source_type}, limit={args.limit}, dry_run={args.dry_run}, "
+                f"reindex_all={args.reindex_all}, target_collection={args.target_collection})"
             )
-            syncer = VectorSyncer(session_factory, milvus_client)
+            if args.reindex_all:
+                syncer = VectorSyncer(
+                    session_factory,
+                    milvus_client,
+                    collection_name=args.target_collection,
+                )
+            else:
+                syncer = VectorSyncer(session_factory, milvus_client)
 
             # 确保 collection 存在
-            ok = await syncer.ensure_collection()
+            if args.reindex_all:
+                ok = await syncer.ensure_collection(require_empty=True)
+            else:
+                ok = await syncer.ensure_collection()
             if not ok:
-                print("[ERROR] 无法创建或验证 Milvus collection，同步中止")
+                print("[ERROR] 无法创建或安全验证 Milvus collection，同步中止")
                 return 1
 
-            sync_stats = await syncer.sync_all(
-                source_type=source_type,
-                limit=args.limit,
-                dry_run=args.dry_run,
-            )
+            if args.reindex_all:
+                sync_stats = await syncer.sync_all(
+                    source_type=source_type,
+                    limit=args.limit,
+                    dry_run=args.dry_run,
+                    reindex_all=True,
+                )
+            else:
+                sync_stats = await syncer.sync_all(
+                    source_type=source_type,
+                    limit=args.limit,
+                    dry_run=args.dry_run,
+                )
             _print_sync_stats(sync_stats)
 
             # 检查同步是否有失败
@@ -1405,7 +1541,15 @@ async def _main() -> int:
             print("\n[check-consistency] 开始一致性检查")
             # --all 模式下使用重试机制，避免 Milvus 可见性延迟误报
             if args.all:
-                result = await check_consistency_with_retry(session_factory, milvus_client)
+                if args.reindex_all:
+                    result = await check_consistency_with_retry(
+                        session_factory,
+                        milvus_client,
+                        collection_name=args.target_collection,
+                        reindex_all=True,
+                    )
+                else:
+                    result = await check_consistency_with_retry(session_factory, milvus_client)
             else:
                 result = await check_consistency(session_factory, milvus_client)
             _print_consistency(result)
@@ -1413,6 +1557,21 @@ async def _main() -> int:
             if not result.is_consistent:
                 print("[ERROR] PG <-> Milvus 一致性检查不通过")
                 exit_code = 1
+            elif args.reindex_all and exit_code == 0:
+                # 只有新 collection 已覆盖全部 active chunk 后，才把新建或
+                # 先前失败的 chunk 晋升为 done，避免向量失败时破坏旧库可用性。
+                finalized = await syncer.finalize_reindex_statuses()
+                print(f"[reindex-finalize] PostgreSQL 状态收口完成: {finalized} chunks")
+
+                final_result = await check_consistency_with_retry(
+                    session_factory,
+                    milvus_client,
+                    collection_name=args.target_collection,
+                )
+                _print_consistency(final_result)
+                if not final_result.is_consistent:
+                    print("[ERROR] reindex 状态收口后一致性检查不通过")
+                    exit_code = 1
 
     finally:
         # 清理 Milvus 连接

@@ -51,7 +51,7 @@ def _make_settings(**overrides: Any) -> SimpleNamespace:
     defaults = {
         "milvus_host": "localhost",
         "milvus_port": 19530,
-        "milvus_collection": "xuanhu_knowledge",
+        "milvus_collection": "xuanhu_knowledge_v3",
         "model_gateway_base_url": "http://localhost:8080/v1",
         "model_gateway_api_key": "sk-test-key",
         "model_gateway_timeout_seconds": 10,
@@ -445,6 +445,29 @@ class TestBuildEmbeddingGatewaySettings:
         assert result.embedding_model == "test-embed"
         assert result.embedding_dim == 768
 
+    @pytest.mark.parametrize(
+        ("configured_url", "expected_base_url"),
+        [
+            ("http://embed-gw:8080/v1", "http://embed-gw:8080/v1"),
+            ("http://embed-gw:8080/v1/", "http://embed-gw:8080/v1"),
+            ("http://embed-gw:8080/v1/embeddings", "http://embed-gw:8080/v1"),
+            ("http://embed-gw:8080/v1/embeddings/", "http://embed-gw:8080/v1"),
+        ],
+    )
+    def test_override_accepts_base_url_or_full_endpoint(
+        self,
+        configured_url: str,
+        expected_base_url: str,
+    ) -> None:
+        settings = _make_settings(
+            embedding_gateway_base_url=configured_url,
+            embedding_gateway_api_key="sk-embed-test",
+        )
+
+        result = _build_embedding_gateway_settings(settings)
+
+        assert result.model_gateway_base_url == expected_base_url
+
     def test_override_timeout_zero_falls_back(self) -> None:
         """embedding_gateway_timeout_seconds=0 时回退到 model_gateway_timeout_seconds。"""
         settings = _make_settings(
@@ -481,7 +504,7 @@ class TestBuildEmbeddingGatewaySettings:
         """RAGRetriever 默认初始化时，gateway client 使用 _build_embedding_gateway_settings
         处理后的 settings（而非原始 settings）。"""
         settings = _make_settings(
-            embedding_gateway_base_url="http://embed-gw:8080/v1/",
+            embedding_gateway_base_url="http://embed-gw:8080/v1/embeddings/",
             embedding_gateway_api_key="sk-embed-test",
         )
 
@@ -542,7 +565,42 @@ class TestRAGRetrieverVectorSearch:
 
         assert len(hits) == 1
         assert hits[0].chunk_id == "chunk-1"
-        assert abs(hits[0].vector_score - 0.9) < 1e-6
+        assert hits[0].vector_score == pytest.approx(0.6)
+        assert mock_milvus.search.call_args.kwargs["collection_name"] == "xuanhu_knowledge_v3"
+
+    async def test_vector_search_normalizes_and_clamps_cosine_similarity(self) -> None:
+        """Milvus 的 COSINE 返回值越大得分越高，并归一化、截断到 [0, 1]。"""
+        settings = _make_settings()
+        gateway = MagicMock(spec=[])
+        gateway.embed = AsyncMock(return_value=[[0.1] * 768])
+
+        raw_similarities = [2.0, 1.0, 0.0, -1.0, -2.0]
+        mock_milvus = MagicMock()
+        mock_milvus.search.return_value = [[
+            {
+                "id": f"vec-{index}",
+                "distance": similarity,
+                "entity": {
+                    "chunk_id": f"chunk-{index}",
+                    "source_type": "herb",
+                    "source_id": f"src-{index}",
+                    "title": f"标题 {index}",
+                    "content_hash": f"hash-{index}",
+                },
+            }
+            for index, similarity in enumerate(raw_similarities)
+        ]]
+
+        retriever = RAGRetriever(
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+        )
+        hits = await retriever._vector_search("黄芪", ["herb"], top_k=5)
+
+        assert [hit.vector_score for hit in hits] == pytest.approx(
+            [1.0, 1.0, 0.5, 0.0, 0.0],
+        )
 
     async def test_vector_search_with_filters(self) -> None:
         """filters 参数传递到 Milvus filter 表达式。"""
@@ -980,10 +1038,10 @@ class TestRAGRetrieverHybridSearch:
         # chunk-ft:  低向量分(0.4), 有全文命中(1.0)
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.2,
+            [{"id": "v1", "distance": 0.8,
               "entity": {"chunk_id": "chunk-vec", "source_type": "herb",
                          "source_id": "src-1", "title": "向量高", "content_hash": "abc"}},
-             {"id": "v2", "distance": 1.2,
+             {"id": "v2", "distance": -0.2,
               "entity": {"chunk_id": "chunk-ft", "source_type": "herb",
                          "source_id": "src-2", "title": "全文高", "content_hash": "def"}}]
         ]
@@ -1039,15 +1097,15 @@ class TestRAGRetrieverHybridSearch:
         gateway = MagicMock(spec=[])
         gateway.embed = AsyncMock(return_value=[[0.1] * 768])
 
-        # Milvus: 两个命中
-        # distance=1.0 → vector_score=1-1.0/2=0.5
-        # distance=1.2 → vector_score=1-1.2/2=0.4
+        # Milvus: PyMilvus 将 COSINE 相似度放在 distance 字段中
+        # similarity=0.0 → vector_score=(0.0+1.0)/2=0.5
+        # similarity=-0.2 → vector_score=(-0.2+1.0)/2=0.4
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 1.0,
+            [{"id": "v1", "distance": 0.0,
               "entity": {"chunk_id": "chunk-vec", "source_type": "herb",
                          "source_id": "src-1", "title": "向量项", "content_hash": "abc"}},
-             {"id": "v2", "distance": 1.2,
+             {"id": "v2", "distance": -0.2,
               "entity": {"chunk_id": "chunk-ft", "source_type": "herb",
                          "source_id": "src-2", "title": "全文项", "content_hash": "def"}}]
         ]

@@ -24,6 +24,7 @@ from typing import Any
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
+from app.core.embedding_gateway import build_embedding_gateway_settings
 from app.core.gateway import ModelGatewayClient
 from app.db.session import get_session_factory
 from app.models.knowledge import KnowledgeChunk
@@ -152,36 +153,13 @@ def _build_embedding_gateway_settings(settings: Any) -> Any:
     """构建 embedding 专用 gateway settings，应用 EMBEDDING_GATEWAY_* 覆盖。
 
     当 EMBEDDING_GATEWAY_BASE_URL 和 EMBEDDING_GATEWAY_API_KEY 均配置时，
-    使用 SimpleNamespace 代理将 embedding 专用配置映射到 model_gateway_* 字段名。
+    将 embedding 专用配置映射到 model_gateway_* 字段名。URL 可填写 base URL
+    或完整的 ``/embeddings`` endpoint。
     否则回退到全局 settings。
 
     与 scripts/sync_knowledge_chunks.py _embed_batch() 中的逻辑一致。
     """
-    from types import SimpleNamespace
-
-    embedding_url = getattr(settings, "embedding_gateway_base_url", "") or ""
-    embedding_key = getattr(settings, "embedding_gateway_api_key", "") or ""
-
-    if embedding_url and embedding_key:
-        return SimpleNamespace(
-            model_gateway_base_url=embedding_url.rstrip("/"),
-            model_gateway_api_key=embedding_key,
-            model_gateway_timeout_seconds=(
-                settings.embedding_gateway_timeout_seconds
-                if getattr(settings, "embedding_gateway_timeout_seconds", 0) > 0
-                else settings.model_gateway_timeout_seconds
-            ),
-            model_gateway_max_retries=(
-                settings.embedding_gateway_max_retries
-                if getattr(settings, "embedding_gateway_max_retries", 0) > 0
-                else settings.model_gateway_max_retries
-            ),
-            model_gateway_route_profile=settings.model_gateway_route_profile,
-            chat_model=settings.chat_model,
-            embedding_model=settings.embedding_model,
-            embedding_dim=settings.embedding_dim,
-        )
-    return settings
+    return build_embedding_gateway_settings(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +413,9 @@ class RAGRetriever:
         if results and len(results) > 0:
             for item in results[0]:
                 entity = item.get("entity", item)
-                # Milvus 返回的 distance，COSINE 度量下为 [0, 2]，需归一化
-                distance = item.get("distance", 0.0)
-                # COSINE distance → similarity: score = 1 - distance/2（归一化到 [0,1]）
-                score = max(0.0, min(1.0, 1.0 - distance / 2.0))
+                # PyMilvus 将 COSINE 相似度放在 distance 字段中；值越大越相似。
+                cosine_similarity = float(item.get("distance", 0.0))
+                score = max(0.0, min(1.0, (cosine_similarity + 1.0) / 2.0))
 
                 hits.append(
                     VectorHit(

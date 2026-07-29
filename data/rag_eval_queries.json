@@ -1,0 +1,148 @@
+[
+  {
+    "query": "脾虚湿困，食少便溏，乏力，苔腻，应参考什么治法和方剂？",
+    "expected_topics": ["脾虚湿困", "健脾化湿", "参苓白术散"],
+    "expected_source_types": ["formula", "herb", "theory", "case"],
+    "notes": "主诉到证型+方剂综合检索，应覆盖多种来源类型",
+    "category": "主诉到证型"
+  },
+  {
+    "query": "情志不舒后胸胁胀痛，嗳气，脉弦，如何辨证？",
+    "expected_topics": ["肝郁气滞", "疏肝理气", "柴胡疏肝散"],
+    "expected_source_types": ["formula", "herb", "theory", "case"],
+    "notes": "主诉到证型检索，脉弦为典型肝郁体征",
+    "category": "主诉到证型"
+  },
+  {
+    "query": "恶寒发热，无汗头痛，鼻塞清涕，属于什么表证？",
+    "expected_topics": ["风寒表证", "辛温解表", "荆防败毒散"],
+    "expected_source_types": ["formula", "herb", "theory"],
+    "notes": "主诉到证型检索，风寒表证典型症状",
+    "category": "主诉到证型"
+  },
+  {
+    "query": "失眠多梦，心悸健忘，食少倦怠，可能用什么方？",
+    "expected_topics": ["心脾两虚", "补益心脾", "归脾汤"],
+    "expected_source_types": ["formula", "herb", "case"],
+    "notes": "主诉到证型+方剂检索",
+    "category": "主诉到证型"
+  },
+  {
+    "query": "咳嗽痰多，痰白易咯，胸闷苔腻，应检索哪些证据？",
+    "expected_topics": ["痰湿蕴肺", "燥湿化痰", "二陈汤"],
+    "expected_source_types": ["formula", "herb", "theory"],
+    "notes": "主诉到证型检索，痰湿咳嗽",
+    "category": "主诉到证型"
+  },
+  {
+    "query": "足三里用于脾胃虚弱时的定位和主治是什么？",
+    "expected_topics": ["足三里", "胃经", "健脾和胃"],
+    "expected_source_types": ["acupoint"],
+    "must_hit_titles": ["足三里"],
+    "notes": "穴位检索，验证 acupoint 类型检索能力",
+    "category": "穴位检索"
+  },
+  {
+    "query": "肝郁气滞证应该用什么方剂治疗？",
+    "expected_topics": ["肝郁气滞", "柴胡疏肝散", "疏肝理气"],
+    "expected_source_types": ["formula", "theory", "herb"],
+    "must_hit_titles": ["柴胡疏肝散"],
+    "notes": "证型到方剂检索，从证型名称直接查方",
+    "category": "证型到方剂"
+  },
+  {
+    "query": "脾虚湿困证适合哪个方剂？",
+    "expected_topics": ["脾虚湿困", "参苓白术散", "健脾化湿"],
+    "expected_source_types": ["formula", "theory"],
+    "must_hit_titles": ["参苓白术散"],
+    "notes": "证型到方剂检索",
+    "category": "证型到方剂"
+  },
+  {
+    "query": "半夏的功效、常用剂量及一般禁忌是什么？",
+    "expected_topics": ["半夏", "燥湿化痰", "3-9g", "禁服"],
+    "expected_source_types": ["herb"],
+    "must_hit_titles": ["半夏"],
+    "notes": "与当前 herb doc_text 可检索字段对齐，不把未进入 chunk 的十八反结构字段当作验收项",
+    "category": "药物禁忌"
+  },
+  {
+    "query": "桂枝在妊娠期使用有什么注意事项？",
+    "expected_topics": ["桂枝", "孕妇", "慎用"],
+    "expected_source_types": ["herb"],
+    "must_hit_titles": ["桂枝"],
+    "notes": "妊娠安全检索，与当前桂枝 doc_text 的可检索内容对齐",
+    "category": "药物禁忌"
+  },
+  {
+    "query": "黄芪的常规煎服用量范围是什么？",
+    "expected_topics": ["黄芪", "9-30g", "用量"],
+    "expected_source_types": ["herb"],
+    "must_hit_titles": ["黄芪"],
+    "notes": "常规剂量检索，避免把结构字段 max_dose 与特殊大剂量说明混为一谈",
+    "category": "剂量上限"
+  },
+  {
+    "query": "太冲穴的定位和主治病症是什么？",
+    "expected_topics": ["太冲", "足厥阴肝经", "头痛", "胁痛"],
+    "expected_source_types": ["acupoint"],
+    "must_hit_titles": ["太冲"],
+    "notes": "穴位检索，验证不同穴位可检索",
+    "category": "穴位检索"
+  },
+  {
+    "query": "风寒表证的辨证要点和治疗原则",
+    "expected_topics": ["风寒表证", "辛温解表", "辨证要点"],
+    "expected_source_types": ["theory", "herb", "case"],
+    "notes": "理论检索，验证 theory 类型",
+    "category": "理论检索"
+  },
+  {
+    "query": "有没有关于脾虚湿困泄泻的医案可以参考？",
+    "expected_topics": ["脾虚", "湿困", "便溏", "泄泻", "医案"],
+    "expected_source_types": ["case", "theory"],
+    "notes": "医案检索，验证 case 类型",
+    "category": "医案检索"
+  },
+  {
+    "query": "酸枣仁的性味归经和功效，以及用于失眠的注意事项",
+    "expected_topics": ["酸枣仁", "养心补肝", "宁心安神", "失眠"],
+    "expected_source_types": ["herb", "theory"],
+    "notes": "跨类型检索，药物+理论",
+    "category": "跨类型检索"
+  },
+  {
+    "query": "川贝母的性味归经和功效是什么？",
+    "expected_topics": ["川贝母", "清热润肺", "化痰止咳"],
+    "expected_source_types": ["herb"],
+    "must_hit_titles": ["川贝母"],
+    "notes": "新药材数据已覆盖川贝母，转为正向回归用例",
+    "category": "药材检索"
+  },
+  {
+    "query": "肾阳虚衰导致的水肿应该如何辨证和选方？",
+    "expected_topics": ["肾阳虚衰", "温阳利水", "真武汤", "金匮肾气丸"],
+    "expected_source_types": ["formula", "case"],
+    "must_hit_titles": ["真武汤", "金匮肾气丸"],
+    "notes": "新方剂和医案数据已覆盖肾阳虚衰水肿，转为正向回归用例",
+    "category": "证型到方剂"
+  },
+  {
+    "query": "大黄的泻下攻积功效和服用注意事项",
+    "expected_topics": ["大黄", "泻下攻积", "后下", "慎用"],
+    "expected_source_types": ["herb"],
+    "must_hit_titles": ["大黄"],
+    "notes": "新药材数据已覆盖大黄，转为正向回归用例",
+    "category": "药物禁忌"
+  },
+  {
+    "query": "涌泉穴的定位和主治是什么？",
+    "expected_topics": [],
+    "expected_source_types": [],
+    "forbidden_topics": ["涌泉"],
+    "forbidden_titles": ["涌泉"],
+    "negative_case": true,
+    "notes": "当前穴位库未覆盖涌泉；top-k 若出现涌泉相关证据则负向用例失败",
+    "category": "无结果场景"
+  }
+]
