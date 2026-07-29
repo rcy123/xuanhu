@@ -50,7 +50,10 @@ class CompletenessPolicyConfig(BaseModel):
 
     policy_version: str = COMPLETENESS_POLICY_VERSION
     no_new_facts_round_threshold: int = Field(default=2, ge=1, le=20)
-    max_followup_rounds: int = Field(default=6, ge=1, le=50)
+    # The largest supported intake can require 12 distinct dimensions before
+    # any clarification retries.  Keep a separate high hard-stop for runaway
+    # dialogue; ordinary progress must not be blocked after only six questions.
+    max_followup_rounds: int = Field(default=20, ge=1, le=50)
 
 
 class ComplaintTenQuestionRule(BaseModel):

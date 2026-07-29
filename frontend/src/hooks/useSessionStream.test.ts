@@ -163,6 +163,52 @@ describe('useSessionStream', () => {
     expect(onSafetyBlocked).toHaveBeenCalledWith(issues, 'prescription')
   })
 
+  it('session.blocked 是可恢复业务状态，保持连接并继续接收事件', async () => {
+    const onSessionBlocked = vi.fn()
+    const onMessageCreated = vi.fn()
+    const { conn, getCaptured } = setupConnectSpy()
+    const { result } = renderHook(() =>
+      useSessionStream({
+        sessionId: 's1',
+        stateVersion: 1,
+        onSessionBlocked,
+        onMessageCreated,
+      }),
+    )
+    await act(async () => {
+      getCaptured().onOpen()
+      getCaptured().onEvent(
+        makeEvent('session.blocked', { blocked_reason: 'intake_stagnated_manual_required' }),
+      )
+    })
+
+    expect(onSessionBlocked).toHaveBeenCalledWith('intake_stagnated_manual_required')
+    expect(conn.close).not.toHaveBeenCalled()
+    expect(result.current.connectionState).toBe('connected')
+
+    await act(async () => {
+      getCaptured().onEvent(makeEvent('message.created', { message_id: 'msg-after-block' }))
+    })
+    expect(onMessageCreated).toHaveBeenCalledWith('msg-after-block')
+  })
+
+  it.each(['session.done', 'session.terminated'] as const)(
+    '%s 关闭连接但不误报网络断开',
+    async (eventType) => {
+      const { conn, getCaptured } = setupConnectSpy()
+      const { result } = renderHook(() =>
+        useSessionStream({ sessionId: 's1', stateVersion: 1 }),
+      )
+      await act(async () => {
+        getCaptured().onOpen()
+        getCaptured().onEvent(makeEvent(eventType))
+      })
+
+      expect(conn.close).toHaveBeenCalledOnce()
+      expect(result.current.connectionState).toBe('idle')
+    },
+  )
+
   it('resync 触发 onResync', async () => {
     const onResync = vi.fn()
     const { getCaptured } = setupConnectSpy()
@@ -321,5 +367,67 @@ describe('useSessionStream', () => {
     })
     expect(onPollingRefresh).toHaveBeenCalled()
     globalThis.EventSource = originalES
+  })
+
+  it('ignores every late callback from a closed session connection', async () => {
+    const captures = new Map<string, HandlerCapture>()
+    vi.spyOn(sse, 'connectSessionStream').mockImplementation((id, handlers) => {
+      captures.set(id, {
+        onEvent: handlers.onEvent,
+        onOpen: handlers.onOpen ?? (() => {}),
+        onError: handlers.onError ?? (() => {}),
+        onResync: handlers.onResync ?? (() => {}),
+      })
+      return makeConn()
+    })
+    const oldMessage = vi.fn()
+    const oldResync = vi.fn()
+    const newMessage = vi.fn()
+    const newResync = vi.fn()
+    const newFinished = vi.fn()
+    const { result, rerender } = renderHook(
+      ({ id }: { id: 's1' | 's2' }) => useSessionStream({
+        sessionId: id,
+        stateVersion: 1,
+        onMessageCreated: id === 's1' ? oldMessage : newMessage,
+        onResync: id === 's1' ? oldResync : newResync,
+        onAgentFinished: id === 's2' ? newFinished : undefined,
+      }),
+      { initialProps: { id: 's1' as 's1' | 's2' } },
+    )
+    const oldHandlers = captures.get('s1')!
+
+    rerender({ id: 's2' })
+    const newHandlers = captures.get('s2')!
+    expect(result.current.connectionState).toBe('connecting')
+
+    await act(async () => {
+      oldHandlers.onOpen()
+      oldHandlers.onEvent(makeEvent('message.created', { message_id: 'old-message' }))
+      oldHandlers.onEvent(makeEvent('agent.started', { agent_name: 'old-agent' }))
+      oldHandlers.onEvent(makeEvent('agent.finished', { agent_name: 'safety_confirmation' }))
+      oldHandlers.onResync(makeEvent('resync', { reason: 'old-resync' }))
+      oldHandlers.onError(new Event('error'))
+    })
+
+    expect(result.current.connectionState).toBe('connecting')
+    expect(result.current.agentRuns).toEqual({})
+    expect(result.current.lastError).toBeNull()
+    expect(oldMessage).not.toHaveBeenCalled()
+    expect(oldResync).not.toHaveBeenCalled()
+    expect(newMessage).not.toHaveBeenCalled()
+    expect(newResync).not.toHaveBeenCalled()
+    expect(newFinished).not.toHaveBeenCalled()
+
+    await act(async () => {
+      newHandlers.onOpen()
+      newHandlers.onEvent(makeEvent('message.created', { message_id: 'new-message' }))
+      newHandlers.onEvent(makeEvent('agent.finished', { agent_name: 'safety_confirmation' }))
+      newHandlers.onResync(makeEvent('resync', { reason: 'new-resync' }))
+    })
+    expect(result.current.connectionState).toBe('connected')
+    expect(newMessage).toHaveBeenCalledWith('new-message')
+    expect(newResync).toHaveBeenCalledWith('new-resync')
+    expect(newFinished).toHaveBeenCalledWith('safety_confirmation')
   })
 })

@@ -12,18 +12,30 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from app.api.request_context import WriteRequestContext
-from app.core.exceptions import ValidationError
+from app.core.exceptions import InvalidStageTransitionError, ValidationError
 from app.db.session import get_session_factory
 from app.main import app
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
-from app.models.domain import SafetyFactAssertion, SafetyFactTransition, SafetyProfile
+from app.models.domain import (
+    GateResult,
+    GraphRun,
+    GraphRunStep,
+    Observation,
+    OutboxEvent,
+    SafetyFactAssertion,
+    SafetyFactTransition,
+    SafetyProfile,
+)
 from app.schemas.domain import CollectionStatus
 from app.schemas.intake import (
+    CandidateSeverity,
     EvidenceSpan,
     IntakeExtractionDecision,
     IntakeExtractionOutput,
     PatientSafetyDelta,
+    RedFlagCandidate,
+    RedFlagCategory,
     SafetyListDelta,
 )
 from app.services.safety_confirmation import SafetyConfirmationService
@@ -118,6 +130,108 @@ def _headers(key: str) -> dict[str, str]:
     return {"X-Doctor-Id": "doctor-safety", "X-Idempotency-Key": key}
 
 
+_FINAL_INQUIRY_FACT_KEYS = (
+    "chief_complaint.symptom",
+    "chief_complaint.course",
+    "present_illness.change",
+    "ten_questions.cold_heat",
+    "ten_questions.stool_urine",
+    "ten_questions.diet",
+    "ten_questions.sleep",
+)
+
+
+async def _create_final_allergy_gap(
+    *,
+    omit_fact_key: str | None = None,
+    outstanding_dimension: str | None = None,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID | None]:
+    factory = get_session_factory()
+    session_id = uuid.uuid4()
+    source_message_id = uuid.uuid4()
+    question_id = uuid.uuid4() if outstanding_dimension is not None else None
+    async with factory() as db, db.begin():
+        session = ConsultSession(
+            id=session_id,
+            patient_info={},
+            chief_complaint="test complaint",
+            current_stage="inquiry",
+            status="active",
+            agent_runtime="langgraph",
+            recovery_status="normal",
+            state_version=1,
+            rollback_counts={},
+        )
+        source = ConsultMessage(
+            id=source_message_id,
+            session_id=session_id,
+            role="patient_proxy",
+            stage="inquiry",
+            content="allergy penicillin",
+        )
+        db.add_all((session, source))
+        await db.flush()
+        for fact_key in _FINAL_INQUIRY_FACT_KEYS:
+            if fact_key == omit_fact_key:
+                continue
+            db.add(
+                Observation(
+                    id=uuid.uuid4(),
+                    session_id=session_id,
+                    fact_key=fact_key,
+                    value={"code": "present"},
+                    normalized_value={"code": "present"},
+                    source_message_id=source_message_id,
+                    status="active",
+                    confidence=1.0,
+                )
+            )
+        db.add(
+            SafetyProfile(
+                id=uuid.uuid4(),
+                session_id=session_id,
+                allergy_collection_status="unknown",
+                pregnancy_collection_status="explicitly_none",
+                lactation_collection_status="explicitly_none",
+                medications_collection_status="explicitly_none",
+                major_conditions_collection_status="explicitly_none",
+                contraindications_collection_status="unknown",
+            )
+        )
+        if question_id is not None:
+            db.add(
+                ConsultMessage(
+                    id=question_id,
+                    session_id=session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="existing unanswered question?",
+                    structured_delta={
+                        "selected_dimension": outstanding_dimension,
+                        "selection_kind": "required",
+                    },
+                )
+            )
+            session.state_snapshot = {
+                "langgraph_intake": {
+                    "last_patient_message_id": str(source_message_id),
+                    "last_question_message_id": str(question_id),
+                    "progress": {"no_new_facts_rounds": 0, "followup_rounds": 3},
+                }
+            }
+        await db.flush()
+        assertions = await SafetyConfirmationService(db).propose_from_intake(
+            session_id=session_id,
+            source_message=source,
+            output=_allergy_output(source_message_id, source.content, "penicillin"),
+            extraction_run_id=uuid.uuid4(),
+            template_version="intake_extraction_v2.jinja2",
+            trace_id=uuid.uuid4().hex,
+        )
+    return session_id, assertions[0].assertion_id, question_id
+
+
 async def test_proposed_fact_is_not_authoritative_until_api_confirmation(client: AsyncClient) -> None:
     session_id, _, assertion_id = await _create_proposal()
     factory = get_session_factory()
@@ -162,6 +276,235 @@ async def test_proposed_fact_is_not_authoritative_until_api_confirmation(client:
         assert transitions == 1
 
 
+async def test_final_confirmation_recomputes_gates_and_becomes_ready_without_patient_turn(
+    client: AsyncClient,
+) -> None:
+    session_id, assertion_id, _ = await _create_final_allergy_gap()
+    response = await client.post(
+        f"/api/v1/consult/sessions/{session_id}/safety-assertions/{assertion_id}/confirm",
+        json={},
+        headers=_headers("confirm-final-gap"),
+    )
+    assert response.status_code == 200
+
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        runs = (
+            await db.scalars(select(GraphRun).where(GraphRun.session_id == session_id))
+        ).all()
+        gates = (
+            await db.scalars(select(GateResult).where(GateResult.session_id == session_id))
+        ).all()
+        steps = (
+            await db.scalars(
+                select(GraphRunStep).where(GraphRunStep.graph_run_id == runs[0].id)
+            )
+        ).all()
+        event = await db.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.session_id == session_id,
+                OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+            )
+        )
+        assert session is not None and session.state_version == 2
+        assert session.status == "active" and session.current_stage == "inquiry"
+        assert session.state_snapshot is not None
+        intake = session.state_snapshot["langgraph_intake"]
+        assert intake["completeness"]["disposition"] == "ready"
+        assert intake["dialogue_status"] == "complete"
+        assert intake["last_question_message_id"] is None
+        assert len(runs) == 1 and runs[0].status == "completed"
+        assert {(gate.gate_name, gate.decision) for gate in gates} == {
+            ("triage", "passed"),
+            ("completeness", "passed"),
+        }
+        assert len(steps) == 5
+        assert event is not None
+        assert event.payload["completeness_disposition"] == "ready"
+        assert event.payload["question_message_id"] is None
+
+
+async def test_rejection_recomputes_and_asks_the_rejected_missing_dimension(
+    client: AsyncClient,
+) -> None:
+    session_id, assertion_id, _ = await _create_final_allergy_gap()
+    response = await client.post(
+        f"/api/v1/consult/sessions/{session_id}/safety-assertions/{assertion_id}/reject",
+        json={"reason_code": "EXTRACTION_INACCURATE"},
+        headers=_headers("reject-final-gap"),
+    )
+    assert response.status_code == 200
+
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        question = await db.scalar(
+            select(ConsultMessage).where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.agent_name == "question_composer",
+            )
+        )
+        event = await db.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.session_id == session_id,
+                OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+            )
+        )
+        assert session is not None and session.state_snapshot is not None
+        assert question is not None
+        assert question.structured_delta is not None
+        assert question.structured_delta["selected_dimension"] == "safety.allergy_status"
+        intake = session.state_snapshot["langgraph_intake"]
+        assert intake["completeness"]["disposition"] == "incomplete"
+        assert intake["dialogue_status"] == "questioning"
+        assert intake["last_question_message_id"] == str(question.id)
+        assert event is not None and event.payload["question_message_id"] == str(question.id)
+
+
+async def test_confirmation_preserves_an_existing_unanswered_question(
+    client: AsyncClient,
+) -> None:
+    session_id, assertion_id, existing_question_id = await _create_final_allergy_gap(
+        omit_fact_key="chief_complaint.course",
+        outstanding_dimension="chief_complaint.course",
+    )
+    assert existing_question_id is not None
+    response = await client.post(
+        f"/api/v1/consult/sessions/{session_id}/safety-assertions/{assertion_id}/confirm",
+        json={},
+        headers=_headers("confirm-preserve-question"),
+    )
+    assert response.status_code == 200
+
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        question_count = await db.scalar(
+            select(func.count()).select_from(ConsultMessage).where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.agent_name == "question_composer",
+            )
+        )
+        event = await db.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.session_id == session_id,
+                OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+            )
+        )
+        assert session is not None and session.state_snapshot is not None
+        intake = session.state_snapshot["langgraph_intake"]
+        assert question_count == 1
+        assert intake["last_question_message_id"] == str(existing_question_id)
+        assert intake["dialogue_status"] == "questioning"
+        assert intake["progress"]["followup_rounds"] == 3
+        # The outbox must not re-emit message.created for the preserved question.
+        assert event is not None and event.payload["question_message_id"] is None
+
+
+async def test_safety_decisions_require_active_inquiry() -> None:
+    session_id, _, assertion_id = await _create_proposal()
+    factory = get_session_factory()
+    async with factory() as db, db.begin():
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        session.current_stage = "syndrome"
+
+    with pytest.raises(InvalidStageTransitionError):
+        async with factory() as db, db.begin():
+            await SafetyConfirmationService(db).transition(
+                session_id=session_id,
+                assertion_id=assertion_id,
+                action="confirm",
+                actor_id="doctor-safety",
+                context=WriteRequestContext(
+                    trace_id=uuid.uuid4().hex,
+                    idempotency_key="reject-non-inquiry",
+                    is_idempotent=True,
+                ),
+                reason_code=None,
+            )
+
+    async with factory() as db:
+        assertion = await db.get(SafetyFactAssertion, assertion_id)
+        assert assertion is not None and assertion.status == "proposed"
+
+
+async def test_red_flag_candidate_cannot_be_resolved_by_generic_safety_confirmation() -> None:
+    factory = get_session_factory()
+    session_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    text = "突然胸痛"
+    async with factory() as db, db.begin():
+        session = ConsultSession(
+            id=session_id,
+            patient_info={},
+            current_stage="inquiry",
+            status="active",
+            agent_runtime="langgraph",
+            recovery_status="normal",
+            state_version=1,
+            rollback_counts={},
+        )
+        message = ConsultMessage(
+            id=message_id,
+            session_id=session_id,
+            role="patient_proxy",
+            stage="inquiry",
+            content=text,
+        )
+        db.add_all((session, message))
+        await db.flush()
+        rows = await SafetyConfirmationService(db).propose_from_intake(
+            session_id=session_id,
+            source_message=message,
+            output=IntakeExtractionOutput(
+                decision=IntakeExtractionDecision.EXTRACTED,
+                red_flag_candidates=(
+                    RedFlagCandidate(
+                        category=RedFlagCategory.SEVERE_PAIN,
+                        source_message_id=message_id,
+                        span=EvidenceSpan(
+                            source_message_id=message_id,
+                            start_char=0,
+                            end_char=len(text),
+                            quote=text,
+                        ),
+                        severity=CandidateSeverity.HIGH,
+                        evidence="acute severe pain",
+                        confidence=0.99,
+                    ),
+                ),
+            ),
+            extraction_run_id=uuid.uuid4(),
+            template_version="triage-raw-text-precheck.v1",
+            source_kind="deterministic_precheck",
+            trace_id=uuid.uuid4().hex,
+        )
+        assertion_id = rows[0].assertion_id
+
+    with pytest.raises(InvalidStageTransitionError) as exc_info:
+        async with factory() as db, db.begin():
+            await SafetyConfirmationService(db).transition(
+                session_id=session_id,
+                assertion_id=assertion_id,
+                action="confirm",
+                actor_id="doctor-safety",
+                context=WriteRequestContext(
+                    trace_id=uuid.uuid4().hex,
+                    idempotency_key="confirm-red-flag-invalid",
+                    is_idempotent=True,
+                ),
+                reason_code=None,
+            )
+    assert exc_info.value.detail is not None
+    assert "triage/recovery" in exc_info.value.detail
+
+    async with factory() as db:
+        assertion = await db.get(SafetyFactAssertion, assertion_id)
+        assert assertion is not None and assertion.status == "proposed"
+
+
 async def test_reject_and_retract_remove_unconfirmed_or_authoritative_projection(client: AsyncClient) -> None:
     rejected_session, _, rejected_id = await _create_proposal(text="我对头孢过敏", allergen="头孢")
     reject = await client.post(
@@ -191,10 +534,28 @@ async def test_reject_and_retract_remove_unconfirmed_or_authoritative_projection
         retracted_profile = await db.scalar(
             select(SafetyProfile).where(SafetyProfile.session_id == retracted_session)
         )
+        rejected_events = (
+            await db.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.session_id == rejected_session,
+                    OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+                )
+            )
+        ).all()
+        retracted_events = (
+            await db.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.session_id == retracted_session,
+                    OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+                )
+            )
+        ).all()
         assert rejected_profile is None
         assert retracted_profile is not None
         assert retracted_profile.allergy_collection_status == "unknown"
         assert retracted_profile.allergens is None
+        assert [event.payload["action"] for event in rejected_events] == ["reject"]
+        assert {event.payload["action"] for event in retracted_events} == {"confirm", "retract"}
 
 
 async def test_confirmed_correction_supersedes_prior_assertion(client: AsyncClient) -> None:
@@ -284,9 +645,16 @@ async def test_concurrent_duplicate_confirmation_serializes_without_double_proje
                 SafetyFactTransition.assertion_id == assertion_id
             )
         )
+        decision_audit_count = await db.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.session_id == session_id,
+                AuditEvent.event_type == "safety_fact.confirm",
+            )
+        )
         assert session is not None and session.state_version == 2
         assert profile is not None and profile.allergens == ["青霉素"]
-        assert transition_count == 2
+        assert transition_count == 1
+        assert decision_audit_count == 1
 
 
 async def test_explicit_structured_form_is_confirmed_with_privacy_minimal_audit(

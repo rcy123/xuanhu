@@ -24,6 +24,7 @@ from app.agent_runtime.repository import (
 from app.agent_runtime.specs import AgentSpec, ModelPolicy, RunArtifact, RunSpec
 from app.agent_runtime.verifiers import VerificationContext
 from app.db.session import _build_async_pg_url
+from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
@@ -33,6 +34,7 @@ from app.models.domain import (
     GraphRunStep,
     Observation,
     OutboxEvent,
+    SafetyFactAssertion,
 )
 from app.schemas.domain import (
     ArtifactRevisionSchema,
@@ -44,6 +46,14 @@ from app.schemas.domain import (
     ObservationStatus,
     SafetyProfileSchema,
 )
+from app.schemas.intake import (
+    EvidenceSpan,
+    IntakeExtractionDecision,
+    IntakeExtractionOutput,
+    PatientSafetyDelta,
+    SafetyListDelta,
+)
+from app.services.safety_confirmation import build_intake_safety_assertion_specs
 from tests._database_safety import destructive_database_environment
 
 pytestmark = pytest.mark.integration
@@ -310,6 +320,132 @@ async def _commit_observation(
     return result.outbox_event_id, session_id
 
 
+async def _safety_specs(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: UUID,
+    message_id: UUID,
+    extraction_run_id: UUID,
+    trace_id: str,
+    safety_value: str = "test",
+    include_medication: bool = False,
+):
+    async with factory() as db:
+        source = await db.get(ConsultMessage, message_id)
+        assert source is not None
+        start = source.content.index(safety_value)
+        span = EvidenceSpan(
+            source_message_id=message_id,
+            start_char=start,
+            end_char=start + len(safety_value),
+            quote=safety_value,
+        )
+        output = IntakeExtractionOutput(
+            decision=IntakeExtractionDecision.EXTRACTED,
+            patient_safety_delta=PatientSafetyDelta(
+                allergy=SafetyListDelta(
+                    status=CollectionStatus.COLLECTED,
+                    values=(safety_value,),
+                    source_message_id=message_id,
+                    value_spans=(span,),
+                ),
+                medications=(
+                    SafetyListDelta(
+                        status=CollectionStatus.COLLECTED,
+                        values=("input",),
+                        source_message_id=message_id,
+                        value_spans=(
+                            EvidenceSpan(
+                                source_message_id=message_id,
+                                start_char=5,
+                                end_char=10,
+                                quote="input",
+                            ),
+                        ),
+                    )
+                    if include_medication
+                    else SafetyListDelta()
+                ),
+            ),
+        )
+        return build_intake_safety_assertion_specs(
+            session_id=session_id,
+            source_message=source,
+            output=output,
+            extraction_run_id=extraction_run_id,
+            template_version="intake-test-v1",
+            source_kind="model_extraction",
+            trace_id=trace_id,
+        )
+
+
+async def _bound_negative_safety_case(
+    factory: async_sessionmaker[AsyncSession],
+) -> tuple[UUID, UUID, UUID, tuple[repository_module.SafetyFactAssertionSpec, ...]]:
+    session_id, question_id, message_id = uuid4(), uuid4(), uuid4()
+    async with factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1))
+        db.add(
+            ConsultMessage(
+                id=question_id,
+                session_id=session_id,
+                role="agent",
+                stage="inquiry",
+                agent_name="question_composer",
+                content="请核实患者是否有已知过敏？",
+                structured_delta={
+                    "selected_dimension": "safety.allergy_status",
+                    "selection_kind": "required",
+                },
+            )
+        )
+        source = ConsultMessage(
+            id=message_id,
+            session_id=session_id,
+            role="doctor",
+            stage="inquiry",
+            content="没有",
+            structured_delta={
+                "binding_version": "intake-reply-binding.v1",
+                "reply_context": {
+                    "question_message_id": str(question_id),
+                    "selected_dimension": "safety.allergy_status",
+                    "selection_kind": "required",
+                },
+            },
+        )
+        db.add(source)
+    span = EvidenceSpan(
+        source_message_id=message_id,
+        start_char=0,
+        end_char=2,
+        quote="没有",
+    )
+    output = IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        patient_safety_delta=PatientSafetyDelta(
+            allergy=SafetyListDelta(
+                status=CollectionStatus.EXPLICITLY_NONE,
+                source_message_id=message_id,
+                negation_span=span,
+            )
+        ),
+    )
+    async with factory() as db:
+        source = await db.get(ConsultMessage, message_id)
+        assert source is not None
+        specs = build_intake_safety_assertion_specs(
+            session_id=session_id,
+            source_message=source,
+            output=output,
+            extraction_run_id=uuid4(),
+            template_version="intake-reply-binding.v1",
+            source_kind="deterministic_reply_binding",
+            trace_id="bound-negative-safety",
+        )
+    return session_id, question_id, message_id, specs
+
+
 def test_orm_and_migration_have_matching_idempotency_and_outbox_constraints() -> None:
     commit_table = DomainCommandCommit.__table__
     outbox_table = OutboxEvent.__table__
@@ -353,6 +489,388 @@ async def test_commit_rebuilds_state_and_atomically_writes_metadata_and_outbox(
     assert event.event_type == DOMAIN_STATE_COMMITTED
     assert event.status == "pending"
     assert event.payload["output_state_version"] == 2
+
+
+async def test_safety_proposal_failure_rolls_back_domain_and_awaiting_confirmation_state(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    specs = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="atomic-safety-failure",
+    )
+    assert len(specs) == 1
+    async with factory() as db, db.begin():
+        db.add(
+            AuditEvent(
+                id=specs[0].audit_event_id,
+                session_id=session_id,
+                event_type="safety_fact.proposed",
+                actor_type="system",
+                payload={"conflict": True},
+                trace_id="conflicting-audit",
+            )
+        )
+
+    with pytest.raises(RepositoryError) as captured:
+        await repository.commit(
+            delta,
+            _context(state, delta, idempotency_key="command-atomic-safety-failure"),
+            graph_version="graph-v2",
+            safety_fact_assertions=specs,
+            session_updates={
+                "state_snapshot": {
+                    "langgraph_intake": {"dialogue_status": "awaiting_safety_confirmation"}
+                }
+            },
+        )
+    assert captured.value.code is RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED
+
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assertion_count = await db.scalar(
+            select(func.count()).select_from(SafetyFactAssertion).where(
+                SafetyFactAssertion.session_id == session_id
+            )
+        )
+        observation_count = await db.scalar(
+            select(func.count()).select_from(Observation).where(Observation.session_id == session_id)
+        )
+        commit_count = await db.scalar(
+            select(func.count()).select_from(DomainCommandCommit).where(
+                DomainCommandCommit.session_id == session_id
+            )
+        )
+        outbox_count = await db.scalar(
+            select(func.count()).select_from(OutboxEvent).where(OutboxEvent.session_id == session_id)
+        )
+    assert session is not None
+    assert session.state_version == 1
+    assert session.state_snapshot in (None, {})
+    assert assertion_count == observation_count == commit_count == outbox_count == 0
+
+
+async def test_domain_commit_replay_backfills_and_idempotently_verifies_safety_proposals(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    context = _context(state, delta, idempotency_key="command-safety-replay")
+    specs = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="atomic-safety-replay",
+    )
+
+    first = await repository.commit(
+        delta,
+        context,
+        graph_version="graph-v2",
+        session_updates={
+            "state_snapshot": {
+                "langgraph_intake": {"dialogue_status": "awaiting_safety_confirmation"}
+            }
+        },
+    )
+    # Simulate a Domain commit created by the former split-write version,
+    # before safety manifests were sealed in the domain_commit step.
+    async with factory() as db, db.begin():
+        domain_step = await db.scalar(
+            select(GraphRunStep).where(
+                GraphRunStep.graph_run_id == first.graph_run_id,
+                GraphRunStep.step_index == 0,
+            )
+        )
+        assert domain_step is not None
+        metadata = dict(domain_step.step_metadata or {})
+        metadata.pop("safety_fact_assertion_manifest", None)
+        domain_step.step_metadata = metadata
+    replay = await repository.commit(
+        delta,
+        context,
+        graph_version="graph-v2",
+        safety_fact_assertions=specs,
+    )
+    second_replay = await repository.commit(
+        delta,
+        context,
+        graph_version="graph-v2",
+        safety_fact_assertions=specs,
+    )
+    assert replay == first == second_replay
+
+    async with factory() as db:
+        assertion_count = await db.scalar(
+            select(func.count()).select_from(SafetyFactAssertion).where(
+                SafetyFactAssertion.session_id == session_id
+            )
+        )
+        proposal_audit_count = await db.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.session_id == session_id,
+                AuditEvent.event_type == "safety_fact.proposed",
+            )
+        )
+    assert assertion_count == 1
+    assert proposal_audit_count == 1
+
+
+async def test_domain_commit_replay_rejects_different_or_extra_safety_manifest_without_inserting(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    context = _context(state, delta, idempotency_key="command-safety-manifest-strict")
+    original = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="safety-manifest-strict",
+    )
+    different = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="safety-manifest-strict",
+        safety_value="input",
+    )
+    extra = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="safety-manifest-strict",
+        include_medication=True,
+    )
+    await repository.commit(
+        delta,
+        context,
+        graph_version="graph-v2",
+        safety_fact_assertions=original,
+    )
+
+    for conflicting_specs in (different, extra, ()):
+        with pytest.raises(RepositoryError) as captured:
+            await repository.commit(
+                delta,
+                context,
+                graph_version="graph-v2",
+                safety_fact_assertions=conflicting_specs,
+            )
+        assert captured.value.code is RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED
+
+    async with factory() as db:
+        assertions = (
+            await db.scalars(
+                select(SafetyFactAssertion).where(SafetyFactAssertion.session_id == session_id)
+            )
+        ).all()
+        audits = (
+            await db.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.session_id == session_id,
+                    AuditEvent.event_type == "safety_fact.proposed",
+                )
+            )
+        ).all()
+    assert [row.id for row in assertions] == [original[0].assertion_id]
+    assert [row.id for row in audits] == [original[0].audit_event_id]
+
+
+async def test_safety_spec_source_message_must_belong_to_domain_delta(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    unrelated_message_id = uuid4()
+    async with factory() as db, db.begin():
+        db.add(
+            ConsultMessage(
+                id=unrelated_message_id,
+                session_id=session_id,
+                role="patient_proxy",
+                stage="inquiry",
+                content="test input",
+            )
+        )
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    specs = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=unrelated_message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="safety-source-scope",
+    )
+
+    with pytest.raises(RepositoryError) as captured:
+        await repository.commit(
+            delta,
+            _context(state, delta, idempotency_key="command-safety-source-scope"),
+            graph_version="graph-v2",
+            safety_fact_assertions=specs,
+        )
+    assert captured.value.code is RepositoryErrorCode.UNSAFE_METADATA
+
+    async with factory() as db:
+        assertion_count = await db.scalar(
+            select(func.count()).select_from(SafetyFactAssertion).where(
+                SafetyFactAssertion.session_id == session_id
+            )
+        )
+        commit_count = await db.scalar(
+            select(func.count()).select_from(DomainCommandCommit).where(
+                DomainCommandCommit.session_id == session_id
+            )
+        )
+    assert assertion_count == commit_count == 0
+
+
+async def test_repository_rejects_forged_reply_binding_provenance_before_clinical_write(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, _, message_id, specs = await _bound_negative_safety_case(factory)
+    spec = specs[0]
+    evidence = spec.evidence_spans[0]
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(
+        session_id=session_id,
+        message_id=message_id,
+        run_id=spec.extraction_run_id,
+    )
+
+    unbound = spec.model_copy(
+        update={
+            "evidence_spans": (
+                evidence.model_copy(
+                    update={
+                        "reply_to_question_message_id": None,
+                        "reply_dimension": None,
+                    }
+                ),
+            )
+        }
+    )
+    wrong_dimension = spec.model_copy(
+        update={
+            "evidence_spans": (
+                evidence.model_copy(update={"reply_dimension": "safety.pregnancy_status"}),
+            )
+        }
+    )
+    mixed_bindings = spec.model_copy(
+        update={
+            "evidence_spans": (
+                evidence,
+                evidence.model_copy(
+                    update={
+                        "reply_to_question_message_id": uuid4(),
+                        "reply_dimension": "safety.pregnancy_status",
+                    }
+                ),
+            )
+        }
+    )
+    disguised_model_extraction = spec.model_copy(update={"source_kind": "model_extraction"})
+
+    for index, forged in enumerate(
+        (unbound, wrong_dimension, mixed_bindings, disguised_model_extraction)
+    ):
+        with pytest.raises(RepositoryError) as captured:
+            await repository.commit(
+                delta,
+                _context(state, delta, idempotency_key=f"forged-safety-binding-{index}"),
+                graph_version="graph-v2",
+                safety_fact_assertions=(forged,),
+            )
+        assert captured.value.code is RepositoryErrorCode.UNSAFE_METADATA
+
+    async with factory() as db, db.begin():
+        source = await db.get(ConsultMessage, message_id, with_for_update=True)
+        assert source is not None
+        original_metadata = dict(source.structured_delta or {})
+        source.structured_delta = {
+            **original_metadata,
+            "reply_context": {
+                **dict(original_metadata["reply_context"]),
+                "selected_dimension": "safety.pregnancy_status",
+            },
+        }
+    with pytest.raises(RepositoryError) as captured:
+        await repository.commit(
+            delta,
+            _context(state, delta, idempotency_key="tampered-source-reply-binding"),
+            graph_version="graph-v2",
+            safety_fact_assertions=specs,
+        )
+    assert captured.value.code is RepositoryErrorCode.UNSAFE_METADATA
+    async with factory() as db, db.begin():
+        source = await db.get(ConsultMessage, message_id, with_for_update=True)
+        assert source is not None
+        source.structured_delta = original_metadata
+
+    result = await repository.commit(
+        delta,
+        _context(state, delta, idempotency_key="valid-source-reply-binding"),
+        graph_version="graph-v2",
+        safety_fact_assertions=specs,
+    )
+    assert result.changed is True
+    async with factory() as db:
+        assertion = await db.get(SafetyFactAssertion, spec.assertion_id)
+    assert assertion is not None
+    assert assertion.source_kind == "deterministic_reply_binding"
+    assert assertion.status == "proposed"
+
+
+async def test_new_empty_safety_manifest_cannot_be_filled_on_replay(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, message_id = await _session_and_message(factory)
+    state = await repository.get_state(session_id)
+    delta = _observation_delta(session_id=session_id, message_id=message_id)
+    context = _context(state, delta, idempotency_key="command-empty-safety-manifest")
+    later_specs = await _safety_specs(
+        factory,
+        session_id=session_id,
+        message_id=message_id,
+        extraction_run_id=delta.run_id,
+        trace_id="empty-safety-manifest",
+    )
+    await repository.commit(delta, context, graph_version="graph-v2")
+
+    with pytest.raises(RepositoryError) as captured:
+        await repository.commit(
+            delta,
+            context,
+            graph_version="graph-v2",
+            safety_fact_assertions=later_specs,
+        )
+    assert captured.value.code is RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED
+
+    async with factory() as db:
+        assertion_count = await db.scalar(
+            select(func.count()).select_from(SafetyFactAssertion).where(
+                SafetyFactAssertion.session_id == session_id
+            )
+        )
+    assert assertion_count == 0
 
 
 async def test_get_gate_results_loads_persisted_completed_run_gates_by_session_and_state(

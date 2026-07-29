@@ -6,7 +6,8 @@
 - GET  /api/v1/consult/sessions/{session_id}
 - POST /api/v1/consult/sessions/{session_id}/terminate
 
-本模块不实现消息、锁、SSE、Agent、RAG、安全审核或病历生成。
+LangGraph 创建会话时会在同一幂等事务内生成模板首问；本模块本身不
+编排消息、锁、SSE、RAG、安全审核或病历生成。
 """
 
 from __future__ import annotations

@@ -45,7 +45,7 @@ from app.schemas.completeness import (
     CompletenessSafetyProfile,
     InquiryDimension,
 )
-from app.schemas.domain import CollectionStatus, ObservationStatus
+from app.schemas.domain import CollectionStatus, GateDecision, ObservationStatus
 from app.schemas.intake import CandidateSeverity, EvidenceSpan, RedFlagCandidate, RedFlagCategory
 from app.schemas.question import (
     GAP_SELECTION_RESULT_SCHEMA_VERSION,
@@ -229,7 +229,7 @@ def test_gap_schema_versions_and_serialization_contract() -> None:
     assert GapSelectionResult.model_validate_json(selection.model_dump_json()) == selection
 
 
-def test_incomplete_selects_single_required_gap_by_safety_priority() -> None:
+def test_incomplete_collects_chief_complaint_before_routine_safety_fields() -> None:
     completeness = evaluate_completeness_policy(
         policy_input(*missing_symptom_facts(), safety_profile=safety(allergy=CollectionStatus.UNKNOWN))
     )
@@ -239,8 +239,77 @@ def test_incomplete_selects_single_required_gap_by_safety_priority() -> None:
     assert completeness.disposition is CompletenessDisposition.INCOMPLETE
     assert selection.disposition is GapSelectionDisposition.SELECTED
     assert selection.selection_kind is GapSelectionKind.REQUIRED
-    assert selection.selected_dimension is InquiryDimension.ALLERGY_STATUS
-    assert selection.priority_rule_id == "gap.priority.safety.allergy_status.v1"
+    assert selection.selected_dimension is InquiryDimension.CHIEF_COMPLAINT_SYMPTOM
+    assert selection.priority_rule_id == "gap.priority.chief_complaint.symptom.v1"
+
+
+def test_course_and_present_change_are_collected_before_routine_safety_fields() -> None:
+    missing_course = tuple(
+        item
+        for item in complete_general_facts()
+        if item.fact_key not in {"chief_complaint.course", "present_illness.change"}
+    )
+    completeness = evaluate_completeness_policy(
+        policy_input(
+            *missing_course,
+            safety_profile=safety(allergy=CollectionStatus.UNKNOWN),
+        )
+    )
+
+    first = select_gap(completeness)
+
+    assert first.selected_dimension is InquiryDimension.BASIC_COURSE
+    assert (
+        GAP_PRIORITY_RULES[InquiryDimension.PRESENT_ILLNESS_CHANGE].required_priority
+        < GAP_PRIORITY_RULES[InquiryDimension.ALLERGY_STATUS].required_priority
+    )
+
+
+def test_pending_safety_dimension_is_deferred_without_changing_completeness() -> None:
+    completeness = evaluate_completeness_policy(
+        policy_input(
+            *complete_general_facts(),
+            safety_profile=safety(
+                allergy=CollectionStatus.UNKNOWN,
+                medications=CollectionStatus.UNKNOWN,
+            ),
+        )
+    )
+
+    selection = select_gap(
+        completeness,
+        pending_safety_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+    )
+
+    assert InquiryDimension.ALLERGY_STATUS in completeness.missing_required
+    assert selection.selected_dimension is InquiryDimension.MEDICATION_STATUS
+    assert selection.deferred_dimensions == (InquiryDimension.ALLERGY_STATUS,)
+
+
+@pytest.mark.asyncio
+async def test_only_pending_safety_gap_returns_no_question_but_gate_stays_failed() -> None:
+    completeness = evaluate_completeness_policy(
+        policy_input(
+            *complete_general_facts(),
+            safety_profile=safety(allergy=CollectionStatus.UNKNOWN),
+        )
+    )
+
+    selection = select_gap(
+        completeness,
+        pending_safety_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+    )
+    outcome = await compose_question(
+        completeness_result=completeness,
+        pending_safety_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+    )
+
+    assert completeness.disposition is CompletenessDisposition.INCOMPLETE
+    assert completeness.gate_result.decision is GateDecision.FAILED
+    assert completeness.missing_required == (InquiryDimension.ALLERGY_STATUS,)
+    assert selection.disposition is GapSelectionDisposition.NO_SELECTION
+    assert selection.deferred_dimensions == (InquiryDimension.ALLERGY_STATUS,)
+    assert outcome.status is QuestionCompositionStatus.NO_QUESTION
 
 
 def test_chief_complaint_priority_beats_ten_question_required_gap() -> None:
@@ -393,7 +462,7 @@ def test_public_select_gap_uses_private_authority_even_if_export_is_rebound() ->
     finally:
         gap_selector.GAP_PRIORITY_RULES = original_export
 
-    assert selection.selected_dimension is InquiryDimension.ALLERGY_STATUS
+    assert selection.selected_dimension is InquiryDimension.CHIEF_COMPLAINT_SYMPTOM
 
 
 @pytest.mark.asyncio
@@ -433,11 +502,11 @@ async def test_forged_selected_dimension_or_priority_rule_is_rejected() -> None:
     authority = select_gap(completeness)
     forged_dimension = authority.model_copy(
         update={
-            "selected_dimension": InquiryDimension.CHIEF_COMPLAINT_SYMPTOM,
-            "priority_rule_id": "gap.priority.chief_complaint.symptom.v1",
+            "selected_dimension": InquiryDimension.ALLERGY_STATUS,
+            "priority_rule_id": "gap.priority.safety.allergy_status.v1",
         }
     )
-    forged_rule = authority.model_copy(update={"priority_rule_id": "gap.priority.chief_complaint.symptom.v1"})
+    forged_rule = authority.model_copy(update={"priority_rule_id": "gap.priority.safety.allergy_status.v1"})
 
     for forged in (forged_dimension, forged_rule):
         outcome = await compose_question(completeness_result=completeness, selection=forged)
@@ -819,6 +888,12 @@ async def test_model_multi_question_identity_connector_and_authority_text_are_re
 def test_normal_chinese_templates_continue_to_pass_single_question_validation() -> None:
     for template in QUESTION_TEMPLATES.values():
         assert validate_single_question_text(template.question) is None
+
+
+def test_question_templates_address_the_doctor_about_the_patient() -> None:
+    for template in QUESTION_TEMPLATES.values():
+        assert "患者" in template.question
+        assert "请问您" not in template.question
 
 
 @pytest.mark.asyncio

@@ -167,6 +167,18 @@ def test_versioned_mapper_projects_only_safe_fields() -> None:
             ["agent.finished", "session.blocked"],
         ),
         (
+            "safety_confirmation.recomputed.v1",
+            {
+                "stage": "inquiry",
+                "action": "confirm",
+                "assertion_id": str(uuid4()),
+                "completeness_disposition": "incomplete",
+                "question_message_id": str(uuid4()),
+                "question_content": "must not be projected",
+            },
+            ["agent.finished", "message.created"],
+        ),
+        (
             "advance.command_started.v1",
             {"from_stage": "inquiry", "to_stage": "syndrome"},
             ["stage.changed", "agent.started"],
@@ -205,6 +217,63 @@ def test_versioned_mapper_covers_current_internal_contracts(
 def test_versioned_mapper_rejects_unknown_contract() -> None:
     with pytest.raises(OutboxMappingError):
         map_outbox_event(_message("future.event.v2", payload={"content": "unsafe"}))
+
+
+def test_safety_recompute_mapper_is_privacy_minimal_and_question_is_optional() -> None:
+    question_id = str(uuid4())
+    payload: dict[str, object] = {
+        "session_id": str(uuid4()),
+        "state_version": 4,
+        "stage": "inquiry",
+        "run_id": str(uuid4()),
+        "action": "reject",
+        "assertion_id": str(uuid4()),
+        "completeness_disposition": "incomplete",
+        "question_message_id": question_id,
+        "question_content": "sensitive clinical question text",
+    }
+
+    mapped = map_outbox_event(_message("safety_confirmation.recomputed.v1", payload=payload))
+
+    assert [item.event_type for item in mapped] == ["agent.finished", "message.created"]
+    assert mapped[0].payload["agent_name"] == "safety_confirmation"
+    assert mapped[1].payload == {
+        "source_event_id": mapped[1].payload["source_event_id"],
+        "state_version": 3,
+        "message_id": question_id,
+        "role": "agent",
+        "stage": "inquiry",
+        "agent_name": "question_composer",
+    }
+    assert "sensitive clinical question text" not in str(mapped)
+
+    payload["question_message_id"] = None
+    payload["question_content"] = None
+    without_question = map_outbox_event(_message("safety_confirmation.recomputed.v1", payload=payload))
+    assert [item.event_type for item in without_question] == ["agent.finished"]
+
+
+def test_safety_recompute_mapper_projects_blocked_business_state() -> None:
+    payload: dict[str, object] = {
+        "session_id": str(uuid4()),
+        "state_version": 4,
+        "stage": "blocked",
+        "blocked_reason": "intake_stagnated_manual_required",
+        "run_id": str(uuid4()),
+        "action": "confirm",
+        "assertion_id": str(uuid4()),
+        "completeness_disposition": "stagnated",
+        "question_message_id": None,
+    }
+
+    mapped = map_outbox_event(_message("safety_confirmation.recomputed.v1", payload=payload))
+
+    assert [item.event_type for item in mapped] == ["agent.finished", "session.blocked"]
+    assert mapped[1].payload["blocked_reason"] == "intake_stagnated_manual_required"
+
+    payload["question_message_id"] = str(uuid4())
+    with pytest.raises(OutboxMappingError):
+        map_outbox_event(_message("safety_confirmation.recomputed.v1", payload=payload))
 
 
 def test_outbox_orm_has_durable_dead_letter_state_and_index() -> None:

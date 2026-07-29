@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -25,6 +26,10 @@ class MessageCreateRequest(BaseModel):
 
     content: str = Field(..., min_length=1, max_length=5000, description="消息正文")
     role: Literal["doctor", "patient_proxy"] = Field(..., description="消息来源角色")
+    reply_to_message_id: UUID | None = Field(
+        default=None,
+        description="当前回答所对应的结构化 Agent 问题；旧客户端可由服务端安全推断",
+    )
 
 
 class AgentMessageItem(BaseModel):

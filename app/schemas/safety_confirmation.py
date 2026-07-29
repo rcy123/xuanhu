@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SAFETY_ASSERTION_SCHEMA_VERSION = "safety-fact-assertion.v1"
 
@@ -39,6 +39,19 @@ class SafetyEvidenceRef(BaseModel):
     start_char: int = Field(ge=0, le=4_000)
     end_char: int = Field(gt=0, le=4_000)
     quote_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reply_to_question_message_id: UUID | None = None
+    reply_dimension: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+
+    @model_validator(mode="after")
+    def reply_binding_is_complete(self) -> SafetyEvidenceRef:
+        if (self.reply_to_question_message_id is None) != (self.reply_dimension is None):
+            raise ValueError("reply binding requires both question id and dimension")
+        return self
 
 
 class SafetyFactAssertionRead(BaseModel):

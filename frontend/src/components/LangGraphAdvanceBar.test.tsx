@@ -6,7 +6,15 @@ import type { SessionDetail } from '@/types/api'
 import { emptySessionReadModel } from '@/utils/readModel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 
-vi.mock('@/utils/id', () => ({ generateIdempotencyKey: () => 'advance-idem-1' }))
+const idMocks = vi.hoisted(() => {
+  let sequence = 0
+  return {
+    generate: vi.fn(() => `advance-idem-${++sequence}`),
+    reset: () => { sequence = 0 },
+  }
+})
+
+vi.mock('@/utils/id', () => ({ generateIdempotencyKey: idMocks.generate }))
 
 function detail(ready = true): SessionDetail {
   const readModel = emptySessionReadModel('langgraph', 2)
@@ -49,6 +57,8 @@ function detail(ready = true): SessionDetail {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  idMocks.generate.mockClear()
+  idMocks.reset()
 })
 
 describe('LangGraphAdvanceBar', () => {
@@ -265,14 +275,74 @@ describe('LangGraphAdvanceBar', () => {
         from_stage: 'inquiry',
         state_version: 4,
       })
-    render(<LangGraphAdvanceBar detail={detail()} onAdvanced={() => {}} />)
+    const { rerender } = render(
+      <LangGraphAdvanceBar detail={detail()} onAdvanced={() => {}} />,
+    )
 
     fireEvent.click(screen.getByTestId('langgraph-advance-button'))
     await screen.findByText('网络失败')
+    const refreshed = detail()
+    refreshed.state_version = 3
+    rerender(<LangGraphAdvanceBar detail={refreshed} onAdvanced={() => {}} />)
     fireEvent.click(screen.getByTestId('langgraph-advance-button'))
 
     await waitFor(() => expect(advance).toHaveBeenCalledTimes(2))
-    expect(advance.mock.calls[0][2]?.idempotencyKey).toBe('advance-idem-1')
-    expect(advance.mock.calls[1][2]?.idempotencyKey).toBe('advance-idem-1')
+    expect(advance.mock.calls[0][2]).toEqual({
+      idempotencyKey: 'advance-idem-1',
+      stateVersion: 2,
+    })
+    expect(advance.mock.calls[1][2]).toEqual({
+      idempotencyKey: 'advance-idem-1',
+      stateVersion: 2,
+    })
+  })
+
+  it('starts a fresh command after a deterministic state-version rejection', async () => {
+    const advance = vi.spyOn(api, 'advanceSession')
+      .mockRejectedValueOnce(new ApiRequestError({
+        code: 'INVALID_STATE_VERSION',
+        userMessage: '状态已更新',
+        status: 409,
+        retryable: true,
+      }))
+      .mockResolvedValueOnce({
+        session_id: 'session-1',
+        current_stage: 'safety',
+        from_stage: 'inquiry',
+        state_version: 4,
+      })
+    const onRefresh = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <LangGraphAdvanceBar
+        detail={detail()}
+        onAdvanced={() => {}}
+        onRefresh={onRefresh}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('langgraph-advance-button'))
+    await screen.findByText('状态已更新')
+    expect(onRefresh).toHaveBeenCalledOnce()
+
+    const refreshed = detail()
+    refreshed.state_version = 3
+    rerender(
+      <LangGraphAdvanceBar
+        detail={refreshed}
+        onAdvanced={() => {}}
+        onRefresh={onRefresh}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('langgraph-advance-button'))
+
+    await waitFor(() => expect(advance).toHaveBeenCalledTimes(2))
+    expect(advance.mock.calls[0][2]).toEqual({
+      idempotencyKey: 'advance-idem-1',
+      stateVersion: 2,
+    })
+    expect(advance.mock.calls[1][2]).toEqual({
+      idempotencyKey: 'advance-idem-2',
+      stateVersion: 3,
+    })
   })
 })

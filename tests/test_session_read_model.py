@@ -18,16 +18,51 @@ from app.db.session import _build_async_pg_url, get_db, reset_session_factory
 from app.main import app
 from app.models.consult import ConsultSession
 from app.models.domain import ArtifactRevision, ArtifactRevisionPayload, GateResult, GraphRun
-from app.schemas.session_read_model import SessionReadModelV1, SessionReadProjection
+from app.schemas.session_read_model import (
+    SessionReadModelV1,
+    SessionReadProjection,
+    SessionUnresolvedReadModelV1,
+)
 from app.services.session_read_model import (
     ArtifactAuthorityRow,
     GateAuthorityRow,
+    _merge_pending_safety_assertions,
     project_session_read_model,
 )
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def test_pending_safety_replaces_duplicate_missing_without_requesting_clinical_review() -> None:
+    projection = SessionReadProjection(
+        read_model=SessionReadModelV1(
+            agent_runtime="langgraph",
+            graph={"revision": 3},
+            review_required=False,
+            unresolved=(
+                SessionUnresolvedReadModelV1(
+                    source="completeness",
+                    kind="missing_required",
+                    key="safety.allergy_status",
+                ),
+                SessionUnresolvedReadModelV1(
+                    source="completeness",
+                    kind="missing_required",
+                    key="safety.medication_status",
+                ),
+            ),
+        )
+    )
+
+    merged = _merge_pending_safety_assertions(projection, ("allergy", "red_flag"))
+
+    assert merged.read_model.review_required is False
+    assert [(item.source, item.kind, item.key) for item in merged.read_model.unresolved] == [
+        ("completeness", "missing_required", "safety.medication_status"),
+        ("safety_confirmation", "unconfirmed_safety_fact", "allergy"),
+    ]
 
 
 def _session(*, state_version: int = 4, snapshot: dict[str, Any] | None = None) -> ConsultSession:

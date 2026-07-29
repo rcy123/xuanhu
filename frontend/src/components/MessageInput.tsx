@@ -14,8 +14,9 @@ interface MessageInputProps {
   submitting: boolean
   error: unknown
   disabled?: boolean
+  disabledReason?: string
   onSubmit: (content: string) => void
-  onRetry: () => void
+  onRetry?: () => void
   /** 上次失败的内容，供重试时回填。 */
   lastContent?: string
 }
@@ -26,6 +27,7 @@ export function MessageInput({
   submitting,
   error,
   disabled,
+  disabledReason,
   onSubmit,
   onRetry,
   lastContent,
@@ -72,7 +74,7 @@ export function MessageInput({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? '当前阶段不可输入问诊消息' : '输入症状描述 / 回复问题…（Enter 发送，Shift+Enter 换行）'}
+          placeholder={disabled ? (disabledReason ?? '当前阶段不可输入问诊消息') : '输入症状描述 / 回复问题…（Enter 发送，Shift+Enter 换行）'}
           autoSize={{ minRows: 2, maxRows: 6 }}
           maxLength={MAX}
           disabled={submitting || disabled}
@@ -91,7 +93,7 @@ export function MessageInput({
         </Button>
       </div>
       <div className="xh-composer-hint">
-        <span>{disabled ? '当前流程阶段已锁定问诊输入' : 'Enter 发送 · Shift + Enter 换行'}</span>
+        <span>{disabled ? (disabledReason ?? '当前流程阶段已锁定问诊输入') : 'Enter 发送 · Shift + Enter 换行'}</span>
         <span>{value.length}/{MAX}</span>
       </div>
     </div>

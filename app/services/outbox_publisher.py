@@ -150,6 +150,45 @@ def map_outbox_event(message: OutboxMessage) -> tuple[MappedSessionEvent, ...]:
             )
         return tuple(events)
 
+    if message.event_type == "safety_confirmation.recomputed.v1":
+        stage = _string(payload, "stage")
+        action = _string(payload, "action")
+        assertion_id = _string(payload, "assertion_id")
+        completeness_disposition = _string(payload, "completeness_disposition")
+        if (
+            stage not in {"inquiry", "blocked"}
+            or action not in {"confirm", "reject", "retract"}
+            or not assertion_id
+            or not completeness_disposition
+        ):
+            raise OutboxMappingError("safety_confirmation.recomputed.v1 has an invalid contract")
+        events = [_agent_event(message, "agent.finished", "safety_confirmation")]
+        question_message_id = _string(payload, "question_message_id")
+        if stage == "blocked":
+            blocked_reason = _string(payload, "blocked_reason")
+            if not blocked_reason or question_message_id:
+                raise OutboxMappingError("blocked safety recompute has an invalid contract")
+            events.append(
+                MappedSessionEvent(
+                    "session.blocked",
+                    {**common, "blocked_reason": blocked_reason},
+                )
+            )
+        elif question_message_id:
+            events.append(
+                MappedSessionEvent(
+                    "message.created",
+                    {
+                        **common,
+                        "message_id": question_message_id,
+                        "role": "agent",
+                        "stage": "inquiry",
+                        "agent_name": "question_composer",
+                    },
+                )
+            )
+        return tuple(events)
+
     if message.event_type == "advance.command_started.v1":
         events = [_agent_event(message, "agent.started", "reasoning")]
         from_stage = _string(payload, "from_stage")

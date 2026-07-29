@@ -200,7 +200,9 @@ class SafetyFactAssertion(Base, UUIDPrimaryKeyMixin):
             name="chk_safety_fact_assertions_status",
         ),
         CheckConstraint(
-            "source_kind IN ('model_extraction','deterministic_precheck','structured_form')",
+            "source_kind IN ("
+            "'model_extraction','deterministic_precheck','deterministic_reply_binding','structured_form'"
+            ")",
             name="chk_safety_fact_assertions_source_kind",
         ),
         CheckConstraint(

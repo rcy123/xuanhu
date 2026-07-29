@@ -37,6 +37,7 @@ from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.message import MessageCreateRequest
 from app.services.http_idempotency import HttpCommandExecutor, session_http_scope
+from app.services.langgraph_intake import resolve_durable_intake_message_response
 from app.services.message import MessageService
 
 router = APIRouter(prefix="/api/v1/consult", tags=["messages"])
@@ -106,7 +107,7 @@ async def create_message(
     )
     # Keep retryable infrastructure failures outside HttpCommandExecutor so
     # the idempotency key can execute after the process runtime recovers.
-    await service.ensure_submission_runtime_available(session_id)
+    is_langgraph = await service.ensure_submission_runtime_available(session_id)
 
     async def submit() -> dict[str, Any]:
         data = await service.submit_message(
@@ -120,6 +121,17 @@ async def create_message(
         return data.model_dump(mode="json", exclude_none=True)
 
     scope = session_http_scope(session_id)
+
+    async def resolve_durable_outcome() -> dict[str, Any] | None:
+        if not is_langgraph:
+            return None
+        return await resolve_durable_intake_message_response(
+            session_id,
+            body,
+            idempotency_key=context.idempotency_key,
+            retry_failed_command=submit,
+        )
+
     result = await HttpCommandExecutor(db).execute(
         operation="session.message.create.v1",
         scope_key=scope,
@@ -134,6 +146,7 @@ async def create_message(
         success_status=200,
         success_message="ok",
         handler=submit,
+        durable_outcome_resolver=resolve_durable_outcome,
     )
     return JSONResponse(
         status_code=result.status_code,

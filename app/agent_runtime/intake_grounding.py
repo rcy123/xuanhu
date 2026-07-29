@@ -204,6 +204,17 @@ _LIST_EXPLICIT_NONE_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 _PREGNANCY_TERMS = ("怀孕", "妊娠", "孕期", "有孕", "未孕", "非孕", "pregnan")
 _LACTATION_TERMS = ("哺乳", "母乳", "喂奶", "泌乳", "lactat", "breastfeed", "nursing")
+_BOUND_EXPLICIT_NONE_PATTERN = re.compile(
+    r"^\s*(?:无|没有|否|不是|未有|none|no)\s*[。.!！]?\s*$",
+    re.IGNORECASE,
+)
+_BOUND_SAFETY_DIMENSIONS = {
+    "allergy": "safety.allergy_status",
+    "medications": "safety.medication_status",
+    "major_conditions": "safety.major_condition_status",
+    "pregnancy": "safety.pregnancy_status",
+    "lactation": "safety.lactation_status",
+}
 
 
 def verify_intake_grounding(
@@ -226,14 +237,28 @@ def verify_intake_grounding(
         ("major_conditions", safety.major_conditions),
         ("contraindications", safety.contraindications),
     ):
-        failure = _verify_list_safety(field_name, delta, messages)
+        failure = _verify_list_safety(
+            field_name,
+            delta,
+            messages,
+            reply_dimension=(
+                input_payload.reply_context.selected_dimension
+                if input_payload.reply_context is not None
+                else None
+            ),
+        )
         if failure is not None:
             return failure
 
-    failure = _verify_pregnancy(safety.pregnancy, messages)
+    reply_dimension = (
+        input_payload.reply_context.selected_dimension
+        if input_payload.reply_context is not None
+        else None
+    )
+    failure = _verify_pregnancy(safety.pregnancy, messages, reply_dimension=reply_dimension)
     if failure is not None:
         return failure
-    return _verify_lactation(safety.lactation, messages)
+    return _verify_lactation(safety.lactation, messages, reply_dimension=reply_dimension)
 
 
 def normalize_grounded_text(value: str) -> str:
@@ -265,6 +290,8 @@ def _verify_list_safety(
     field_name: str,
     delta: SafetyListDelta,
     messages: dict[UUID, str],
+    *,
+    reply_dimension: str | None,
 ) -> IntakeGroundingFailureKind | None:
     if delta.status is CollectionStatus.UNKNOWN:
         return None
@@ -287,9 +314,11 @@ def _verify_list_safety(
     message = _verified_message(span, delta.source_message_id, messages)
     if message is None:
         return IntakeGroundingFailureKind.SPAN_INVALID
-    if _LIST_EXPLICIT_NONE_PATTERNS[field_name].search(
-        unicodedata.normalize("NFKC", span.quote)
-    ) is None:
+    normalized_quote = unicodedata.normalize("NFKC", span.quote)
+    if (
+        _LIST_EXPLICIT_NONE_PATTERNS[field_name].search(normalized_quote) is None
+        and not _is_bound_explicit_none(field_name, normalized_quote, reply_dimension)
+    ):
         return IntakeGroundingFailureKind.VALUE_MISMATCH
     allow_history = field_name in {"allergy", "major_conditions"}
     if not _explicit_negative_context(message, span, allow_history=allow_history):
@@ -302,6 +331,8 @@ def _verify_list_safety(
 def _verify_pregnancy(
     delta: PregnancyDelta,
     messages: dict[UUID, str],
+    *,
+    reply_dimension: str | None,
 ) -> IntakeGroundingFailureKind | None:
     if delta.status is CollectionStatus.UNKNOWN:
         return None
@@ -309,7 +340,10 @@ def _verify_pregnancy(
     message = _verified_message(delta.span, delta.source_message_id, messages)
     if message is None:
         return IntakeGroundingFailureKind.SPAN_INVALID
-    if not _contains_any(delta.span.quote, _PREGNANCY_TERMS):
+    if not _contains_any(delta.span.quote, _PREGNANCY_TERMS) and not (
+        delta.status is CollectionStatus.EXPLICITLY_NONE
+        and _is_bound_explicit_none("pregnancy", delta.span.quote, reply_dimension)
+    ):
         return IntakeGroundingFailureKind.VALUE_MISMATCH
 
     if delta.status is CollectionStatus.EXPLICITLY_NONE or delta.value is PregnancyValue.NOT_PREGNANT:
@@ -328,6 +362,8 @@ def _verify_pregnancy(
 def _verify_lactation(
     delta: LactationDelta,
     messages: dict[UUID, str],
+    *,
+    reply_dimension: str | None,
 ) -> IntakeGroundingFailureKind | None:
     if delta.status is CollectionStatus.UNKNOWN:
         return None
@@ -335,7 +371,10 @@ def _verify_lactation(
     message = _verified_message(delta.span, delta.source_message_id, messages)
     if message is None:
         return IntakeGroundingFailureKind.SPAN_INVALID
-    if not _contains_any(delta.span.quote, _LACTATION_TERMS):
+    if not _contains_any(delta.span.quote, _LACTATION_TERMS) and not (
+        delta.status is CollectionStatus.EXPLICITLY_NONE
+        and _is_bound_explicit_none("lactation", delta.span.quote, reply_dimension)
+    ):
         return IntakeGroundingFailureKind.VALUE_MISMATCH
     if delta.status is CollectionStatus.EXPLICITLY_NONE or delta.value is LactationValue.NOT_LACTATING:
         if not _explicit_negative_context(message, delta.span, allow_history=False):
@@ -346,6 +385,17 @@ def _verify_lactation(
     if not _affirmed_current_context(message, delta.span, allow_history=False):
         return IntakeGroundingFailureKind.CONTEXT_UNSAFE
     return None
+
+
+def _is_bound_explicit_none(
+    field_name: str,
+    quote: str,
+    reply_dimension: str | None,
+) -> bool:
+    return (
+        reply_dimension == _BOUND_SAFETY_DIMENSIONS.get(field_name)
+        and _BOUND_EXPLICIT_NONE_PATTERN.fullmatch(quote) is not None
+    )
 
 
 def _verified_message(

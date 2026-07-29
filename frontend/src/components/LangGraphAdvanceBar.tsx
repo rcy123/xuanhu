@@ -42,14 +42,26 @@ const DISPOSITION_META: Record<
 interface LangGraphAdvanceBarProps {
   detail: SessionDetail
   onAdvanced: (result: AdvanceData) => Promise<void> | void
+  onRefresh?: () => Promise<unknown> | void
   onRecovered?: (result: RecoveryData) => Promise<void> | void
 }
 
-export function LangGraphAdvanceBar({ detail, onAdvanced, onRecovered }: LangGraphAdvanceBarProps) {
+interface PendingAdvanceRequest {
+  sessionId: string
+  idempotencyKey: string
+  stateVersion: number
+}
+
+export function LangGraphAdvanceBar({
+  detail,
+  onAdvanced,
+  onRefresh,
+  onRecovered,
+}: LangGraphAdvanceBarProps) {
   const [submitting, setSubmitting] = useState(false)
   const [recoverySubmitting, setRecoverySubmitting] = useState(false)
   const [error, setError] = useState<ApiRequestError | null>(null)
-  const pendingKey = useRef<string | null>(null)
+  const pendingAdvance = useRef<PendingAdvanceRequest | null>(null)
   const pendingRecoveryKey = useRef<string | null>(null)
 
   if (detail.agent_runtime !== 'langgraph') return null
@@ -70,23 +82,43 @@ export function LangGraphAdvanceBar({ detail, onAdvanced, onRecovered }: LangGra
   const handleAdvance = async () => {
     setSubmitting(true)
     setError(null)
-    pendingKey.current ??= generateIdempotencyKey()
+    if (pendingAdvance.current?.sessionId !== detail.session_id) {
+      pendingAdvance.current = {
+        sessionId: detail.session_id,
+        idempotencyKey: generateIdempotencyKey(),
+        stateVersion: detail.state_version,
+      }
+    }
+    const request = pendingAdvance.current
     try {
       const result = await advanceSession(
-        detail.session_id,
+        request.sessionId,
         {},
-        { idempotencyKey: pendingKey.current, stateVersion: detail.state_version },
+        { idempotencyKey: request.idempotencyKey, stateVersion: request.stateVersion },
       )
-      pendingKey.current = null
+      pendingAdvance.current = null
       await onAdvanced(result)
     } catch (caught: unknown) {
-      setError(caught instanceof ApiRequestError ? caught : new ApiRequestError({
+      const commandError = caught instanceof ApiRequestError ? caught : new ApiRequestError({
         code: 'ADVANCE_FAILED',
         userMessage: '推进失败，请稍后重试',
         status: 0,
         retryable: true,
         cause: caught,
-      }))
+      })
+      const outcomeUncertain = commandError.status === 0
+        || commandError.status >= 500
+        || commandError.code === 'HTTP_COMMAND_RECOVERY_REQUIRED'
+        || commandError.code === 'BAD_RESPONSE'
+      if (!outcomeUncertain) pendingAdvance.current = null
+      if (commandError.code === 'INVALID_STATE_VERSION') {
+        try {
+          await onRefresh?.()
+        } catch {
+          // Preserve the original command error; the clinician can retry refresh separately.
+        }
+      }
+      setError(commandError)
     } finally {
       setSubmitting(false)
     }

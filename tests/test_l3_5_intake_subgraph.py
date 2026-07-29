@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from alembic import command
@@ -12,7 +12,9 @@ from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, select, text
+from sqlalchemy import null as sql_null
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.services.langgraph_intake as langgraph_intake_module
@@ -23,11 +25,20 @@ from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.runtime import AgentRuntime
 from app.agent_runtime.state import XuanhuGraphState, default_state, validate_state_json_safe
 from app.api.advance import _run_langgraph_advance as _production_run_langgraph_advance
-from app.core.exceptions import InsufficientInquiryError
+from app.core.exceptions import InsufficientInquiryError, ModelGatewayUnavailableError
+from app.core.exceptions import ValidationError as XuanhuValidationError
 from app.db.session import _build_async_pg_url
 from app.main import app
 from app.models.consult import ConsultMessage, ConsultSession
-from app.models.domain import DomainCommandCommit, GateResult, GraphRun, IntakeCommandClaim, OutboxEvent
+from app.models.domain import (
+    DomainCommandCommit,
+    GateResult,
+    GraphRun,
+    IntakeCommandClaim,
+    OutboxEvent,
+    SafetyFactAssertion,
+)
+from app.models.http_command import HttpCommandClaim
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.schemas.domain import CollectionStatus
 from app.schemas.intake import (
@@ -109,6 +120,24 @@ class _E2EFakeGateway:
     @property
     def question_model_calls(self) -> int:
         return sum(1 for item in self.calls if item["output_schema"] is QuestionComposerModelOutput)
+
+
+class _UnavailableOnceGateway(_E2EFakeGateway):
+    def __init__(self) -> None:
+        super().__init__("incomplete")
+        self._failed = False
+
+    async def chat_structured(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: type[BaseModel],
+        **kwargs: Any,
+    ) -> Any:
+        if output_schema is IntakeExtractionOutput and not self._failed:
+            self._failed = True
+            self.calls.append({"agent_name": kwargs.get("agent_name"), "output_schema": output_schema})
+            raise ModelGatewayUnavailableError()
+        return await super().chat_structured(messages, output_schema, **kwargs)
 
 
 def _source_message(messages: list[dict[str, Any]]) -> tuple[uuid.UUID, str]:
@@ -303,7 +332,8 @@ async def db_factory(migrated_database: str) -> AsyncIterator[async_sessionmaker
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE intake_command_claims, domain_command_commits, outbox_events, gate_results, "
+                "TRUNCATE http_command_claims, intake_command_claims, domain_command_commits, "
+                "outbox_events, gate_results, "
                 "artifact_revisions, graph_run_steps, graph_runs, safety_profiles, observations, "
                 "consult_messages, consult_sessions CASCADE"
             )
@@ -359,6 +389,419 @@ async def test_langgraph_messages_e2e_incomplete_uses_template_question_and_one_
         "gates_and_route",
     }
     assert claim.intermediate_payload["gates"]["route"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_bound_bare_negative_creates_pending_safety_fact_without_repeating_allergy(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    question_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(
+            ConsultSession(
+                id=session_id,
+                patient_info={},
+                state_version=1,
+                agent_runtime="langgraph",
+                state_snapshot={
+                    "langgraph_intake": {
+                        "last_question_message_id": str(question_id),
+                        "progress": {"no_new_facts_rounds": 0, "followup_rounds": 1},
+                    }
+                },
+            )
+        )
+        db.add(
+            ConsultMessage(
+                id=question_id,
+                session_id=session_id,
+                role="agent",
+                stage="inquiry",
+                agent_name="question_composer",
+                content="为补充用药安全信息，请问您目前是否有已知过敏？",
+                structured_delta={
+                    "selected_dimension": "safety.allergy_status",
+                    "selection_kind": "required",
+                },
+                trace_id="bound-negative-question",
+            )
+        )
+
+    async with db_factory() as db:
+        response = await LangGraphIntakeMessageRunner(db).submit_message(
+            str(session_id),
+            MessageCreateRequest(
+                role="patient_proxy",
+                content="没有",
+                reply_to_message_id=question_id,
+            ),
+            doctor_id="doctor-a",
+            trace_id="bound-negative-answer",
+            x_state_version=1,
+        )
+
+    async with db_factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assertion = await db.scalar(
+            select(SafetyFactAssertion).where(SafetyFactAssertion.session_id == session_id)
+        )
+        patient_message = await db.scalar(
+            select(ConsultMessage).where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.role == "patient_proxy",
+            )
+        )
+        latest_question = await db.scalar(
+            select(ConsultMessage)
+            .where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.agent_name == "question_composer",
+                ConsultMessage.id != question_id,
+            )
+            .order_by(ConsultMessage.created_at.desc())
+        )
+
+    assert gateway.intake_calls == 0
+    assert session is not None
+    assert session.status == "active"
+    assert session.state_snapshot["langgraph_intake"]["progress"]["no_new_facts_rounds"] == 0
+    assert assertion is not None
+    assert assertion.field_name == "allergy"
+    assert assertion.status == "proposed"
+    assert assertion.source_kind == "deterministic_reply_binding"
+    assert patient_message is not None
+    assert patient_message.structured_delta["reply_context"] == {
+        "question_message_id": str(question_id),
+        "selected_dimension": "safety.allergy_status",
+        "selection_kind": "required",
+    }
+    assert response.agent_message is not None
+    assert latest_question is not None
+    assert latest_question.structured_delta["selected_dimension"] != "safety.allergy_status"
+
+
+@pytest.mark.asyncio
+async def test_explicit_stale_reply_question_is_rejected_before_patient_message_or_claim(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    stale_question_id = uuid.uuid4()
+    current_question_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(
+            ConsultSession(
+                id=session_id,
+                patient_info={},
+                state_version=1,
+                agent_runtime="langgraph",
+                state_snapshot={
+                    "langgraph_intake": {
+                        "last_question_message_id": str(current_question_id),
+                        "progress": {"no_new_facts_rounds": 0, "followup_rounds": 2},
+                    }
+                },
+            )
+        )
+        db.add_all(
+            [
+                ConsultMessage(
+                    id=stale_question_id,
+                    session_id=session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="Do you have any known allergies?",
+                    structured_delta={
+                        "selected_dimension": "safety.allergy_status",
+                        "selection_kind": "required",
+                    },
+                    trace_id="stale-reply-question",
+                ),
+                ConsultMessage(
+                    id=current_question_id,
+                    session_id=session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="Are you currently taking any medications?",
+                    structured_delta={
+                        "selected_dimension": "safety.medication_status",
+                        "selection_kind": "required",
+                    },
+                    trace_id="current-reply-question",
+                ),
+            ]
+        )
+
+    async with db_factory() as db:
+        with pytest.raises(XuanhuValidationError) as captured:
+            await LangGraphIntakeMessageRunner(db).submit_message(
+                str(session_id),
+                MessageCreateRequest(
+                    role="patient_proxy",
+                    content="no",
+                    reply_to_message_id=stale_question_id,
+                ),
+                doctor_id="doctor-a",
+                trace_id="stale-reply-answer",
+                x_state_version=1,
+                idempotency_key="stale-reply-answer",
+            )
+        assert "current intake question" in (captured.value.detail or "")
+
+    async with db_factory() as db:
+        patient_message_count = await db.scalar(
+            select(func.count())
+            .select_from(ConsultMessage)
+            .where(ConsultMessage.session_id == session_id, ConsultMessage.role == "patient_proxy")
+        )
+        claim_count = await db.scalar(
+            select(func.count())
+            .select_from(IntakeCommandClaim)
+            .where(IntakeCommandClaim.session_id == session_id)
+        )
+        session = await db.get(ConsultSession, session_id)
+
+    assert gateway.intake_calls == 0
+    assert patient_message_count == 0
+    assert claim_count == 0
+    assert session is not None
+    assert session.state_version == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_cross_session_reply_question_is_rejected_before_patient_message_or_claim(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    foreign_session_id = uuid.uuid4()
+    foreign_question_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add_all(
+            [
+                ConsultSession(
+                    id=session_id,
+                    patient_info={},
+                    state_version=1,
+                    agent_runtime="langgraph",
+                    # Exercise the ownership check even if a corrupt/stale
+                    # snapshot points at another session's otherwise valid question.
+                    state_snapshot={
+                        "langgraph_intake": {
+                            "last_question_message_id": str(foreign_question_id),
+                            "progress": {"no_new_facts_rounds": 0, "followup_rounds": 1},
+                        }
+                    },
+                ),
+                ConsultSession(
+                    id=foreign_session_id,
+                    patient_info={},
+                    state_version=1,
+                    agent_runtime="langgraph",
+                ),
+                ConsultMessage(
+                    id=foreign_question_id,
+                    session_id=foreign_session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="Do you have any known allergies?",
+                    structured_delta={
+                        "selected_dimension": "safety.allergy_status",
+                        "selection_kind": "required",
+                    },
+                    trace_id="foreign-reply-question",
+                ),
+            ]
+        )
+
+    async with db_factory() as db:
+        with pytest.raises(XuanhuValidationError) as captured:
+            await LangGraphIntakeMessageRunner(db).submit_message(
+                str(session_id),
+                MessageCreateRequest(
+                    role="patient_proxy",
+                    content="no",
+                    reply_to_message_id=foreign_question_id,
+                ),
+                doctor_id="doctor-a",
+                trace_id="cross-session-reply-answer",
+                x_state_version=1,
+                idempotency_key="cross-session-reply-answer",
+            )
+        assert "not a valid intake question" in (captured.value.detail or "")
+
+    async with db_factory() as db:
+        patient_message_count = await db.scalar(
+            select(func.count())
+            .select_from(ConsultMessage)
+            .where(ConsultMessage.session_id == session_id, ConsultMessage.role == "patient_proxy")
+        )
+        claim_count = await db.scalar(
+            select(func.count())
+            .select_from(IntakeCommandClaim)
+            .where(IntakeCommandClaim.session_id == session_id)
+        )
+        session = await db.get(ConsultSession, session_id)
+
+    assert gateway.intake_calls == 0
+    assert patient_message_count == 0
+    assert claim_count == 0
+    assert session is not None
+    assert session.state_version == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_reply_question_uuid_is_rejected_by_schema_and_api_without_writes(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = uuid.uuid4()
+    async with db_factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
+
+    malformed_body = {
+        "role": "patient_proxy",
+        "content": "no",
+        "reply_to_message_id": "definitely-not-a-uuid",
+    }
+    with pytest.raises(PydanticValidationError):
+        MessageCreateRequest.model_validate(malformed_body)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json=malformed_body,
+            headers={
+                "X-Doctor-Id": "doctor-a",
+                "X-State-Version": "1",
+                "X-Request-Id": "malformed-reply-question",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "VALIDATION_ERROR"
+    async with db_factory() as db:
+        patient_message_count = await db.scalar(
+            select(func.count())
+            .select_from(ConsultMessage)
+            .where(ConsultMessage.session_id == session_id, ConsultMessage.role == "patient_proxy")
+        )
+        claim_count = await db.scalar(
+            select(func.count())
+            .select_from(IntakeCommandClaim)
+            .where(IntakeCommandClaim.session_id == session_id)
+        )
+    assert patient_message_count == 0
+    assert claim_count == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_client_without_reply_id_binds_only_current_canonical_question(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    stale_question_id = uuid.uuid4()
+    current_question_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(
+            ConsultSession(
+                id=session_id,
+                patient_info={},
+                state_version=1,
+                agent_runtime="langgraph",
+                state_snapshot={
+                    "langgraph_intake": {
+                        "last_question_message_id": str(current_question_id),
+                        "progress": {"no_new_facts_rounds": 0, "followup_rounds": 2},
+                    }
+                },
+            )
+        )
+        db.add_all(
+            [
+                ConsultMessage(
+                    id=stale_question_id,
+                    session_id=session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="Are you currently taking any medications?",
+                    structured_delta={
+                        "selected_dimension": "safety.medication_status",
+                        "selection_kind": "required",
+                    },
+                    trace_id="legacy-stale-question",
+                ),
+                ConsultMessage(
+                    id=current_question_id,
+                    session_id=session_id,
+                    role="agent",
+                    stage="inquiry",
+                    agent_name="question_composer",
+                    content="Do you have any known allergies?",
+                    structured_delta={
+                        "selected_dimension": "safety.allergy_status",
+                        "selection_kind": "required",
+                    },
+                    trace_id="legacy-current-question",
+                ),
+            ]
+        )
+
+    async with db_factory() as db:
+        await LangGraphIntakeMessageRunner(db).submit_message(
+            str(session_id),
+            # Deliberately omit reply_to_message_id to emulate a legacy client.
+            MessageCreateRequest(role="patient_proxy", content="no"),
+            doctor_id="doctor-a",
+            trace_id="legacy-bound-answer",
+            x_state_version=1,
+            idempotency_key="legacy-bound-answer",
+        )
+
+    async with db_factory() as db:
+        patient_message = await db.scalar(
+            select(ConsultMessage).where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.role == "patient_proxy",
+            )
+        )
+        assertions = (
+            await db.scalars(
+                select(SafetyFactAssertion).where(SafetyFactAssertion.session_id == session_id)
+            )
+        ).all()
+        claim = await db.scalar(
+            select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id)
+        )
+
+    assert gateway.intake_calls == 0
+    assert patient_message is not None
+    assert patient_message.structured_delta is not None
+    assert patient_message.structured_delta["reply_context"] == {
+        "question_message_id": str(current_question_id),
+        "selected_dimension": "safety.allergy_status",
+        "selection_kind": "required",
+    }
+    assert len(assertions) == 1
+    assert assertions[0].field_name == "allergy"
+    assert assertions[0].source_kind == "deterministic_reply_binding"
+    assert claim is not None
+    assert claim.patient_message_id == patient_message.id
 
 
 @pytest.mark.asyncio
@@ -564,15 +1007,16 @@ async def test_langgraph_messages_recovers_when_claim_completion_is_interrupted_
     async with db_factory() as db:
         claim = await db.scalar(select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id))
         commit = await db.scalar(select(DomainCommandCommit).where(DomainCommandCommit.session_id == session_id))
+        session = await db.get(ConsultSession, session_id)
         agent_message_count = await db.scalar(
             text("SELECT count(*) FROM consult_messages WHERE session_id = :sid AND role = 'agent'"),
             {"sid": session_id},
         )
 
-    # Safety facts are now proposed assertions until explicitly confirmed, so
-    # the authoritative completeness gate correctly persists one follow-up.
-    # Recovery must reconstruct that exact response without duplicating it.
-    assert response.agent_message is not None
+    # All remaining gaps are backed by proposed safety assertions. The runtime
+    # must wait for doctor confirmation rather than repeating those questions,
+    # and recovery must reconstruct that exact no-question response.
+    assert response.agent_message is None
     assert response.current_stage == "inquiry"
     assert response.state_version == 3
     assert gateway.intake_calls == 1
@@ -580,9 +1024,192 @@ async def test_langgraph_messages_recovers_when_claim_completion_is_interrupted_
     assert claim.status == "completed"
     assert claim.response_payload is not None
     assert claim.response_payload == response.model_dump(mode="json")
-    assert claim.question_message_id == uuid.UUID(response.agent_message.message_id)
-    assert agent_message_count == 1
+    assert claim.question_message_id is None
+    assert agent_message_count == 0
+    assert session is not None
+    assert session.state_snapshot["langgraph_intake"]["dialogue_status"] == "awaiting_safety_confirmation"
     assert commit is not None
+
+
+@pytest.mark.asyncio
+async def test_messages_api_repairs_ambiguous_http_claim_from_completed_intake(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    gateway = _E2EFakeGateway("incomplete")
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
+
+    idempotency_key = f"message-http-repair-{uuid.uuid4()}"
+    request_body = {"role": "patient_proxy", "content": "headache"}
+    headers = {
+        "X-Doctor-Id": "doctor-http-repair",
+        "X-Idempotency-Key": idempotency_key,
+        "X-State-Version": "1",
+    }
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json=request_body,
+            headers=headers,
+        )
+        assert first.status_code == 200, first.text
+
+        async with db_factory() as db, db.begin():
+            http_claim = await db.scalar(
+                select(HttpCommandClaim).where(
+                    HttpCommandClaim.operation == "session.message.create.v1",
+                    HttpCommandClaim.scope_key == f"session:{session_id}",
+                )
+            )
+            assert http_claim is not None
+            http_claim.status = "ambiguous"
+            http_claim.http_status = None
+            http_claim.response_payload = cast(Any, sql_null())
+            http_claim.error_payload = cast(Any, sql_null())
+            http_claim.lease_expires_at = None
+            http_claim.completed_at = None
+
+        replay = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json=request_body,
+            headers=headers,
+        )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["data"] == first.json()["data"]
+    assert gateway.intake_calls == 1
+    async with db_factory() as db:
+        repaired = await db.scalar(
+            select(HttpCommandClaim).where(
+                HttpCommandClaim.operation == "session.message.create.v1",
+                HttpCommandClaim.scope_key == f"session:{session_id}",
+            )
+        )
+        intake_claim_count = await db.scalar(
+            select(func.count())
+            .select_from(IntakeCommandClaim)
+            .where(IntakeCommandClaim.session_id == session_id)
+        )
+        patient_message_count = await db.scalar(
+            select(func.count())
+            .select_from(ConsultMessage)
+            .where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.role == "patient_proxy",
+            )
+        )
+    assert repaired is not None and repaired.status == "completed"
+    assert intake_claim_count == 1
+    assert patient_message_count == 1
+
+
+@pytest.mark.asyncio
+async def test_messages_api_same_public_command_resumes_gateway_failed_intake_without_new_message(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    gateway = _UnavailableOnceGateway()
+    _install_fake_runtime(monkeypatch, gateway)
+    async with db_factory() as db, db.begin():
+        db.add(ConsultSession(id=session_id, patient_info={}, state_version=1, agent_runtime="langgraph"))
+
+    idempotency_key = f"message-gateway-resume-{uuid.uuid4()}"
+    request_body = {"role": "patient_proxy", "content": "headache"}
+    headers = {
+        "X-Doctor-Id": "doctor-gateway-resume",
+        "X-Idempotency-Key": idempotency_key,
+        "X-State-Version": "1",
+    }
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json=request_body,
+            headers=headers,
+        )
+        assert first.status_code == 503, first.text
+        assert first.json()["code"] == "AGENT_TRIGGER_FAILED"
+        assert first.json()["agent_error_code"] == "MODEL_GATEWAY_UNAVAILABLE"
+        assert first.json()["retryable"] is True
+
+        async with db_factory() as db:
+            failed_intake = await db.scalar(
+                select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id)
+            )
+            failed_http = await db.scalar(
+                select(HttpCommandClaim).where(
+                    HttpCommandClaim.operation == "session.message.create.v1",
+                    HttpCommandClaim.scope_key == f"session:{session_id}",
+                )
+            )
+            assert failed_intake is not None
+            failed_run = await db.get(GraphRun, failed_intake.run_id)
+            message_count_after_failure = await db.scalar(
+                select(func.count())
+                .select_from(ConsultMessage)
+                .where(
+                    ConsultMessage.session_id == session_id,
+                    ConsultMessage.role == "patient_proxy",
+                )
+            )
+        original_claim_id = failed_intake.id
+        original_message_id = failed_intake.patient_message_id
+        original_run_id = failed_intake.run_id
+        assert failed_intake.status == "failed"
+        assert failed_intake.error_code == "MODEL_GATEWAY_UNAVAILABLE"
+        assert failed_http is not None and failed_http.status == "failed"
+        assert failed_run is not None and failed_run.status == "failed"
+        assert failed_run.completed_at is not None
+        assert message_count_after_failure == 1
+
+        # Simulate legacy failure records written before GraphRun failure was
+        # persisted atomically with the internal intake claim.
+        async with db_factory() as db, db.begin():
+            legacy_run = await db.get(GraphRun, original_run_id, with_for_update=True)
+            assert legacy_run is not None
+            legacy_run.status = "running"
+            legacy_run.completed_at = None
+
+        retry = await client.post(
+            f"/api/v1/consult/sessions/{session_id}/messages",
+            json=request_body,
+            headers=headers,
+        )
+
+    assert retry.status_code == 200, retry.text
+    assert gateway.intake_calls == 2
+    async with db_factory() as db:
+        completed_intake = await db.scalar(
+            select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id)
+        )
+        completed_http = await db.scalar(
+            select(HttpCommandClaim).where(
+                HttpCommandClaim.operation == "session.message.create.v1",
+                HttpCommandClaim.scope_key == f"session:{session_id}",
+            )
+        )
+        completed_run = await db.get(GraphRun, original_run_id)
+        patient_messages = (
+            await db.scalars(
+                select(ConsultMessage).where(
+                    ConsultMessage.session_id == session_id,
+                    ConsultMessage.role == "patient_proxy",
+                )
+            )
+        ).all()
+    assert completed_intake is not None
+    assert completed_intake.id == original_claim_id
+    assert completed_intake.patient_message_id == original_message_id
+    assert completed_intake.run_id == original_run_id
+    assert completed_intake.status == "completed"
+    assert completed_http is not None and completed_http.status == "completed"
+    assert completed_run is not None and completed_run.status == "completed"
+    assert [message.id for message in patient_messages] == [original_message_id]
 
 
 @pytest.mark.asyncio
@@ -989,6 +1616,91 @@ async def test_langgraph_advance_requires_current_ready_gate(
                 state_version=2,
                 trace_id="advance-no-gate",
             )
+
+
+@pytest.mark.asyncio
+async def test_langgraph_advance_ready_gate_still_requires_proposed_safety_resolution(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = uuid.uuid4()
+    source_message_id = uuid.uuid4()
+    async with db_factory() as db, db.begin():
+        db.add(
+            ConsultSession(
+                id=session_id,
+                patient_info={},
+                state_version=2,
+                current_stage="inquiry",
+                agent_runtime="langgraph",
+            )
+        )
+        db.add(
+            ConsultMessage(
+                id=source_message_id,
+                session_id=session_id,
+                role="patient_proxy",
+                stage="inquiry",
+                content="No known allergies.",
+                trace_id="advance-pending-safety-source",
+            )
+        )
+        db.add(
+            GateResult(
+                id=uuid.uuid4(),
+                session_id=session_id,
+                gate_name=COMPLETENESS_GATE_NAME,
+                policy_version=COMPLETENESS_POLICY_VERSION,
+                input_state_version=2,
+                decision="passed",
+                details={"disposition": "ready"},
+            )
+        )
+        await db.flush()
+        db.add(
+            SafetyFactAssertion(
+                id=uuid.uuid4(),
+                session_id=session_id,
+                field_name="allergy",
+                value={"status": "explicitly_none", "items": []},
+                value_digest="a" * 64,
+                assertion_fingerprint="b" * 64,
+                status="proposed",
+                source_kind="structured_form",
+                source_message_id=source_message_id,
+                extraction_run_id=None,
+                template_version="advance-gate-test.v1",
+                evidence_spans=[],
+                evidence_digest="c" * 64,
+                proposed_by_actor_type="doctor",
+                proposed_by_actor_id="doctor-a",
+            )
+        )
+
+    async with db_factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        with pytest.raises(InsufficientInquiryError) as captured:
+            await _run_langgraph_advance(
+                db,
+                session,
+                session_id=str(session_id),
+                state_version=2,
+                trace_id="advance-pending-safety",
+            )
+        assert "proposed safety facts" in (captured.value.detail or "")
+
+    async with db_factory() as db:
+        refreshed = await db.get(ConsultSession, session_id)
+        claim_count = await db.scalar(
+            select(func.count())
+            .select_from(IntakeCommandClaim)
+            .where(IntakeCommandClaim.session_id == session_id)
+        )
+
+    assert refreshed is not None
+    assert refreshed.current_stage == "inquiry"
+    assert refreshed.state_version == 2
+    assert claim_count == 0
 
 
 @pytest.mark.asyncio

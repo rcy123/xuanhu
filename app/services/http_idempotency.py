@@ -82,16 +82,12 @@ class HttpCommandExecutor:
         handler: Callable[[], Awaitable[dict[str, Any]]],
         durable_outcome_resolver: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> HttpCommandResult:
-        """Execute a public write exactly once for a claimed logical command."""
+        """Execute a public write under a durable claim and scope lock.
 
-        if not is_idempotent:
-            data = await handler()
-            return HttpCommandResult(
-                data=data,
-                status_code=success_status,
-                message=success_message,
-                replayed=False,
-            )
+        Headerless requests carry a fresh server-generated key and are stored
+        as ``non_idempotent``.  They therefore participate in concurrency
+        control without exposing a caller-replayable logical command.
+        """
 
         key_digest = _digest_text(idempotency_key)
         request_digest = _digest_json(request_payload)

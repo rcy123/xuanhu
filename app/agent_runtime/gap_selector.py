@@ -76,121 +76,121 @@ _GAP_PRIORITY_RULES_AUTHORITY: Mapping[InquiryDimension, GapPriorityRule] = Froz
         GapPriorityRule(
             rule_id="gap.priority.chief_complaint.category.v1",
             dimension=InquiryDimension.CHIEF_COMPLAINT_CATEGORY,
-            conflict_priority=90,
+            conflict_priority=80,
         ),
         GapPriorityRule(
             rule_id="gap.priority.safety.allergy_status.v1",
             dimension=InquiryDimension.ALLERGY_STATUS,
-            required_priority=100,
-            conflict_priority=100,
+            required_priority=500,
+            conflict_priority=90,
         ),
         GapPriorityRule(
             rule_id="gap.priority.safety.pregnancy_status.v1",
             dimension=InquiryDimension.PREGNANCY_STATUS,
-            required_priority=110,
-            conflict_priority=110,
+            required_priority=530,
+            conflict_priority=91,
         ),
         GapPriorityRule(
             rule_id="gap.priority.safety.lactation_status.v1",
             dimension=InquiryDimension.LACTATION_STATUS,
-            required_priority=120,
-            conflict_priority=120,
+            required_priority=540,
+            conflict_priority=92,
         ),
         GapPriorityRule(
             rule_id="gap.priority.safety.medication_status.v1",
             dimension=InquiryDimension.MEDICATION_STATUS,
-            required_priority=130,
-            conflict_priority=130,
+            required_priority=510,
+            conflict_priority=93,
         ),
         GapPriorityRule(
             rule_id="gap.priority.safety.major_condition_status.v1",
             dimension=InquiryDimension.MAJOR_CONDITION_STATUS,
-            required_priority=140,
-            conflict_priority=140,
+            required_priority=520,
+            conflict_priority=94,
         ),
         GapPriorityRule(
             rule_id="gap.priority.chief_complaint.symptom.v1",
             dimension=InquiryDimension.CHIEF_COMPLAINT_SYMPTOM,
-            required_priority=200,
-            conflict_priority=200,
+            required_priority=100,
+            conflict_priority=100,
         ),
         GapPriorityRule(
             rule_id="gap.priority.chief_complaint.course.v1",
             dimension=InquiryDimension.BASIC_COURSE,
-            required_priority=210,
-            conflict_priority=210,
+            required_priority=110,
+            conflict_priority=110,
         ),
         GapPriorityRule(
             rule_id="gap.priority.present_illness.change.v1",
             dimension=InquiryDimension.PRESENT_ILLNESS_CHANGE,
-            required_priority=300,
-            conflict_priority=300,
+            required_priority=120,
+            conflict_priority=120,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.cold_heat.v1",
             dimension=InquiryDimension.TEN_COLD_HEAT,
-            required_priority=400,
-            conflict_priority=400,
+            required_priority=200,
+            conflict_priority=200,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.stool_urine.v1",
             dimension=InquiryDimension.TEN_STOOL_URINE,
-            required_priority=410,
-            conflict_priority=410,
+            required_priority=210,
+            conflict_priority=210,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.diet.v1",
             dimension=InquiryDimension.TEN_DIET,
-            required_priority=420,
-            conflict_priority=420,
+            required_priority=220,
+            conflict_priority=220,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.sleep.v1",
             dimension=InquiryDimension.TEN_SLEEP,
-            required_priority=430,
-            conflict_priority=430,
+            required_priority=230,
+            conflict_priority=230,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.respiratory.v1",
             dimension=InquiryDimension.TEN_RESPIRATORY,
-            required_priority=440,
-            conflict_priority=440,
+            required_priority=240,
+            conflict_priority=240,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.pain.v1",
             dimension=InquiryDimension.TEN_PAIN,
-            required_priority=450,
-            conflict_priority=450,
+            required_priority=250,
+            conflict_priority=250,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.menses_leukorrhea.v1",
             dimension=InquiryDimension.TEN_MENSES_LEUKORRHEA,
-            required_priority=460,
-            conflict_priority=460,
+            required_priority=260,
+            conflict_priority=260,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.sweat.v1",
             dimension=InquiryDimension.TEN_SWEAT,
-            required_priority=470,
-            conflict_priority=470,
+            required_priority=270,
+            conflict_priority=270,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.head_body.v1",
             dimension=InquiryDimension.TEN_HEAD_BODY,
-            required_priority=480,
-            conflict_priority=480,
+            required_priority=280,
+            conflict_priority=280,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.chest_abdomen.v1",
             dimension=InquiryDimension.TEN_CHEST_ABDOMEN,
-            required_priority=490,
-            conflict_priority=490,
+            required_priority=290,
+            conflict_priority=290,
         ),
         GapPriorityRule(
             rule_id="gap.priority.ten_questions.thirst.v1",
             dimension=InquiryDimension.TEN_THIRST,
-            required_priority=500,
-            conflict_priority=500,
+            required_priority=300,
+            conflict_priority=300,
         ),
         GapPriorityRule(
             rule_id="gap.priority.past_history.v1",
@@ -263,25 +263,48 @@ def canonicalize_gap_selection_input(input_payload: object) -> CompletenessPolic
     return canonical
 
 
-def select_gap(completeness_result: object) -> GapSelectionResult:
+def select_gap(
+    completeness_result: object,
+    *,
+    pending_safety_dimensions: tuple[InquiryDimension, ...] = (),
+) -> GapSelectionResult:
     """Select at most one deterministic required/conflict gap."""
 
-    return _select_gap_with_priority_registry(completeness_result, _GAP_PRIORITY_RULES_AUTHORITY)
+    return _select_gap_with_priority_registry(
+        completeness_result,
+        _GAP_PRIORITY_RULES_AUTHORITY,
+        pending_safety_dimensions=pending_safety_dimensions,
+    )
 
 
 def _select_gap_with_priority_registry(
     completeness_result: object,
     priority_registry: Mapping[InquiryDimension, GapPriorityRule],
+    *,
+    pending_safety_dimensions: tuple[InquiryDimension, ...] = (),
 ) -> GapSelectionResult:
     """Private test seam. Production callers cannot choose priority rules."""
 
     completeness = canonicalize_gap_selection_input(completeness_result)
+    deferred = _canonical_pending_safety_dimensions(pending_safety_dimensions)
     if completeness.disposition is CompletenessDisposition.INCOMPLETE:
+        dimensions = tuple(
+            item for item in completeness.missing_required if item not in deferred
+        )
+        if not dimensions:
+            return GapSelectionResult(
+                input_state_version=completeness.input_state_version,
+                disposition=GapSelectionDisposition.NO_SELECTION,
+                selection_kind=GapSelectionKind.NONE,
+                source_completeness_disposition=completeness.disposition.value,
+                deferred_dimensions=deferred,
+            )
         return _select_from_dimensions(
             completeness=completion_result_to_selection_source(completeness),
-            dimensions=completeness.missing_required,
+            dimensions=dimensions,
             kind=GapSelectionKind.REQUIRED,
             priority_registry=priority_registry,
+            deferred_dimensions=deferred,
         )
     if completeness.disposition is CompletenessDisposition.CONFLICT:
         return _select_from_dimensions(
@@ -289,12 +312,14 @@ def _select_gap_with_priority_registry(
             dimensions=tuple(item.dimension for item in completeness.conflicting_dimensions),
             kind=GapSelectionKind.CONFLICT,
             priority_registry=priority_registry,
+            deferred_dimensions=deferred,
         )
     return GapSelectionResult(
         input_state_version=completeness.input_state_version,
         disposition=GapSelectionDisposition.NO_SELECTION,
         selection_kind=GapSelectionKind.NONE,
         source_completeness_disposition=completeness.disposition.value,
+        deferred_dimensions=deferred,
     )
 
 
@@ -310,6 +335,7 @@ def _select_from_dimensions(
     dimensions: tuple[InquiryDimension, ...],
     kind: GapSelectionKind,
     priority_registry: Mapping[InquiryDimension, GapPriorityRule],
+    deferred_dimensions: tuple[InquiryDimension, ...] = (),
 ) -> GapSelectionResult:
     unique_dimensions = tuple(sorted(frozenset(dimensions), key=lambda item: item.value))
     if not unique_dimensions:
@@ -333,7 +359,32 @@ def _select_from_dimensions(
         selection_kind=kind,
         priority_rule_id=selected_rule.rule_id,
         source_completeness_disposition=completeness.disposition.value,
+        deferred_dimensions=deferred_dimensions,
     )
+
+
+def _canonical_pending_safety_dimensions(
+    dimensions: tuple[InquiryDimension, ...],
+) -> tuple[InquiryDimension, ...]:
+    safety_dimensions = {
+        InquiryDimension.ALLERGY_STATUS,
+        InquiryDimension.MEDICATION_STATUS,
+        InquiryDimension.MAJOR_CONDITION_STATUS,
+        InquiryDimension.PREGNANCY_STATUS,
+        InquiryDimension.LACTATION_STATUS,
+    }
+    try:
+        canonical = tuple(
+            sorted(
+                {InquiryDimension(item) for item in dimensions},
+                key=lambda item: item.value,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise GapSelectionInputError(GapSelectionFailureCode.INPUT_SCHEMA_INVALID) from exc
+    if any(item not in safety_dimensions for item in canonical):
+        raise GapSelectionInputError(GapSelectionFailureCode.INPUT_SCHEMA_INVALID)
+    return canonical
 
 
 def _completeness_result_is_internally_consistent(result: CompletenessPolicyResult) -> bool:

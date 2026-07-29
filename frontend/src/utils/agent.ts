@@ -88,6 +88,9 @@ export function canAdvanceLangGraph(detail: SessionDetail): boolean {
     detail.agent_runtime !== 'langgraph'
     || detail.current_stage !== 'inquiry'
     || detail.status !== 'active'
+    || detail.read_model.unresolved.some(
+      (item) => item.source === 'safety_confirmation',
+    )
   ) {
     return false
   }

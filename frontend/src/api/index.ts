@@ -24,6 +24,10 @@ import type {
   RecoveryRequest,
   ReviewData,
   ReviewRequest,
+  SafetyAssertionDecisionRequest,
+  SafetyAssertionStatus,
+  SafetyFactAssertion,
+  SafetyFactAssertionList,
   SessionCreateData,
   SessionCreateRequest,
   SessionDetail,
@@ -112,7 +116,8 @@ export function submitMessage(
 }
 
 /**
- * 提交消息（带自动重试，处理 409 SESSION_BUSY / INVALID_STATE_VERSION）。
+ * 提交消息（带自动重试，处理 SESSION_BUSY 等不确定失败）。
+ * INVALID_STATE_VERSION 是确定失败，由 useMessages 校验回复绑定后新建命令。
  * 默认重试 3 次，间隔 1.5s。
  */
 export function submitMessageWithRetry(
@@ -129,6 +134,12 @@ export function submitMessageWithRetry(
       body: JSON.stringify(body),
       ctx: writeContext,
       maxRetries,
+      // A stale state version is a deterministic command failure.  Replaying
+      // the same idempotency key cannot fix it because state_version is part of
+      // the backend request digest; useMessages performs the safe rebase.
+      // AGENT_TRIGGER_FAILED already has a saved doctor message/failed claim;
+      // only an explicit exact-command retry may ask the backend to resume it.
+      retryExcludedCodes: ['INVALID_STATE_VERSION', 'AGENT_TRIGGER_FAILED'],
     },
   )
 }
@@ -146,6 +157,61 @@ export function listMessages(
       ctx,
     },
   )
+}
+
+// ---------------------------------------------------------------------------
+// 问诊安全事实确认
+// ---------------------------------------------------------------------------
+
+/** 查询安全事实候选；默认只返回尚待医生确认的项目。 */
+export function listSafetyAssertions(
+  sessionId: string,
+  status: SafetyAssertionStatus | undefined = 'proposed',
+  ctx?: RequestContext,
+): Promise<SafetyFactAssertionList> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : ''
+  return request<SafetyFactAssertionList>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/safety-assertions${query}`,
+    { method: 'GET', ctx },
+  )
+}
+
+function decideSafetyAssertion(
+  sessionId: string,
+  assertionId: string,
+  action: 'confirm' | 'reject',
+  body: SafetyAssertionDecisionRequest,
+  ctx?: RequestContext,
+): Promise<SafetyFactAssertion> {
+  const writeContext = withIdempotencyKey(ctx)
+  return request<SafetyFactAssertion>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/safety-assertions/${encodeURIComponent(assertionId)}/${action}`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+      ctx: writeContext,
+    },
+  )
+}
+
+/** 医生确认候选事实，并由后端投影到权威安全档案。 */
+export function confirmSafetyAssertion(
+  sessionId: string,
+  assertionId: string,
+  body: SafetyAssertionDecisionRequest = {},
+  ctx?: RequestContext,
+): Promise<SafetyFactAssertion> {
+  return decideSafetyAssertion(sessionId, assertionId, 'confirm', body, ctx)
+}
+
+/** 医生驳回候选事实；该候选不会进入权威安全档案。 */
+export function rejectSafetyAssertion(
+  sessionId: string,
+  assertionId: string,
+  body: SafetyAssertionDecisionRequest = {},
+  ctx?: RequestContext,
+): Promise<SafetyFactAssertion> {
+  return decideSafetyAssertion(sessionId, assertionId, 'reject', body, ctx)
 }
 
 // ---------------------------------------------------------------------------

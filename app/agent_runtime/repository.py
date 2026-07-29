@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select, update
@@ -35,6 +35,7 @@ from app.models.domain import (
     GraphRunStep,
     Observation,
     OutboxEvent,
+    SafetyFactAssertion,
     SafetyProfile,
 )
 from app.models.review import DoctorReview, MedicalRecord
@@ -42,7 +43,36 @@ from app.models.safety import SafetyRuleRun
 from app.schemas.domain import ArtifactRevisionSchema, GateResultSchema, ObservationSchema, SafetyProfileSchema
 
 DOMAIN_STATE_COMMITTED = "domain.state_committed.v1"
+SAFETY_FACT_MANIFEST_VERSION = "intake-safety-fact-manifest.v1"
+_INTAKE_SAFETY_SOURCE_KINDS = (
+    "model_extraction",
+    "deterministic_precheck",
+    "deterministic_reply_binding",
+)
+_INTAKE_REPLY_BINDING_VERSION = "intake-reply-binding.v1"
+_SAFETY_REPLY_DIMENSION_BY_FIELD = {
+    "allergy": "safety.allergy_status",
+    "pregnancy": "safety.pregnancy_status",
+    "lactation": "safety.lactation_status",
+    "medications": "safety.medication_status",
+    "major_conditions": "safety.major_condition_status",
+}
+_EXPLICIT_NONE_REPLY = re.compile(
+    r"^\s*(?:无|没有|否|不是|未有|none|no)\s*[。.!！]?\s*$",
+    re.IGNORECASE,
+)
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def _canonical_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def artifact_payload_digest(payload_schema_version: str, payload: dict[str, object]) -> str:
@@ -185,6 +215,175 @@ class ConsultMessageSpec(BaseModel):
     trace_id: str | None = Field(default=None, max_length=64)
 
 
+class SafetyFactEvidenceSpec(BaseModel):
+    """Privacy-minimal, immutable evidence reference for a safety proposal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_message_id: UUID
+    start_char: int = Field(ge=0)
+    end_char: int = Field(gt=0)
+    quote_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reply_to_question_message_id: UUID | None = None
+    reply_dimension: str | None = Field(
+        default=None,
+        pattern=(
+            r"^safety\.(allergy_status|pregnancy_status|lactation_status|"
+            r"medication_status|major_condition_status)$"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def valid_range_and_reply_binding(self) -> SafetyFactEvidenceSpec:
+        if self.end_char <= self.start_char:
+            raise ValueError("safety evidence range must be non-empty")
+        if (self.reply_to_question_message_id is None) != (self.reply_dimension is None):
+            raise ValueError("safety evidence reply binding must be complete")
+        return self
+
+
+class SafetyFactAssertionSpec(BaseModel):
+    """Atomic, content-addressed safety proposal persisted with a Domain commit."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    assertion_id: UUID
+    session_id: UUID
+    field_name: str = Field(
+        pattern=r"^(allergy|pregnancy|lactation|medications|major_conditions|contraindications|red_flag)$"
+    )
+    value: dict[str, object]
+    value_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    assertion_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: str = Field(default="proposed", pattern=r"^proposed$")
+    source_kind: str = Field(
+        pattern=r"^(model_extraction|deterministic_precheck|deterministic_reply_binding)$"
+    )
+    source_message_id: UUID
+    extraction_run_id: UUID
+    template_version: str = Field(min_length=1, max_length=64)
+    evidence_spans: tuple[SafetyFactEvidenceSpec, ...] = Field(min_length=1)
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    proposed_by_actor_type: str = Field(pattern=r"^(model|system)$")
+    proposed_by_actor_id: None = None
+    audit_event_id: UUID
+    audit_event_type: str = Field(default="safety_fact.proposed", pattern=r"^safety_fact\.proposed$")
+    audit_actor_type: str = Field(pattern=r"^(agent|system)$")
+    audit_actor_id: None = None
+    audit_trace_id: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def verify_content_addressed_identity(self) -> SafetyFactAssertionSpec:
+        evidence_payload = [item.model_dump(mode="json", exclude_none=True) for item in self.evidence_spans]
+        if self.value_digest != _canonical_json_digest(self.value):
+            raise ValueError("safety assertion value digest mismatch")
+        if self.evidence_digest != _canonical_json_digest(evidence_payload):
+            raise ValueError("safety assertion evidence digest mismatch")
+        expected_fingerprint = _canonical_json_digest(
+            {
+                "session_id": str(self.session_id),
+                "field_name": self.field_name,
+                "value_digest": self.value_digest,
+                "source_kind": self.source_kind,
+                "source_message_id": str(self.source_message_id),
+                "extraction_run_id": str(self.extraction_run_id),
+                "template_version": self.template_version,
+                "evidence_digest": self.evidence_digest,
+            }
+        )
+        if self.assertion_fingerprint != expected_fingerprint:
+            raise ValueError("safety assertion fingerprint mismatch")
+        if self.assertion_id != uuid5(
+            NAMESPACE_URL,
+            f"xuanhu:safety-assertion:{self.session_id}:{expected_fingerprint}",
+        ):
+            raise ValueError("safety assertion stable id mismatch")
+        if self.audit_event_id != uuid5(self.assertion_id, "safety-fact-proposal-audit.v1"):
+            raise ValueError("safety proposal audit stable id mismatch")
+        expected_actor = "agent" if self.source_kind == "model_extraction" else "system"
+        expected_proposer = "model" if self.source_kind == "model_extraction" else "system"
+        if self.audit_actor_type != expected_actor or self.proposed_by_actor_type != expected_proposer:
+            raise ValueError("safety proposal actor metadata does not match source kind")
+        if any(item.source_message_id != self.source_message_id for item in self.evidence_spans):
+            raise ValueError("safety evidence source message mismatch")
+        bindings = tuple(
+            (item.reply_to_question_message_id, item.reply_dimension)
+            for item in self.evidence_spans
+        )
+        if self.source_kind == "deterministic_reply_binding":
+            expected_dimension = _SAFETY_REPLY_DIMENSION_BY_FIELD.get(self.field_name)
+            if expected_dimension is None or any(
+                question_id is None or dimension is None
+                for question_id, dimension in bindings
+            ):
+                raise ValueError("deterministic safety reply requires a bindable field and bound evidence")
+            question_ids = {question_id for question_id, _ in bindings}
+            dimensions = {dimension for _, dimension in bindings}
+            if len(question_ids) != 1 or dimensions != {expected_dimension}:
+                raise ValueError("deterministic safety reply binding does not match its field")
+            if self.value.get("collection_status") != "explicitly_none":
+                raise ValueError("deterministic safety reply may only represent an explicit negative")
+        elif any(question_id is not None or dimension is not None for question_id, dimension in bindings):
+            raise ValueError("only deterministic safety replies may carry question binding")
+        if self.source_kind == "deterministic_precheck" and self.field_name != "red_flag":
+            raise ValueError("deterministic triage precheck may only propose a red flag")
+        return self
+
+
+def _safety_fact_manifest_entry(
+    *,
+    assertion_id: UUID,
+    assertion_fingerprint: str,
+    value_digest: str,
+    evidence_digest: str,
+    field_name: str,
+    source_kind: str,
+    source_message_id: UUID,
+    extraction_run_id: UUID | None,
+    template_version: str,
+) -> dict[str, object]:
+    return {
+        "assertion_id": str(assertion_id),
+        "assertion_fingerprint": assertion_fingerprint,
+        "value_digest": value_digest,
+        "evidence_digest": evidence_digest,
+        "field_name": field_name,
+        "source_kind": source_kind,
+        "source_message_id": str(source_message_id),
+        "extraction_run_id": str(extraction_run_id) if extraction_run_id is not None else None,
+        "template_version": template_version,
+    }
+
+
+def _safety_fact_manifest(entries: Sequence[dict[str, object]]) -> dict[str, object]:
+    ordered = sorted(entries, key=lambda item: str(item["assertion_id"]))
+    return {
+        "version": SAFETY_FACT_MANIFEST_VERSION,
+        "count": len(ordered),
+        "assertion_ids": [str(item["assertion_id"]) for item in ordered],
+        "content_digest": _canonical_json_digest(ordered),
+    }
+
+
+def _safety_fact_spec_manifest(specs: Sequence[SafetyFactAssertionSpec]) -> dict[str, object]:
+    return _safety_fact_manifest(
+        [
+            _safety_fact_manifest_entry(
+                assertion_id=item.assertion_id,
+                assertion_fingerprint=item.assertion_fingerprint,
+                value_digest=item.value_digest,
+                evidence_digest=item.evidence_digest,
+                field_name=item.field_name,
+                source_kind=item.source_kind,
+                source_message_id=item.source_message_id,
+                extraction_run_id=item.extraction_run_id,
+                template_version=item.template_version,
+            )
+            for item in specs
+        ]
+    )
+
+
 class SafetyRuleRunSpec(BaseModel):
     """Atomic compatibility projection for one authoritative safety artifact."""
 
@@ -315,6 +514,7 @@ class DomainRepository(Protocol):
         graph_steps: Sequence[GraphStepSpec] = (),
         artifact_payloads: Sequence[ArtifactPayloadSpec] = (),
         consult_messages: Sequence[ConsultMessageSpec] = (),
+        safety_fact_assertions: Sequence[SafetyFactAssertionSpec] = (),
         safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
         doctor_reviews: Sequence[DoctorReviewSpec] = (),
         medical_records: Sequence[MedicalRecordSpec] = (),
@@ -517,6 +717,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         graph_steps: Sequence[GraphStepSpec] = (),
         artifact_payloads: Sequence[ArtifactPayloadSpec] = (),
         consult_messages: Sequence[ConsultMessageSpec] = (),
+        safety_fact_assertions: Sequence[SafetyFactAssertionSpec] = (),
         safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
         doctor_reviews: Sequence[DoctorReviewSpec] = (),
         medical_records: Sequence[MedicalRecordSpec] = (),
@@ -547,6 +748,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 if existing is not None:
                     if existing.delta_digest != digest:
                         raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+                    await self._replay_safety_fact_assertions(
+                        session,
+                        delta,
+                        existing_commit=existing,
+                        safety_fact_assertions=safety_fact_assertions,
+                    )
                     return self._commit_result(existing)
 
                 if locked.state_version != delta.expected_state_version:
@@ -592,7 +799,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         step_index=0,
                         step_name="domain_commit",
                         status="completed",
-                        step_metadata={"state_version": next_state.state_version},
+                        step_metadata={
+                            "state_version": next_state.state_version,
+                            "safety_fact_assertion_manifest": _safety_fact_spec_manifest(
+                                safety_fact_assertions
+                            ),
+                        },
                     )
                 )
                 for index, step in enumerate(graph_steps, start=1):
@@ -644,6 +856,11 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                             trace_id=message.trace_id,
                         )
                     )
+                await self._persist_safety_fact_assertions(
+                    session,
+                    delta,
+                    safety_fact_assertions=safety_fact_assertions,
+                )
                 if session_updates:
                     self._apply_session_updates(locked, session_updates)
                 # Explicit flush phases make FK ordering unambiguous without
@@ -980,6 +1197,255 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         content_digest=payload.content_digest,
                     )
                 )
+
+    @classmethod
+    async def _replay_safety_fact_assertions(
+        cls,
+        session: AsyncSession,
+        delta: DomainDelta,
+        *,
+        existing_commit: DomainCommandCommit,
+        safety_fact_assertions: Sequence[SafetyFactAssertionSpec],
+    ) -> None:
+        """Seal legacy split commits once, then require an exact proposal manifest."""
+
+        cls._validate_safety_fact_spec_scope(delta, safety_fact_assertions)
+        source_message_ids = tuple(delta.source_message_ids)
+        existing_rows = (
+            await session.scalars(
+                select(SafetyFactAssertion).where(
+                    SafetyFactAssertion.session_id == delta.session_id,
+                    SafetyFactAssertion.source_message_id.in_(source_message_ids),
+                    SafetyFactAssertion.source_kind.in_(_INTAKE_SAFETY_SOURCE_KINDS),
+                )
+            )
+        ).all()
+        existing_manifest = _safety_fact_manifest(
+            [
+                _safety_fact_manifest_entry(
+                    assertion_id=row.id,
+                    assertion_fingerprint=row.assertion_fingerprint,
+                    value_digest=row.value_digest,
+                    evidence_digest=row.evidence_digest,
+                    field_name=row.field_name,
+                    source_kind=row.source_kind,
+                    source_message_id=row.source_message_id,
+                    extraction_run_id=row.extraction_run_id,
+                    template_version=row.template_version,
+                )
+                for row in existing_rows
+            ]
+        )
+        requested_manifest = _safety_fact_spec_manifest(safety_fact_assertions)
+        domain_step = await session.scalar(
+            select(GraphRunStep).where(
+                GraphRunStep.graph_run_id == existing_commit.graph_run_id,
+                GraphRunStep.step_index == 0,
+                GraphRunStep.step_name == "domain_commit",
+            )
+        )
+        if domain_step is None:
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        metadata = dict(domain_step.step_metadata or {})
+        sealed_manifest = metadata.get("safety_fact_assertion_manifest")
+        if sealed_manifest is not None:
+            if sealed_manifest != requested_manifest or existing_manifest != requested_manifest:
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        elif existing_rows and existing_manifest != requested_manifest:
+            # A historical split commit may be sealed only with the exact set
+            # already persisted by its former post-commit safety transaction.
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        # With no sealed manifest and no rows this is the one compatibility
+        # path for a historical Domain commit whose split safety write never
+        # happened.  The transaction below fills (or seals empty) exactly once.
+        await cls._persist_safety_fact_assertions(
+            session,
+            delta,
+            safety_fact_assertions=safety_fact_assertions,
+        )
+        metadata["safety_fact_assertion_manifest"] = requested_manifest
+        domain_step.step_metadata = metadata
+        await session.flush()
+
+    @staticmethod
+    def _validate_safety_fact_spec_scope(
+        delta: DomainDelta,
+        safety_fact_assertions: Sequence[SafetyFactAssertionSpec],
+    ) -> None:
+        allowed_source_message_ids = frozenset(delta.source_message_ids)
+        if (
+            any(item.session_id != delta.session_id for item in safety_fact_assertions)
+            or any(
+                item.source_message_id not in allowed_source_message_ids
+                for item in safety_fact_assertions
+            )
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+    @staticmethod
+    async def _validate_safety_fact_provenance(
+        session: AsyncSession,
+        item: SafetyFactAssertionSpec,
+        source: ConsultMessage,
+    ) -> None:
+        """Recheck reply provenance at the database trust boundary."""
+
+        bindings = tuple(
+            (evidence.reply_to_question_message_id, evidence.reply_dimension)
+            for evidence in item.evidence_spans
+        )
+        if item.source_kind != "deterministic_reply_binding":
+            if any(question_id is not None or dimension is not None for question_id, dimension in bindings):
+                raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+            if item.source_kind == "deterministic_precheck" and item.field_name != "red_flag":
+                raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+            return
+
+        expected_dimension = _SAFETY_REPLY_DIMENSION_BY_FIELD.get(item.field_name)
+        question_ids = {question_id for question_id, _ in bindings if question_id is not None}
+        dimensions = {dimension for _, dimension in bindings if dimension is not None}
+        if (
+            expected_dimension is None
+            or len(bindings) == 0
+            or any(
+                question_id is None or dimension is None
+                for question_id, dimension in bindings
+            )
+            or len(question_ids) != 1
+            or dimensions != {expected_dimension}
+            or item.value.get("collection_status") != "explicitly_none"
+            or _EXPLICIT_NONE_REPLY.fullmatch(source.content) is None
+            or len(item.evidence_spans) != 1
+            or item.evidence_spans[0].start_char != 0
+            or item.evidence_spans[0].end_char != len(source.content)
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+        structured = source.structured_delta if isinstance(source.structured_delta, dict) else {}
+        raw_context = structured.get("reply_context")
+        question_id = next(iter(question_ids))
+        if (
+            source.role not in {"doctor", "patient_proxy"}
+            or source.stage != "inquiry"
+            or structured.get("binding_version") != _INTAKE_REPLY_BINDING_VERSION
+            or not isinstance(raw_context, dict)
+            or str(raw_context.get("question_message_id")) != str(question_id)
+            or raw_context.get("selected_dimension") != expected_dimension
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+        question = await session.get(ConsultMessage, question_id)
+        question_structured = question.structured_delta if question is not None else None
+        if (
+            question is None
+            or question.session_id != item.session_id
+            or question.role != "agent"
+            or question.stage != "inquiry"
+            or question.agent_name != "question_composer"
+            or not isinstance(question_structured, dict)
+            or question_structured.get("selected_dimension") != expected_dimension
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+    @classmethod
+    async def _persist_safety_fact_assertions(
+        cls,
+        session: AsyncSession,
+        delta: DomainDelta,
+        *,
+        safety_fact_assertions: Sequence[SafetyFactAssertionSpec],
+    ) -> None:
+        """Persist safety proposals and their audits in the Domain transaction."""
+
+        assertion_ids = {item.assertion_id for item in safety_fact_assertions}
+        audit_ids = {item.audit_event_id for item in safety_fact_assertions}
+        if len(assertion_ids) != len(safety_fact_assertions) or len(audit_ids) != len(safety_fact_assertions):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        cls._validate_safety_fact_spec_scope(delta, safety_fact_assertions)
+
+        for item in safety_fact_assertions:
+            source = await session.get(ConsultMessage, item.source_message_id)
+            if source is None or source.session_id != delta.session_id:
+                raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+            await cls._validate_safety_fact_provenance(session, item, source)
+            evidence_payload = [
+                evidence.model_dump(mode="json", exclude_none=True)
+                for evidence in item.evidence_spans
+            ]
+            for evidence in item.evidence_spans:
+                if evidence.end_char > len(source.content):
+                    raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+                quote = source.content[evidence.start_char : evidence.end_char]
+                if hashlib.sha256(quote.encode("utf-8")).hexdigest() != evidence.quote_digest:
+                    raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+                if evidence.reply_to_question_message_id is not None:
+                    question = await session.get(ConsultMessage, evidence.reply_to_question_message_id)
+                    structured = question.structured_delta if question is not None else None
+                    if (
+                        question is None
+                        or question.session_id != delta.session_id
+                        or question.role != "agent"
+                        or question.stage != "inquiry"
+                        or question.agent_name != "question_composer"
+                        or not isinstance(structured, dict)
+                        or structured.get("selected_dimension") != evidence.reply_dimension
+                    ):
+                        raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+
+            assertion_values: dict[str, object] = {
+                "session_id": item.session_id,
+                "field_name": item.field_name,
+                "value": item.value,
+                "value_digest": item.value_digest,
+                "assertion_fingerprint": item.assertion_fingerprint,
+                "source_kind": item.source_kind,
+                "source_message_id": item.source_message_id,
+                "extraction_run_id": item.extraction_run_id,
+                "template_version": item.template_version,
+                "evidence_spans": evidence_payload,
+                "evidence_digest": item.evidence_digest,
+                "proposed_by_actor_type": item.proposed_by_actor_type,
+                "proposed_by_actor_id": item.proposed_by_actor_id,
+            }
+            existing_assertion = await session.get(SafetyFactAssertion, item.assertion_id)
+            if existing_assertion is None:
+                session.add(
+                    SafetyFactAssertion(
+                        id=item.assertion_id,
+                        status=item.status,
+                        **assertion_values,
+                    )
+                )
+            elif any(
+                getattr(existing_assertion, name) != value
+                for name, value in assertion_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+            audit_payload: dict[str, object] = {
+                "assertion_id": str(item.assertion_id),
+                "field_name": item.field_name,
+                "status": item.status,
+                "value_digest": item.value_digest,
+                "evidence_digest": item.evidence_digest,
+                "source_message_id": str(item.source_message_id),
+                "extraction_run_id": str(item.extraction_run_id),
+                "template_version": item.template_version,
+            }
+            audit_values: dict[str, object] = {
+                "session_id": item.session_id,
+                "event_type": item.audit_event_type,
+                "actor_type": item.audit_actor_type,
+                "actor_id": item.audit_actor_id,
+                "payload": audit_payload,
+                "trace_id": item.audit_trace_id,
+            }
+            existing_audit = await session.get(AuditEvent, item.audit_event_id)
+            if existing_audit is None:
+                session.add(AuditEvent(id=item.audit_event_id, **audit_values))
+            elif any(getattr(existing_audit, name) != value for name, value in audit_values.items()):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
 
     @staticmethod
     async def _persist_product_projections(

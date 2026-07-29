@@ -32,6 +32,7 @@ import { FormulaEditModal } from './FormulaEditModal'
 import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
+import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { stageLabel } from '@/utils/stage'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
@@ -75,11 +76,11 @@ function PatientBar({ detail }: { detail: SessionDetail }) {
 }
 
 export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProps) {
-  const [lastSubmittedContent, setLastSubmittedContent] = useState<string | null>(null)
   const [pendingReviewFormula, setPendingReviewFormula] = useState<Formula | null>(null)
   const [blockedIssues, setBlockedIssues] = useState<SafetyIssue[] | null>(null)
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null)
   const [contextOpen, setContextOpen] = useState(false)
+  const [pendingSafetyCount, setPendingSafetyCount] = useState<number | null>(null)
 
   const { detail, loading, error, selectSession, refreshDetail } = detailHook
   const {
@@ -88,8 +89,11 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     error: msgError,
     submitting,
     submitError,
+    pendingSubmission,
+    lastFailedContent,
     loadMessages,
     submit,
+    retryPending,
     clear,
   } = messagesHook
 
@@ -103,18 +107,21 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   useEffect(() => {
     if (!sessionId) {
       clear()
-      setLastSubmittedContent(null)
       setPendingReviewFormula(null)
       setBlockedIssues(null)
       setRollbackTarget(null)
       setContextOpen(false)
+      setPendingSafetyCount(null)
       return
     }
-    setLastSubmittedContent(null)
+    // Invalidate in-flight loads/submissions from the previously selected
+    // session before establishing the new message history boundary.
+    clear()
     setPendingReviewFormula(null)
     setBlockedIssues(null)
     setRollbackTarget(null)
     setContextOpen(false)
+    setPendingSafetyCount(null)
     void loadMessages(sessionId)
   }, [sessionId, loadMessages, clear])
 
@@ -132,6 +139,15 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
       if (sessionId) void loadMessages(sessionId)
     },
     [sessionId, loadMessages],
+  )
+
+  const handleAgentFinished = useCallback(
+    (agentName: string) => {
+      if (agentName !== 'intake' && agentName !== 'safety_confirmation') return
+      void refreshDetail()
+      if (sessionId) void loadMessages(sessionId)
+    },
+    [loadMessages, refreshDetail, sessionId],
   )
 
   // SSE 回调：onResync — 流断裂后全量同步
@@ -192,6 +208,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     stateVersion: detail?.state_version,
     onStageChanged: handleStageChanged,
     onMessageCreated: handleMessageCreated,
+    onAgentFinished: handleAgentFinished,
     onResync: handleResync,
     onReviewRequired: handleReviewRequired,
     onSafetyBlocked: handleSafetyBlocked,
@@ -207,6 +224,41 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     const running = entries.find(([, v]) => v.status === 'running')
     return running ? running[0] : null
   }, [streamHook.agentRuns])
+
+  const replyToQuestionId = useMemo(() => {
+    const latest = messages.at(-1)
+    if (
+      latest?.role === 'agent'
+      && latest.agent_name === 'question_composer'
+      && typeof latest.structured_delta?.selected_dimension === 'string'
+    ) {
+      return latest.id
+    }
+    return undefined
+  }, [messages])
+
+  const pendingSafetyHint = detail?.read_model.unresolved.some(
+    (item) => (
+      item.source === 'safety_confirmation'
+      && item.kind === 'unconfirmed_safety_fact'
+      && item.key !== 'red_flag'
+    ),
+  ) ?? false
+  const hasPendingSafety = pendingSafetyCount === null
+    ? pendingSafetyHint
+    : pendingSafetyCount > 0
+  const waitingOnlyForSafetyConfirmation = Boolean(
+    detail?.agent_runtime === 'langgraph'
+    && detail.current_stage === 'inquiry'
+    && detail.status === 'active'
+    && hasPendingSafety
+    && !replyToQuestionId,
+  )
+
+  const handleSafetyConfirmationChanged = useCallback(async () => {
+    await refreshDetail()
+    if (sessionId) await loadMessages(sessionId)
+  }, [loadMessages, refreshDetail, sessionId])
 
   // ---------- P8-4 医师确认与病历状态 ----------
   const [reviewSubmitting, setReviewSubmitting] = useState(false)
@@ -226,7 +278,12 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   // 当 detail 变为 done 时拉取病历
   useEffect(() => {
-    if (!sessionId) return
+    if (!sessionId || detail?.session_id !== sessionId) {
+      setRecord(null)
+      setRecordError(null)
+      setRecordEditing(false)
+      return
+    }
     if (detail?.current_stage === 'done' && detail?.status === 'done') {
       setRecordLoading(true)
       setRecordError(null)
@@ -245,12 +302,12 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
       setRecordEditing(false)
       setRecordExportError(null)
     }
-  }, [sessionId, detail?.current_stage, detail?.status])
+  }, [sessionId, detail?.session_id, detail?.current_stage, detail?.status])
 
   // ---------- 医师确认操作 ----------
 
   const handleConfirm = useCallback(() => {
-    if (!sessionId || !detail) return
+    if (!sessionId || !detail || detail.session_id !== sessionId) return
     setReviewSubmitting(true)
     setReviewError(null)
     reviewPrescription(
@@ -275,7 +332,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   const handleModifySubmit = useCallback(
     (override: FormulaOverride, feedback?: string) => {
-      if (!sessionId || !detail) return
+      if (!sessionId || !detail || detail.session_id !== sessionId) return
       setReviewSubmitting(true)
       setModifyReviewError(null)
       reviewPrescription(
@@ -313,7 +370,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   }, [])
 
   const handleRequestMoreInfo = useCallback(() => {
-    if (!sessionId || !detail) return
+    if (!sessionId || !detail || detail.session_id !== sessionId) return
     setReviewSubmitting(true)
     setReviewError(null)
     reviewPrescription(
@@ -333,7 +390,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   const handleRejectSubmit = useCallback(
     (feedback: string) => {
-      if (!sessionId || !detail) return
+      if (!sessionId || !detail || detail.session_id !== sessionId) return
       setReviewSubmitting(true)
       setReviewError(null)
       reviewPrescription(
@@ -374,7 +431,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   const handleRecordSave = useCallback(
     (body: RecordUpdateRequest) => {
-      if (!sessionId || !detail) return
+      if (!sessionId || !detail || detail.session_id !== sessionId) return
       setRecordSaving(true)
       setRecordSaveError(null)
       updateRecord(sessionId, body, { stateVersion: detail.state_version })
@@ -456,7 +513,22 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   }
 
   // 当前阶段是否允许提交问诊消息：仅 inquiry 阶段允许
-  const canSubmit = detail ? detail.current_stage === 'inquiry' : false
+  if (detail && detail.session_id !== sessionId) {
+    return (
+      <main className="xh-empty-workspace" data-testid="session-detail-boundary-loading">
+        <Spin />
+        <Text type="secondary">{'\u6b63\u5728\u5207\u6362\u4f1a\u8bdd\u2026'}</Text>
+      </main>
+    )
+  }
+
+  const canSubmit = detail
+    ? (
+        detail.current_stage === 'inquiry'
+        && !waitingOnlyForSafetyConfirmation
+        && pendingSubmission == null
+      )
+    : false
 
   const handleRefreshDetailForVersion = async (): Promise<number | undefined> => {
     const fresh = await refreshDetail()
@@ -464,16 +536,23 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   }
 
   const submitContent = (content: string) => {
-    if (!sessionId || !detail) return
-    setLastSubmittedContent(content)
-    void submit(
-      sessionId,
-      content,
-      detail.state_version,
-      handleRefreshDetailForVersion,
-    ).then((ok) => {
+    if (!sessionId || !detail || detail.session_id !== sessionId) return
+    const submission = replyToQuestionId
+      ? submit(
+          sessionId,
+          content,
+          detail.state_version,
+          handleRefreshDetailForVersion,
+          replyToQuestionId,
+        )
+      : submit(
+          sessionId,
+          content,
+          detail.state_version,
+          handleRefreshDetailForVersion,
+        )
+    void submission.then((ok) => {
       if (ok) {
-        setLastSubmittedContent(null)
         // 提交成功后刷新会话详情（stage 可能推进，state_version 更新）
         void refreshDetail()
       }
@@ -481,8 +560,20 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   }
 
   const retryLastSubmit = () => {
-    if (!lastSubmittedContent) return
-    submitContent(lastSubmittedContent)
+    if (
+      !sessionId
+      || !detail
+      || detail.session_id !== sessionId
+      || !pendingSubmission
+    ) return
+    // The hook owns the immutable reply/question binding.  The latest message
+    // may already be a newer question after a lost network response.
+    void retryPending(
+      sessionId,
+      handleRefreshDetailForVersion,
+    ).then((ok) => {
+      if (ok) void refreshDetail()
+    })
   }
 
   const hasClinicalSummary = detail != null && (
@@ -557,12 +648,33 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 error={msgError}
                 onRetry={() => sessionId && void loadMessages(sessionId)}
               />
+              {detail ? (
+                <SafetyConfirmationPanel
+                  key={detail.session_id}
+                  sessionId={detail.session_id}
+                  refreshKey={detail.state_version}
+                  enabled={
+                    detail.agent_runtime === 'langgraph'
+                    && detail.current_stage === 'inquiry'
+                    && detail.status === 'active'
+                  }
+                  pendingHint={pendingSafetyHint}
+                  blocksFreeInput={waitingOnlyForSafetyConfirmation}
+                  onPendingChange={setPendingSafetyCount}
+                  onChanged={handleSafetyConfirmationChanged}
+                />
+              ) : null}
               <MessageInput
                 submitting={submitting}
                 error={submitError}
                 disabled={detail != null && !canSubmit}
-                onRetry={retryLastSubmit}
-                lastContent={lastSubmittedContent ?? undefined}
+                disabledReason={waitingOnlyForSafetyConfirmation
+                  ? '请先完成上方安全信息确认，系统随后会继续问诊'
+                  : pendingSubmission
+                    ? '上一条消息结果尚未确认，请先使用错误提示中的重试'
+                    : undefined}
+                onRetry={pendingSubmission ? retryLastSubmit : undefined}
+                lastContent={pendingSubmission?.content ?? lastFailedContent ?? undefined}
                 onSubmit={submitContent}
               />
             </div>
@@ -604,6 +716,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
               {detail ? (
                 <LangGraphAdvanceBar
                   detail={detail}
+                  onRefresh={refreshDetail}
                   onAdvanced={async () => {
                     await refreshDetail()
                     if (sessionId) await loadMessages(sessionId)

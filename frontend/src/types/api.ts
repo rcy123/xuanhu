@@ -189,6 +189,62 @@ export type ReviewAction = 'confirm' | 'modify' | 'reject' | 'request_more_info'
 /** 安全问题严重度。 */
 export type Severity = 'info' | 'warning' | 'high' | 'blocker'
 
+/** High-risk safety facts remain non-authoritative until a doctor decides them. */
+export type SafetyAssertionStatus =
+  | 'proposed'
+  | 'confirmed'
+  | 'rejected'
+  | 'superseded'
+  | 'retracted'
+
+export type SafetyFactField =
+  | 'allergy'
+  | 'pregnancy'
+  | 'lactation'
+  | 'medications'
+  | 'major_conditions'
+  | 'contraindications'
+  | 'red_flag'
+
+export interface SafetyEvidenceRef {
+  source_message_id: string
+  start_char: number
+  end_char: number
+  quote_digest: string
+  reply_to_question_message_id?: string | null
+  reply_dimension?: string | null
+}
+
+export interface SafetyFactAssertion {
+  schema_version: 'safety-fact-assertion.v1'
+  assertion_id: string
+  session_id: string
+  field_name: SafetyFactField
+  value: Record<string, unknown>
+  value_digest: string
+  status: SafetyAssertionStatus
+  source_kind: string
+  source_message_id: string
+  extraction_run_id?: string | null
+  template_version: string
+  evidence_spans: SafetyEvidenceRef[]
+  evidence_digest: string
+  proposed_at: string
+  confirmed_at?: string | null
+  rejected_at?: string | null
+  retracted_at?: string | null
+  superseded_at?: string | null
+  supersedes_assertion_id?: string | null
+}
+
+export interface SafetyFactAssertionList {
+  items: SafetyFactAssertion[]
+}
+
+export interface SafetyAssertionDecisionRequest {
+  reason_code?: string | null
+}
+
 /** 安全问题类型。 */
 export type SafetyIssueType =
   | 'eighteen_incompatibilities'
@@ -393,6 +449,8 @@ export interface MessageCreateRequest {
   content: string
   /** doctor=医师代录，patient_proxy=预留。 */
   role: 'doctor' | 'patient_proxy'
+  /** 当前回答所对应的结构化 Agent 问题。 */
+  reply_to_message_id?: string | null
 }
 
 /** 提交消息响应 data。P8-6: 新增 agent_message / sufficiency_report。 */

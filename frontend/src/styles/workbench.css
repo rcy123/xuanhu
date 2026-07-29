@@ -621,6 +621,85 @@
   background: rgba(255, 254, 250, 0.98);
 }
 
+.xh-safety-confirmation {
+  display: flex;
+  flex: 0 0 auto;
+  max-height: min(46vh, 430px);
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 16px;
+  overflow-y: auto;
+  border-top: 1px solid rgba(169, 120, 36, 0.32);
+  background: #fffaf0;
+}
+
+.xh-safety-confirmation.is-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  color: var(--xh-text-secondary);
+}
+
+.xh-safety-confirmation-heading,
+.xh-safety-assertion,
+.xh-safety-assertion-actions {
+  display: flex;
+  align-items: center;
+}
+
+.xh-safety-confirmation-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.xh-safety-confirmation-heading > div,
+.xh-safety-reviewer-field,
+.xh-safety-assertion-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.xh-safety-confirmation-heading .anticon {
+  margin-inline-end: 5px;
+  color: #9a6c19;
+}
+
+.xh-safety-reviewer-field label {
+  color: var(--xh-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.xh-safety-reviewer-field .ant-typography,
+.xh-safety-confirmation-heading .ant-typography {
+  font-size: 11px;
+}
+
+.xh-safety-assertion-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.xh-safety-assertion {
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid rgba(169, 120, 36, 0.22);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.xh-safety-assertion-copy {
+  min-width: 0;
+}
+
+.xh-safety-assertion-actions {
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
 .xh-composer-error {
   margin-bottom: 8px;
 }
@@ -1207,6 +1286,19 @@
 
   .xh-message-composer {
     padding: 10px;
+  }
+
+  .xh-safety-confirmation {
+    padding: 11px 10px;
+  }
+
+  .xh-safety-assertion {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .xh-safety-assertion-actions .ant-btn {
+    flex: 1;
   }
 
   .xh-send-button {

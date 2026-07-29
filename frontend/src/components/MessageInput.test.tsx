@@ -47,4 +47,23 @@ describe('MessageInput', () => {
     const input = inputs[inputs.length - 1]
     expect(input).toHaveAttribute('disabled')
   })
+
+  it('shows a specific reason when safety confirmation locks input', () => {
+    wrap(
+      <MessageInput
+        submitting={false}
+        error={null}
+        disabled
+        disabledReason="请先完成安全信息确认"
+        onSubmit={() => {}}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getAllByText('请先完成安全信息确认').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('message-input').at(-1)).toHaveAttribute(
+      'placeholder',
+      '请先完成安全信息确认',
+    )
+  })
 })

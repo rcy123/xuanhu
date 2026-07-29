@@ -1,7 +1,8 @@
 """会话管理服务层。
 
 提供创建、列表、详情、终止四个 P3-1 核心用例，并在同一事务中写入审计事件。
-本层不调用 Agent、RAG、模型网关或会话锁。
+LangGraph 创建路径会基于同事务内的确定性初始 Domain seed 生成模板首问；
+不调用 RAG、模型网关或会话锁。
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from app.schemas.session import (
     SessionTerminateResponse,
 )
 from app.services.initial_domain_seed import InitialDomainSeeder
+from app.services.initial_intake_question import create_initial_intake_question
 from app.services.runtime_switch_audit import (
     PostgresRuntimeSwitchAuditRepository,
     RuntimeSwitchAuditMismatch,
@@ -124,10 +126,17 @@ class SessionService:
         await self._db.refresh(session)
 
         if agent_runtime == "langgraph":
-            await InitialDomainSeeder(self._db).seed(
+            seed_outcome = await InitialDomainSeeder(self._db).seed(
                 session,
                 request,
                 doctor_id=doctor_id,
+                trace_id=trace_id,
+            )
+            await create_initial_intake_question(
+                self._db,
+                session,
+                seed_outcome.seed,
+                seed_outcome.triage_result,
                 trace_id=trace_id,
             )
 

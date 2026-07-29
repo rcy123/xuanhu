@@ -27,34 +27,45 @@ export function useSessionDetail(): UseSessionDetailResult {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ApiRequestError | null>(null)
   const mounted = useRef(true)
+  const requestedSessionIdRef = useRef<string | null>(null)
+  const requestGenerationRef = useRef(0)
 
   useEffect(() => {
     mounted.current = true
     return () => {
       mounted.current = false
+      requestGenerationRef.current += 1
     }
   }, [])
 
   const refreshDetail = useCallback(async (): Promise<SessionDetail | null> => {
-    if (!sessionId) return null
+    const targetSessionId = requestedSessionIdRef.current
+    if (!targetSessionId) return null
+    const generation = ++requestGenerationRef.current
+    const isCurrentRequest = () => (
+      mounted.current
+      && requestedSessionIdRef.current === targetSessionId
+      && requestGenerationRef.current === generation
+    )
     setLoading(true)
     setError(null)
     try {
-      const data = await getSession(sessionId)
-      if (mounted.current) {
+      const data = await getSession(targetSessionId)
+      if (isCurrentRequest() && data.session_id === targetSessionId) {
         setDetail(data)
+        return data
       }
-      return data
+      return null
     } catch (err) {
-      if (mounted.current) {
+      if (isCurrentRequest()) {
         setError(err instanceof ApiRequestError ? err : null)
         setDetail(null)
       }
       return null
     } finally {
-      if (mounted.current) setLoading(false)
+      if (isCurrentRequest()) setLoading(false)
     }
-  }, [sessionId])
+  }, [])
 
   useEffect(() => {
     if (!sessionId) {
@@ -67,6 +78,12 @@ export function useSessionDetail(): UseSessionDetailResult {
   }, [sessionId, refreshDetail])
 
   const selectSession = useCallback((id: string | null) => {
+    if (requestedSessionIdRef.current === id) return
+    requestedSessionIdRef.current = id
+    requestGenerationRef.current += 1
+    setDetail(null)
+    setError(null)
+    setLoading(id !== null)
     setSessionId(id)
   }, [])
 

@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.schemas.domain import SafetyProfileSchema
 
-INITIAL_DOMAIN_SEED_VERSION = "initial-domain-seed.v1"
+INITIAL_DOMAIN_SEED_VERSION = "initial-domain-seed.v2"
 
 
 class SeedObservation(BaseModel):

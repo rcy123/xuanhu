@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -62,9 +62,22 @@ class ActiveObservationContext(_IntakeModel):
         return self
 
 
+class IntakeReplyContext(_IntakeModel):
+    """Trusted binding to the one structured question answered by this turn."""
+
+    question_message_id: UUID
+    selected_dimension: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+    selection_kind: Literal["required", "conflict"]
+
+
 class IntakeExtractionInput(_IntakeModel):
     current_messages: tuple[IntakeMessage, ...] = Field(min_length=1, max_length=8)
     historical_active_facts: tuple[ActiveObservationContext, ...] = Field(default=(), max_length=128)
+    reply_context: IntakeReplyContext | None = None
 
     @model_validator(mode="after")
     def current_patient_messages_only(self) -> IntakeExtractionInput:

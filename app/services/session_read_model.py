@@ -45,6 +45,15 @@ _FORMULA_GATE_POLICY = "formula-consistency-policy.v1"
 _CANONICAL_GATE_NAME = "canonical_verifier_chain"
 _CANONICAL_GATE_POLICY = "l2-4-v1"
 
+_SAFETY_FIELD_TO_COMPLETENESS_DIMENSION = {
+    "allergy": "safety.allergy_status",
+    "medications": "safety.medication_status",
+    "major_conditions": "safety.major_condition_status",
+    "pregnancy": "safety.pregnancy_status",
+    "lactation": "safety.lactation_status",
+}
+_TRIAGE_OWNED_SAFETY_FIELDS = frozenset({"red_flag"})
+
 
 @dataclass(frozen=True, slots=True)
 class GateAuthorityRow:
@@ -504,6 +513,45 @@ def project_session_read_model(
     )
 
 
+def _merge_pending_safety_assertions(
+    projection: SessionReadProjection,
+    pending_fields: tuple[str, ...],
+) -> SessionReadProjection:
+    """Project confirmation work without changing clinical-review semantics.
+
+    A proposed safety assertion is deliberately not authoritative, so the
+    completeness gate may still report its dimension as missing.  For the
+    operator-facing unresolved list, however, the more actionable confirmation
+    item replaces that duplicate missing marker until the assertion is settled.
+    """
+
+    fields = tuple(
+        sorted(set(pending_fields) - _TRIAGE_OWNED_SAFETY_FIELDS)
+    )
+    if not fields:
+        return projection
+    pending_dimensions = {
+        dimension
+        for field_name in fields
+        if (dimension := _SAFETY_FIELD_TO_COMPLETENESS_DIMENSION.get(field_name)) is not None
+    }
+    unresolved = tuple(
+        item
+        for item in projection.read_model.unresolved
+        if not (item.source == "completeness" and item.kind == "missing_required" and item.key in pending_dimensions)
+        and not (item.source == "safety_confirmation" and item.kind == "unconfirmed_safety_fact" and item.key in fields)
+    ) + tuple(
+        SessionUnresolvedReadModelV1(
+            source="safety_confirmation",
+            kind="unconfirmed_safety_fact",
+            key=field_name,
+        )
+        for field_name in fields
+    )
+    read_model = projection.read_model.model_copy(update={"unresolved": unresolved})
+    return projection.model_copy(update={"read_model": read_model})
+
+
 class SessionReadModelService:
     """Load authoritative persistence rows and build a versioned projection."""
 
@@ -580,18 +628,7 @@ class SessionReadModelService:
         )
         if not pending_fields:
             return projection
-        unresolved = projection.read_model.unresolved + tuple(
-            SessionUnresolvedReadModelV1(
-                source="safety_confirmation",
-                kind="unconfirmed_safety_fact",
-                key=field_name,
-            )
-            for field_name in pending_fields
-        )
-        read_model = projection.read_model.model_copy(
-            update={"review_required": True, "unresolved": unresolved}
-        )
-        return projection.model_copy(update={"read_model": read_model})
+        return _merge_pending_safety_assertions(projection, pending_fields)
 
 
 __all__ = [

@@ -75,6 +75,17 @@ describe('canAdvanceLangGraph', () => {
       ...langGraphDetail(),
       read_model: { ...langGraphDetail().read_model, gates: [] },
     })).toBe(false)
+    expect(canAdvanceLangGraph({
+      ...langGraphDetail(),
+      read_model: {
+        ...langGraphDetail().read_model,
+        unresolved: [{
+          source: 'safety_confirmation',
+          kind: 'unconfirmed_safety_fact',
+          key: 'contraindications',
+        }],
+      },
+    })).toBe(false)
   })
 })
 

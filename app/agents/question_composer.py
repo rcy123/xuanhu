@@ -45,6 +45,8 @@ QUESTION_COMPOSER_VERIFIER_CHAIN = ("question_schema", "single_question", "no_au
 QUESTION_COMPOSER_TOOL_PERMISSIONS = frozenset({Capability.READ_STATE})
 QUESTION_COMPOSER_FAILURE_POLICY = FailurePolicy()
 QUESTION_SAFETY_INSTRUCTION = (
+    "The user is a doctor documenting a patient. Address the doctor and refer to the patient; "
+    "never phrase the question as if the doctor were the patient. "
     "Only phrase one short clarification question for the selected dimension. "
     "Do not choose gaps, add another question, request identity data, diagnose, prescribe, "
     "or mention readiness, route, stage, triage, completeness, force, or override."
@@ -113,57 +115,75 @@ def _conflict_template(dimension: InquiryDimension, text: str) -> QuestionTempla
 _QUESTION_TEMPLATES_AUTHORITY: Mapping[tuple[InquiryDimension, GapSelectionKind], QuestionTemplate] = (
     FrozenQuestionTemplateRegistry(
         (
-            _required_template(InquiryDimension.ALLERGY_STATUS, "请问您目前是否有已知过敏情况？"),
-            _required_template(InquiryDimension.PREGNANCY_STATUS, "请问您目前是否处于妊娠状态？"),
-            _required_template(InquiryDimension.LACTATION_STATUS, "请问您目前是否处于哺乳期？"),
-            _required_template(InquiryDimension.MEDICATION_STATUS, "请问您目前是否正在使用药物？"),
-            _required_template(InquiryDimension.MAJOR_CONDITION_STATUS, "请问您目前是否有重大疾病史需要说明？"),
-            _required_template(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, "请问您这次最主要的不舒服是什么？"),
-            _required_template(InquiryDimension.BASIC_COURSE, "请问这个主要不舒服已经持续多久了？"),
-            _required_template(InquiryDimension.PRESENT_ILLNESS_CHANGE, "请问这次不舒服最近的变化情况怎样？"),
-            _required_template(InquiryDimension.TEN_COLD_HEAT, "请问您最近怕冷发热的情况怎样？"),
-            _required_template(InquiryDimension.TEN_SWEAT, "请问您最近出汗情况怎样？"),
-            _required_template(InquiryDimension.TEN_HEAD_BODY, "请问您最近头身感受怎样？"),
-            _required_template(InquiryDimension.TEN_STOOL_URINE, "请问您最近二便情况怎样？"),
-            _required_template(InquiryDimension.TEN_DIET, "请问您最近饮食情况怎样？"),
-            _required_template(InquiryDimension.TEN_CHEST_ABDOMEN, "请问您最近胸腹部感受怎样？"),
-            _required_template(InquiryDimension.TEN_THIRST, "请问您最近口渴情况怎样？"),
-            _required_template(InquiryDimension.TEN_SLEEP, "请问您最近睡眠情况怎样？"),
-            _required_template(InquiryDimension.TEN_MENSES_LEUKORRHEA, "请问您最近经带情况怎样？"),
-            _required_template(InquiryDimension.TEN_PAIN, "请问您疼痛情况怎样？"),
-            _required_template(InquiryDimension.TEN_RESPIRATORY, "请问您最近呼吸情况怎样？"),
-            _conflict_template(InquiryDimension.CHIEF_COMPLAINT_CATEGORY, "请您澄清一下：主诉类别目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.ALLERGY_STATUS, "请您澄清一下：过敏采集状态目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.PREGNANCY_STATUS, "请您澄清一下：妊娠状态目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.LACTATION_STATUS, "请您澄清一下：哺乳状态目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.MEDICATION_STATUS, "请您澄清一下：当前用药状态目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.MAJOR_CONDITION_STATUS, "请您澄清一下：重大疾病状态目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, "请您澄清一下：主要不舒服目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.BASIC_COURSE, "请您澄清一下：病程目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.PRESENT_ILLNESS_CHANGE, "请您澄清一下：现病变化目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_COLD_HEAT, "请您澄清一下：寒热情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_SWEAT, "请您澄清一下：出汗情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_HEAD_BODY, "请您澄清一下：头身感受目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_STOOL_URINE, "请您澄清一下：二便情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_DIET, "请您澄清一下：饮食情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_CHEST_ABDOMEN, "请您澄清一下：胸腹感受目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_THIRST, "请您澄清一下：口渴情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_SLEEP, "请您澄清一下：睡眠情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_MENSES_LEUKORRHEA, "请您澄清一下：经带情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_PAIN, "请您澄清一下：疼痛情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.TEN_RESPIRATORY, "请您澄清一下：呼吸情况目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.PAST_HISTORY, "请您澄清一下：既往史目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.FOUR_DIAGNOSIS, "请您澄清一下：四诊信息目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.PATIENT_SEX, "请您澄清一下：适用性判断中的性别目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.PATIENT_AGE, "请您澄清一下：适用性判断中的年龄目前以哪个说法为准？"),
-            _conflict_template(InquiryDimension.MENOPAUSE_STATUS, "请您澄清一下：绝经状态目前以哪个说法为准？"),
+            _required_template(
+                InquiryDimension.ALLERGY_STATUS,
+                "为补充用药安全信息，请核实患者是否有已知过敏？",
+            ),
+            _required_template(
+                InquiryDimension.PREGNANCY_STATUS,
+                "为补充用药安全信息，请核实患者目前是否处于妊娠状态？",
+            ),
+            _required_template(
+                InquiryDimension.LACTATION_STATUS,
+                "为补充用药安全信息，请核实患者目前是否处于哺乳期？",
+            ),
+            _required_template(
+                InquiryDimension.MEDICATION_STATUS,
+                "为补充用药安全信息，请核实患者目前是否正在服用药物？",
+            ),
+            _required_template(
+                InquiryDimension.MAJOR_CONDITION_STATUS,
+                "为补充用药安全信息，请核实患者是否有需要说明的重要疾病史？",
+            ),
+            _required_template(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, "请补充患者此次最主要的不适是什么？"),
+            _required_template(InquiryDimension.BASIC_COURSE, "请补充患者主要不适已持续多久？"),
+            _required_template(
+                InquiryDimension.PRESENT_ILLNESS_CHANGE,
+                "请补充患者此次具体有哪些不适，症状近期如何变化？",
+            ),
+            _required_template(InquiryDimension.TEN_COLD_HEAT, "请补充患者近期怕冷、发热的情况？"),
+            _required_template(InquiryDimension.TEN_SWEAT, "患者近期出汗情况怎样？"),
+            _required_template(InquiryDimension.TEN_HEAD_BODY, "患者近期头身感受怎样？"),
+            _required_template(InquiryDimension.TEN_STOOL_URINE, "患者近期二便情况怎样？"),
+            _required_template(InquiryDimension.TEN_DIET, "患者近期饮食情况怎样？"),
+            _required_template(InquiryDimension.TEN_CHEST_ABDOMEN, "患者近期胸腹部感受怎样？"),
+            _required_template(InquiryDimension.TEN_THIRST, "患者近期口渴情况怎样？"),
+            _required_template(InquiryDimension.TEN_SLEEP, "患者近期睡眠情况怎样？"),
+            _required_template(InquiryDimension.TEN_MENSES_LEUKORRHEA, "患者近期经带情况怎样？"),
+            _required_template(InquiryDimension.TEN_PAIN, "患者疼痛情况怎样？"),
+            _required_template(InquiryDimension.TEN_RESPIRATORY, "患者近期呼吸情况怎样？"),
+            _conflict_template(InquiryDimension.CHIEF_COMPLAINT_CATEGORY, "请核实患者主诉类别以哪项记录为准？"),
+            _conflict_template(InquiryDimension.ALLERGY_STATUS, "请核实患者过敏状态以哪项记录为准？"),
+            _conflict_template(InquiryDimension.PREGNANCY_STATUS, "请核实患者妊娠状态以哪项记录为准？"),
+            _conflict_template(InquiryDimension.LACTATION_STATUS, "请核实患者哺乳状态以哪项记录为准？"),
+            _conflict_template(InquiryDimension.MEDICATION_STATUS, "请核实患者当前用药状态以哪项记录为准？"),
+            _conflict_template(InquiryDimension.MAJOR_CONDITION_STATUS, "请核实患者重大疾病状态以哪项记录为准？"),
+            _conflict_template(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, "请核实患者主要不适以哪项记录为准？"),
+            _conflict_template(InquiryDimension.BASIC_COURSE, "请核实患者病程以哪项记录为准？"),
+            _conflict_template(InquiryDimension.PRESENT_ILLNESS_CHANGE, "请核实患者现病变化以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_COLD_HEAT, "请核实患者寒热情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_SWEAT, "请核实患者出汗情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_HEAD_BODY, "请核实患者头身感受以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_STOOL_URINE, "请核实患者二便情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_DIET, "请核实患者饮食情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_CHEST_ABDOMEN, "请核实患者胸腹感受以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_THIRST, "请核实患者口渴情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_SLEEP, "请核实患者睡眠情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_MENSES_LEUKORRHEA, "请核实患者经带情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_PAIN, "请核实患者疼痛情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.TEN_RESPIRATORY, "请核实患者呼吸情况以哪项记录为准？"),
+            _conflict_template(InquiryDimension.PAST_HISTORY, "请核实患者既往史以哪项记录为准？"),
+            _conflict_template(InquiryDimension.FOUR_DIAGNOSIS, "请核实患者四诊信息以哪项记录为准？"),
+            _conflict_template(InquiryDimension.PATIENT_SEX, "请核实患者性别以哪项记录为准？"),
+            _conflict_template(InquiryDimension.PATIENT_AGE, "请核实患者年龄以哪项记录为准？"),
+            _conflict_template(InquiryDimension.MENOPAUSE_STATUS, "请核实患者绝经状态以哪项记录为准？"),
             _conflict_template(
                 InquiryDimension.PREGNANCY_APPLICABILITY_FLAG,
-                "请您澄清一下：妊娠适用性目前以哪个说法为准？",
+                "请核实患者妊娠适用性以哪项记录为准？",
             ),
             _conflict_template(
                 InquiryDimension.LACTATION_APPLICABILITY_FLAG,
-                "请您澄清一下：哺乳适用性目前以哪个说法为准？",
+                "请核实患者哺乳适用性以哪项记录为准？",
             ),
         )
     )
@@ -317,6 +337,7 @@ def build_question_context(
 async def compose_question(
     *,
     completeness_result: object,
+    pending_safety_dimensions: tuple[InquiryDimension, ...] = (),
     selection: GapSelectionResult | None = None,
     runtime: AgentRuntime | None = None,
     run_spec: RunSpec | None = None,
@@ -326,7 +347,10 @@ async def compose_question(
     """Compose zero or one question without writing state or changing gates."""
 
     try:
-        authoritative_selection = select_gap(completeness_result)
+        authoritative_selection = select_gap(
+            completeness_result,
+            pending_safety_dimensions=pending_safety_dimensions,
+        )
     except (ValueError, TypeError, AttributeError):
         return _failed(QuestionComposerFailureCode.INPUT_SCHEMA_INVALID)
     if selection is not None:

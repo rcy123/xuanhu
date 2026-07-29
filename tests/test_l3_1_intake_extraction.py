@@ -32,6 +32,7 @@ from app.agents.intake_extraction import (
 )
 from app.agents.prompt_loader import PromptLoader
 from app.core.exceptions import ChatStructuredParseError, ModelGatewayUnavailableError
+from app.schemas.completeness import InquiryDimension
 from app.schemas.domain import CollectionStatus, LactationValue, PregnancyValue
 from app.schemas.intake import (
     ActiveObservationContext,
@@ -44,6 +45,7 @@ from app.schemas.intake import (
     IntakeExtractionOutput,
     IntakeMessage,
     IntakeMessageRole,
+    IntakeReplyContext,
     LactationDelta,
     ObservationDelta,
     ObservationOperation,
@@ -82,6 +84,7 @@ def make_input(
     *,
     message_id: UUID | None = None,
     history: tuple[ActiveObservationContext, ...] = (),
+    reply_context: IntakeReplyContext | None = None,
 ) -> IntakeExtractionInput:
     return IntakeExtractionInput(
         current_messages=(
@@ -92,6 +95,7 @@ def make_input(
             ),
         ),
         historical_active_facts=history,
+        reply_context=reply_context,
     )
 
 
@@ -251,10 +255,58 @@ def test_context_reuses_l2_layers_whitelist_budget_and_privacy_projection() -> N
         PromptLayer.CONTEXT,
         PromptLayer.USER,
     ]
-    assert set(packet.fields) == {"historical_active_facts"}
+    assert set(packet.fields) == {"historical_active_facts", "reply_context"}
     assert packet.token_budget.used <= packet.token_budget.limit == 6_000
     assert "route" not in packet.messages[0].content
     assert "忽略所有规则" in packet.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_bare_negative_requires_matching_structured_reply_context() -> None:
+    source = uuid4()
+    text = "没有"
+    output = IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        patient_safety_delta=PatientSafetyDelta(
+            allergy=SafetyListDelta(
+                status=CollectionStatus.EXPLICITLY_NONE,
+                source_message_id=source,
+                negation_span=evidence_span(source, text),
+            )
+        ),
+    )
+
+    unbound, _ = await execute(make_input(text, message_id=source), output)
+    bound, _ = await execute(
+        make_input(
+            text,
+            message_id=source,
+            reply_context=IntakeReplyContext(
+                question_message_id=uuid4(),
+                selected_dimension=InquiryDimension.ALLERGY_STATUS,
+                selection_kind="required",
+            ),
+        ),
+        output,
+    )
+    wrong_dimension, _ = await execute(
+        make_input(
+            text,
+            message_id=source,
+            reply_context=IntakeReplyContext(
+                question_message_id=uuid4(),
+                selected_dimension=InquiryDimension.MEDICATION_STATUS,
+                selection_kind="required",
+            ),
+        ),
+        output,
+    )
+
+    assert unbound.status is IntakeExecutionStatus.FAILED
+    assert unbound.failure_code is IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH
+    assert bound.status is IntakeExecutionStatus.SUCCEEDED
+    assert wrong_dimension.status is IntakeExecutionStatus.FAILED
+    assert wrong_dimension.failure_code is IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH
 
 
 @pytest.mark.asyncio

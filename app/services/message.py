@@ -229,12 +229,14 @@ class MessageService:
             sufficiency_report=sufficiency,
         )
 
-    async def ensure_submission_runtime_available(self, session_id: str) -> None:
+    async def ensure_submission_runtime_available(self, session_id: str) -> bool:
         """Fail before HTTP idempotency claims when LangGraph is unavailable."""
 
         session = await self._load_session(session_id)
         if getattr(session, "agent_runtime", "legacy") == "langgraph":
             self._require_langgraph_runtime()
+            return True
+        return False
 
     def _require_langgraph_runtime(self) -> None:
         if self._shared_langgraph_runtime is None and not self._allow_request_local_langgraph_runtime:

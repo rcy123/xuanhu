@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,7 +25,7 @@ from app.schemas.domain import (
 )
 from app.schemas.domain_seed import INITIAL_DOMAIN_SEED_VERSION, InitialDomainSeed, SeedObservation
 from app.schemas.session import PatientInfo, SessionCreateRequest
-from app.schemas.triage import TriageDisposition, TriagePolicyInput
+from app.schemas.triage import TriageDisposition, TriagePolicyInput, TriagePolicyResult
 from app.schemas.types import Gender, PregnancyStatus
 from app.services.safety_confirmation import SafetyConfirmationService
 
@@ -35,11 +36,58 @@ INITIAL_DOMAIN_SEED_AUDIT = "initial_domain_seed.created"
 @dataclass(frozen=True)
 class InitialDomainSeedOutcome:
     seed: InitialDomainSeed
-    triage_disposition: TriageDisposition | None
+    triage_result: TriagePolicyResult
+
+    @property
+    def triage_disposition(self) -> TriageDisposition:
+        return self.triage_result.disposition
 
 
 def _stable_id(session_id: uuid.UUID, kind: str) -> uuid.UUID:
     return uuid.uuid5(session_id, f"{INITIAL_DOMAIN_SEED_VERSION}:{kind}")
+
+
+def _evaluate_initial_triage(
+    source_message_id: uuid.UUID,
+    complaint: str,
+    *,
+    state_version: int,
+) -> tuple[TriagePolicyResult, tuple[str, ...]]:
+    """Evaluate an optional chief complaint without fabricating empty evidence."""
+
+    if complaint:
+        precheck = evaluate_raw_text_triage_precheck(source_message_id, complaint)
+        candidates = precheck.candidates
+        matched_rule_ids = precheck.matched_rule_ids
+    else:
+        candidates = ()
+        matched_rule_ids = ()
+    triage = evaluate_triage_policy(
+        TriagePolicyInput(
+            input_state_version=state_version,
+            red_flag_candidates=candidates,
+        )
+    )
+    return triage, tuple(matched_rule_ids)
+
+
+_COURSE_PATTERN = re.compile(
+    r"(?P<course>"
+    r"(?:约|大约|近|已有|持续)?\s*"
+    r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百半]+)\s*"
+    r"(?:小时|天|日|周|星期|个月|月|年)"
+    r"(?:前|来|余|左右)?)"
+    r"(?=$|[，。；、,\s]|伴|并|且|后)"
+)
+
+
+def _extract_explicit_course(complaint: str) -> str | None:
+    """Return a conservative explicit duration phrase from a chief complaint."""
+
+    match = _COURSE_PATTERN.search(complaint)
+    if match is None:
+        return None
+    return re.sub(r"\s+", "", match.group("course"))
 
 
 def _list_collection(
@@ -95,6 +143,16 @@ def build_initial_domain_seed(session_id: uuid.UUID, request: SessionCreateReque
                 normalized_value=complaint,
             )
         )
+        course = _extract_explicit_course(complaint)
+        if course is not None:
+            observations.append(
+                SeedObservation(
+                    observation_id=_stable_id(session_id, "observation:chief_complaint.course"),
+                    fact_key="chief_complaint.course",
+                    value=course,
+                    normalized_value=course,
+                )
+            )
     if request.patient_info.age is not None:
         observations.append(
             SeedObservation(
@@ -169,7 +227,13 @@ class InitialDomainSeeder:
             existing_digest = (existing.structured_delta or {}).get("payload_digest")
             if existing_digest != seed.payload_digest:
                 raise ValueError("initial domain seed digest mismatch")
-            return InitialDomainSeedOutcome(seed=seed, triage_disposition=None)
+            complaint = (request.chief_complaint or "").strip()
+            triage, _ = _evaluate_initial_triage(
+                seed.source_message_id,
+                complaint,
+                state_version=session.state_version,
+            )
+            return InitialDomainSeedOutcome(seed=seed, triage_result=triage)
 
         complaint = (request.chief_complaint or "").strip()
         safety_collection_status = {
@@ -238,39 +302,37 @@ class InitialDomainSeeder:
             template_version=INITIAL_DOMAIN_SEED_VERSION,
         )
 
-        triage_disposition: TriageDisposition | None = None
-        if complaint:
-            precheck = evaluate_raw_text_triage_precheck(seed.source_message_id, complaint)
-            triage = evaluate_triage_policy(
-                TriagePolicyInput(input_state_version=session.state_version, red_flag_candidates=precheck.candidates)
+        triage, matched_rule_ids = _evaluate_initial_triage(
+            seed.source_message_id,
+            complaint,
+            state_version=session.state_version,
+        )
+        if triage.disposition is not TriageDisposition.CONTINUE:
+            gate = to_gate_result_schema(triage)
+            details = dict(gate.details or {})
+            details.update(
+                {
+                    "triage_precheck_version": TRIAGE_PRECHECK_VERSION,
+                    "triage_precheck_rule_ids": list(matched_rule_ids),
+                }
             )
-            triage_disposition = triage.disposition
-            if triage.disposition is not TriageDisposition.CONTINUE:
-                gate = to_gate_result_schema(triage)
-                details = dict(gate.details or {})
-                details.update(
-                    {
-                        "triage_precheck_version": TRIAGE_PRECHECK_VERSION,
-                        "triage_precheck_rule_ids": list(precheck.matched_rule_ids),
-                    }
+            self._db.add(
+                GateResult(
+                    id=_stable_id(session.id, "gate:triage"),
+                    session_id=session.id,
+                    graph_run_id=None,
+                    gate_name=gate.gate_name,
+                    policy_version=gate.policy_version,
+                    input_state_version=gate.input_state_version,
+                    decision=gate.decision.value,
+                    details=details,
                 )
-                self._db.add(
-                    GateResult(
-                        id=_stable_id(session.id, "gate:triage"),
-                        session_id=session.id,
-                        graph_run_id=None,
-                        gate_name=gate.gate_name,
-                        policy_version=gate.policy_version,
-                        input_state_version=gate.input_state_version,
-                        decision=gate.decision.value,
-                        details=details,
-                    )
-                )
-                session.current_stage = "blocked"
-                session.status = "blocked"
-                session.recovery_status = "manual_required"
-                session.blocked_reason = f"triage:{triage.disposition.value}"
-                session.blocked_at = datetime.now(UTC).replace(tzinfo=None)
+            )
+            session.current_stage = "blocked"
+            session.status = "blocked"
+            session.recovery_status = "manual_required"
+            session.blocked_reason = f"triage:{triage.disposition.value}"
+            session.blocked_at = datetime.now(UTC).replace(tzinfo=None)
 
         self._db.add(
             AuditEvent(
@@ -291,4 +353,4 @@ class InitialDomainSeeder:
         await self._db.flush()
         # A duplicate deterministic source can only exist for this session.
         assert await self._db.scalar(select(ConsultMessage.id).where(ConsultMessage.id == seed.source_message_id))
-        return InitialDomainSeedOutcome(seed=seed, triage_disposition=triage_disposition)
+        return InitialDomainSeedOutcome(seed=seed, triage_result=triage)

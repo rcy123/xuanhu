@@ -83,6 +83,56 @@ beforeEach(() => {
   __setBaseUrlResolver(() => BASE)
 })
 
+describe('message retry command boundaries', () => {
+  it('does not internally replay INVALID_STATE_VERSION with the same command key', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        status: 409,
+        body: {
+          code: 'INVALID_STATE_VERSION',
+          message: 'stale',
+          retryable: true,
+          trace_id: 'trace-stale',
+        },
+      }),
+    )
+
+    await expect(
+      submitMessageWithRetry(
+        's-1',
+        { content: 'answer', role: 'doctor' },
+        { stateVersion: 1, idempotencyKey: 'fixed-command-key' },
+        3,
+      ),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_VERSION' })
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not internally replay AGENT_TRIGGER_FAILED after the message was saved', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        status: 503,
+        body: {
+          code: 'AGENT_TRIGGER_FAILED',
+          message: 'saved message but agent failed',
+          retryable: true,
+          trace_id: 'trace-agent-failed',
+        },
+      }),
+    )
+
+    await expect(
+      submitMessageWithRetry(
+        's-1',
+        { content: 'answer', role: 'doctor', reply_to_message_id: 'question-1' },
+        { stateVersion: 4, idempotencyKey: 'saved-command-key' },
+        3,
+      ),
+    ).rejects.toMatchObject({ code: 'AGENT_TRIGGER_FAILED' })
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+})
+
 afterEach(() => {
   vi.restoreAllMocks()
 })

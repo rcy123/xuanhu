@@ -54,7 +54,13 @@ from app.core.exceptions import (
 from app.db.session import get_db, get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
-from app.models.domain import GateResult, GraphRun, IntakeCommandClaim, OutboxEvent
+from app.models.domain import (
+    GateResult,
+    GraphRun,
+    IntakeCommandClaim,
+    OutboxEvent,
+    SafetyFactAssertion,
+)
 from app.schemas.advance import AdvanceRequest
 from app.schemas.common import success_response
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
@@ -589,6 +595,24 @@ async def _run_langgraph_advance(
                         detail=(
                             f"session_id={locked.id} current_stage={locked.current_stage} "
                             "LangGraph advance requires persisted completeness disposition=ready for current state_version"
+                        ),
+                    )
+                pending_safety_assertion_id = await db.scalar(
+                    select(SafetyFactAssertion.id)
+                    .where(
+                        SafetyFactAssertion.session_id == locked.id,
+                        SafetyFactAssertion.status == "proposed",
+                        # Red flags are owned by the triage/recovery boundary,
+                        # not the generic safety-fact confirmation workflow.
+                        SafetyFactAssertion.field_name != "red_flag",
+                    )
+                    .limit(1)
+                )
+                if pending_safety_assertion_id is not None:
+                    raise InsufficientInquiryError(
+                        detail=(
+                            f"session_id={locked.id} LangGraph advance requires all "
+                            "proposed safety facts to be explicitly resolved by a doctor"
                         ),
                     )
                 gate_id = gate.id

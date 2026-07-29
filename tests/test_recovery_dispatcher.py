@@ -14,6 +14,7 @@ from sqlalchemy.sql import Select
 from app.db.session import get_db
 from app.main import app
 from app.schemas.recovery import RecoveryRequest, RecoveryResponse
+from app.services.http_idempotency import HttpCommandExecutor, HttpCommandResult
 from app.services.langgraph_recovery import LangGraphRecoveryService
 from app.services.recovery import RecoveryService
 from app.services.session_lock import SessionLock
@@ -45,6 +46,26 @@ class _ReadOnlySession:
 
     async def rollback(self) -> None:
         self.rolled_back = True
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dispatch_from_command_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This unit suite owns runtime dispatch only, not durable command claims."""
+
+    async def _execute(
+        self: HttpCommandExecutor,
+        **kwargs: Any,
+    ) -> HttpCommandResult:
+        del self
+        data = await kwargs["handler"]()
+        return HttpCommandResult(
+            data=data,
+            status_code=kwargs["success_status"],
+            message=kwargs["success_message"],
+            replayed=False,
+        )
+
+    monkeypatch.setattr(HttpCommandExecutor, "execute", _execute)
 
 
 async def _post_recover(

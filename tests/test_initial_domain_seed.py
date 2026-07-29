@@ -43,6 +43,28 @@ def test_omitted_safety_fields_remain_unknown() -> None:
     assert safety.lactation_collection_status is CollectionStatus.UNKNOWN
 
 
+def test_explicit_course_is_seeded_from_clear_chief_complaint_duration() -> None:
+    for complaint, expected in (
+        ("感冒三天", "三天"),
+        ("咳嗽 3 天，伴咽痛", "3天"),
+        ("头痛半月", "半月"),
+    ):
+        seed = build_initial_domain_seed(
+            uuid4(),
+            SessionCreateRequest(agent_runtime="langgraph", chief_complaint=complaint),
+        )
+        facts = {item.fact_key: item.value for item in seed.observations}
+        assert facts["chief_complaint.course"] == expected
+
+
+def test_ambiguous_change_timing_is_not_seeded_as_whole_course() -> None:
+    seed = build_initial_domain_seed(
+        uuid4(),
+        SessionCreateRequest(agent_runtime="langgraph", chief_complaint="头痛，3天前加重"),
+    )
+    assert "chief_complaint.course" not in {item.fact_key for item in seed.observations}
+
+
 def test_explicit_empty_and_nonempty_safety_lists_are_distinct() -> None:
     seed = build_initial_domain_seed(
         uuid4(),

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.main import app
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
-from app.models.domain import GateResult, Observation, SafetyProfile
+from app.models.domain import GateResult, GraphRun, Observation, SafetyProfile
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -285,6 +285,80 @@ async def test_create_langgraph_session_seeds_identity_free_domain_state(
     history = await client.get(f"/api/v1/consult/sessions/{sid}/messages")
     assert history.status_code == 200
     assert all(item.get("agent_name") != "initial_domain_seed" for item in history.json()["data"]["items"])
+
+
+async def test_create_langgraph_session_persists_first_question_without_extra_user_message(
+    client: AsyncClient,
+    db: AsyncSession,
+    enable_public_langgraph: None,
+) -> None:
+    data = await _create_session(
+        client,
+        {
+            "agent_runtime": "langgraph",
+            "chief_complaint": "感冒三天",
+            "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}AUTO-FIRST"},
+        },
+    )
+    sid = uuid.UUID(data["session_id"])
+    await db.rollback()
+
+    session = await db.get(ConsultSession, sid)
+    messages = (
+        await db.execute(
+            select(ConsultMessage)
+            .where(
+                ConsultMessage.session_id == sid,
+                ConsultMessage.agent_name == "question_composer",
+            )
+            .order_by(ConsultMessage.created_at)
+        )
+    ).scalars().all()
+    facts = {
+        item.fact_key: item.value
+        for item in (
+            await db.execute(select(Observation).where(Observation.session_id == sid))
+        ).scalars()
+    }
+    graph_run = await db.scalar(
+        select(GraphRun).where(
+            GraphRun.session_id == sid,
+            GraphRun.command_id == f"bootstrap:{sid}",
+        )
+    )
+    gates = (
+        await db.execute(
+            select(GateResult).where(
+                GateResult.session_id == sid,
+                GateResult.graph_run_id == graph_run.id if graph_run is not None else False,
+            )
+        )
+    ).scalars().all()
+
+    assert session is not None
+    assert session.state_version == 1
+    assert session.current_stage == "inquiry"
+    assert facts["chief_complaint.course"] == "三天"
+    assert len(messages) == 1
+    assert messages[0].structured_delta["selected_dimension"] == "present_illness.change"
+    assert "具体有哪些不适" in messages[0].content
+    assert "患者" in messages[0].content
+    assert "请问您" not in messages[0].content
+    assert "过敏" not in messages[0].content
+    assert graph_run is not None and graph_run.status == "completed"
+    assert {item.gate_name for item in gates} == {"triage", "completeness"}
+    assert session.state_snapshot["langgraph_intake"]["last_question_message_id"] == str(
+        messages[0].id
+    )
+    assert session.state_snapshot["langgraph_intake"]["progress"] == {
+        "no_new_facts_rounds": 0,
+        "followup_rounds": 1,
+    }
+
+    history = await client.get(f"/api/v1/consult/sessions/{sid}/messages")
+    assert history.status_code == 200
+    visible = history.json()["data"]["items"]
+    assert [item["id"] for item in visible] == [str(messages[0].id)]
 
 
 async def test_create_langgraph_session_red_flag_chief_complaint_blocks_immediately(

@@ -31,6 +31,7 @@ export interface UseSessionStreamOptions {
   stateVersion: number | undefined
   onStageChanged?: (toStage: string, stateVersion: number) => void
   onMessageCreated?: (messageId: string) => void
+  onAgentFinished?: (agentName: string) => void
   onResync?: (reason: string) => void
   onReviewRequired?: (modifiedFormula: Formula, safetyReview: Record<string, unknown>) => void
   onSafetyBlocked?: (issues: SafetyIssue[], rollbackTarget?: string | null) => void
@@ -63,12 +64,16 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
   const connRef = useRef<SseConnection | null>(null)
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const consecutiveErrorsRef = useRef(0)
+  const connectionGenerationRef = useRef(0)
   const mountedRef = useRef(true)
   const optionsRef = useRef(options)
   optionsRef.current = options
 
   // 关闭连接 + 定时器
   const teardown = useCallback(() => {
+    // Invalidate callbacks before close(); transports may synchronously emit
+    // a final error while being closed.
+    connectionGenerationRef.current += 1
     if (connRef.current) {
       connRef.current.close()
       connRef.current = null
@@ -80,11 +85,17 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
   }, [])
 
   // 启动轮询
-  const startPolling = useCallback(() => {
+  const startPolling = useCallback((generation: number, targetSessionId: string) => {
+    const isCurrentScope = () => (
+      mountedRef.current
+      && connectionGenerationRef.current === generation
+      && optionsRef.current.sessionId === targetSessionId
+    )
+    if (!isCurrentScope()) return
     if (pollTimerRef.current !== null) return
     setConnectionState('polling')
     pollTimerRef.current = setInterval(() => {
-      optionsRef.current.onPollingRefresh?.()
+      if (isCurrentScope()) optionsRef.current.onPollingRefresh?.()
     }, POLL_INTERVAL_MS)
   }, [])
 
@@ -136,6 +147,7 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
             ...prev,
             [agentName]: { status: 'done', agentRunId },
           }))
+          opts.onAgentFinished?.(agentName)
         }
         break
       }
@@ -155,20 +167,20 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
         opts.onSessionDone?.(recordId)
         // 终态：关闭连接
         teardown()
-        setConnectionState('disconnected')
+        setConnectionState('idle')
         break
       }
       case 'session.blocked': {
         const reason = payload?.blocked_reason as string | undefined
         opts.onSessionBlocked?.(reason ?? '')
-        teardown()
-        setConnectionState('disconnected')
+        // blocked 是可恢复的业务状态，不代表 SSE 网络断开。
+        // 保持订阅，以便接收后续恢复、消息及阶段变更事件。
         break
       }
       case 'session.terminated': {
         opts.onSessionTerminated?.()
         teardown()
-        setConnectionState('disconnected')
+        setConnectionState('idle')
         break
       }
       case 'heartbeat':
@@ -184,6 +196,12 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
   const connectInner = useCallback(() => {
     const id = optionsRef.current.sessionId
     if (!id) return
+    const generation = ++connectionGenerationRef.current
+    const isCurrentConnection = () => (
+      mountedRef.current
+      && connectionGenerationRef.current === generation
+      && optionsRef.current.sessionId === id
+    )
 
     setConnectionState('connecting')
     setLastError(null)
@@ -191,11 +209,11 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
 
     const conn = sse.connectSessionStream(id, {
       onEvent: (event: SessionEvent) => {
-        if (!mountedRef.current) return
+        if (!isCurrentConnection()) return
         handleEvent(event)
       },
       onOpen: () => {
-        if (!mountedRef.current) return
+        if (!isCurrentConnection()) return
         consecutiveErrorsRef.current = 0
         if (pollTimerRef.current !== null) {
           clearInterval(pollTimerRef.current)
@@ -205,19 +223,20 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
         setLastError(null)
       },
       onError: (_err: Event) => {
-        if (!mountedRef.current) return
+        if (!isCurrentConnection()) return
         consecutiveErrorsRef.current++
         if (consecutiveErrorsRef.current >= MAX_CONSECUTIVE_ERRORS) {
+          const pollingGeneration = ++connectionGenerationRef.current
           connRef.current?.close()
           connRef.current = null
-          startPolling()
+          startPolling(pollingGeneration, id)
         } else {
           setConnectionState('connecting')
           setLastError('连接中断，正在重连…')
         }
       },
       onResync: (event: SessionEvent) => {
-        if (!mountedRef.current) return
+        if (!isCurrentConnection()) return
         const reason = typeof event.payload?.reason === 'string' ? event.payload.reason : 'unknown'
         optionsRef.current.onResync?.(reason)
       },
@@ -245,9 +264,13 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
     }
 
     // 检查 EventSource 是否可用
+    setAgentRuns({})
+    setLastError(null)
+
     if (typeof EventSource === 'undefined') {
       // 直接降级为轮询
-      startPolling()
+      const pollingGeneration = ++connectionGenerationRef.current
+      startPolling(pollingGeneration, sessionId)
       return () => {
         mountedRef.current = false
         teardown()

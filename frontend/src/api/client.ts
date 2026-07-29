@@ -167,16 +167,28 @@ export async function requestWithRetry<T>(
     ctx?: RequestContext
     maxRetries?: number
     delayMs?: number
+    /** Retryable business errors that must still terminate this command. */
+    retryExcludedCodes?: readonly string[]
   } = {},
 ): Promise<T> {
-  const { maxRetries = 3, delayMs = 1500, ...fetchOptions } = options
+  const {
+    maxRetries = 3,
+    delayMs = 1500,
+    retryExcludedCodes = [],
+    ...fetchOptions
+  } = options
 
   let lastError: ApiRequestError | undefined
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await request<T>(path, fetchOptions)
     } catch (err: unknown) {
-      if (err instanceof ApiRequestError && err.retryable && attempt < maxRetries) {
+      if (
+        err instanceof ApiRequestError
+        && err.retryable
+        && !retryExcludedCodes.includes(err.code)
+        && attempt < maxRetries
+      ) {
         lastError = err
         await sleep(delayMs)
         continue

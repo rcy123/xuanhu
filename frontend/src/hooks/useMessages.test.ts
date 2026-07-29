@@ -1,9 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { useMessages } from './useMessages'
 import * as api from '@/api/index'
 import { ApiRequestError } from '@/api/errors'
-import type { CursorData, MessageItem } from '@/types/api'
+import type { CursorData, MessageCreateData, MessageItem } from '@/types/api'
 
 function makeMsg(id: string, role: MessageItem['role']): MessageItem {
   return {
@@ -17,6 +17,10 @@ function makeMsg(id: string, role: MessageItem['role']): MessageItem {
 }
 
 describe('useMessages', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('loadMessages 加载并按时间升序', async () => {
     // 后端返回倒序，前端应反转为升序
     const data: CursorData<MessageItem> = {
@@ -60,8 +64,12 @@ describe('useMessages', () => {
     expect(submitSpy).toHaveBeenCalledWith(
       's',
       { content: '头痛', role: 'doctor' },
-      expect.objectContaining({ stateVersion: 1 }),
+      expect.objectContaining({
+        stateVersion: 1,
+        idempotencyKey: expect.any(String),
+      }),
     )
+    expect(result.current.pendingSubmission).toBeNull()
   })
 
   it('INVALID_STATE_VERSION 触发刷新并重提一次', async () => {
@@ -102,6 +110,301 @@ describe('useMessages', () => {
     // 重试调用应使用刷新后的版本号 2（最后一次调用）
     const lastCall = submitSpy.mock.calls[submitSpy.mock.calls.length - 1]
     expect(lastCall[2]?.stateVersion).toBe(2)
+    expect(lastCall[2]?.idempotencyKey).not.toBe(submitSpy.mock.calls[0][2]?.idempotencyKey)
+    expect(lastCall[1]).toEqual(submitSpy.mock.calls[0][1])
+  })
+
+  it('does not rebase a stale command after the structured question has changed', async () => {
+    const versionErr = new ApiRequestError({
+      code: 'INVALID_STATE_VERSION',
+      userMessage: 'stale version',
+      status: 409,
+      retryable: true,
+    })
+    const submitSpy = vi.spyOn(api, 'submitMessageWithRetry').mockRejectedValue(versionErr)
+    vi.spyOn(api, 'listMessages').mockResolvedValue({
+      items: [{
+        ...makeMsg('question-new', 'agent'),
+        agent_name: 'question_composer',
+        structured_delta: { selected_dimension: 'safety.allergy_status' },
+      }],
+      has_more: false,
+      next_cursor: null,
+    })
+    const { result } = renderHook(() => useMessages())
+
+    let ok = true
+    await act(async () => {
+      ok = await result.current.submit(
+        's',
+        'old answer',
+        1,
+        async () => 2,
+        'question-old',
+      )
+    })
+
+    expect(ok).toBe(false)
+    expect(submitSpy).toHaveBeenCalledTimes(1)
+    expect(result.current.pendingSubmission).toBeNull()
+    expect(result.current.submitError).toMatchObject({
+      code: 'REPLY_CONTEXT_CHANGED',
+      retryable: false,
+    })
+  })
+
+  it('does not send a rebased command when refreshed state_version is missing', async () => {
+    const versionErr = new ApiRequestError({
+      code: 'INVALID_STATE_VERSION',
+      userMessage: 'stale version',
+      status: 409,
+      retryable: true,
+    })
+    const submitSpy = vi.spyOn(api, 'submitMessageWithRetry').mockRejectedValue(versionErr)
+    const listSpy = vi.spyOn(api, 'listMessages')
+    const { result } = renderHook(() => useMessages())
+
+    let ok = true
+    await act(async () => {
+      ok = await result.current.submit('s', 'answer', 1, async () => undefined)
+    })
+
+    expect(ok).toBe(false)
+    expect(submitSpy).toHaveBeenCalledTimes(1)
+    expect(listSpy).not.toHaveBeenCalled()
+    expect(result.current.submitError?.code).toBe('REBASE_STATE_VERSION_MISSING')
+    expect(result.current.pendingSubmission).toBeNull()
+  })
+
+  it('does not let an old session history response overwrite the newly selected session', async () => {
+    let resolveOld!: (data: CursorData<MessageItem>) => void
+    const oldResponse = new Promise<CursorData<MessageItem>>((resolve) => {
+      resolveOld = resolve
+    })
+    vi.spyOn(api, 'listMessages').mockImplementation(async (sessionId) => {
+      if (sessionId === 'old-session') return oldResponse
+      return {
+        items: [makeMsg('8', 'agent')],
+        has_more: false,
+        next_cursor: null,
+      }
+    })
+    const { result } = renderHook(() => useMessages())
+
+    let oldLoad!: Promise<MessageItem[] | null>
+    await act(async () => {
+      oldLoad = result.current.loadMessages('old-session')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      result.current.clear()
+      await result.current.loadMessages('new-session')
+    })
+    expect(result.current.messages.map((item) => item.id)).toEqual(['8'])
+
+    await act(async () => {
+      resolveOld({
+        items: [makeMsg('1', 'doctor')],
+        has_more: false,
+        next_cursor: null,
+      })
+      await oldLoad
+    })
+
+    expect(result.current.messages.map((item) => item.id)).toEqual(['8'])
+    expect(result.current.loading).toBe(false)
+  })
+
+  it('does not let an old submission completion clear the new session pending command', async () => {
+    let resolveOld!: (data: MessageCreateData) => void
+    const oldResponse = new Promise<MessageCreateData>((resolve) => {
+      resolveOld = resolve
+    })
+    const newResponseLost = new ApiRequestError({
+      code: 'NETWORK_ERROR',
+      userMessage: 'new response lost',
+      status: 0,
+      retryable: true,
+    })
+    vi.spyOn(api, 'submitMessageWithRetry')
+      .mockImplementationOnce(() => oldResponse)
+      .mockRejectedValueOnce(newResponseLost)
+    const listSpy = vi.spyOn(api, 'listMessages').mockResolvedValue({
+      items: [],
+      has_more: false,
+      next_cursor: null,
+    })
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 1 as number)
+
+    let oldSubmit!: Promise<boolean>
+    await act(async () => {
+      oldSubmit = result.current.submit('old-session', 'old answer', 1, refresh, 'old-question')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      result.current.clear()
+      await result.current.loadMessages('new-session')
+    })
+    await act(async () => {
+      await result.current.submit('new-session', 'new answer', 1, refresh, 'new-question')
+    })
+    const newPending = result.current.pendingSubmission
+    expect(newPending).toMatchObject({
+      content: 'new answer',
+      replyToMessageId: 'new-question',
+    })
+
+    await act(async () => {
+      resolveOld({
+        message_id: 'old-message',
+        session_id: 'old-session',
+        role: 'agent',
+        stage: 'inquiry',
+        content: 'old next question',
+        current_stage: 'inquiry',
+        state_version: 2,
+        created_at: '',
+      })
+      await oldSubmit
+    })
+
+    expect(result.current.pendingSubmission).toBe(newPending)
+    expect(result.current.submitError).toBe(newResponseLost)
+    expect(listSpy).toHaveBeenCalledTimes(1)
+    expect(listSpy).toHaveBeenCalledWith('new-session', { limit: 100 })
+  })
+
+  it('keeps the exact saved-message command for explicit AGENT_TRIGGER_FAILED retry', async () => {
+    const agentFailed = new ApiRequestError({
+      code: 'AGENT_TRIGGER_FAILED',
+      userMessage: 'message saved but agent failed',
+      status: 503,
+      retryable: true,
+    })
+    const submitSpy = vi.spyOn(api, 'submitMessageWithRetry')
+      .mockRejectedValueOnce(agentFailed)
+      .mockResolvedValueOnce({
+        message_id: 'message-1',
+        session_id: 's',
+        role: 'agent',
+        stage: 'inquiry',
+        content: 'resumed',
+        current_stage: 'inquiry',
+        state_version: 5,
+        created_at: '',
+      })
+    vi.spyOn(api, 'listMessages').mockResolvedValue({
+      items: [],
+      has_more: false,
+      next_cursor: null,
+    })
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 99 as number)
+
+    let firstOk = true
+    await act(async () => {
+      firstOk = await result.current.submit('s', 'answer', 4, refresh, 'question-1')
+    })
+    expect(firstOk).toBe(false)
+    const savedCommand = result.current.pendingSubmission
+    expect(savedCommand).toMatchObject({
+      content: 'answer',
+      replyToMessageId: 'question-1',
+      stateVersion: 4,
+      idempotencyKey: expect.any(String),
+    })
+
+    let retryOk = false
+    await act(async () => {
+      retryOk = await result.current.retryPending('s', refresh)
+    })
+    expect(retryOk).toBe(true)
+    expect(refresh).not.toHaveBeenCalled()
+    expect(submitSpy).toHaveBeenCalledTimes(2)
+    expect(submitSpy.mock.calls[1][1]).toEqual(submitSpy.mock.calls[0][1])
+    expect(submitSpy.mock.calls[1][2]).toEqual(submitSpy.mock.calls[0][2])
+    expect(result.current.pendingSubmission).toBeNull()
+  })
+
+  it('network response loss keeps the original question binding and idempotency key for manual retry', async () => {
+    const lostResponse = new ApiRequestError({
+      code: 'NETWORK_ERROR',
+      userMessage: 'response lost',
+      status: 0,
+      retryable: true,
+    })
+    const submitSpy = vi
+      .spyOn(api, 'submitMessageWithRetry')
+      .mockRejectedValueOnce(lostResponse)
+      .mockResolvedValueOnce({
+        message_id: 'patient-message',
+        session_id: 's',
+        role: 'agent',
+        stage: 'inquiry',
+        content: 'next question',
+        current_stage: 'inquiry',
+        state_version: 3,
+        created_at: '',
+      })
+    vi.spyOn(api, 'listMessages').mockResolvedValue({
+      items: [{
+        ...makeMsg('3', 'agent'),
+        agent_name: 'question_composer',
+        structured_delta: { selected_dimension: 'safety.medication_status' },
+      }],
+      has_more: false,
+      next_cursor: null,
+    })
+
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 3 as number)
+
+    let firstOk = true
+    await act(async () => {
+      firstOk = await result.current.submit('s', 'no', 1, refresh, 'question-old')
+    })
+    expect(firstOk).toBe(false)
+    expect(result.current.pendingSubmission).toMatchObject({
+      content: 'no',
+      replyToMessageId: 'question-old',
+      stateVersion: 1,
+      idempotencyKey: expect.any(String),
+    })
+    expect(Object.isFrozen(result.current.pendingSubmission)).toBe(true)
+    const uncertainPending = result.current.pendingSubmission
+
+    let replacementOk = true
+    await act(async () => {
+      replacementOk = await result.current.submit('s', 'different answer', 3, refresh, 'question-new')
+    })
+    expect(replacementOk).toBe(false)
+    expect(submitSpy).toHaveBeenCalledTimes(1)
+    expect(result.current.pendingSubmission).toBe(uncertainPending)
+
+    // SSE/history refresh has already exposed a newer question before the
+    // doctor presses retry.
+    await act(async () => {
+      await result.current.loadMessages('s')
+    })
+    expect(result.current.messages.at(-1)?.id).toBe('3')
+
+    let retryOk = false
+    await act(async () => {
+      retryOk = await result.current.retryPending('s', refresh)
+    })
+    expect(retryOk).toBe(true)
+
+    const [firstBody, retryBody] = submitSpy.mock.calls.map((call) => call[1])
+    expect(firstBody.reply_to_message_id).toBe('question-old')
+    expect(retryBody.reply_to_message_id).toBe('question-old')
+    expect(retryBody.content).toBe('no')
+    expect(submitSpy.mock.calls[0][2]?.stateVersion).toBe(1)
+    expect(submitSpy.mock.calls[1][2]?.stateVersion).toBe(1)
+    expect(submitSpy.mock.calls[1][2]?.idempotencyKey).toBe(
+      submitSpy.mock.calls[0][2]?.idempotencyKey,
+    )
+    expect(result.current.pendingSubmission).toBeNull()
   })
 
   it('不可重试错误设置 submitError', async () => {
@@ -120,5 +423,7 @@ describe('useMessages', () => {
     })
     expect(ok).toBe(false)
     await waitFor(() => expect(result.current.submitError?.code).toBe('INVALID_STAGE_TRANSITION'))
+    expect(result.current.pendingSubmission).toBeNull()
+    expect(result.current.lastFailedContent).toBe('\u5934\u75db')
   })
 })

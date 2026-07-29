@@ -5,12 +5,14 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
+import { act, render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import { Modal } from 'antd'
 import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import * as api from '@/api/index'
+import * as sse from '@/api/sse'
+import { ApiRequestError } from '@/api/errors'
 import type { SessionDetail } from '@/types/api'
 import { emptySessionReadModel } from '@/utils/readModel'
 
@@ -61,8 +63,11 @@ function makeMessagesHook(overrides: Partial<UseMessagesResult> = {}): UseMessag
     error: null,
     submitting: false,
     submitError: null,
-    loadMessages: vi.fn().mockResolvedValue(undefined),
+    pendingSubmission: null,
+    lastFailedContent: null,
+    loadMessages: vi.fn().mockResolvedValue(null),
     submit: vi.fn().mockResolvedValue(true),
+    retryPending: vi.fn().mockResolvedValue(true),
     clear: vi.fn(),
     ...overrides,
   }
@@ -71,11 +76,58 @@ function makeMessagesHook(overrides: Partial<UseMessagesResult> = {}): UseMessag
 describe('ChatPanel P8-4 集成', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.spyOn(api, 'listSafetyAssertions').mockResolvedValue({ items: [] })
   })
 
   afterEach(() => {
     cleanup()
     document.body.innerHTML = ''
+    vi.restoreAllMocks()
+  })
+
+  it('locks free-form input while only a doctor safety confirmation is pending', async () => {
+    const readModel = emptySessionReadModel('langgraph', 2)
+    readModel.unresolved = [{
+      source: 'safety_confirmation',
+      kind: 'unconfirmed_safety_fact',
+      key: 'allergy',
+    }]
+    vi.mocked(api.listSafetyAssertions).mockResolvedValue({
+      items: [{
+        schema_version: 'safety-fact-assertion.v1',
+        assertion_id: 'assertion-1',
+        session_id: 's1',
+        field_name: 'allergy',
+        value: { collection_status: 'explicitly_none', values: null },
+        value_digest: 'a'.repeat(64),
+        status: 'proposed',
+        source_kind: 'deterministic_reply_binding',
+        source_message_id: 'message-1',
+        extraction_run_id: 'run-1',
+        template_version: 'intake_extraction_v2.jinja2',
+        evidence_spans: [],
+        evidence_digest: 'b'.repeat(64),
+        proposed_at: '2026-07-29T10:00:00Z',
+      }],
+    })
+    const detail = makeDetail({
+      agent_runtime: 'langgraph',
+      read_model: readModel,
+      state_version: 2,
+    })
+
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail })}
+        messagesHook={makeMessagesHook({ messages: [] })}
+      />,
+    )
+
+    expect(await screen.findByTestId('safety-confirmation-panel')).toBeInTheDocument()
+    expect(screen.getByTestId('safety-confirmation-blocked-input')).toBeInTheDocument()
+    expect(screen.getByTestId('message-input')).toBeDisabled()
+    expect(screen.getByTestId('safety-reviewer-id')).toHaveValue('')
   })
 
   it('review 阶段且 pending_review=true 时显示 ReviewActionsBar', () => {
@@ -262,4 +314,110 @@ describe('ChatPanel P8-4 集成', () => {
 
     getRecordSpy.mockRestore()
   })
+
+  it('releases the input lock when a stale safety hint resolves to an empty list', async () => {
+    const readModel = emptySessionReadModel('langgraph', 2)
+    readModel.unresolved = [{
+      source: 'safety_confirmation',
+      kind: 'unconfirmed_safety_fact',
+      key: 'allergy',
+    }]
+    vi.mocked(api.listSafetyAssertions).mockResolvedValue({ items: [] })
+    const detail = makeDetail({
+      agent_runtime: 'langgraph',
+      read_model: readModel,
+      state_version: 2,
+    })
+
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail })}
+        messagesHook={makeMessagesHook()}
+      />,
+    )
+
+    await waitFor(() => expect(api.listSafetyAssertions).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByTestId('message-input')).toBeEnabled())
+    expect(screen.queryByTestId('safety-confirmation-panel')).not.toBeInTheDocument()
+  })
+
+  it('locks new input while an uncertain message command is pending exact replay', () => {
+    const pendingError = new ApiRequestError({
+      code: 'NETWORK_ERROR',
+      userMessage: 'response lost',
+      status: 0,
+      retryable: true,
+    })
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook()}
+        messagesHook={makeMessagesHook({
+          submitError: pendingError,
+          pendingSubmission: {
+            content: 'original answer',
+            replyToMessageId: 'question-1',
+            idempotencyKey: 'fixed-key',
+            stateVersion: 1,
+          },
+          lastFailedContent: 'original answer',
+        })}
+      />,
+    )
+
+    expect(screen.getByTestId('message-input')).toBeDisabled()
+    expect(screen.getByTestId('message-input')).toHaveAttribute('placeholder')
+    expect(screen.getByTestId('error-retry')).toBeInTheDocument()
+  })
+
+  it('does not render actionable controls for detail from another session', () => {
+    const staleDetail = makeDetail({ session_id: 's1' })
+    const submit = vi.fn().mockResolvedValue(true)
+    render(
+      <ChatPanel
+        sessionId="s2"
+        detailHook={makeDetailHook({ sessionId: 's2', detail: staleDetail })}
+        messagesHook={makeMessagesHook({ submit })}
+      />,
+    )
+
+    expect(screen.getByTestId('session-detail-boundary-loading')).toBeInTheDocument()
+    expect(screen.queryByTestId('message-input')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('safety-confirmation-panel')).not.toBeInTheDocument()
+    expect(submit).not.toHaveBeenCalled()
+  })
+
+  it.each(['intake', 'safety_confirmation'])(
+    'refreshes detail and messages when another window finishes %s',
+    async (agentName) => {
+    let onEvent: ((event: import('@/types/api').SessionEvent) => void) | undefined
+    vi.mocked(sse.connectSessionStream).mockImplementation((_id, handlers) => {
+      onEvent = handlers.onEvent
+      return { close: vi.fn(), closed: false, lastEventId: null }
+    })
+    const refreshDetail = vi.fn().mockResolvedValue(makeDetail({ state_version: 2 }))
+    const loadMessages = vi.fn().mockResolvedValue([])
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ refreshDetail })}
+        messagesHook={makeMessagesHook({ loadMessages })}
+      />,
+    )
+    refreshDetail.mockClear()
+    loadMessages.mockClear()
+
+    await act(async () => {
+      onEvent?.({
+        event_id: `event-${agentName}-finished`,
+        event_type: 'agent.finished',
+        payload: { agent_name: agentName },
+      })
+    })
+
+    await waitFor(() => expect(refreshDetail).toHaveBeenCalledTimes(1))
+    expect(loadMessages).toHaveBeenCalledWith('s1')
+    },
+  )
 })

@@ -16,10 +16,12 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.request_context import WriteRequestContext, write_request_context
 from app.core.exceptions import (
     HttpCommandRecoveryRequiredError,
     HttpCommandReplayError,
@@ -71,6 +73,7 @@ async def _execute(
     key: str,
     payload: dict[str, Any],
     handler: Any,
+    is_idempotent: bool = True,
 ) -> Any:
     async with factory() as db:
         return await HttpCommandExecutor(db, session_factory=factory).execute(
@@ -78,12 +81,31 @@ async def _execute(
             scope_key=scope or "global",
             concurrency_scope=scope,
             idempotency_key=key,
-            is_idempotent=True,
+            is_idempotent=is_idempotent,
             request_payload=payload,
             success_status=200,
             success_message="ok",
             handler=lambda: handler(db),
         )
+
+
+def _headerless_context() -> WriteRequestContext:
+    return write_request_context(
+        Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/",
+                "raw_path": b"/",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("test", 80),
+            }
+        )
+    )
 
 
 async def test_same_key_concurrent_workers_execute_one_side_effect_and_replay(
@@ -486,6 +508,113 @@ async def test_different_key_is_rejected_while_same_session_command_is_running(
     finally:
         release.set()
         await first
+
+
+async def test_non_idempotent_commands_share_scope_lock_but_later_random_key_runs_independently(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    operation = f"{_OPERATION_PREFIX}non-idempotent-scope"
+    scope = f"session:{uuid.uuid4()}"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+    active_handlers = 0
+    max_active_handlers = 0
+    first_context = _headerless_context()
+    overlap_context = _headerless_context()
+    later_context = _headerless_context()
+    assert not first_context.is_idempotent
+    assert not overlap_context.is_idempotent
+    assert not later_context.is_idempotent
+    assert len(
+        {
+            first_context.idempotency_key,
+            overlap_context.idempotency_key,
+            later_context.idempotency_key,
+        }
+    ) == 3
+
+    async def first_handler(db: AsyncSession) -> dict[str, Any]:
+        nonlocal active_handlers, max_active_handlers
+        del db
+        calls.append("first")
+        active_handlers += 1
+        max_active_handlers = max(max_active_handlers, active_handlers)
+        entered.set()
+        try:
+            await release.wait()
+            return {"command": "first"}
+        finally:
+            active_handlers -= 1
+
+    async def must_not_overlap(db: AsyncSession) -> dict[str, Any]:
+        del db
+        calls.append("overlap")
+        pytest.fail("a headerless command must not bypass the concurrency scope")
+
+    first = asyncio.create_task(
+        _execute(
+            factory,
+            operation=operation,
+            scope=scope,
+            key=first_context.idempotency_key,
+            payload={"body": {"command": "first"}},
+            handler=first_handler,
+            is_idempotent=first_context.is_idempotent,
+        )
+    )
+    await entered.wait()
+    try:
+        with pytest.raises(SessionBusyError):
+            await _execute(
+                factory,
+                operation=operation,
+                scope=scope,
+                key=overlap_context.idempotency_key,
+                payload={"body": {"command": "overlap"}},
+                handler=must_not_overlap,
+                is_idempotent=overlap_context.is_idempotent,
+            )
+    finally:
+        release.set()
+    first_result = await first
+
+    async def later_handler(db: AsyncSession) -> dict[str, Any]:
+        nonlocal active_handlers, max_active_handlers
+        del db
+        calls.append("later")
+        active_handlers += 1
+        max_active_handlers = max(max_active_handlers, active_handlers)
+        active_handlers -= 1
+        return {"command": "later"}
+
+    later_result = await _execute(
+        factory,
+        operation=operation,
+        scope=scope,
+        key=later_context.idempotency_key,
+        payload={"body": {"command": "later"}},
+        handler=later_handler,
+        is_idempotent=later_context.is_idempotent,
+    )
+
+    async with factory() as db:
+        claims = (
+            await db.scalars(
+                select(HttpCommandClaim)
+                .where(HttpCommandClaim.operation == operation)
+                .order_by(HttpCommandClaim.created_at)
+            )
+        ).all()
+    assert calls == ["first", "later"]
+    assert max_active_handlers == 1
+    assert not first_result.replayed and not later_result.replayed
+    assert first_result.data == {"command": "first"}
+    assert later_result.data == {"command": "later"}
+    assert len(claims) == 2
+    assert {claim.idempotency_mode for claim in claims} == {"non_idempotent"}
+    assert {claim.status for claim in claims} == {"completed"}
+    assert len({claim.idempotency_key_digest for claim in claims}) == 2
 
 
 async def test_create_session_api_same_key_different_trace_creates_once(

@@ -89,14 +89,29 @@ class GapSelectionResult(_QuestionModel):
     selection_kind: GapSelectionKind
     priority_rule_id: str | None = Field(default=None, max_length=96)
     source_completeness_disposition: str = Field(min_length=1, max_length=64)
+    deferred_dimensions: tuple[InquiryDimension, ...] = ()
 
     @model_validator(mode="after")
     def selection_is_consistent(self) -> GapSelectionResult:
+        safety_dimensions = {
+            InquiryDimension.ALLERGY_STATUS,
+            InquiryDimension.MEDICATION_STATUS,
+            InquiryDimension.MAJOR_CONDITION_STATUS,
+            InquiryDimension.PREGNANCY_STATUS,
+            InquiryDimension.LACTATION_STATUS,
+        }
+        if (
+            len(self.deferred_dimensions) != len(set(self.deferred_dimensions))
+            or any(item not in safety_dimensions for item in self.deferred_dimensions)
+        ):
+            raise ValueError("only unique pending safety dimensions may be deferred")
         if self.disposition is GapSelectionDisposition.SELECTED:
             if self.selected_dimension is None:
                 raise ValueError("selected gap requires a dimension")
             if self.selection_kind is GapSelectionKind.NONE or self.priority_rule_id is None:
                 raise ValueError("selected gap requires kind and priority rule")
+            if self.selected_dimension in self.deferred_dimensions:
+                raise ValueError("selected gap cannot also be deferred")
         else:
             if (
                 self.selected_dimension is not None
