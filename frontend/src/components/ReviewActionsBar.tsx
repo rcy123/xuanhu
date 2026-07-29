@@ -74,15 +74,7 @@ export function ReviewActionsBar({
   return (
     <div
       data-testid="review-actions-bar"
-      style={{
-        padding: 'var(--xh-space-l)',
-        borderTop: '1px solid var(--xh-border)',
-        borderBottom: '1px solid var(--xh-border)',
-        background: 'var(--xh-bg-card)',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 'var(--xh-space-m)',
-      }}
+      className="xh-review-actions"
     >
       {error ? (
         <ErrorBanner error={error} onRetry={onRetry} />
@@ -97,7 +89,7 @@ export function ReviewActionsBar({
           <div style={{ fontSize: 13, marginBottom: 'var(--xh-space-m)', color: 'var(--xh-text-secondary)' }}>
             ⚠ 请仔细审核以上处方内容
           </div>
-          <Space size="middle">
+          <Space size="small" wrap>
             {detail.agent_runtime === 'langgraph' && onRequestMoreInfo ? (
               <Button
                 icon={<QuestionCircleOutlined />}

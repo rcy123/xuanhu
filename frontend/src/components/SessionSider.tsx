@@ -6,7 +6,8 @@
  */
 
 import { useState } from 'react'
-import { Layout, theme, Typography } from 'antd'
+import { Layout, Typography } from 'antd'
+import { HistoryOutlined } from '@ant-design/icons'
 import type { UseSessionsResult } from '@/hooks/useSessions'
 import type { SessionCreateRequest } from '@/types/api'
 import { SessionList } from './SessionList'
@@ -23,7 +24,6 @@ interface SessionSiderProps {
 }
 
 export function SessionSider({ sessionsHook, selectedId, onSelect, onCreated }: SessionSiderProps) {
-  const { token } = theme.useToken()
   const [modalOpen, setModalOpen] = useState(false)
 
   const handleCreate = async (body: SessionCreateRequest): Promise<string> => {
@@ -35,21 +35,14 @@ export function SessionSider({ sessionsHook, selectedId, onSelect, onCreated }: 
   return (
     <Sider
       width={280}
-      style={{
-        background: token.colorBgContainer,
-        borderRight: '1px solid var(--xh-border)',
-        overflow: 'auto',
-        padding: 'var(--xh-space-l)',
-      }}
+      className="xh-session-sider"
     >
-      <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 18 }}>🌿</span>
-        <Text
-          strong
-          style={{ fontFamily: 'var(--xh-font-serif)', color: 'var(--xh-primary)' }}
-        >
-          悬壶会话
-        </Text>
+      <div className="xh-session-sider-heading">
+        <div>
+          <Text className="xh-section-kicker">CONSULTATIONS</Text>
+          <Text strong>问诊会话</Text>
+        </div>
+        <HistoryOutlined aria-hidden="true" />
       </div>
       <SessionList
         sessions={sessionsHook.sessions}

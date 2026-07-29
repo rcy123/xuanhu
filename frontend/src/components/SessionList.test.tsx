@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { render, screen, fireEvent, act, within } from '@testing-library/react'
 import { ConfigProvider, App as AntdApp } from 'antd'
 import { SessionList } from './SessionList'
 import type { SessionListItem } from '@/types/api'
@@ -85,6 +85,34 @@ describe('SessionList', () => {
       fireEvent.click(item)
     })
     expect(onSelect).toHaveBeenCalledWith('s1')
+  })
+
+  it('可按患者与主诉快速筛选会话', () => {
+    wrap(
+      <SessionList
+        sessions={[
+          makeSession('s1'),
+          makeSession('s2', {
+            patient_info: { name: '王芳', gender: 'female', age: 42 },
+            chief_complaint: '咳嗽两周',
+          }),
+        ]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        onSelect={() => {}}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+
+    const lists = screen.getAllByTestId('session-list')
+    const currentList = lists[lists.length - 1]
+    fireEvent.change(within(currentList).getByLabelText('搜索会话'), {
+      target: { value: '咳嗽' },
+    })
+    expect(currentList.querySelector('[data-session-id="s2"]')).toBeInTheDocument()
+    expect(currentList.querySelector('[data-session-id="s1"]')).not.toBeInTheDocument()
   })
 
   it('空列表显示空态', () => {

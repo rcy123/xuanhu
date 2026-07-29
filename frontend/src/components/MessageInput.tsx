@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { Button, Input, Space } from 'antd'
+import { Button, Input } from 'antd'
 import { SendOutlined } from '@ant-design/icons'
 import { ErrorBanner } from './ErrorBanner'
 
@@ -60,13 +60,13 @@ export function MessageInput({
   const filled = value.trim().length > 0
 
   return (
-    <div style={{ borderTop: '1px solid var(--xh-border)', padding: 'var(--xh-space-l)' }}>
+    <div className="xh-message-composer">
       {error ? (
-        <div style={{ marginBottom: 8 }}>
+        <div className="xh-composer-error">
           <ErrorBanner error={error as never} onRetry={onRetry} />
         </div>
       ) : null}
-      <Space.Compact style={{ width: '100%' }}>
+      <div className="xh-composer-row">
         <Input.TextArea
           data-testid="message-input"
           value={value}
@@ -76,7 +76,7 @@ export function MessageInput({
           autoSize={{ minRows: 2, maxRows: 6 }}
           maxLength={MAX}
           disabled={submitting || disabled}
-          style={{ borderRadius: '6px 0 0 6px' }}
+          className="xh-composer-input"
         />
         <Button
           type="primary"
@@ -84,11 +84,16 @@ export function MessageInput({
           onClick={submit}
           loading={submitting}
           disabled={!filled || disabled}
-          style={{ height: 'auto' }}
+          size="large"
+          className="xh-send-button"
         >
           发送
         </Button>
-      </Space.Compact>
+      </div>
+      <div className="xh-composer-hint">
+        <span>{disabled ? '当前流程阶段已锁定问诊输入' : 'Enter 发送 · Shift + Enter 换行'}</span>
+        <span>{value.length}/{MAX}</span>
+      </div>
     </div>
   )
 }

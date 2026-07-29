@@ -49,15 +49,7 @@ export function StreamStatus({ state, runningAgent, onReconnect }: StreamStatusP
   return (
     <div
       data-testid="stream-status"
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: '4px var(--xh-space-l)',
-        fontSize: 12,
-        background: 'var(--xh-bg-card)',
-        borderBottom: '1px solid var(--xh-border)',
-      }}
+      className={`xh-stream-status is-${state}`}
     >
       <Space size={4}>
         {dot}

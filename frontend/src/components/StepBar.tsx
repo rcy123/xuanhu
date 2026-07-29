@@ -93,13 +93,7 @@ export function StepBar({
     <div
       data-testid="step-bar"
       data-runtime={agentRuntime}
-      style={{
-        background: 'var(--xh-bg-card)',
-        border: '1px solid var(--xh-border)',
-        borderRadius: 'var(--xh-radius-card)',
-        padding: 'var(--xh-space-l)',
-        marginBottom: 'var(--xh-space-l)',
-      }}
+      className="xh-step-bar"
     >
       <Steps current={current} status={overallStatus} size="small" items={items} style={{ padding: 0 }} />
     </div>

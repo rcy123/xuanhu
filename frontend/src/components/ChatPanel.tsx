@@ -11,7 +11,12 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Empty, Spin, Typography, Layout, theme } from 'antd'
+import { Button, Spin, Tag, Typography } from 'antd'
+import {
+  CloseOutlined,
+  FileSearchOutlined,
+  MessageOutlined,
+} from '@ant-design/icons'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import { useSessionStream } from '@/hooks/useSessionStream'
@@ -28,11 +33,11 @@ import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
+import { stageLabel } from '@/utils/stage'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
 
-const { Content } = Layout
 const { Text, Title } = Typography
 
 interface ChatPanelProps {
@@ -44,40 +49,37 @@ interface ChatPanelProps {
 function PatientBar({ detail }: { detail: SessionDetail }) {
   const p = detail.patient_info
   const parts: string[] = []
-  if (p.name) parts.push(p.name)
   if (p.gender && p.gender !== 'unknown') {
     parts.push(p.gender === 'male' ? '男' : '女')
   }
   if (p.age != null) parts.push(`${p.age}岁`)
   return (
-    <div
-      style={{
-        padding: '8px var(--xh-space-l)',
-        borderBottom: '1px solid var(--xh-border)',
-        background: 'var(--xh-bg-card)',
-      }}
-    >
-      <Text style={{ fontSize: 13 }}>
-        患者：{parts.length > 0 ? parts.join(' · ') : '未填写'}
-      </Text>
-      {detail.chief_complaint ? (
-        <>
-          <Text type="secondary" style={{ margin: '0 8px' }}>|</Text>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            主诉：{detail.chief_complaint}
-          </Text>
-        </>
-      ) : null}
+    <div className="xh-patient-bar">
+      <div className="xh-patient-avatar" aria-hidden="true">
+        {p.name?.trim().slice(0, 1) || '患'}
+      </div>
+      <div className="xh-patient-copy">
+        <div className="xh-patient-name-row">
+          <Text strong>{p.name || '未命名患者'}</Text>
+          {parts.length > 0 ? <Text type="secondary">{parts.join(' · ')}</Text> : null}
+          <Tag className="xh-stage-tag" color="processing">
+            {stageLabel(detail.current_stage)}
+          </Tag>
+        </div>
+        <Text type="secondary" ellipsis={{ tooltip: detail.chief_complaint }}>
+          主诉：{detail.chief_complaint || '尚未填写'}
+        </Text>
+      </div>
     </div>
   )
 }
 
 export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProps) {
-  const { token } = theme.useToken()
   const [lastSubmittedContent, setLastSubmittedContent] = useState<string | null>(null)
   const [pendingReviewFormula, setPendingReviewFormula] = useState<Formula | null>(null)
   const [blockedIssues, setBlockedIssues] = useState<SafetyIssue[] | null>(null)
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null)
+  const [contextOpen, setContextOpen] = useState(false)
 
   const { detail, loading, error, selectSession, refreshDetail } = detailHook
   const {
@@ -105,12 +107,14 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
       setPendingReviewFormula(null)
       setBlockedIssues(null)
       setRollbackTarget(null)
+      setContextOpen(false)
       return
     }
     setLastSubmittedContent(null)
     setPendingReviewFormula(null)
     setBlockedIssues(null)
     setRollbackTarget(null)
+    setContextOpen(false)
     void loadMessages(sessionId)
   }, [sessionId, loadMessages, clear])
 
@@ -431,29 +435,23 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   if (!sessionId) {
     return (
-      <Content
-        style={{
-          background: 'var(--xh-bg-page)',
-          padding: 'var(--xh-space-xxl)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          overflow: 'auto',
-        }}
-      >
-        <Empty
-          description={
-            <div>
-              <Title level={4} style={{ fontFamily: 'var(--xh-font-serif)' }}>
-                开始一次问诊
-              </Title>
-              <Text type="secondary">
-                请在左侧选择已有会话，或点击「新建问诊」创建会话。
-              </Text>
-            </div>
-          }
-        />
-      </Content>
+      <main className="xh-empty-workspace">
+        <div className="xh-empty-illustration" aria-hidden="true">
+          <span>问</span>
+        </div>
+        <Text className="xh-section-kicker">CLINICAL WORKSPACE</Text>
+        <Title level={3}>开始一次问诊</Title>
+        <Text type="secondary">
+          从左侧选择已有会话，或新建问诊。对话、诊疗摘要和复核动作会在各自区域清晰呈现。
+        </Text>
+        <div className="xh-empty-flow" aria-label="问诊流程">
+          <span>问诊采集</span>
+          <i />
+          <span>辨证分析</span>
+          <i />
+          <span>安全复核</span>
+        </div>
+      </main>
     )
   }
 
@@ -487,16 +485,35 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     submitContent(lastSubmittedContent)
   }
 
+  const hasClinicalSummary = detail != null && (
+    detail.sufficiency_report != null
+    || detail.syndrome_result != null
+    || detail.base_formula != null
+    || detail.modified_formula != null
+    || effectivePendingFormula != null
+    || detail.safety_review != null
+    || blockedIssues != null
+    || detail.agent_runtime === 'langgraph'
+    || detail.current_stage === 'record'
+    || detail.current_stage === 'done'
+  )
+
   return (
-    <Layout style={{ background: 'var(--xh-bg-page)' }}>
-      <Content style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <StreamStatus
-          state={streamHook.connectionState}
-          lastError={streamHook.lastError}
-          runningAgent={runningAgent}
-          onReconnect={streamHook.reconnect}
-        />
-        <div style={{ padding: 'var(--xh-space-l) var(--xh-space-l) 0' }}>
+    <>
+      <main className="xh-clinical-workspace">
+        <div className="xh-case-header">
+          {detail ? <PatientBar detail={detail} /> : null}
+          <Button
+            className="xh-context-trigger"
+            icon={<FileSearchOutlined />}
+            aria-label="打开诊疗摘要"
+            onClick={() => setContextOpen(true)}
+          >
+            诊疗摘要
+          </Button>
+        </div>
+
+        <div className="xh-progress-region">
           <StepBar
             currentStage={detail?.current_stage ?? null}
             agentRuntime={detail?.agent_runtime}
@@ -504,130 +521,168 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
             agentRuns={streamHook.agentRuns}
           />
         </div>
-        {detail ? <PatientBar detail={detail} /> : null}
-        <StageResultsPanel
-          detail={detail}
-          pendingReviewFormula={effectivePendingFormula}
-          blockedIssues={blockedIssues}
-          rollbackTarget={rollbackTarget}
-        />
-        {detail ? (
-          <LangGraphAdvanceBar
-            detail={detail}
-            onAdvanced={async () => {
-              await refreshDetail()
-              if (sessionId) await loadMessages(sessionId)
-            }}
-            onRecovered={async () => {
-              await refreshDetail()
-              if (sessionId) await loadMessages(sessionId)
-            }}
-          />
-        ) : null}
-        {/* P8-4: 医师确认操作区 */}
-        {detail ? (
-          <ReviewActionsBar
-            detail={detail}
-            pendingReviewFormula={effectivePendingFormula}
-            blockedIssues={blockedIssues}
-            submitting={reviewSubmitting}
-            error={reviewError}
-            onConfirm={handleConfirm}
-            onModify={handleModify}
-            onReject={handleReject}
-            onRequestMoreInfo={handleRequestMoreInfo}
-            onRetry={handleReviewRetry}
-          />
-        ) : null}
 
-        {/* P8-4: 病历 Panel */}
-        {detail ? (
-          <RecordPanel
-            detail={detail}
-            record={record}
-            loading={recordLoading}
-            error={recordError}
-            editing={recordEditing}
-            saving={recordSaving}
-            saveError={recordSaveError}
-            exportError={recordExportError}
-            onExport={handleExport}
-            onExportErrorDismiss={() => setRecordExportError(null)}
-            onEdit={handleRecordEdit}
-            onCancelEdit={handleRecordCancelEdit}
-            onSave={handleRecordSave}
-            onRetry={() => {
-              setRecordError(null)
-              if (sessionId) {
-                setRecordLoading(true)
-                getRecord(sessionId, 'latest')
-                  .then((data) => { setRecord(data); setRecordLoading(false) })
-                  .catch((err: unknown) => {
-                    if (err instanceof ApiRequestError) setRecordError(err)
-                    setRecordLoading(false)
-                  })
-              }
-            }}
-          />
-        ) : null}
+        <div className="xh-workspace-columns">
+          <section className="xh-conversation-pane" aria-label="问诊对话">
+            <div className="xh-pane-heading">
+              <div>
+                <Text className="xh-section-kicker">CONSULTATION</Text>
+                <Title level={5}>
+                  <MessageOutlined aria-hidden="true" />
+                  问诊对话
+                </Title>
+              </div>
+              <Text type="secondary">对话记录实时保存</Text>
+            </div>
+            <StreamStatus
+              state={streamHook.connectionState}
+              lastError={streamHook.lastError}
+              runningAgent={runningAgent}
+              onReconnect={streamHook.reconnect}
+            />
+            {error ? (
+              <div className="xh-inline-feedback">
+                <ErrorBanner error={error} onRetry={refreshDetail} />
+              </div>
+            ) : null}
+            {loading && !detail ? (
+              <div className="xh-centered-state xh-detail-loading">
+                <Spin />
+              </div>
+            ) : null}
+            <div className="xh-message-surface">
+              <MessageList
+                messages={messages}
+                loading={msgLoading}
+                error={msgError}
+                onRetry={() => sessionId && void loadMessages(sessionId)}
+              />
+              <MessageInput
+                submitting={submitting}
+                error={submitError}
+                disabled={detail != null && !canSubmit}
+                onRetry={retryLastSubmit}
+                lastContent={lastSubmittedContent ?? undefined}
+                onSubmit={submitContent}
+              />
+            </div>
+          </section>
 
-        {/* P8-4: 处方编辑 Modal */}
-        <FormulaEditModal
-          open={modifyModalOpen}
-          initialFormula={effectivePendingFormula}
-          submitting={reviewSubmitting}
-          reviewError={modifyReviewError}
-          onCancel={() => { setModifyModalOpen(false); setModifyReviewError(null) }}
-          onSubmit={handleModifySubmit}
-        />
-
-        {/* P8-4: 否决 Modal */}
-        <RejectModal
-          open={rejectModalOpen}
-          submitting={reviewSubmitting}
-          onCancel={() => setRejectModalOpen(false)}
-          onSubmit={handleRejectSubmit}
-        />
-        {error ? (
-          <div style={{ padding: 'var(--xh-space-l)' }}>
-            <ErrorBanner error={error} onRetry={refreshDetail} />
-          </div>
-        ) : null}
-        {loading && !detail ? (
-          <div style={{ textAlign: 'center', padding: 48 }}>
-            <Spin />
-          </div>
-        ) : null}
-        <div
-          style={{
-            flex: 1,
-            display: 'flex',
-            flexDirection: 'column',
-            margin: 'var(--xh-space-l)',
-            background: token.colorBgContainer,
-            border: '1px solid var(--xh-border)',
-            borderRadius: 'var(--xh-radius-card)',
-            overflow: 'hidden',
-            boxShadow: 'var(--xh-shadow-card)',
-          }}
-        >
-          <MessageList
-            messages={messages}
-            loading={msgLoading}
-            error={msgError}
-            onRetry={() => sessionId && void loadMessages(sessionId)}
-          />
-          <MessageInput
-            submitting={submitting}
-            error={submitError}
-            disabled={detail != null && !canSubmit}
-            onRetry={retryLastSubmit}
-            lastContent={lastSubmittedContent ?? undefined}
-            onSubmit={submitContent}
+          <aside
+            className={`xh-context-pane${contextOpen ? ' is-open' : ''}`}
+            aria-label="诊疗摘要"
+          >
+            <div className="xh-context-pane-heading">
+              <div>
+                <Text className="xh-section-kicker">CLINICAL SUMMARY</Text>
+                <Title level={5}>诊疗摘要</Title>
+              </div>
+              <Button
+                className="xh-context-close"
+                type="text"
+                icon={<CloseOutlined />}
+                aria-label="关闭诊疗摘要"
+                onClick={() => setContextOpen(false)}
+              />
+            </div>
+            <div className="xh-context-scroll">
+              {!hasClinicalSummary ? (
+                <div className="xh-summary-empty">
+                  <div className="xh-summary-empty-icon" aria-hidden="true">诊</div>
+                  <Text strong>等待诊疗结果</Text>
+                  <Text type="secondary">
+                    完成问诊后，完备性判断、辨证、处方和安全审核会依次显示在这里。
+                  </Text>
+                </div>
+              ) : null}
+              <StageResultsPanel
+                detail={detail}
+                pendingReviewFormula={effectivePendingFormula}
+                blockedIssues={blockedIssues}
+                rollbackTarget={rollbackTarget}
+              />
+              {detail ? (
+                <LangGraphAdvanceBar
+                  detail={detail}
+                  onAdvanced={async () => {
+                    await refreshDetail()
+                    if (sessionId) await loadMessages(sessionId)
+                  }}
+                  onRecovered={async () => {
+                    await refreshDetail()
+                    if (sessionId) await loadMessages(sessionId)
+                  }}
+                />
+              ) : null}
+              {detail ? (
+                <ReviewActionsBar
+                  detail={detail}
+                  pendingReviewFormula={effectivePendingFormula}
+                  blockedIssues={blockedIssues}
+                  submitting={reviewSubmitting}
+                  error={reviewError}
+                  onConfirm={handleConfirm}
+                  onModify={handleModify}
+                  onReject={handleReject}
+                  onRequestMoreInfo={handleRequestMoreInfo}
+                  onRetry={handleReviewRetry}
+                />
+              ) : null}
+              {detail ? (
+                <RecordPanel
+                  detail={detail}
+                  record={record}
+                  loading={recordLoading}
+                  error={recordError}
+                  editing={recordEditing}
+                  saving={recordSaving}
+                  saveError={recordSaveError}
+                  exportError={recordExportError}
+                  onExport={handleExport}
+                  onExportErrorDismiss={() => setRecordExportError(null)}
+                  onEdit={handleRecordEdit}
+                  onCancelEdit={handleRecordCancelEdit}
+                  onSave={handleRecordSave}
+                  onRetry={() => {
+                    setRecordError(null)
+                    if (sessionId) {
+                      setRecordLoading(true)
+                      getRecord(sessionId, 'latest')
+                        .then((data) => { setRecord(data); setRecordLoading(false) })
+                        .catch((err: unknown) => {
+                          if (err instanceof ApiRequestError) setRecordError(err)
+                          setRecordLoading(false)
+                        })
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
+          </aside>
+          <button
+            type="button"
+            className={`xh-context-scrim${contextOpen ? ' is-open' : ''}`}
+            aria-label="关闭诊疗摘要"
+            onClick={() => setContextOpen(false)}
           />
         </div>
-      </Content>
-    </Layout>
+      </main>
+
+      <FormulaEditModal
+        open={modifyModalOpen}
+        initialFormula={effectivePendingFormula}
+        submitting={reviewSubmitting}
+        reviewError={modifyReviewError}
+        onCancel={() => { setModifyModalOpen(false); setModifyReviewError(null) }}
+        onSubmit={handleModifySubmit}
+      />
+      <RejectModal
+        open={rejectModalOpen}
+        submitting={reviewSubmitting}
+        onCancel={() => setRejectModalOpen(false)}
+        onSubmit={handleRejectSubmit}
+      />
+    </>
   )
 }
 

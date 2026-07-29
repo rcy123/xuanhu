@@ -14,6 +14,10 @@ import { Card, Descriptions, Tag, Typography, Table } from 'antd'
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
+  FileDoneOutlined,
+  MedicineBoxOutlined,
+  SearchOutlined,
+  SafetyCertificateOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
@@ -49,12 +53,12 @@ function SufficiencyCard({ report }: { report: Record<string, unknown> }) {
   return (
     <Card
       size="small"
+      className="xh-summary-card"
       title={
         <span>
-          🔍 完备性判断报告
+          <SearchOutlined /> 完备性判断报告
         </span>
       }
-      style={{ marginBottom: 'var(--xh-space-l)' }}
     >
       {sufficient !== undefined ? (
         <div style={{ marginBottom: 8 }}>
@@ -86,12 +90,12 @@ function SyndromeCard({ result }: { result: Record<string, unknown> }) {
   return (
     <Card
       size="small"
+      className="xh-summary-card"
       title={
         <span>
-          📋 辨证结论
+          <FileDoneOutlined /> 辨证结论
         </span>
       }
-      style={{ marginBottom: 'var(--xh-space-l)' }}
     >
       {pattern ? (
         <Descriptions column={1} size="small" style={{ marginBottom: 8 }}>
@@ -152,16 +156,16 @@ function FormulaCard({
   return (
     <Card
       size="small"
+      className="xh-summary-card"
       title={
         <span>
-          📜 处方
+          <MedicineBoxOutlined /> 处方
         </span>
       }
-      style={{ marginBottom: 'var(--xh-space-l)' }}
     >
-      <div style={{ display: 'flex', gap: 'var(--xh-space-l)', flexWrap: 'wrap' }}>
+      <div className="xh-formula-grid">
         {hasBase ? (
-          <div style={{ flex: 1, minWidth: 280 }}>
+          <div className="xh-formula-column">
             <Text type="secondary" style={{ fontSize: 12 }}>
               参考基础方
               {baseFormula!.name ? `：${baseFormula!.name}` : ''}
@@ -182,7 +186,7 @@ function FormulaCard({
           </div>
         ) : null}
         {hasModified ? (
-          <div style={{ flex: 1, minWidth: 280 }}>
+          <div className="xh-formula-column">
             <Text type="secondary" style={{ fontSize: 12 }}>
               加减方
               {modifiedFormula!.name ? `：${modifiedFormula!.name}` : ''}
@@ -205,13 +209,7 @@ function FormulaCard({
       </div>
       {hasPending ? (
         <div
-          style={{
-            marginTop: 'var(--xh-space-l)',
-            padding: 'var(--xh-space-l)',
-            border: '2px solid var(--xh-primary)',
-            borderRadius: 'var(--xh-radius-card)',
-            background: 'var(--xh-bg-card)',
-          }}
+          className="xh-pending-formula"
           data-testid="pending-review-formula"
         >
           <Title level={5} style={{ color: 'var(--xh-primary)', marginTop: 0 }}>
@@ -276,15 +274,12 @@ function SafetyReviewCard({
   return (
     <Card
       size="small"
+      className={`xh-summary-card ${isBlocked ? 'is-danger' : 'is-success'}`}
       title={
         <span>
-          🛡 安全审核
+          <SafetyCertificateOutlined /> 安全审核
         </span>
       }
-      style={{
-        marginBottom: 'var(--xh-space-l)',
-        borderLeft: isBlocked ? '3px solid var(--xh-error)' : '3px solid var(--xh-success)',
-      }}
     >
       {isBlocked ? (
         <>
@@ -385,13 +380,7 @@ export function StageResultsPanel({
   return (
     <div
       data-testid="stage-results-panel"
-      style={{
-        padding: 'var(--xh-space-l)',
-        background: 'var(--xh-bg-page)',
-        borderBottom: '1px solid var(--xh-border)',
-        maxHeight: 360,
-        overflow: 'auto',
-      }}
+      className="xh-stage-results"
     >
       {hasSufficiency ? (
         <SufficiencyCard report={detail.sufficiency_report!} />

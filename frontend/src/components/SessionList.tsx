@@ -5,8 +5,9 @@
  * 选中高亮；空态/加载态/错误态（含重试）。
  */
 
-import { Button, Empty, Spin, Tag, Typography } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import { useMemo, useState } from 'react'
+import { Button, Empty, Input, Spin, Tag, Typography } from 'antd'
+import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import type { SessionListItem } from '@/types/api'
 import { formatTime, patientSummary } from '@/utils/format'
 import { sessionTag } from '@/utils/sessionTag'
@@ -36,6 +37,7 @@ function SessionItem({
   const tag = sessionTag(session)
   return (
     <div
+      className="xh-session-item"
       role="button"
       tabIndex={0}
       data-session-id={session.session_id}
@@ -47,28 +49,20 @@ function SessionItem({
           onSelect(session.session_id)
         }
       }}
-      style={{
-        padding: '10px 12px',
-        borderRadius: 'var(--xh-radius-card)',
-        cursor: 'pointer',
-        border: selected ? '2px solid var(--xh-secondary)' : '1px solid var(--xh-border)',
-        background: selected ? 'var(--xh-bg-card)' : 'transparent',
-        marginBottom: 8,
-      }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="xh-session-item-main">
         <Text
           strong
-          style={{ fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}
+          className="xh-session-patient"
         >
           {patientSummary(session) || '未命名患者'}
         </Text>
-        <Tag color={tag.color} style={{ margin: 0, fontSize: 11 }}>
+        <Tag color={tag.color} className="xh-session-status">
           {tag.label}
         </Tag>
       </div>
-      <div style={{ marginTop: 4 }}>
-        <Text type="secondary" style={{ fontSize: 11 }}>
+      <div className="xh-session-complaint">
+        <Text type="secondary">
           {session.chief_complaint
             ? session.chief_complaint.length > 18
               ? `${session.chief_complaint.slice(0, 18)}…`
@@ -76,19 +70,17 @@ function SessionItem({
             : '—'}
         </Text>
       </div>
-      <div style={{ marginTop: 2 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 11 }}>
+      <div className="xh-session-meta">
+          <Text type="secondary">
             {formatTime(session.updated_at)}
           </Text>
           <Tag
             color={session.agent_runtime === 'langgraph' ? 'geekblue' : 'default'}
-            style={{ margin: 0, fontSize: 10, lineHeight: '16px' }}
+            className="xh-runtime-tag"
             data-testid={`runtime-${session.session_id}`}
           >
             {session.agent_runtime === 'langgraph' ? 'LangGraph v2' : 'Legacy'}
           </Tag>
-        </div>
       </div>
     </div>
   )
@@ -103,14 +95,48 @@ export function SessionList({
   onRefresh,
   onCreate,
 }: SessionListProps) {
+  const [query, setQuery] = useState('')
+  const filteredSessions = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase()
+    if (!normalized) return sessions
+    return sessions.filter((session) => {
+      const searchable = [
+        patientSummary(session),
+        session.chief_complaint ?? '',
+        session.current_stage,
+      ].join(' ').toLocaleLowerCase()
+      return searchable.includes(normalized)
+    })
+  }, [query, sessions])
+
   return (
-    <div data-testid="session-list" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <Button type="primary" icon={<PlusOutlined />} block style={{ marginBottom: 12 }} onClick={onCreate}>
+    <div data-testid="session-list" className="xh-session-list">
+      <Button
+        type="primary"
+        icon={<PlusOutlined />}
+        block
+        size="large"
+        className="xh-create-session"
+        onClick={onCreate}
+      >
         新建问诊
       </Button>
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      <Input
+        allowClear
+        prefix={<SearchOutlined />}
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="搜索患者或主诉"
+        className="xh-session-search"
+        aria-label="搜索会话"
+      />
+      <div className="xh-session-list-label">
+        <Text type="secondary">最近会话</Text>
+        <Text type="secondary">{filteredSessions.length}</Text>
+      </div>
+      <div className="xh-session-list-scroll">
         {loading && sessions.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: 24 }}>
+          <div className="xh-centered-state">
             <Spin />
           </div>
         ) : null}
@@ -123,7 +149,13 @@ export function SessionList({
             description={<Text type="secondary">暂无会话</Text>}
           />
         ) : null}
-        {sessions.map((s) => (
+        {!loading && !error && sessions.length > 0 && filteredSessions.length === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={<Text type="secondary">没有匹配的会话</Text>}
+          />
+        ) : null}
+        {filteredSessions.map((s) => (
           <SessionItem
             key={s.session_id}
             session={s}

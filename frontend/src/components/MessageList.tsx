@@ -26,33 +26,22 @@ function MessageBubble({ msg }: { msg: MessageItem }) {
     <div
       data-message-id={msg.id}
       data-role={msg.role}
-      style={{
-        display: 'flex',
-        justifyContent: isAgent ? 'flex-start' : 'flex-end',
-        marginBottom: 12,
-      }}
+      className={`xh-message-row ${isAgent ? 'is-agent' : 'is-clinician'}`}
     >
       <div
-        style={{
-          maxWidth: '75%',
-          padding: '10px 14px',
-          borderRadius: 'var(--xh-radius-card)',
-          background: isAgent ? 'var(--xh-bg-card)' : 'var(--xh-bg-page)',
-          border: isAgent ? 'none' : '1px solid var(--xh-border)',
-          borderLeft: isAgent ? '3px solid var(--xh-border)' : undefined,
-        }}
+        className="xh-message-bubble"
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <div className="xh-message-author">
           {isAgent ? (
             <RobotOutlined style={{ fontSize: 12, color: 'var(--xh-secondary)' }} />
           ) : (
             <UserOutlined style={{ fontSize: 12, color: 'var(--xh-primary)' }} />
           )}
-          <Text type="secondary" style={{ fontSize: 11 }}>
+          <Text type="secondary">
             {isAgent ? (msg.agent_name ?? '悬壶') : '医师'}
           </Text>
         </div>
-        <Text style={{ fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        <Text className="xh-message-content">
           {msg.content}
         </Text>
         {msg.stage ? (
@@ -77,13 +66,7 @@ export function MessageList({ messages, loading, error, onRetry }: MessageListPr
   return (
     <div
       data-testid="message-list"
-      style={{
-        flex: 1,
-        overflow: 'auto',
-        padding: 'var(--xh-space-l)',
-        display: 'flex',
-        flexDirection: 'column',
-      }}
+      className="xh-message-list"
     >
       {loading ? (
         <div style={{ textAlign: 'center', padding: 48 }}>

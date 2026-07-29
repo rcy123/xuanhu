@@ -132,10 +132,10 @@ export function LangGraphAdvanceBar({ detail, onAdvanced, onRecovered }: LangGra
       : '进入辨证开方'
 
   return (
-    <div data-testid="langgraph-advance-bar" style={{ padding: '8px var(--xh-space-l)' }}>
+    <div data-testid="langgraph-advance-bar" className="xh-runtime-control">
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
         <Space wrap>
-          <Text strong>LangGraph v2</Text>
+          <Text strong>流程状态</Text>
           <Tag color={dispositionMeta.color} data-testid="langgraph-disposition">
             {dispositionMeta.label}
           </Tag>

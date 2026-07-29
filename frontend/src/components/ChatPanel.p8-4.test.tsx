@@ -101,6 +101,30 @@ describe('ChatPanel P8-4 集成', () => {
     expect(screen.getByTestId('review-actions-bar')).toBeInTheDocument()
   })
 
+  it('将问诊对话与诊疗摘要拆分为独立工作区', () => {
+    const detail = makeDetail({
+      syndrome_result: {
+        pattern: '风寒束表',
+        evidence: '恶寒、无汗、脉浮紧',
+      },
+    })
+
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail })}
+        messagesHook={makeMessagesHook()}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: '问诊对话' })).toBeInTheDocument()
+    const summary = screen.getByRole('complementary', { name: '诊疗摘要' })
+    expect(summary).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '打开诊疗摘要' }))
+    expect(summary).toHaveClass('is-open')
+  })
+
   it('阻断态（safety_review.passed=false）不显示确认/修改按钮', () => {
     const detail = makeDetail({
       current_stage: 'review',

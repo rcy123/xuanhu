@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react'
-import { Alert, Modal, Form, Input, Select, InputNumber, Typography } from 'antd'
+import { Modal, Form, Input, Select, InputNumber, Typography } from 'antd'
 import type { SessionCreateRequest } from '@/types/api'
 
 const { Text } = Typography
@@ -64,6 +64,8 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
       okText="创建"
       cancelText="取消"
       destroyOnHidden
+      width={640}
+      className="xh-create-session-modal"
     >
       <Form
         form={form}
@@ -71,14 +73,6 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
         style={{ marginTop: 16 }}
         onFinish={handleFinish}
       >
-        <Alert
-          type="info"
-          showIcon
-          message="运行时由后端发布配置决定"
-          description="新会话不在浏览器中强制指定运行时；后端会使用已审计的默认配置，既有会话仍保持创建时的运行时身份。"
-          style={{ marginBottom: 16 }}
-          data-testid="runtime-managed-notice"
-        />
         <Form.Item
           name="chief_complaint"
           label="主诉"
@@ -94,19 +88,24 @@ export function CreateSessionModal({ open, creating, onClose, onSubmit }: Create
             showCount
           />
         </Form.Item>
-        <Form.Item name="patient_name" label="患者姓名">
-          <Input placeholder="选填" maxLength={100} />
-        </Form.Item>
-        <Form.Item name="gender" label="性别">
-          <Select placeholder="未知" allowClear>
-            <Select.Option value="male">男</Select.Option>
-            <Select.Option value="female">女</Select.Option>
-            <Select.Option value="unknown">未知</Select.Option>
-          </Select>
-        </Form.Item>
-        <Form.Item name="age" label="年龄">
-          <InputNumber min={0} max={130} placeholder="选填" style={{ width: '100%' }} />
-        </Form.Item>
+        <div className="xh-patient-fields">
+          <Form.Item name="patient_name" label="患者姓名">
+            <Input placeholder="选填" maxLength={100} />
+          </Form.Item>
+          <Form.Item name="gender" label="性别">
+            <Select placeholder="未知" allowClear>
+              <Select.Option value="male">男</Select.Option>
+              <Select.Option value="female">女</Select.Option>
+              <Select.Option value="unknown">未知</Select.Option>
+            </Select>
+          </Form.Item>
+          <Form.Item name="age" label="年龄">
+            <InputNumber min={0} max={130} placeholder="选填" style={{ width: '100%' }} />
+          </Form.Item>
+        </div>
+        <div className="xh-runtime-note" data-testid="runtime-managed-notice">
+          运行时由后端发布配置决定
+        </div>
         {error ? (
           <Text type="danger" style={{ fontSize: 12 }}>
             {error}

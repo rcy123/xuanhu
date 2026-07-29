@@ -13,6 +13,7 @@ import {
   SaveOutlined,
   ExportOutlined,
   CloseOutlined,
+  FileTextOutlined,
 } from '@ant-design/icons'
 import type { SessionDetail, RecordResponse, RecordUpdateRequest } from '@/types/api'
 import type { ApiRequestError } from '@/api/errors'
@@ -89,8 +90,8 @@ export function RecordPanel({
     return (
       <Card
         size="small"
-        title={<span>📄 病历</span>}
-        style={{ margin: 'var(--xh-space-l)', borderTop: '1px solid var(--xh-border)' }}
+        title={<span><FileTextOutlined /> 病历</span>}
+        className="xh-summary-card xh-record-card"
         data-testid="record-panel"
       >
         <Skeleton active paragraph={{ rows: 6 }} />
@@ -106,12 +107,12 @@ export function RecordPanel({
     return (
       <Card
         size="small"
-        title={<span>📄 中医病历</span>}
-        style={{ margin: 'var(--xh-space-l)', borderTop: '1px solid var(--xh-border)' }}
+        title={<span><FileTextOutlined /> 中医病历</span>}
+        className="xh-summary-card xh-record-card"
         data-testid="record-panel"
         extra={
           editing ? (
-            <Space>
+            <Space wrap>
               <Button
                 size="small"
                 icon={<CloseOutlined />}
@@ -133,7 +134,7 @@ export function RecordPanel({
               </Button>
             </Space>
           ) : (
-            <Space>
+            <Space wrap>
               <Button
                 size="small"
                 icon={<ExportOutlined />}

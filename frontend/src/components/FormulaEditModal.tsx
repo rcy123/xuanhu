@@ -117,6 +117,7 @@ export function FormulaEditModal({
       okButtonProps={{ disabled: submitting, 'data-testid': 'formula-edit-submit' } as ButtonProps}
       width={640}
       destroyOnHidden
+      className="xh-formula-modal"
     >
       {reviewError ? (
         <Alert
@@ -146,19 +147,18 @@ export function FormulaEditModal({
         />
       ) : null}
 
-      <div style={{ marginBottom: 'var(--xh-space-m)' }}>
+      <div className="xh-formula-field">
         <Text type="secondary" style={{ fontSize: 12 }}>方名</Text>
         <Input
           placeholder="如：麻杏石甘汤加减"
           value={name}
           onChange={(e) => setName(e.target.value)}
           data-testid="formula-edit-name"
-          style={{ marginTop: 4 }}
         />
       </div>
 
-      <div style={{ marginBottom: 'var(--xh-space-m)' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+      <div className="xh-formula-field">
+        <div className="xh-formula-field-heading">
           <Text type="secondary" style={{ fontSize: 12 }}>药材组成</Text>
           <Button size="small" icon={<PlusOutlined />} onClick={addHerb} data-testid="formula-edit-add-herb">
             添加药材
@@ -172,26 +172,21 @@ export function FormulaEditModal({
         {herbs.map((herb) => (
           <div
             key={herb.key}
-            style={{
-              display: 'flex',
-              gap: 8,
-              marginBottom: 8,
-              alignItems: 'center',
-            }}
+            className="xh-formula-edit-row"
             data-testid="formula-edit-herb-row"
           >
             <Input
               placeholder="药材名"
               value={herb.herb}
               onChange={(e) => updateHerb(herb.key, 'herb', e.target.value)}
-              style={{ flex: 2 }}
+              className="xh-formula-herb-name"
               data-testid="formula-edit-herb-name"
             />
             <InputNumber
               placeholder="剂量"
               value={herb.dose ?? undefined}
               onChange={(v) => updateHerb(herb.key, 'dose', v)}
-              style={{ flex: 1 }}
+              className="xh-formula-herb-dose"
               min={0}
               data-testid="formula-edit-herb-dose"
             />
@@ -199,14 +194,14 @@ export function FormulaEditModal({
               placeholder="单位"
               value={herb.unit}
               onChange={(e) => updateHerb(herb.key, 'unit', e.target.value)}
-              style={{ width: 60 }}
+              className="xh-formula-herb-unit"
               data-testid="formula-edit-herb-unit"
             />
             <Input
               placeholder="备注"
               value={herb.note ?? ''}
               onChange={(e) => updateHerb(herb.key, 'note', e.target.value)}
-              style={{ flex: 1 }}
+              className="xh-formula-herb-note"
             />
             <Button
               size="small"
@@ -220,7 +215,7 @@ export function FormulaEditModal({
         ))}
       </div>
 
-      <div style={{ marginBottom: 'var(--xh-space-m)' }}>
+      <div className="xh-formula-field">
         <Text type="secondary" style={{ fontSize: 12 }}>加减理由</Text>
         <Input.TextArea
           placeholder="修改处方的理由（可选）"
@@ -228,11 +223,10 @@ export function FormulaEditModal({
           onChange={(e) => setRationale(e.target.value)}
           rows={3}
           data-testid="formula-edit-rationale"
-          style={{ marginTop: 4 }}
         />
       </div>
 
-      <div>
+      <div className="xh-formula-field">
         <Text type="secondary" style={{ fontSize: 12 }}>修改备注（可选）</Text>
         <Input.TextArea
           placeholder="备注信息将随审核记录保存"
@@ -240,7 +234,6 @@ export function FormulaEditModal({
           onChange={(e) => setFeedback(e.target.value)}
           rows={2}
           data-testid="formula-edit-feedback"
-          style={{ marginTop: 4 }}
         />
       </div>
     </Modal>

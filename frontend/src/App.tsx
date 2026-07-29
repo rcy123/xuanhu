@@ -10,67 +10,55 @@
  * 不接 SSE、不做 review/病历（P8-3/P8-4）。
  */
 
-import { Layout, Typography } from 'antd'
+import { Button, Typography } from 'antd'
+import { MenuOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import { Link, Route, Routes, useNavigate, useParams } from 'react-router-dom'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useSessions } from '@/hooks/useSessions'
 import { useSessionDetail } from '@/hooks/useSessionDetail'
 import { useMessages } from '@/hooks/useMessages'
 import { SessionSider } from '@/components/SessionSider'
 import { ChatPanel } from '@/components/ChatPanel'
+import './styles/workbench.css'
 
-const { Header } = Layout
 const { Title, Text } = Typography
 
 function DisclaimerBar() {
   return (
-    <div
-      style={{
-        background: 'var(--xh-border)',
-        color: 'var(--xh-text)',
-        padding: '4px var(--xh-space-l)',
-        fontSize: 12,
-        textAlign: 'center',
-      }}
-    >
+    <div className="xh-disclaimer">
+      <SafetyCertificateOutlined aria-hidden="true" />
       辅助决策工具，所有结论仅供参考，需经执业中医师确认后使用。
     </div>
   )
 }
 
-function BrandHeader() {
+function BrandHeader({ onOpenNavigation }: { onOpenNavigation: () => void }) {
   return (
-    <Header
-      style={{
-        background: 'var(--xh-bg-card)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: '0 var(--xh-space-l)',
-        borderBottom: '1px solid var(--xh-border)',
-        height: 56,
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: 20 }}>🌿</span>
-        <Title
-          level={4}
-          style={{
-            margin: 0,
-            fontFamily: 'var(--xh-font-serif)',
-            color: 'var(--xh-primary)',
-          }}
-        >
-          悬壶
-        </Title>
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          Xuanhu
-        </Text>
+    <header className="xh-brand-header">
+      <div className="xh-brand-cluster">
+        <Button
+          className="xh-mobile-menu"
+          type="text"
+          icon={<MenuOutlined />}
+          aria-label="打开会话导航"
+          onClick={onOpenNavigation}
+        />
+        <div className="xh-brand-mark" aria-hidden="true">
+          悬
+        </div>
+        <div className="xh-brand-copy">
+          <div className="xh-brand-title-row">
+            <Title level={4}>悬壶</Title>
+            <Text>Xuanhu</Text>
+          </div>
+          <Text type="secondary">中医 AI 辅助诊疗工作台</Text>
+        </div>
       </div>
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        中医 AI 辅助诊疗工作台
-      </Text>
-    </Header>
+      <div className="xh-header-context" aria-label="当前工作区">
+        <span className="xh-header-context-dot" />
+        临床工作区
+      </div>
+    </header>
   )
 }
 
@@ -81,6 +69,7 @@ function Workbench() {
   const refreshSessions = sessionsHook.refresh
   const navigate = useNavigate()
   const params = useParams<{ id?: string }>()
+  const [navigationOpen, setNavigationOpen] = useState(false)
 
   const selectedId = params.id ?? null
 
@@ -92,10 +81,12 @@ function Workbench() {
   }, [selectedId, refreshSessions])
 
   const handleSelect = (id: string) => {
+    setNavigationOpen(false)
     navigate(`/sessions/${id}`)
   }
 
   const handleCreated = (id: string) => {
+    setNavigationOpen(false)
     navigate(`/sessions/${id}`)
   }
 
@@ -111,31 +102,45 @@ function Workbench() {
   )
 
   return (
-    <Layout style={{ height: '100vh' }}>
-      <BrandHeader />
+    <div className="xh-app-shell">
+      <BrandHeader onOpenNavigation={() => setNavigationOpen(true)} />
       <DisclaimerBar />
-      <Layout>
-        <SessionSider
-          sessionsHook={sessionsHook}
-          selectedId={selectedId}
-          onSelect={handleSelect}
-          onCreated={handleCreated}
+      <div className="xh-app-body">
+        <aside
+          className={`xh-session-rail${navigationOpen ? ' is-open' : ''}`}
+          aria-label="问诊会话导航"
+        >
+          <SessionSider
+            sessionsHook={sessionsHook}
+            selectedId={selectedId}
+            onSelect={handleSelect}
+            onCreated={handleCreated}
+          />
+        </aside>
+        <button
+          type="button"
+          className={`xh-navigation-scrim${navigationOpen ? ' is-open' : ''}`}
+          aria-label="关闭会话导航"
+          onClick={() => setNavigationOpen(false)}
         />
         {chatPanel}
-      </Layout>
-    </Layout>
+      </div>
+    </div>
   )
 }
 
 function PlaceholderHome() {
   return (
-    <div style={{ padding: 32, textAlign: 'center' }}>
-      <Title level={3} style={{ fontFamily: 'var(--xh-font-serif)' }}>
-        悬壶工作台
-      </Title>
-      <Text type="secondary">
-        请访问 <Link to="/workbench">工作台</Link> 开始问诊。
-      </Text>
+    <div className="xh-home">
+      <div className="xh-home-card">
+        <div className="xh-home-mark" aria-hidden="true">悬</div>
+        <Text className="xh-home-eyebrow">XUANHU CLINICAL COPILOT</Text>
+        <Title level={2}>悬壶工作台</Title>
+        <Text type="secondary">
+          请访问工作台，将问诊、辨证、安全审核与医师复核放在一个清晰、可追溯的临床工作流中。
+        </Text>
+        <Link className="xh-home-action" to="/workbench">进入工作台</Link>
+      </div>
     </div>
   )
 }
