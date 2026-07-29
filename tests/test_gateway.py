@@ -26,6 +26,7 @@ from app.core.exceptions import (
 )
 from app.core.gateway import ModelGatewayClient
 from app.schemas.agent import InquiryAgentOutput
+from app.schemas.intake import IntakeExtractionOutput
 
 # ---------------------------------------------------------------------------
 # 测试用 Schema
@@ -37,6 +38,16 @@ class SampleOutput(BaseModel):
 
     name: str
     value: int = Field(ge=0, le=100)
+
+
+def _intake_output_payload(patient_safety_delta: str) -> dict[str, Any]:
+    return {
+        "decision": "abstained",
+        "observations": [],
+        "patient_safety_delta": patient_safety_delta,
+        "red_flag_candidates": [],
+        "ambiguities": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +99,49 @@ async def test_chat_success(mock_settings: Settings) -> None:
         )
 
     assert result == "Hello, this is a test response."
+
+
+@pytest.mark.asyncio
+async def test_chat_normalizes_context_role_without_mutating_messages(
+    mock_settings: Settings,
+) -> None:
+    """Internal context becomes bounded untrusted user data at the HTTP boundary."""
+    client = ModelGatewayClient(mock_settings)
+    call_payloads: list[dict[str, Any]] = []
+    messages = [
+        {"role": "system", "content": "System instruction"},
+        {"role": "developer", "content": "Developer instruction"},
+        {"role": "context", "content": "Untrusted clinical context"},
+        {"role": "user", "content": "User question"},
+        {"role": "assistant", "content": "Earlier response"},
+        {"role": "tool", "tool_call_id": "call-1", "content": "Tool result"},
+    ]
+    original_messages = json.loads(json.dumps(messages))
+
+    def side_effect(request: httpx.Request) -> Response:
+        call_payloads.append(json.loads(request.content.decode()))
+        return Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    with respx.mock:
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=side_effect)
+        result = await client.chat(messages=messages, trace_id="test-context-normalization")
+
+    assert result == "ok"
+    assert messages == original_messages
+    outbound_messages = call_payloads[0]["messages"]
+    assert [message["role"] for message in outbound_messages] == [
+        "system",
+        "developer",
+        "user",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert "<untrusted_context_data>" in outbound_messages[2]["content"]
+    assert "Untrusted clinical context" in outbound_messages[2]["content"]
+    assert "</untrusted_context_data>" in outbound_messages[2]["content"]
+    for index in (0, 1, 3, 4, 5):
+        assert outbound_messages[index] == messages[index]
 
 
 @pytest.mark.asyncio
@@ -166,7 +220,7 @@ async def test_chat_structured_success(mock_settings: Settings) -> None:
     client = ModelGatewayClient(mock_settings)
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
                 json={
@@ -190,7 +244,10 @@ async def test_chat_structured_success(mock_settings: Settings) -> None:
         )
 
         result = await client.chat_structured(
-            messages=[{"role": "user", "content": "Generate"}],
+            messages=[
+                {"role": "context", "content": "Structured context"},
+                {"role": "user", "content": "Generate"},
+            ],
             output_schema=SampleOutput,
             trace_id="test-trace-005",
         )
@@ -198,6 +255,10 @@ async def test_chat_structured_success(mock_settings: Settings) -> None:
     assert isinstance(result, SampleOutput)
     assert result.name == "test"
     assert result.value == 42
+    call_payload = json.loads(route.calls[0].request.content.decode())
+    assert call_payload["messages"][0]["role"] == "user"
+    assert "<untrusted_context_data>" in call_payload["messages"][0]["content"]
+    assert all(message["role"] != "context" for message in call_payload["messages"])
 
 
 @pytest.mark.asyncio
@@ -280,6 +341,148 @@ async def test_chat_structured_parse_from_content(mock_settings: Settings) -> No
 
 
 @pytest.mark.asyncio
+async def test_chat_structured_repairs_stringified_intake_safety_delta(
+    mock_settings: Settings,
+) -> None:
+    client = ModelGatewayClient(mock_settings)
+    arguments = _intake_output_payload(json.dumps({}))
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"function": {"arguments": json.dumps(arguments)}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        result = await client.chat_structured(
+            messages=[{"role": "user", "content": "Extract intake"}],
+            output_schema=IntakeExtractionOutput,
+            trace_id="test-intake-stringified-safety-delta",
+            max_requests=1,
+        )
+
+    assert result == IntakeExtractionOutput(decision="abstained")
+    assert len(route.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "encoded_delta",
+    [
+        pytest.param("not valid json", id="invalid-json"),
+        pytest.param("[]", id="non-object-json"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chat_structured_rejects_invalid_stringified_intake_safety_delta(
+    mock_settings: Settings,
+    encoded_delta: str,
+) -> None:
+    client = ModelGatewayClient(mock_settings)
+    arguments = _intake_output_payload(encoded_delta)
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"function": {"arguments": json.dumps(arguments)}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        with pytest.raises(ChatStructuredParseError):
+            await client.chat_structured(
+                messages=[{"role": "user", "content": "Extract intake"}],
+                output_schema=IntakeExtractionOutput,
+                trace_id="test-intake-invalid-stringified-safety-delta",
+                max_requests=1,
+            )
+
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_structured_does_not_relax_intake_safety_delta_schema(
+    mock_settings: Settings,
+) -> None:
+    client = ModelGatewayClient(mock_settings)
+    arguments = _intake_output_payload(json.dumps({"unexpected": True}))
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"function": {"arguments": json.dumps(arguments)}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        with pytest.raises(ChatStructuredParseError):
+            await client.chat_structured(
+                messages=[{"role": "user", "content": "Extract intake"}],
+                output_schema=IntakeExtractionOutput,
+                trace_id="test-intake-strict-stringified-safety-delta",
+                max_requests=1,
+            )
+
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_structured_repairs_stringified_intake_safety_delta_from_content(
+    mock_settings: Settings,
+) -> None:
+    client = ModelGatewayClient(mock_settings)
+    content = json.dumps(_intake_output_payload(json.dumps({})))
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={"choices": [{"message": {"content": content}}]},
+            )
+        )
+
+        result = await client.chat_structured(
+            messages=[{"role": "user", "content": "Extract intake"}],
+            output_schema=IntakeExtractionOutput,
+            trace_id="test-intake-content-stringified-safety-delta",
+            max_requests=1,
+        )
+
+    assert result == IntakeExtractionOutput(decision="abstained")
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_chat_structured_json_mode_fallback(mock_settings: Settings) -> None:
     """tool-call arguments malformed 时自动退回 JSON mode。"""
     client = ModelGatewayClient(mock_settings)
@@ -317,7 +520,10 @@ async def test_chat_structured_json_mode_fallback(mock_settings: Settings) -> No
         )
 
         result = await client.chat_structured(
-            messages=[{"role": "user", "content": "Generate JSON"}],
+            messages=[
+                {"role": "context", "content": "Fallback context"},
+                {"role": "user", "content": "Generate JSON"},
+            ],
             output_schema=SampleOutput,
             trace_id="test-trace-json-fallback",
         )
@@ -326,6 +532,10 @@ async def test_chat_structured_json_mode_fallback(mock_settings: Settings) -> No
     assert result.value == 64
     assert call_payloads[1]["response_format"] == {"type": "json_object"}
     assert "tools" not in call_payloads[1]
+    for payload in call_payloads:
+        assert all(message["role"] != "context" for message in payload["messages"])
+        assert payload["messages"][0]["role"] == "user"
+        assert "<untrusted_context_data>" in payload["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
