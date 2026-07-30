@@ -144,9 +144,9 @@ jobs:
       - name: Scan repository history and clean working tree for secrets
         run: |
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 \
-            git /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
+            git /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact --verbose
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 \
-            dir /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact
+            dir /repo --gitleaks-ignore-path=/repo/.gitleaksignore --no-banner --redact --verbose
       - name: Validate Prometheus Outbox alerting rules
         run: |
           docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
