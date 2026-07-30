@@ -164,6 +164,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --frozen
+      - name: Ensure pip is available for pip-audit
+        run: uv pip install pip
       - name: Audit Python environment
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
