@@ -110,7 +110,7 @@ class _E2EFakeGateway:
             source_id, content = _source_message(messages)
             return _intake_output(self.mode, source_id, content)
         if output_schema is QuestionComposerModelOutput:
-            return QuestionComposerModelOutput(question="请补充一个关键信息。")
+            return QuestionComposerModelOutput(question="请结合患者目前情况补充这一项信息？")
         raise AssertionError(f"unexpected output schema: {output_schema}")
 
     @property
@@ -346,7 +346,7 @@ async def db_factory(migrated_database: str) -> AsyncIterator[async_sessionmaker
 
 
 @pytest.mark.asyncio
-async def test_langgraph_messages_e2e_incomplete_uses_template_question_and_one_intake_call(
+async def test_langgraph_messages_e2e_incomplete_uses_model_question_and_one_intake_call(
     db_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -374,7 +374,7 @@ async def test_langgraph_messages_e2e_incomplete_uses_template_question_and_one_
     assert response.agent_message is not None
     assert response.current_stage == "inquiry"
     assert gateway.intake_calls == 1
-    assert gateway.question_model_calls == 0
+    assert gateway.question_model_calls == 1
     assert outbox_count == 1
     assert claim is not None
     assert claim.status == "completed"

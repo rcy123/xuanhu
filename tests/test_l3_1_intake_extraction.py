@@ -238,8 +238,8 @@ def test_agent_spec_prompt_and_permissions_are_explicit_and_read_only() -> None:
     )
     prompt = PromptLoader(MANIFEST).load(INTAKE_AGENT_NAME)
     assert prompt.prompt_version == INTAKE_PROMPT_VERSION
-    assert "next question" in prompt.content
-    assert "prompt-injection" in prompt.content
+    assert "下一个问题" in prompt.content
+    assert "提示注入" in prompt.content
 
 
 def test_context_reuses_l2_layers_whitelist_budget_and_privacy_projection() -> None:

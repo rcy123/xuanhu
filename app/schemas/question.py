@@ -15,10 +15,13 @@ GAP_SELECTOR_POLICY_VERSION: Literal["gap-selector-policy.v1"] = "gap-selector-p
 QUESTION_MODEL_OUTPUT_SCHEMA_VERSION: Literal["question-composer-model-output.v1"] = (
     "question-composer-model-output.v1"
 )
+QUESTION_MODEL_INPUT_SCHEMA_VERSION: Literal["question-composer-model-input.v2"] = (
+    "question-composer-model-input.v2"
+)
 QUESTION_RESULT_SCHEMA_VERSION: Literal["question-composer-result.v1"] = "question-composer-result.v1"
 QUESTION_COMPOSER_AGENT_NAME: Literal["question_composer"] = "question_composer"
-QUESTION_COMPOSER_AGENT_VERSION: Literal["question-composer-agent.v1"] = "question-composer-agent.v1"
-QUESTION_COMPOSER_PROMPT_VERSION: Literal["question_composer_v1.jinja2"] = "question_composer_v1.jinja2"
+QUESTION_COMPOSER_AGENT_VERSION: Literal["question-composer-agent.v2"] = "question-composer-agent.v2"
+QUESTION_COMPOSER_PROMPT_VERSION: Literal["question_composer_v2.jinja2"] = "question_composer_v2.jinja2"
 QUESTION_TEMPLATE_REGISTRY_VERSION: Literal["question-template-registry.v1"] = "question-template-registry.v1"
 
 
@@ -58,6 +61,7 @@ class QuestionComposerFailureCode(StrEnum):
     SELECTION_AUTHORITY_MISMATCH = "QUESTION_SELECTION_AUTHORITY_MISMATCH"
     TEMPLATE_CONTRACT_MISMATCH = "QUESTION_TEMPLATE_CONTRACT_MISMATCH"
     RUNTIME_CONTRACT_MISMATCH = "QUESTION_RUNTIME_CONTRACT_MISMATCH"
+    MODEL_UNAVAILABLE = "QUESTION_MODEL_UNAVAILABLE"
     MODEL_OUTPUT_INVALID = "QUESTION_MODEL_OUTPUT_INVALID"
     SINGLE_QUESTION_INVALID = "QUESTION_SINGLE_QUESTION_INVALID"
 
@@ -122,11 +126,32 @@ class GapSelectionResult(_QuestionModel):
         return self
 
 
+class QuestionComposerClinicalFact(_QuestionModel):
+    """Bounded clinical context; identity and safety-profile fields are excluded."""
+
+    fact_key: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
+    value: str = Field(min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def clinical_fact_only(self) -> QuestionComposerClinicalFact:
+        allowed = (
+            "chief_complaint.",
+            "present_illness.",
+            "ten_questions.",
+            "past_history",
+            "four_diagnosis",
+        )
+        if not self.fact_key.startswith(allowed):
+            raise ValueError("question context only accepts bounded clinical facts")
+        return self
+
+
 class QuestionComposerModelInput(_QuestionModel):
-    schema_version: Literal["question-composer-model-input.v1"] = "question-composer-model-input.v1"
+    schema_version: Literal["question-composer-model-input.v2"] = QUESTION_MODEL_INPUT_SCHEMA_VERSION
     selected_dimension: InquiryDimension
     selection_kind: GapSelectionKind
-    safety_instruction: str = Field(min_length=1, max_length=400)
+    safety_instruction: str = Field(min_length=1, max_length=800)
+    clinical_context: tuple[QuestionComposerClinicalFact, ...] = Field(default=(), max_length=24)
 
     @model_validator(mode="after")
     def model_input_requires_selected_kind(self) -> QuestionComposerModelInput:

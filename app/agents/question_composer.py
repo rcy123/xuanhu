@@ -1,4 +1,4 @@
-"""L3-4 template-first Question Composer with restricted model fallback."""
+"""L3-4 model-first Question Composer with deterministic safe fallback."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.gap_selector import select_gap
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
-from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunSpec
+from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunSpec, RuntimeErrorCode
 from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
 from app.core.config import get_settings
@@ -27,6 +27,7 @@ from app.schemas.question import (
     GapSelectionDisposition,
     GapSelectionKind,
     GapSelectionResult,
+    QuestionComposerClinicalFact,
     QuestionComposerFailureCode,
     QuestionComposerModelInput,
     QuestionComposerModelOutput,
@@ -40,14 +41,14 @@ QUESTION_CONTEXT_TOKEN_LIMIT = 1_000
 QUESTION_MODEL_TIMEOUT_SECONDS = 10
 QUESTION_MODEL_MAX_TOKENS = 120
 QUESTION_MODEL_TEMPERATURE = 0.1
-QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v1"
+QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v2"
 QUESTION_COMPOSER_VERIFIER_CHAIN = ("question_schema", "single_question", "no_authority_fields")
 QUESTION_COMPOSER_TOOL_PERMISSIONS = frozenset({Capability.READ_STATE})
 QUESTION_COMPOSER_FAILURE_POLICY = FailurePolicy()
 QUESTION_SAFETY_INSTRUCTION = (
     "The user is a doctor documenting a patient. Address the doctor and refer to the patient; "
     "never phrase the question as if the doctor were the patient. "
-    "Only phrase one short clarification question for the selected dimension. "
+    "Use the bounded clinical context to phrase one natural clarification question for the selected dimension. "
     "Do not choose gaps, add another question, request identity data, diagnose, prescribe, "
     "or mention readiness, route, stage, triage, completeness, force, or override."
 )
@@ -232,7 +233,6 @@ _SECOND_QUESTION_MARKERS = (
     "顺便",
     "再问一下",
 )
-_MULTI_TASK_CONNECTORS = ("以及", "或者", "或", "和", " and ", " or ")
 _IDENTITY_MARKERS = (
     "姓名",
     "名字",
@@ -311,7 +311,12 @@ def build_question_context(
     if template.prompt_version != QUESTION_COMPOSER_PROMPT_VERSION:
         raise PromptManifestError("question composer prompt version mismatch")
     builder = ContextBuilder(
-        allowed_fields={"selected_dimension", "selection_kind", "safety_instruction"},
+        allowed_fields={
+            "selected_dimension",
+            "selection_kind",
+            "safety_instruction",
+            "clinical_context",
+        },
         token_limit=QUESTION_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
     )
@@ -338,6 +343,7 @@ async def compose_question(
     *,
     completeness_result: object,
     pending_safety_dimensions: tuple[InquiryDimension, ...] = (),
+    clinical_context: tuple[QuestionComposerClinicalFact, ...] = (),
     selection: GapSelectionResult | None = None,
     runtime: AgentRuntime | None = None,
     run_spec: RunSpec | None = None,
@@ -367,6 +373,7 @@ async def compose_question(
         agent_spec=agent_spec,
         prompt_loader=prompt_loader,
         template_registry=_QUESTION_TEMPLATES_AUTHORITY,
+        clinical_context=clinical_context,
     )
 
 
@@ -378,8 +385,14 @@ async def _compose_question_with_template_registry(
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
     template_registry: Mapping[tuple[InquiryDimension, GapSelectionKind], QuestionTemplate],
+    clinical_context: tuple[QuestionComposerClinicalFact, ...] = (),
 ) -> QuestionCompositionOutcome:
-    """Private test seam for template-miss fallback; not a production authority path."""
+    """Compose with the model when runtime provenance is available.
+
+    Templates are validated deterministic fallbacks.  Bootstrap callers that
+    cannot safely open an audited model run omit ``run_spec`` and use the same
+    fallback without making the model branch authoritative.
+    """
 
     try:
         selection = _canonicalize_selection(selection)
@@ -392,16 +405,37 @@ async def _compose_question_with_template_registry(
 
     template_key = (selection.selected_dimension, selection.selection_kind)
     template = template_registry.get(template_key)
-    if template is not None:
-        return _template_result(selection, template, template_key=template_key)
+    template_outcome = (
+        _template_result(selection, template, template_key=template_key)
+        if template is not None
+        else None
+    )
+    if template_outcome is not None and template_outcome.status is not QuestionCompositionStatus.SUCCEEDED:
+        return template_outcome
+    if run_spec is None:
+        return template_outcome or _failed(QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH)
 
-    return await _model_result(
+    model_outcome = await _model_result(
         selection=selection,
         runtime=runtime or AgentRuntime(),
         run_spec=run_spec,
         agent_spec=agent_spec or build_question_composer_agent_spec(),
         prompt_loader=prompt_loader,
+        clinical_context=clinical_context,
     )
+    if model_outcome.status is QuestionCompositionStatus.SUCCEEDED:
+        return model_outcome
+    if (
+        template_outcome is not None
+        and model_outcome.failure_code
+        in {
+            QuestionComposerFailureCode.MODEL_UNAVAILABLE,
+            QuestionComposerFailureCode.MODEL_OUTPUT_INVALID,
+            QuestionComposerFailureCode.SINGLE_QUESTION_INVALID,
+        }
+    ):
+        return template_outcome
+    return model_outcome
 
 
 def validate_single_question_text(question: str) -> QuestionComposerFailureCode | None:
@@ -418,8 +452,6 @@ def validate_single_question_text(question: str) -> QuestionComposerFailureCode 
     if not text.endswith(("?", "？")):
         return QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
     if any(marker in text for marker in _SECOND_QUESTION_MARKERS):
-        return QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
-    if any(marker in text for marker in _MULTI_TASK_CONNECTORS):
         return QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
     if _contains_identity_request(text):
         return QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
@@ -470,12 +502,14 @@ async def _model_result(
     run_spec: RunSpec | None,
     agent_spec: AgentSpec,
     prompt_loader: PromptLoader | None,
+    clinical_context: tuple[QuestionComposerClinicalFact, ...],
 ) -> QuestionCompositionOutcome:
     assert selection.selected_dimension is not None
     input_payload = QuestionComposerModelInput(
         selected_dimension=selection.selected_dimension,
         selection_kind=selection.selection_kind,
         safety_instruction=QUESTION_SAFETY_INSTRUCTION,
+        clinical_context=clinical_context,
     )
     try:
         input_payload = _canonicalize_model_input(input_payload)
@@ -498,7 +532,13 @@ async def _model_result(
             [message.model_dump(mode="json") for message in packet.messages],
         )
         model_output = _canonicalize_model_output(artifact.output)
-    except RuntimeErrorBase:
+    except RuntimeErrorBase as exc:
+        if exc.code in {
+            RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT,
+            RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE,
+            RuntimeErrorCode.RUN_DEADLINE_EXCEEDED,
+        }:
+            return _failed(QuestionComposerFailureCode.MODEL_UNAVAILABLE)
         return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
     except QuestionModelOutputBoundaryError:
         return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)

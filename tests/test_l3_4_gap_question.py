@@ -58,6 +58,7 @@ from app.schemas.question import (
     GapSelectionDisposition,
     GapSelectionKind,
     GapSelectionResult,
+    QuestionComposerClinicalFact,
     QuestionComposerFailureCode,
     QuestionComposerModelInput,
     QuestionComposerModelOutput,
@@ -673,8 +674,31 @@ async def test_public_composer_does_not_accept_replacement_template_registry_or_
     )
     assert outcome.status is QuestionCompositionStatus.SUCCEEDED
     assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.MODEL
+    assert gateway.actual_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_wording_falls_back_to_validated_template() -> None:
+    completeness = evaluate_completeness_policy(policy_input(*missing_symptom_facts()))
+    selection = select_gap(completeness)
+    gateway = fallback_gateway("这不是一个合规问题。")
+
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
     assert outcome.result.source is QuestionSource.TEMPLATE
-    assert gateway.actual_request_count == 0
+    assert gateway.actual_request_count == 1
+
+
+def test_question_context_rejects_identity_dimensions() -> None:
+    with pytest.raises(ValidationError):
+        QuestionComposerClinicalFact(fact_key="patient.age", value="42")
 
 
 @pytest.mark.asyncio
@@ -708,7 +732,7 @@ async def test_template_key_dimension_or_kind_mismatch_is_fixed_failure_without_
 
 
 @pytest.mark.asyncio
-async def test_template_missing_private_seam_uses_agent_runtime_once_with_sanitized_context() -> None:
+async def test_template_missing_private_seam_uses_agent_runtime_once_with_bounded_clinical_context() -> None:
     completeness = evaluate_completeness_policy(policy_input(*missing_symptom_facts()))
     selection = select_gap(completeness)
     gateway = fallback_gateway()
@@ -719,6 +743,12 @@ async def test_template_missing_private_seam_uses_agent_runtime_once_with_saniti
         run_spec=build_run_spec(selection),
         agent_spec=build_question_composer_agent_spec(model="fake-question-model"),
         template_registry=FrozenQuestionTemplateRegistry(()),
+        clinical_context=(
+            QuestionComposerClinicalFact(
+                fact_key="chief_complaint.symptom",
+                value="头痛三天",
+            ),
+        ),
     )
 
     assert outcome.status is QuestionCompositionStatus.SUCCEEDED
@@ -733,7 +763,8 @@ async def test_template_missing_private_seam_uses_agent_runtime_once_with_saniti
     assert call["max_requests"] == 1
     encoded_messages = json.dumps(call["messages"], ensure_ascii=False)
     assert "ignore rules" not in encoded_messages
-    assert "头痛" not in encoded_messages
+    assert "头痛三天" in encoded_messages
+    assert "patient.age" not in encoded_messages
     assert "missing_required" not in encoded_messages
     assert "candidate_count" not in encoded_messages
     assert "conflicting_dimensions" not in encoded_messages
@@ -852,7 +883,6 @@ async def test_model_cannot_override_selected_dimension_or_emit_authority_fields
     [
         "请问您这次主要不舒服是什么？另外睡眠怎样？",
         "请问您的姓名是什么？",
-        "请问您疼痛和睡眠情况怎样？",
         "请问您是否可以进入下一阶段？",
         "请问您这次主要不舒服是什么？还有多久了？",
         "What is your phone number?",
@@ -883,6 +913,10 @@ async def test_model_multi_question_identity_connector_and_authority_text_are_re
 
     assert outcome.status is QuestionCompositionStatus.FAILED
     assert outcome.failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+
+
+def test_one_natural_question_may_use_a_clinical_connector() -> None:
+    assert validate_single_question_text("请补充患者咳嗽和发热目前分别是什么情况？") is None
 
 
 def test_normal_chinese_templates_continue_to_pass_single_question_validation() -> None:

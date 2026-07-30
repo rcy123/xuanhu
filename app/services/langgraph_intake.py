@@ -109,7 +109,12 @@ from app.schemas.intake import (
     SafetyListDelta,
 )
 from app.schemas.message import AgentMessageItem, MessageCreateRequest, MessageCreateResponse, SufficiencyReportData
-from app.schemas.question import QuestionCompositionStatus
+from app.schemas.question import (
+    QUESTION_COMPOSER_AGENT_VERSION,
+    QUESTION_COMPOSER_PROMPT_VERSION,
+    QuestionComposerClinicalFact,
+    QuestionCompositionStatus,
+)
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
 from app.services.events import EventService
 from app.services.safety_confirmation import build_intake_safety_assertion_specs
@@ -648,6 +653,7 @@ class LangGraphIntakeMessageRunner:
                     claim.session_id,
                     completeness_result,
                     computation.pending_safety_dimensions,
+                    computation.next_state,
                     trace_id,
                     claim.idempotency_key,
                 )
@@ -786,20 +792,22 @@ class LangGraphIntakeMessageRunner:
         session_id: uuid.UUID,
         completeness_result: Any,
         pending_safety_dimensions: tuple[InquiryDimension, ...],
+        domain_state: DomainState,
         trace_id: str,
         command_key: str,
     ) -> dict[str, Any] | None:
         outcome = await compose_question(
             completeness_result=completeness_result,
             pending_safety_dimensions=pending_safety_dimensions,
+            clinical_context=_question_clinical_context(domain_state),
             runtime=AgentRuntime(),
             run_spec=RunSpec(
                 run_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-question:{session_id}:{command_key}"),
                 session_id=session_id,
                 state_version=completeness_result.input_state_version,
                 stage="intake_question",
-                agent_spec_version="question-composer-agent.v1",
-                prompt_version="question_composer_v1.jinja2",
+                agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
+                prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
                 policy_version=QUESTION_COMPOSER_POLICY_VERSION,
                 deadline_at=_deadline(10),
                 total_attempt_budget=1,
@@ -1743,6 +1751,7 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                 claim.session_id,
                 computation.completeness_result,
                 computation.pending_safety_dimensions,
+                computation.next_state,
                 _node_trace_id(state),
                 claim.idempotency_key,
             )
@@ -2477,6 +2486,37 @@ def _session_updates(
         "blocked_at": blocked_at,
         "state_snapshot": snapshot,
     }
+
+
+def _question_clinical_context(state: DomainState) -> tuple[QuestionComposerClinicalFact, ...]:
+    """Project active non-identity clinical facts for natural question wording."""
+
+    allowed_prefixes = (
+        "chief_complaint.",
+        "present_illness.",
+        "ten_questions.",
+        "past_history",
+        "four_diagnosis",
+    )
+    facts: list[QuestionComposerClinicalFact] = []
+    for item in sorted(_current_observations(state.observations), key=lambda row: row.fact_key):
+        if not item.fact_key.startswith(allowed_prefixes):
+            continue
+        raw_value = item.normalized_value if item.normalized_value is not None else item.value
+        if raw_value is None:
+            continue
+        value = (
+            raw_value
+            if isinstance(raw_value, str)
+            else json.dumps(raw_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        value = value.strip()[:240]
+        if not value:
+            continue
+        facts.append(QuestionComposerClinicalFact(fact_key=item.fact_key, value=value))
+        if len(facts) == 24:
+            break
+    return tuple(facts)
 
 
 def _graph_steps(disposition: CompletenessDisposition) -> tuple[GraphStepSpec, ...]:

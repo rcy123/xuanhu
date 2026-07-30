@@ -73,7 +73,7 @@ async def test_langgraph_message_round_performance_baseline(
     monkeypatch: pytest.MonkeyPatch,
     enable_public_langgraph: None,
 ) -> None:
-    """20 isolated L3 rounds use one observed model call and no question LLM."""
+    """20 isolated L3 rounds use one intake call and one question-wording call."""
 
     del enable_public_langgraph
     gateway = _ObservedBaselineGateway()
@@ -152,8 +152,8 @@ async def test_langgraph_message_round_performance_baseline(
 
     assert failures == 0
     assert gateway.intake_calls == 20
-    assert gateway.question_model_calls == 0
-    assert gateway.prompt_tokens == 340
-    assert gateway.completion_tokens == 100
-    assert gateway.total_tokens == 440
+    assert gateway.question_model_calls == 20
+    assert gateway.prompt_tokens == 680
+    assert gateway.completion_tokens == 200
+    assert gateway.total_tokens == 880
     assert p95 < 5000, f"p50_ms={p50:.2f} p95_ms={p95:.2f} max_ms={maximum:.2f}"
