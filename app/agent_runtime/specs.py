@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -88,6 +88,11 @@ class RunSpec(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("deadline_at must be timezone-aware")
         return value
+
+    def remaining_seconds(self, *, now: datetime | None = None) -> float:
+        """剩余执行预算（秒）。``now`` 缺省取当前 UTC 时刻。"""
+        reference = now if now is not None else datetime.now(UTC)
+        return (self.deadline_at - reference).total_seconds()
 
 
 class TokenUsage(BaseModel):

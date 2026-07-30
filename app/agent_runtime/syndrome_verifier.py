@@ -29,6 +29,9 @@ from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 SYNDROME_AGENT_NAME = "syndrome_draft"
 SYNDROME_AGENT_VERSION = "syndrome-draft-agent.v1"
 SYNDROME_PROMPT_VERSION = "syndrome_draft_v1.jinja2"
+# Syndrom 综合 AgentSpec 单次模型调用超时上限（s）。必须 >= MODEL_GATEWAY_TIMEOUT_SECONDS，
+# 否则外层会先于网关内层判超时并错误归因为 MODEL_GATEWAY_TIMEOUT。
+SYNDROME_MODEL_TIMEOUT_SECONDS = 75
 SYNDROME_VERIFIER_CHAIN = (
     "schema",
     "run_provenance",
@@ -190,7 +193,7 @@ def _valid_agent_spec(spec: AgentSpec) -> bool:
         and spec.output_schema is SyndromeDraft
         and policy.temperature == 0.1
         and policy.max_tokens <= 1_500
-        and policy.timeout_seconds <= 20
+        and policy.timeout_seconds <= SYNDROME_MODEL_TIMEOUT_SECONDS
         and policy.max_attempts == 1
         and spec.tool_permissions == frozenset({Capability.READ_STATE})
         and spec.verifier_chain == SYNDROME_VERIFIER_CHAIN

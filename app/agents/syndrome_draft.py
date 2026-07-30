@@ -34,6 +34,7 @@ from app.agent_runtime.specs import (
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_NAME,
     SYNDROME_AGENT_VERSION,
+    SYNDROME_MODEL_TIMEOUT_SECONDS,
     SYNDROME_PROMPT_VERSION,
     SYNDROME_VERIFIER_CHAIN,
     SyndromeGateAuthority,
@@ -53,7 +54,6 @@ from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.syndrome import SyndromeDraft, SyndromeDraftInput, SyndromeObservationContext
 
 SYNDROME_CONTEXT_TOKEN_LIMIT = 4_000
-SYNDROME_MODEL_TIMEOUT_SECONDS = 20
 SYNDROME_MODEL_MAX_TOKENS = 1_500
 SYNDROME_MODEL_TEMPERATURE = 0.1
 SYNDROME_ARTIFACT_TYPE = "syndrome_draft"

@@ -237,7 +237,9 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             agent_spec_version=SYNDROME_AGENT_VERSION,
             prompt_version=SYNDROME_PROMPT_VERSION,
             policy_version=SYNDROME_POLICY_VERSION,
-            deadline_at=_deadline(30),
+            # 节点级 RunSpec deadline 需 > SYNDROME AgentSpec ModelPolicy.timeout(75s)
+            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+            deadline_at=_deadline(90),
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:syndrome",
             trace_id=_node_trace_id(state),
@@ -400,7 +402,9 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             agent_spec_version=FORMULA_AGENT_VERSION,
             prompt_version=FORMULA_PROMPT_VERSION,
             policy_version=FORMULA_POLICY_VERSION,
-            deadline_at=_deadline(35),
+            # 节点级 RunSpec deadline 需 > FORMULA AgentSpec ModelPolicy.timeout(75s)
+            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+            deadline_at=_deadline(90),
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:formula",
             trace_id=_node_trace_id(state),

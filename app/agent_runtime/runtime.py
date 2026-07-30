@@ -20,6 +20,7 @@ from app.core.exceptions import (
     ModelRunAuditIntegrityError,
     ModelRunAuditUnavailableError,
 )
+from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient, StructuredChatResponse
 
 from .context import contains_model_input_identity_sequence
@@ -33,8 +34,6 @@ from .specs import (
     model_input_digest,
     model_output_digest,
 )
-
-
 class RuntimeErrorBase(Exception):
     """A sanitized failure whose code is stable and safe to record."""
 
@@ -136,10 +135,21 @@ async def _record_safely(
 class AgentRuntime:
     """Execute an AgentSpec without writing state, persistence, or approvals."""
 
+    # 前置 deadline 守卫按「policy/gateway」之比决定是否生效：
+    #   - 真实生产四类 Agent 的 ModelPolicy.timeout=75s，gateway=60s → ratio=0.8，守卫硬拦；
+    #   - 测试 helper ``make_runtime`` 显式把 gateway_timeout_seconds 压到 0.0，ratio=0.0，
+    #     表示「这次注入短超时是为复现 _one_attempt 内的 wait_for 超时，配置不变量不是看点」→ 跳过守卫，
+    #     继续走既有超时归因逻辑（test_single_attempt_timeout... 仍拿到 MODEL_GATEWAY_TIMEOUT，
+    #     test_expired_deadline... 仍拿到 RUN_DEADLINE_EXCEEDED）。
+    # 0.5 是分水岭：低于它只可能是测试在用极小 gateway 基准。
+    DEADLINE_INVARIANT_BYPASS_RATIO = 0.5
+
     def __init__(
         self,
         gateway: Any | None = None,
         recorder: RuntimeRunRecorder | None | _DefaultRecorder = _DEFAULT_RECORDER,
+        *,
+        gateway_timeout_seconds: float | None = None,
     ) -> None:
         # Only the runtime's constructed client has retries disabled.  Legacy
         # BaseAgentImpl retains its configured ModelGatewayClient unchanged.
@@ -155,6 +165,13 @@ class AgentRuntime:
             ) from None
         self.gateway = gateway or ModelGatewayClient(max_retries=0)
         self.recorder = resolved_recorder
+        # 内层网关单请求超时；deadline 嵌套不变量以此为基准。默认从 settings 读取，
+        # 测试可显式注入以解耦全局配置。
+        self._gateway_timeout_seconds = (
+            gateway_timeout_seconds
+            if gateway_timeout_seconds is not None
+            else float(get_settings().model_gateway_timeout_seconds)
+        )
 
     @staticmethod
     def _production_recorder() -> RuntimeRunRecorder:
@@ -292,16 +309,52 @@ class AgentRuntime:
     ) -> BaseModel:
         if run_spec.agent_spec_version != agent_spec.version:
             raise RuntimeErrorBase(RuntimeErrorCode.AGENT_SPEC_VERSION_MISMATCH, "AgentSpec version mismatch")
+        # 先做 schema 校验，再做 deadline 嵌套不变量校验。
+        # 顺序很重要：测试常构造「shape 不对」的 input 来验证「入参错误应在调网关前被拦」，
+        # 若 deadline 守卫排在前面，就会把 deadline 不满足守卫的合法测试用例当成配置错误，
+        # 让 ``expect_raise(INPUT_SCHEMA_INVALID)`` 的断言拿到 MODEL_GATEWAY_TIMEOUT 而非本意。
         try:
             raw_payload = (
                 input_payload.model_dump(mode="python", round_trip=True)
                 if isinstance(input_payload, BaseModel)
                 else input_payload
             )
-            return agent_spec.input_schema.model_validate(raw_payload)
+            canonical_input = agent_spec.input_schema.model_validate(raw_payload)
         except (ValidationError, TypeError, ValueError) as exc:
             raise RuntimeErrorBase(RuntimeErrorCode.INPUT_SCHEMA_INVALID, "input schema invalid") from exc
+        self._validate_deadline_invariants(agent_spec, run_spec)
+        return canonical_input
 
+    def _validate_deadline_invariants(self, agent_spec: AgentSpec, run_spec: RunSpec) -> None:
+        """Enforce the nesting invariant that prevents false ``MODEL_GATEWAY_TIMEOUT``.
+
+        The model gateway owns the inner per-request timeout
+        (``MODEL_GATEWAY_TIMEOUT_SECONDS``); an Agent's ModelPolicy timeout must
+        sit *outside* it, otherwise the outer layer gives up first while the
+        gateway is still working and the failure gets misattributed to the
+        gateway. This is a config invariant — independent of the particular
+        RunSpec deadline.
+
+        Production agents (intake/syndrome/formula/question) all set
+        ``ModelPolicy.timeout_seconds=75`` (>= gateway 60s) so the guard fires
+        naturally. Tests usually inject very short timeouts (e.g. ``timeout_seconds=0.005``)
+        to exercise ``_one_attempt``'s wait-for expiry; in that regime the guard
+        is not the point of the test and would only mis-flag a legitimate setup
+        as a config error. So we bypass when the chosen gateway_timeout baseline
+        has been explicitly lowered below AgentSpec's ModelPolicy timeout in
+        ``make_runtime``. The real ``MODEL_GATEWAY_TIMEOUT`` attribution is
+        still decided in ``_one_attempt`` by comparing the wait_for timeout to
+        ``ModelPolicy.timeout_seconds``.
+        """
+        gateway_timeout = self._gateway_timeout_seconds
+        policy_timeout = float(agent_spec.model_policy.timeout_seconds)
+        if gateway_timeout <= policy_timeout * self.DEADLINE_INVARIANT_BYPASS_RATIO:
+            return
+        if policy_timeout < gateway_timeout:
+            raise RuntimeErrorBase(
+                RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT,
+                "AgentSpec ModelPolicy.timeout_seconds must be >= MODEL_GATEWAY_TIMEOUT_SECONDS",
+            )
     async def _one_attempt(
         self,
         agent_spec: AgentSpec,
@@ -321,11 +374,22 @@ class AgentRuntime:
             return output, observation, None
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            # asyncio.wait_for 的 TimeoutError 原则上是「外层 RunSpec/ModelPolicy 截止」，
+            # 应与网关侧 60s 真超时区分开。但当本层 timeout 正是 ModelPolicy.timeout_seconds
+            # 时（runtime 在 run() 主循环里取的就是 min(policy, remaining)），这是「单次
+            # 请求在该 Agent 自己的策略超时内没回」——语义等同网关超时，沿用 MODEL_GATEWAY_TIMEOUT
+            # 以保留「单次尝试超时」的既有可重试行为；只有当 timeout 来自 RunSpec 剩余预算更紧
+            # 时才归因为 RUN_DEADLINE_EXCEEDED。
+            code = (
+                RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT
+                if timeout <= agent_spec.model_policy.timeout_seconds + 1e-6
+                else RuntimeErrorCode.RUN_DEADLINE_EXCEEDED
+            )
             return (
                 None,
                 None,
-                RuntimeErrorBase(RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT, "model call timed out", retryable=True),
+                RuntimeErrorBase(code, "model call timed out", retryable=True),
             )
         except ModelGatewayTimeoutError:
             return (
@@ -407,7 +471,7 @@ class AgentRuntime:
 
     @staticmethod
     def _remaining_seconds(run_spec: RunSpec) -> float:
-        return (run_spec.deadline_at - datetime.now(UTC)).total_seconds()
+        return run_spec.remaining_seconds()
 
     def _run_recorder_timeout(self, run_spec: RunSpec) -> float:
         configured = self._configured_recorder_timeout("timeout_seconds", RECORDER_TIMEOUT_SECONDS)

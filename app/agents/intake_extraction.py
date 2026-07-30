@@ -84,7 +84,9 @@ def build_intake_agent_spec(*, model: str | None = None) -> AgentSpec:
             model=model or get_settings().chat_model,
             temperature=0.1,
             max_tokens=3_000,
-            timeout_seconds=30,
+            # 必须 >= MODEL_GATEWAY_TIMEOUT_SECONDS（内层单请求超时），否则外层先判超时却归因为
+            # MODEL_GATEWAY_TIMEOUT。配合节点级 RunSpec deadline(90s) 给 recorder 留余量。
+            timeout_seconds=75,
             max_attempts=1,
         ),
         tool_permissions=frozenset({Capability.READ_STATE}),

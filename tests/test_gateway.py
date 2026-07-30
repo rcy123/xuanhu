@@ -1030,3 +1030,37 @@ async def test_chat_no_retry_on_4xx(mock_settings: Settings) -> None:
 
     assert call_count == 1  # 不重试
     assert exc_info.value.retryable is False
+
+# --- A2 empty-content-guard test appended ---
+@pytest.mark.asyncio
+async def test_chat_structured_empty_content_skips_json_fallback(mock_settings: Settings) -> None:
+    """A2: reasoning models returning empty content must not burn a JSON fallback request."""
+    client = ModelGatewayClient(mock_settings)
+    call_payloads: list[dict[str, Any]] = []
+
+    def side_effect(request: httpx.Request) -> Response:
+        call_payloads.append(json.loads(request.content.decode()))
+        # 推理模型常态：tool_calls 空、content 空。
+        return Response(
+            200,
+            json={"choices": [{"message": {"tool_calls": [], "content": None}}]},
+        )
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+            side_effect=side_effect
+        )
+        with pytest.raises(ChatStructuredParseError):
+            await client.chat_structured(
+                messages=[{"role": "user", "content": "Extract"}],
+                output_schema=SampleOutput,
+                trace_id="test-empty-content-no-fallback",
+            )
+
+    # 关键断言：空 content 不触发 JSON fallback —— 主请求按 gateway retry 策略重试
+    # (max_retries=2 → 3 次主请求)，但每次都是 tool-choice 主请求，没有一次退入 JSON mode。
+    assert len(route.calls) == 3
+    for payload in call_payloads:
+        assert "tools" in payload
+        assert "response_format" not in payload
+

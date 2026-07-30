@@ -507,11 +507,21 @@ class ModelGatewayClient:
                     type(exc).__name__,
                 )
 
+            # 推理模型（如 mimo-v2.5-pro）走 tool_choice 强制结构化时，content / tool_calls
+            # 全空属于「这次 reasoning 跑完但没产出工具调用」的常态，不是 schema 不匹配。
+            # 此刻再发一發 JSON fallback 大概率仍拿不到有效结构，却会把单链路耗时翻倍
+            # （主请求 14s + fallback 14s）并挤爆外层节点 deadline。故「空 content」直接当本
+            # 次失败计入重试，只有「content 非空但解析失败」才值得 fallback 重新要结构。
+            empty_content_parse_failure = last_parse_error == "模型返回内容为空"
 
             # A bounded caller owns a request budget.  Its one request must
             # not be expanded by the optional JSON fallback.
             if max_requests is not None:
                 break
+
+            if empty_content_parse_failure:
+                # 空内容：推理模型常态，不浪费 fallback 请求，直接进入下一次 retry（若有预算）。
+                continue
 
             fallback_result = await self._chat_structured_json_fallback(
                 messages=messages,

@@ -284,7 +284,7 @@ def verify_formula_artifact(
 
 FORMULA_MODEL_TEMPERATURE = 0.1
 FORMULA_MODEL_MAX_TOKENS = 2_000
-FORMULA_MODEL_TIMEOUT_SECONDS = 25
+FORMULA_MODEL_TIMEOUT_SECONDS = 75  # >= MODEL_GATEWAY_TIMEOUT_SECONDS（60s），避免外层先判超时
 
 
 def _valid_agent_spec(spec: AgentSpec) -> bool:

@@ -30,7 +30,12 @@ from app.agent_runtime.completeness_policy import completeness_to_gate_result_sc
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
-from app.agent_runtime.intake_verifier import INTAKE_AGENT_VERSION, INTAKE_POLICY_VERSION, INTAKE_PROMPT_VERSION
+from app.agent_runtime.intake_verifier import (
+    INTAKE_AGENT_NAME,
+    INTAKE_AGENT_VERSION,
+    INTAKE_POLICY_VERSION,
+    INTAKE_PROMPT_VERSION,
+)
 from app.agent_runtime.lifecycle import SharedLangGraphRuntime
 from app.agent_runtime.reducer import DomainDelta, DomainState, reduce_domain_state
 from app.agent_runtime.repository import (
@@ -809,7 +814,9 @@ class LangGraphIntakeMessageRunner:
                 agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
                 prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
                 policy_version=QUESTION_COMPOSER_POLICY_VERSION,
-                deadline_at=_deadline(10),
+                # intake 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
+                # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；保留余量给 recorder/console。
+                deadline_at=_deadline(90),
                 total_attempt_budget=1,
                 idempotency_key=f"{command_key}:question",
                 trace_id=trace_id,
@@ -895,7 +902,19 @@ class LangGraphIntakeMessageRunner:
             _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
             return response
 
-    async def _mark_claim_failed(self, claim_id: uuid.UUID, error_code: str) -> None:
+    async def _mark_claim_failed(
+        self,
+        claim_id: uuid.UUID,
+        error_code: str,
+        *,
+        failure_context: dict[str, Any] | None = None,
+    ) -> None:
+        """标记 claim 失败并固化失败现场快照。
+
+        ``failure_context`` 携带排障所需的非 PII 元数据（失败的图节点名、
+        最后完成的步骤、模型调用尝试数、模型请求 run_id、error_code），
+        合并进 ``intermediate_payload["failure"]`` 供事后定位，不污染成功路径。
+        """
         if self._db.in_transaction():
             await self._db.rollback()
         async with self._db.begin():
@@ -903,6 +922,13 @@ class LangGraphIntakeMessageRunner:
             if claim is not None and claim.status != "completed":
                 claim.status = "failed"
                 claim.error_code = error_code[:64]
+                if failure_context:
+                    payload = dict(claim.intermediate_payload or {})
+                    failure = dict(payload.get("failure") or {})
+                    failure.update(failure_context)
+                    failure["error_code"] = error_code[:64]
+                    payload["failure"] = failure
+                    claim.intermediate_payload = payload
                 claim.updated_at = func.now()
                 graph_run = await self._db.get(GraphRun, claim.run_id, with_for_update=True)
                 if graph_run is not None and graph_run.status == "running":
@@ -1057,7 +1083,9 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                 agent_spec_version=INTAKE_AGENT_VERSION,
                 prompt_version=INTAKE_PROMPT_VERSION,
                 policy_version=INTAKE_POLICY_VERSION,
-                deadline_at=_deadline(30),
+                # 节点级 RunSpec deadline 需 > INTAKE AgentSpec ModelPolicy.timeout(75s) 且
+                # > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，否则外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+                deadline_at=_deadline(90),
                 total_attempt_budget=1,
                 idempotency_key=f"{claim.idempotency_key}:intake",
                 trace_id=_node_trace_id(state),
@@ -1082,7 +1110,16 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                     step="extract_intake",
                 )
                 return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
-            await runner._mark_claim_failed(claim.id, code)  # noqa: SLF001
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "extract_intake",
+                    "last_step": "extract_intake",
+                    "model_run_id": str(run_id),
+                    "model_agent_name": INTAKE_AGENT_NAME,
+                },
+            )
             return _sanitized_graph_error(state, code, "intake extraction failed")
         _INTAKE_OUTPUT_CACHE[claim.id] = intake_result.output
         await _save_intermediate(
@@ -1532,7 +1569,7 @@ async def _load_or_retry_intake_output(
             agent_spec_version=INTAKE_AGENT_VERSION,
             prompt_version=INTAKE_PROMPT_VERSION,
             policy_version=INTAKE_POLICY_VERSION,
-            deadline_at=_deadline(30),
+            deadline_at=_deadline(90),  # 与主路径对齐：> INTAKE ModelPolicy(75s) & 网关 60s
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:intake",
             trace_id=trace_id,

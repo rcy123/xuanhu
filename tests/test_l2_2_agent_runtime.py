@@ -230,6 +230,18 @@ def secret_messages() -> list[dict[str, Any]]:
     return [{"role": "user", "content": "Alice, api-key=secret-key, prompt must not be recorded"}]
 
 
+def make_runtime(
+    gateway: Any = None,
+    recorder: Any = None,
+    *,
+    # 测试用 ModelPolicy timeout 普遍是 0.005~1s，远小于生产 gateway 60s。把测试基准
+    # 压到 0.0 让 AgentRuntime 的 deadline 嵌套守卫（policy >= gateway）进入「测试注入
+    # 短超时」旁路而不误拦，既验证守卫代码路径存在，又不破坏既有超时归因断言。
+    gateway_timeout_seconds: float = 0.0,
+) -> AgentRuntime:
+    return AgentRuntime(gateway, recorder, gateway_timeout_seconds=gateway_timeout_seconds)
+
+
 def test_model_input_digest_is_stable_for_canonical_equivalent_payloads() -> None:
     first = MappingInputPayload(attributes={"b": 2, "a": 1})
     second = MappingInputPayload(attributes={"a": 1, "b": 2})
@@ -309,7 +321,7 @@ def test_specs_validate_boundaries_and_are_read_only() -> None:
 async def test_input_schema_is_rejected_before_gateway_call() -> None:
     gateway = FakeGateway([{"answer": "unused"}])
     with pytest.raises(RuntimeErrorBase, match="input schema") as exc_info:
-        await AgentRuntime(gateway, recorder=None).run(make_spec(), make_run(), {"wrong": "shape"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(make_spec(), make_run(), {"wrong": "shape"}, secret_messages())
     assert exc_info.value.code is RuntimeErrorCode.INPUT_SCHEMA_INVALID
     assert gateway.actual_request_count == 0
 
@@ -318,7 +330,7 @@ async def test_input_schema_is_rejected_before_gateway_call() -> None:
 async def test_output_schema_is_rejected_after_gateway_call() -> None:
     gateway = FakeGateway([{"wrong": "shape"}])
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder=None).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     assert exc_info.value.code is RuntimeErrorCode.OUTPUT_SCHEMA_INVALID
     assert gateway.actual_request_count == 1
 
@@ -327,7 +339,7 @@ async def test_output_schema_is_rejected_after_gateway_call() -> None:
 async def test_version_mismatch_rejected_before_gateway_call() -> None:
     gateway = FakeGateway([{"answer": "unused"}])
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder=None).run(
+        await make_runtime(gateway, recorder=None).run(
             make_spec(), make_run(version="v2"), {"request": "ok"}, secret_messages()
         )
     assert exc_info.value.code is RuntimeErrorCode.AGENT_SPEC_VERSION_MISMATCH
@@ -339,7 +351,7 @@ async def test_success_artifact_and_gateway_parameters_are_complete() -> None:
     gateway = FakeGateway([{"answer": "ok"}])
     recorder = FakeRecorder()
     run = make_run()
-    artifact = await AgentRuntime(gateway, recorder).run(make_spec(), run, {"request": "ok"}, secret_messages())
+    artifact = await make_runtime(gateway, recorder).run(make_spec(), run, {"request": "ok"}, secret_messages())
     call = gateway.calls[0]
     assert artifact.output == OutputPayload(answer="ok")
     # A legacy fake does not report serving metadata.  Requested model must not
@@ -365,7 +377,7 @@ async def test_success_artifact_and_gateway_parameters_are_complete() -> None:
 async def test_observed_gateway_populates_actual_model_usage_and_output_digest() -> None:
     gateway = ObservedGateway([{"answer": "ok"}])
     recorder = FakeRecorder()
-    artifact = await AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+    artifact = await make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
 
     assert artifact.model_actual == "served-model-2026-07"
     assert artifact.usage.prompt_tokens == 17
@@ -386,7 +398,7 @@ async def test_observed_gateway_populates_actual_model_usage_and_output_digest()
 async def test_failure_policy_allows_only_listed_retryable_codes() -> None:
     gateway = FakeGateway([ModelGatewayUnavailableError(retryable=True), {"answer": "ok"}])
     spec = make_spec(retryable_codes={RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE})
-    artifact = await AgentRuntime(gateway, recorder=None).run(spec, make_run(), {"request": "ok"}, secret_messages())
+    artifact = await make_runtime(gateway, recorder=None).run(spec, make_run(), {"request": "ok"}, secret_messages())
     assert artifact.attempts == 2
     assert gateway.actual_request_count == 2
 
@@ -395,7 +407,7 @@ async def test_failure_policy_allows_only_listed_retryable_codes() -> None:
 async def test_failure_policy_rejects_retryable_gateway_error_not_listed() -> None:
     gateway = FakeGateway([ModelGatewayUnavailableError(retryable=True), {"answer": "unused"}])
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder=None).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     assert exc_info.value.code is RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE
     assert gateway.actual_request_count == 1
 
@@ -405,7 +417,7 @@ async def test_non_retryable_gateway_error_stops_even_when_code_is_allowed() -> 
     gateway = FakeGateway([ModelGatewayUnavailableError(retryable=False), {"answer": "unused"}])
     spec = make_spec(retryable_codes={RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE})
     with pytest.raises(RuntimeErrorBase):
-        await AgentRuntime(gateway, recorder=None).run(spec, make_run(), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(spec, make_run(), {"request": "ok"}, secret_messages())
     assert gateway.actual_request_count == 1
 
 
@@ -414,7 +426,7 @@ async def test_total_attempt_budget_caps_actual_model_requests() -> None:
     gateway = FakeGateway([ChatStructuredParseError(), ChatStructuredParseError(), {"answer": "unused"}])
     spec = make_spec(max_attempts=10, retryable_codes={RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID})
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder=None).run(spec, make_run(budget=2), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(spec, make_run(budget=2), {"request": "ok"}, secret_messages())
     assert exc_info.value.code is RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID
     assert gateway.actual_request_count == 2
     assert len(gateway.calls) == 2
@@ -425,7 +437,7 @@ async def test_model_policy_max_attempts_caps_actual_model_requests() -> None:
     gateway = FakeGateway([ChatStructuredParseError(), ChatStructuredParseError(), {"answer": "unused"}])
     spec = make_spec(max_attempts=2, retryable_codes={RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID})
     with pytest.raises(RuntimeErrorBase):
-        await AgentRuntime(gateway, recorder=None).run(spec, make_run(budget=10), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder=None).run(spec, make_run(budget=10), {"request": "ok"}, secret_messages())
     assert gateway.actual_request_count == 2
 
 
@@ -434,7 +446,7 @@ async def test_expired_deadline_makes_zero_gateway_calls_and_records_failure() -
     gateway = FakeGateway([{"answer": "unused"}])
     recorder = FakeRecorder()
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder).run(
+        await make_runtime(gateway, recorder).run(
             make_spec(),
             make_run(deadline=datetime.now(UTC) - timedelta(seconds=1)),
             {"request": "ok"},
@@ -450,7 +462,7 @@ async def test_single_attempt_timeout_is_recorded_and_not_retried_without_policy
     gateway = FakeGateway([{"answer": "late"}], delay_seconds=0.03)
     recorder = FakeRecorder()
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder).run(
+        await make_runtime(gateway, recorder).run(
             make_spec(timeout_seconds=0.005), make_run(), {"request": "ok"}, secret_messages()
         )
     assert exc_info.value.code is RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT
@@ -463,7 +475,7 @@ async def test_complete_run_deadline_prevents_a_second_gateway_call() -> None:
     gateway = FakeGateway([ChatStructuredParseError(), {"answer": "unused"}], delay_seconds=0.03)
     spec = make_spec(max_attempts=3, retryable_codes={RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID})
     with pytest.raises(RuntimeErrorBase):
-        await AgentRuntime(gateway, recorder=None).run(
+        await make_runtime(gateway, recorder=None).run(
             spec,
             make_run(deadline=datetime.now(UTC) + timedelta(seconds=0.01)),
             {"request": "ok"},
@@ -477,7 +489,7 @@ async def test_cancelled_error_propagates_and_is_recorded() -> None:
     gateway = FakeGateway([{"answer": "never"}], delay_seconds=1)
     recorder = FakeRecorder()
     task = asyncio.create_task(
-        AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+        make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     )
     await gateway.entered.wait()
     task.cancel()
@@ -490,7 +502,7 @@ async def test_cancelled_error_propagates_and_is_recorded() -> None:
 async def test_recorder_is_minimal_and_its_failure_is_degraded() -> None:
     gateway = FakeGateway([{"answer": "ok"}])
     recorder = FakeRecorder(fail=True)
-    await AgentRuntime(gateway, recorder).run(
+    await make_runtime(gateway, recorder).run(
         make_spec(),
         make_run(),
         {"request": "Alice patient identity"},
@@ -537,7 +549,7 @@ async def test_model_run_audit_integrity_conflict_fails_closed(
     recorder = IntegrityConflictRecorder(conflict_type())
 
     with pytest.raises(ModelRunAuditIntegrityError) as exc_info:
-        await AgentRuntime(FakeGateway([{"answer": "ok"}]), recorder).run(
+        await make_runtime(FakeGateway([{"answer": "ok"}]), recorder).run(
             make_spec(),
             make_run(),
             {"request": "private patient input"},
@@ -566,7 +578,7 @@ async def test_already_finalized_started_record_fails_before_model_call() -> Non
         ModelRunAuditAlreadyFinalizedError,
         match="^model-run audit already finalized$",
     ):
-        await AgentRuntime(gateway, recorder).run(
+        await make_runtime(gateway, recorder).run(
             make_spec(),
             make_run(),
             {"request": "private patient input"},
@@ -598,7 +610,7 @@ async def test_required_recorder_failure_never_degrades_to_model_execution_succe
         ModelRunAuditUnavailableError,
         match="^model-run audit unavailable$",
     ) as exc_info:
-        await AgentRuntime(gateway, recorder).run(
+        await make_runtime(gateway, recorder).run(
             make_spec(),
             make_run(),
             {"request": "private patient input"},
@@ -626,7 +638,7 @@ async def test_blocked_started_recorder_is_bounded_by_run_deadline_before_gatewa
     deadline = datetime.now(UTC) + timedelta(seconds=0.01)
     with pytest.raises(RuntimeErrorBase) as exc_info:
         await asyncio.wait_for(
-            AgentRuntime(gateway, recorder).run(
+            make_runtime(gateway, recorder).run(
                 make_spec(), make_run(deadline=deadline), {"request": "ok"}, secret_messages()
             ),
             timeout=0.3,
@@ -641,7 +653,7 @@ async def test_blocked_succeeded_recorder_does_not_change_success_or_leave_task(
     gateway = FakeGateway([{"answer": "ok"}])
     recorder = BlockingRecorder({"succeeded"})
     artifact = await asyncio.wait_for(
-        AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages()),
+        make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages()),
         timeout=0.3,
     )
     assert artifact.output == OutputPayload(answer="ok")
@@ -655,7 +667,7 @@ async def test_blocked_failed_recorder_preserves_fixed_error_code() -> None:
     recorder = BlockingRecorder({"failed"})
     with pytest.raises(RuntimeErrorBase) as exc_info:
         await asyncio.wait_for(
-            AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages()),
+            make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages()),
             timeout=0.3,
         )
     assert exc_info.value.code is RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE
@@ -667,7 +679,7 @@ async def test_blocked_cancelled_recorder_preserves_cancelled_error() -> None:
     gateway = FakeGateway([{"answer": "never"}], delay_seconds=1)
     recorder = BlockingRecorder({"cancelled"})
     task = asyncio.create_task(
-        AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+        make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     )
     await gateway.entered.wait()
     task.cancel()
@@ -681,7 +693,7 @@ async def test_recorder_secret_exception_never_enters_primary_error_chain_or_eve
     gateway = FakeGateway([ModelGatewayUnavailableError(retryable=False)])
     recorder = FakeRecorder(fail=True)
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        await AgentRuntime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
+        await make_runtime(gateway, recorder).run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     assert exc_info.value.code is RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE
     chain: list[BaseException] = []
     current: BaseException | None = exc_info.value
@@ -697,7 +709,7 @@ def test_sync_recorder_is_rejected_before_execution_or_thread_creation() -> None
     recorder = SyncRecorder()
     threads_before = {thread.ident for thread in threading.enumerate()}
     with pytest.raises(RuntimeErrorBase) as exc_info:
-        AgentRuntime(FakeGateway([{"answer": "unused"}]), recorder)  # type: ignore[arg-type]
+        make_runtime(FakeGateway([{"answer": "unused"}]), recorder)  # type: ignore[arg-type]
     assert exc_info.value.code is RuntimeErrorCode.RECORDER_ASYNC_REQUIRED
     assert recorder.called.is_set() is False
     assert "sync-secret" not in repr(exc_info.value)
@@ -707,6 +719,8 @@ def test_sync_recorder_is_rejected_before_execution_or_thread_creation() -> None
 
 
 def test_omitted_recorder_uses_required_postgres_audit_with_injected_gateway() -> None:
+    # 这里必须直接构造 AgentRuntime（不经 make_runtime 注入 gateway_timeout_seconds=0.0），
+    # 以断言「完全不传参时 recorder 仍回落到生产 PostgresModelRunRecorder」。
     runtime = AgentRuntime(FakeGateway([{"answer": "unused"}]))
 
     assert isinstance(runtime.recorder, PostgresModelRunRecorder)
@@ -716,7 +730,7 @@ def test_omitted_recorder_uses_required_postgres_audit_with_injected_gateway() -
 @pytest.mark.asyncio
 async def test_blocked_async_recorder_leaves_no_runtime_pending_task() -> None:
     recorder = BlockingRecorder({"succeeded"})
-    artifact = await AgentRuntime(FakeGateway([{"answer": "ok"}]), recorder).run(
+    artifact = await make_runtime(FakeGateway([{"answer": "ok"}]), recorder).run(
         make_spec(), make_run(), {"request": "ok"}, secret_messages()
     )
     assert artifact.output == OutputPayload(answer="ok")
@@ -731,9 +745,19 @@ async def test_blocked_async_recorder_leaves_no_runtime_pending_task() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_and_artifact_have_no_authoritative_state_or_approval_surface() -> None:
-    runtime = AgentRuntime(FakeGateway([{"answer": "ok"}]), recorder=None)
+    runtime = make_runtime(FakeGateway([{"answer": "ok"}]), recorder=None)
     artifact = await runtime.run(make_spec(), make_run(), {"request": "ok"}, secret_messages())
     assert not hasattr(runtime, "state")
     assert not hasattr(runtime, "approve_safety")
     assert not hasattr(runtime, "transition_stage")
     assert {"state", "stage", "verified", "approved", "submitted"}.isdisjoint(type(artifact).model_fields)
+# --- A1 guard test appended ---
+@pytest.mark.asyncio
+async def test_deadline_invariant_rejects_policy_below_gateway_timeout() -> None:
+    """A1: when ModelPolicy.timeout < gateway_timeout, preflight raises MODEL_GATEWAY_TIMEOUT."""
+    runtime = AgentRuntime(FakeGateway([{"answer": "unused"}]), recorder=None, gateway_timeout_seconds=60.0)
+    spec = make_spec(timeout_seconds=30)
+    with pytest.raises(RuntimeErrorBase) as exc_info:
+        await runtime.run(spec, make_run(), {"request": "ok"}, secret_messages())
+    assert exc_info.value.code is RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT
+
