@@ -88,7 +88,7 @@ class _FakeAsyncSession:
 @pytest.mark.asyncio
 async def test_failed_intake_claim_releases_ephemeral_output() -> None:
     claim_id = uuid.uuid4()
-    claim = SimpleNamespace(status="running", error_code=None, updated_at=None)
+    claim = SimpleNamespace(status="running", error_code=None, updated_at=None, run_id=uuid.uuid4())
     db = _FakeAsyncSession(claim)
     intake_module._INTAKE_OUTPUT_CACHE[claim_id] = object()  # type: ignore[assignment]
 
