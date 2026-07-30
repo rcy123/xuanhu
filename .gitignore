@@ -55,6 +55,8 @@ node_modules/
 # data
 data/
 !data/sample_*.json
+new_data/
+staging/
 
 # Documentation
 # Most ad-hoc/generated documents remain ignored. Agent architecture,
