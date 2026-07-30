@@ -12,9 +12,6 @@ concurrency:
   group: quality-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  UV_FROZEN: "1"
-
 jobs:
   unit:
     name: Unit + contract (Python 3.12)
@@ -29,7 +26,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - name: Sync locked environment
-        run: uv sync --locked --group dev
+        run: uv sync --frozen --group dev
       - name: Run isolated unit and L0 contract suites
         run: uv run pytest
 
@@ -45,7 +42,7 @@ jobs:
           version: "0.11.28"
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --locked --group dev
+      - run: uv sync --frozen --group dev
       - name: Ruff
         run: uv run ruff check .
       - name: Strict mypy (application and operational scripts)
@@ -97,7 +94,7 @@ jobs:
           version: "0.11.28"
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --locked --group dev
+      - run: uv sync --frozen --group dev
       - name: Run real-service tests in isolated xdist databases
         run: >-
           uv run pytest -o addopts="" -m "integration and not performance"
@@ -164,7 +161,7 @@ jobs:
           version: "0.11.28"
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --locked
+      - run: uv sync --frozen
       - name: Audit Python environment
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
