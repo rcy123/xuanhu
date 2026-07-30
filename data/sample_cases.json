@@ -1,0 +1,87 @@
+[
+  {
+    "entry_type": "case",
+    "title": "模拟医案：脾虚湿困便溏",
+    "disease_category": "泄泻",
+    "syndrome": "脾虚湿困",
+    "treatment_principle": "健脾化湿，和中止泻。",
+    "formula_summary": "参考参苓白术散方向，酌加陈皮、砂仁以醒脾行气。",
+    "content": "患者A，成年人，主诉大便溏薄反复两月，食后腹胀，纳少，乏力，晨起口淡不渴。舌淡胖，苔白腻，脉缓弱。辨为脾虚湿困，治以健脾化湿。此为完全模拟医案，不含真实患者信息。",
+    "source": "模拟脱敏医案集 v0.1",
+    "metadata": {
+      "deidentified": true,
+      "age_band": "adult",
+      "sex": "unspecified",
+      "tags": ["便溏", "脾虚", "湿困"],
+      "license": "synthetic"
+    }
+  },
+  {
+    "entry_type": "case",
+    "title": "模拟医案：肝郁气滞胁痛",
+    "disease_category": "胁痛",
+    "syndrome": "肝郁气滞",
+    "treatment_principle": "疏肝理气，缓急止痛。",
+    "formula_summary": "参考柴胡疏肝散方向，伴睡眠欠佳可酌配安神药。",
+    "content": "患者B，成年人，情志不舒后出现两胁胀痛，胸闷善太息，嗳气后稍舒，纳可，大便正常。舌淡红，苔薄白，脉弦。辨为肝郁气滞。此为完全模拟医案，不含真实患者信息。",
+    "source": "模拟脱敏医案集 v0.1",
+    "metadata": {
+      "deidentified": true,
+      "age_band": "adult",
+      "sex": "unspecified",
+      "tags": ["胁痛", "肝郁", "气滞"],
+      "license": "synthetic"
+    }
+  },
+  {
+    "entry_type": "case",
+    "title": "模拟医案：风寒表证感冒",
+    "disease_category": "感冒",
+    "syndrome": "风寒表证",
+    "treatment_principle": "辛温解表，散寒宣肺。",
+    "formula_summary": "参考荆防败毒散方向，需确认无明显热象。",
+    "content": "患者C，成年人，受凉后恶寒明显，发热轻，无汗，头痛项强，鼻塞流清涕，口不渴。舌苔薄白，脉浮紧。辨为风寒表证。此为完全模拟医案，不含真实患者信息。",
+    "source": "模拟脱敏医案集 v0.1",
+    "metadata": {
+      "deidentified": true,
+      "age_band": "adult",
+      "sex": "unspecified",
+      "tags": ["感冒", "风寒", "无汗"],
+      "license": "synthetic"
+    }
+  },
+  {
+    "entry_type": "case",
+    "title": "模拟医案：心脾两虚不寐",
+    "disease_category": "不寐",
+    "syndrome": "心脾两虚",
+    "treatment_principle": "益气补血，养心安神。",
+    "formula_summary": "参考归脾汤方向，注意与阴虚火旺、痰热扰心鉴别。",
+    "content": "患者D，成年人，失眠多梦半年，伴心悸健忘，食少，工作后易疲乏，面色少华。舌淡，苔薄，脉细弱。辨为心脾两虚。此为完全模拟医案，不含真实患者信息。",
+    "source": "模拟脱敏医案集 v0.1",
+    "metadata": {
+      "deidentified": true,
+      "age_band": "adult",
+      "sex": "unspecified",
+      "tags": ["失眠", "心悸", "心脾两虚"],
+      "license": "synthetic"
+    }
+  },
+  {
+    "entry_type": "case",
+    "title": "模拟医案：痰湿蕴肺咳嗽",
+    "disease_category": "咳嗽",
+    "syndrome": "痰湿蕴肺",
+    "treatment_principle": "燥湿化痰，理气和中。",
+    "formula_summary": "参考二陈汤方向，若痰黄口渴需辨为痰热。",
+    "content": "患者E，成年人，咳嗽十余日，痰多色白，胸闷，纳呆，口不渴，大便偏黏。舌苔白腻，脉滑。辨为痰湿蕴肺。此为完全模拟医案，不含真实患者信息。",
+    "source": "模拟脱敏医案集 v0.1",
+    "metadata": {
+      "deidentified": true,
+      "age_band": "adult",
+      "sex": "unspecified",
+      "tags": ["咳嗽", "痰多", "痰湿"],
+      "license": "synthetic"
+    }
+  }
+]

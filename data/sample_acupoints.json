@@ -1,0 +1,42 @@
+[
+  {
+    "name": "足三里",
+    "aliases": ["下陵"],
+    "meridian": "足阳明胃经",
+    "location": "小腿外侧，犊鼻下3寸，犊鼻与解溪连线上。",
+    "indications": "胃痛，呕吐，腹胀，泄泻，便秘，虚劳诸证，下肢痿痹。",
+    "operation": "直刺1-2寸；可灸。",
+    "contraindications": [],
+    "source": "模拟针灸学小样本"
+  },
+  {
+    "name": "中脘",
+    "aliases": [],
+    "meridian": "任脉",
+    "location": "上腹部，前正中线上，脐中上4寸。",
+    "indications": "胃痛，呕吐，吞酸，腹胀，泄泻，黄疸，癫狂。",
+    "operation": "直刺0.8-1.2寸；孕妇慎针。",
+    "contraindications": ["孕妇慎针"],
+    "source": "模拟针灸学小样本"
+  },
+  {
+    "name": "太冲",
+    "aliases": [],
+    "meridian": "足厥阴肝经",
+    "location": "足背，第1、2跖骨结合部之前凹陷中。",
+    "indications": "头痛眩晕，目赤肿痛，胁痛，月经不调，情志抑郁。",
+    "operation": "直刺0.5-0.8寸。",
+    "contraindications": [],
+    "source": "模拟针灸学小样本"
+  },
+  {
+    "name": "神门",
+    "aliases": [],
+    "meridian": "手少阴心经",
+    "location": "腕前区，腕掌侧远端横纹尺侧端，尺侧腕屈肌腱的桡侧缘。",
+    "indications": "心痛，心烦，惊悸，怔忡，健忘，失眠，痴呆。",
+    "operation": "直刺0.3-0.5寸。",
+    "contraindications": [],
+    "source": "模拟针灸学小样本"
+  }
+]

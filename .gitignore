@@ -54,6 +54,7 @@ node_modules/
 
 # data
 data/
+!data/sample_*.json
 
 # Documentation
 # Most ad-hoc/generated documents remain ignored. Agent architecture,

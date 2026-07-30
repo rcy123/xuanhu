@@ -1,0 +1,47 @@
+[
+  {
+    "unit_name": "g",
+    "aliases": ["克", "公克"],
+    "to_grams": 1.0,
+    "conversion_type": "standard",
+    "precision_note": "标准克重单位。",
+    "is_standard": true,
+    "enabled": true
+  },
+  {
+    "unit_name": "两",
+    "aliases": ["市两"],
+    "to_grams": 30.0,
+    "conversion_type": "fixed",
+    "precision_note": "MVP 安全审核采用现代标准保守换算：1 两 = 30g；古籍剂量不可直接套用。",
+    "is_standard": false,
+    "enabled": true
+  },
+  {
+    "unit_name": "钱",
+    "aliases": ["市钱"],
+    "to_grams": 3.0,
+    "conversion_type": "fixed",
+    "precision_note": "MVP 安全审核采用现代标准保守换算：1 钱 = 3g。",
+    "is_standard": false,
+    "enabled": true
+  },
+  {
+    "unit_name": "枚",
+    "aliases": ["个"],
+    "to_grams": null,
+    "conversion_type": "herb_specific",
+    "precision_note": "需按药材和炮制规格单独判断。",
+    "is_standard": false,
+    "enabled": true
+  },
+  {
+    "unit_name": "适量",
+    "aliases": ["少许"],
+    "to_grams": null,
+    "conversion_type": "unsupported",
+    "precision_note": "不支持自动换算，需人工确认。",
+    "is_standard": false,
+    "enabled": true
+  }
+]

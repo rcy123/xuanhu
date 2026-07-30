@@ -1,0 +1,57 @@
+[
+  {
+    "entry_type": "theory",
+    "title": "脾虚湿困证辨治要点",
+    "disease_category": "脾胃病",
+    "syndrome": "脾虚湿困",
+    "treatment_principle": "健脾益气，化湿和中。",
+    "formula_summary": "可参考参苓白术散、香砂六君子汤等方向，需随证加减。",
+    "content": "脾主运化，脾气不足则水谷精微运化失司，湿浊内生，可见食少便溏、肢体困重、气短乏力、舌淡苔白腻。辨证需结合寒热、虚实与湿邪轻重，不应仅凭单一便溏即定方。",
+    "source": "模拟理论条目：脾胃辨证小样本",
+    "metadata": {"tags": ["脾虚", "湿困", "便溏"], "license": "synthetic"}
+  },
+  {
+    "entry_type": "theory",
+    "title": "肝郁气滞证辨治要点",
+    "disease_category": "情志相关病证",
+    "syndrome": "肝郁气滞",
+    "treatment_principle": "疏肝解郁，理气止痛。",
+    "formula_summary": "可参考柴胡疏肝散类方，伴血瘀、痰郁、化火时需辨别加减。",
+    "content": "肝主疏泄，情志不遂可致气机郁滞。常见胸胁胀痛、善太息、嗳气、情绪抑郁或易怒，脉弦。若口苦口干、急躁易怒、舌红苔黄，应考虑郁而化火。",
+    "source": "模拟理论条目：肝胆辨证小样本",
+    "metadata": {"tags": ["肝郁", "气滞", "胁痛"], "license": "synthetic"}
+  },
+  {
+    "entry_type": "theory",
+    "title": "风寒表证辨治要点",
+    "disease_category": "外感病",
+    "syndrome": "风寒表证",
+    "treatment_principle": "辛温解表，宣肺散寒。",
+    "formula_summary": "可参考荆防败毒散、麻黄汤、桂枝汤等方向，需分有汗无汗与体质虚实。",
+    "content": "风寒袭表，卫阳被遏，常见恶寒重、发热轻、无汗、头痛身痛、鼻塞清涕、口不渴、舌苔薄白、脉浮紧。若咽痛明显、口渴、苔黄，应重新辨别风热或寒包火。",
+    "source": "模拟理论条目：外感辨证小样本",
+    "metadata": {"tags": ["风寒", "表证", "恶寒"], "license": "synthetic"}
+  },
+  {
+    "entry_type": "theory",
+    "title": "心脾两虚失眠辨治要点",
+    "disease_category": "不寐",
+    "syndrome": "心脾两虚",
+    "treatment_principle": "补益心脾，养血安神。",
+    "formula_summary": "可参考归脾汤方向，兼痰热、阴虚火旺者不宜混同。",
+    "content": "思虑劳倦伤及心脾，心血不足则神失所养，脾气不足则生化乏源。可见失眠多梦、心悸健忘、食少体倦、面色少华、舌淡、脉细弱。",
+    "source": "模拟理论条目：不寐辨证小样本",
+    "metadata": {"tags": ["失眠", "心脾两虚", "归脾汤"], "license": "synthetic"}
+  },
+  {
+    "entry_type": "theory",
+    "title": "痰湿蕴肺咳嗽辨治要点",
+    "disease_category": "咳嗽",
+    "syndrome": "痰湿蕴肺",
+    "treatment_principle": "燥湿化痰，理气止咳。",
+    "formula_summary": "可参考二陈汤类方，寒痰、热痰、燥痰需分别处理。",
+    "content": "脾失健运，湿聚成痰，上贮于肺，则肺失宣降。常见咳嗽痰多、痰白而黏或易咯、胸闷脘痞、纳呆、苔白腻、脉滑。",
+    "source": "模拟理论条目：肺系病辨证小样本",
+    "metadata": {"tags": ["咳嗽", "痰湿", "二陈汤"], "license": "synthetic"}
+  }
+]

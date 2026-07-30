@@ -1,0 +1,110 @@
+[
+  {
+    "name": "参苓白术散",
+    "aliases": ["参苓白术丸"],
+    "composition": [
+      {"herb": "党参", "dose": 12, "unit": "g"},
+      {"herb": "白术", "dose": 9, "unit": "g"},
+      {"herb": "茯苓", "dose": 12, "unit": "g"},
+      {"herb": "山药", "dose": 12, "unit": "g"},
+      {"herb": "莲子", "dose": 9, "unit": "g"},
+      {"herb": "薏苡仁", "dose": 15, "unit": "g"},
+      {"herb": "砂仁", "dose": 3, "unit": "g", "note": "后下"},
+      {"herb": "桔梗", "dose": 6, "unit": "g"},
+      {"herb": "甘草", "dose": 6, "unit": "g"}
+    ],
+    "effect": "益气健脾，渗湿止泻。",
+    "indications": "脾虚湿困，食少便溏，气短乏力，胸脘痞闷，舌淡苔白腻。",
+    "usage": "水煎服；模拟数据仅用于 RAG 验证。",
+    "source": "模拟教材摘录：方剂学小样本",
+    "modification_rules": [
+      {"condition": "湿重苔腻", "action": "可酌加苍术、厚朴以燥湿行气"},
+      {"condition": "便溏明显", "action": "可酌加炮姜、补骨脂以温中止泻"}
+    ]
+  },
+  {
+    "name": "柴胡疏肝散",
+    "aliases": [],
+    "composition": [
+      {"herb": "柴胡", "dose": 6, "unit": "g"},
+      {"herb": "白芍", "dose": 9, "unit": "g"},
+      {"herb": "枳壳", "dose": 6, "unit": "g"},
+      {"herb": "陈皮", "dose": 6, "unit": "g"},
+      {"herb": "川芎", "dose": 6, "unit": "g"},
+      {"herb": "香附", "dose": 9, "unit": "g"},
+      {"herb": "甘草", "dose": 3, "unit": "g"}
+    ],
+    "effect": "疏肝解郁，行气止痛。",
+    "indications": "肝郁气滞，胸胁胀痛，情志抑郁，嗳气太息，脉弦。",
+    "usage": "水煎服；模拟数据仅用于 RAG 验证。",
+    "source": "模拟教材摘录：方剂学小样本",
+    "modification_rules": [
+      {"condition": "胁痛较甚", "action": "可酌加郁金、延胡索以理气止痛"},
+      {"condition": "情志郁结伴失眠", "action": "可酌加合欢皮、酸枣仁"}
+    ]
+  },
+  {
+    "name": "二陈汤",
+    "aliases": [],
+    "composition": [
+      {"herb": "半夏", "dose": 9, "unit": "g", "note": "制半夏"},
+      {"herb": "陈皮", "dose": 9, "unit": "g"},
+      {"herb": "茯苓", "dose": 12, "unit": "g"},
+      {"herb": "甘草", "dose": 3, "unit": "g"},
+      {"herb": "生姜", "dose": 3, "unit": "片"},
+      {"herb": "乌梅", "dose": 1, "unit": "枚"}
+    ],
+    "effect": "燥湿化痰，理气和中。",
+    "indications": "湿痰证，咳嗽痰多，色白易咯，胸膈痞闷，恶心呕吐，苔白腻。",
+    "usage": "水煎服；模拟数据仅用于 RAG 验证。",
+    "source": "模拟教材摘录：方剂学小样本",
+    "modification_rules": [
+      {"condition": "痰多胸闷明显", "action": "可酌加枳实、瓜蒌以宽胸化痰"},
+      {"condition": "寒痰较重", "action": "可酌加干姜、细辛，需注意安全审核"}
+    ]
+  },
+  {
+    "name": "归脾汤",
+    "aliases": [],
+    "composition": [
+      {"herb": "黄芪", "dose": 15, "unit": "g"},
+      {"herb": "党参", "dose": 12, "unit": "g"},
+      {"herb": "白术", "dose": 9, "unit": "g"},
+      {"herb": "茯苓", "dose": 12, "unit": "g"},
+      {"herb": "酸枣仁", "dose": 15, "unit": "g"},
+      {"herb": "龙眼肉", "dose": 12, "unit": "g"},
+      {"herb": "木香", "dose": 6, "unit": "g"},
+      {"herb": "甘草", "dose": 3, "unit": "g"}
+    ],
+    "effect": "益气补血，健脾养心。",
+    "indications": "心脾两虚，失眠多梦，心悸健忘，食少体倦，面色少华。",
+    "usage": "水煎服；模拟数据仅用于 RAG 验证。",
+    "source": "模拟教材摘录：方剂学小样本",
+    "modification_rules": [
+      {"condition": "失眠明显", "action": "可酌加柏子仁、夜交藤"},
+      {"condition": "食少腹胀", "action": "可酌加陈皮、砂仁以醒脾行气"}
+    ]
+  },
+  {
+    "name": "荆防败毒散",
+    "aliases": [],
+    "composition": [
+      {"herb": "荆芥", "dose": 9, "unit": "g"},
+      {"herb": "防风", "dose": 9, "unit": "g"},
+      {"herb": "柴胡", "dose": 6, "unit": "g"},
+      {"herb": "川芎", "dose": 6, "unit": "g"},
+      {"herb": "羌活", "dose": 6, "unit": "g"},
+      {"herb": "独活", "dose": 6, "unit": "g"},
+      {"herb": "茯苓", "dose": 9, "unit": "g"},
+      {"herb": "甘草", "dose": 3, "unit": "g"}
+    ],
+    "effect": "发汗解表，散风祛湿。",
+    "indications": "风寒湿邪在表，恶寒发热，无汗，头项强痛，肢体酸楚，鼻塞声重。",
+    "usage": "水煎服；模拟数据仅用于 RAG 验证。",
+    "source": "模拟教材摘录：方剂学小样本",
+    "modification_rules": [
+      {"condition": "鼻塞清涕明显", "action": "可酌加辛夷、白芷"},
+      {"condition": "咽痛口渴明显", "action": "需重新辨别是否转为风热，不宜机械套用"}
+    ]
+  }
+]
