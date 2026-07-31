@@ -47,12 +47,17 @@ from app.agent_runtime.commands import (
     NODE_RECOVERY_PLACEHOLDER,
     NODE_REVIEW_PLACEHOLDER,
 )
+from app.agent_runtime.intake_orchestrator import NODE_INTAKE_ORCHESTRATOR_V1
 from app.agent_runtime.intake_subgraph import IntakeExecutor, build_intake_subgraph
 from app.agent_runtime.reasoning_subgraph import ReasoningExecutor, build_reasoning_subgraph
 from app.agent_runtime.recovery_node import RecoveryExecutor, build_recovery_subgraph
 from app.agent_runtime.review_node import ReviewExecutor, build_review_subgraph
 from app.agent_runtime.routing import command_router, route_after_router
 from app.agent_runtime.state import XuanhuGraphState
+
+# 0b 预留：IntakeOrchestrator 挂载点常量（阶段 2c 接入采集层循环时使用）。
+# 本阶段仅声明不接线——不进入 _PLACEHOLDER_NODES、不加边，图结构零变更。
+_INTAKE_ORCHESTRATOR_MOUNT: str = NODE_INTAKE_ORCHESTRATOR_V1
 
 # 占位节点列表（不含 command_router 和终端节点）。
 _PLACEHOLDER_NODES: tuple[str, ...] = (
@@ -113,6 +118,11 @@ def build_main_graph(
 
     # 注册 command_router 节点
     graph.add_node(NODE_COMMAND_ROUTER, command_router)
+    # 0b IntakeOrchestrator 挂载点（仅预留常量，本阶段不接线、不改图结构）：
+    # 阶段 2c 在此把采集层循环接入——intake 子图入口前经 NODE_INTAKE_ORCHESTRATOR_V1
+    # 调用 IntakeOrchestrator.evaluate（见 app/agent_runtime/intake_orchestrator.py），
+    # 按 CollectDecision 驱动 collect→decide→collect/advance 循环（含 cap+stagnation 保护）。
+    # 本阶段行为零变更：NoopOrchestrationPolicy 恒 collect_more，与现状逐轮进图等价。
     intake_node: Any = build_intake_subgraph(intake_executor=intake_executor)
     graph.add_node(NODE_INTAKE_SUBGRAPH_V1, intake_node)
     reasoning_node: Any = build_reasoning_subgraph(reasoning_executor=reasoning_executor)
