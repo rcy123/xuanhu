@@ -83,7 +83,6 @@ def test_intake_output_dimension_slots_optional() -> None:
 
 
 def test_derive_dimension_slots_from_verified_observations() -> None:
-    """2b: 代码从已验证 observations 派生粗槽位(决策 12 改容器不改判定)。"""
     from datetime import UTC, datetime
     from uuid import uuid4
 
@@ -141,3 +140,214 @@ def test_derive_dimension_slots_from_verified_observations() -> None:
     sleep = by_dim["ten_questions.sleep"]
     assert sleep["completeness"] == "partial"
     assert sleep["missing_slots"]
+
+
+def test_slot_based_covered_requires_slot_completeness() -> None:
+    """2c: 灰度开启后 covered 认「粗槽位齐」——修复问题 6「一键即过」。
+
+    - slot_based=False(默认/现状): 寒热任一键命中即 covered(一键即过)。
+    - slot_based=True: 寒热需 keyset 内 2 项(怕冷+发热)才 covered;1 项不齐。
+    - 无阈值维度(如睡眠,阈值 1)两个口径一致。
+    """
+    from app.agent_runtime.completeness_policy import evaluate_completeness_policy
+    from app.schemas.completeness import (
+        CompletenessDomainSnapshot,
+        CompletenessObservationFact,
+        CompletenessPolicyInput,
+        CompletenessProgress,
+        CompletenessSafetyProfile,
+    )
+    from app.schemas.domain import GateDecision, GateResultSchema
+    from app.schemas.triage import TriageGateDetails, TriageGateResult
+
+    from uuid import UUID, uuid4
+
+    session_id = uuid4()
+
+    def run(slot_based: bool, *, with_fever: bool) -> tuple[bool, bool]:
+        def fact(key: str) -> CompletenessObservationFact:
+            return CompletenessObservationFact(
+                observation_id=uuid4(),
+                session_id=session_id,
+                fact_key=key,
+                value_fingerprint=key,
+                normalized_code=None,
+                status="active",
+            )
+
+        facts = [
+            fact("chief_complaint.symptom"),
+            fact("present_illness.chills"),
+        ]
+        if with_fever:
+            facts.append(fact("present_illness.fever"))
+        triage_gate = TriageGateResult(
+            gate_name="triage",
+            policy_version="triage-red-flag.v1",
+            input_state_version=1,
+            decision=GateDecision.PASSED,
+            details=TriageGateDetails(
+                disposition="continue",
+                candidate_count=0,
+                category_counts=(),
+                rule_ids=(),
+                rules=(),
+                source_message_ids=(),
+                risk_level="none",
+            ),
+        )
+        domain_snapshot = CompletenessDomainSnapshot(
+            session_id=session_id,
+            state_version=1,
+            observations=tuple(facts),
+            safety_profile=None,
+        )
+        result = evaluate_completeness_policy(
+            CompletenessPolicyInput(
+                input_state_version=1,
+                domain_snapshot=domain_snapshot,
+                triage_gate=triage_gate,
+                progress=CompletenessProgress(),
+                slot_based=slot_based,
+            )
+        )
+        return (
+            InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions,
+            InquiryDimension.TEN_SLEEP in result.covered_dimensions,
+        )
+
+    # 现状口径(灰度关闭): 单条 chills 即 covered(一键即过)。
+    cold_heat, _ = run(slot_based=False, with_fever=False)
+    assert cold_heat is True
+    # 槽位口径(灰度开启): 单条 chills 不齐(阈值 2)→ 不 covered。
+    cold_heat, _ = run(slot_based=True, with_fever=False)
+    assert cold_heat is False
+    # 槽位口径: chills + fever 两项齐 → covered。
+    cold_heat, _ = run(slot_based=True, with_fever=True)
+    assert cold_heat is True
+    # 无阈值维度(睡眠阈值 1)两个口径一致: 无事实均不 covered。
+    _, sleep = run(slot_based=True, with_fever=False)
+    assert sleep is False
+
+    # 整维 canonical 键(ten_questions.cold_heat)命中 → 视为齐(模型合键输出,
+    # 如"怕冷有一点点,不发烧,也没有出汗"合成一条),避免粗槽位数键漏判。
+    facts = [
+        CompletenessObservationFact(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="ten_questions.cold_heat",
+            value_fingerprint="ten_questions.cold_heat",
+            normalized_code=None,
+            status="active",
+        )
+    ]
+    result = evaluate_completeness_policy(
+        CompletenessPolicyInput(
+            input_state_version=1,
+            domain_snapshot=CompletenessDomainSnapshot(
+                session_id=session_id,
+                state_version=1,
+                observations=tuple(facts),
+                safety_profile=None,
+            ),
+            triage_gate=TriageGateResult(
+                gate_name="triage",
+                policy_version="triage-red-flag.v1",
+                input_state_version=1,
+                decision=GateDecision.PASSED,
+                details=TriageGateDetails(
+                    disposition="continue",
+                    candidate_count=0,
+                    category_counts=(),
+                    rule_ids=(),
+                    rules=(),
+                    source_message_ids=(),
+                    risk_level="none",
+                ),
+            ),
+            progress=CompletenessProgress(),
+            slot_based=True,
+        )
+    )
+    assert InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions
+
+
+def test_stagnation_cap_partial_vs_manual_handoff() -> None:
+    """2d(决策 11): cap 到分流——缺非安全维度 → PARTIAL 推进;缺安全项 → STAGNATED 转人工。"""
+    from app.agent_runtime.completeness_policy import evaluate_completeness_policy
+    from app.schemas.completeness import (
+        CompletenessDomainSnapshot,
+        CompletenessObservationFact,
+        CompletenessPolicyInput,
+        CompletenessProgress,
+        CompletenessSafetyProfile,
+    )
+    from app.schemas.domain import GateDecision, GateResultSchema
+    from app.schemas.triage import TriageGateDetails, TriageGateResult
+    from uuid import UUID, uuid4
+
+    session_id = uuid4()
+
+    def run(*keys: str, no_new_facts_rounds: int, safety_complete: bool = True) -> str:
+        def fact(key: str) -> CompletenessObservationFact:
+            return CompletenessObservationFact(
+                observation_id=uuid4(),
+                session_id=session_id,
+                fact_key=key,
+                value_fingerprint=key,
+                normalized_code="male" if key == "patient.sex" else None,
+                status="active",
+            )
+
+        safety_profile = (
+            CompletenessSafetyProfile(
+                session_id=session_id,
+                allergy_collection_status="explicitly_none",
+                medications_collection_status="explicitly_none",
+                major_conditions_collection_status="explicitly_none",
+            )
+            if safety_complete
+            else None
+        )
+
+        triage_gate = TriageGateResult(
+            gate_name="triage",
+            policy_version="triage-red-flag.v1",
+            input_state_version=1,
+            decision=GateDecision.PASSED,
+            details=TriageGateDetails(
+                disposition="continue",
+                candidate_count=0,
+                category_counts=(),
+                rule_ids=(),
+                rules=(),
+                source_message_ids=(),
+                risk_level="none",
+            ),
+        )
+        result = evaluate_completeness_policy(
+            CompletenessPolicyInput(
+                input_state_version=1,
+                domain_snapshot=CompletenessDomainSnapshot(
+                    session_id=session_id,
+                    state_version=1,
+                    observations=tuple(fact(key) for key in keys),
+                    safety_profile=safety_profile,
+                ),
+                triage_gate=triage_gate,
+                progress=CompletenessProgress(no_new_facts_rounds=no_new_facts_rounds),
+            )
+        )
+        return result.disposition.value
+
+    # cap 到(no_new_facts_rounds≥2)且缺非安全维度(寒热未采)→ PARTIAL 推进。
+    # (male 性别使妊娠/哺乳不适用,安全三项已齐,missing 只剩非安全维度)
+    assert run("chief_complaint.symptom", "patient.sex", no_new_facts_rounds=2) == "partial"
+    # cap 到且安全项(过敏)缺失 → STAGNATED 转人工(铁律 9)。
+    assert (
+        run("chief_complaint.symptom", "present_illness.chills", "present_illness.fever",
+            "patient.sex", no_new_facts_rounds=2, safety_complete=False)
+        == "stagnated"
+    )
+    # 未到 cap → 正常 INCOMPLETE 继续追问。
+    assert run("chief_complaint.symptom", "patient.sex", no_new_facts_rounds=0) == "incomplete"

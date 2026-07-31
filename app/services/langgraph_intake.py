@@ -156,6 +156,8 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
         "MODEL_OUTPUT_TRUNCATED",
         "INTAKE_GROUNDING_SPAN_INVALID",
         "INTAKE_GROUNDING_VALUE_MISMATCH",
+        # 模型 decision=extracted 但候选为空(重复提取被拒/合键遗漏)属输出质量问题。
+        "INTAKE_DECISION_CONTENT_MISMATCH",
         # 0d-2：composer 模型失败（自由措辞生成失败）同属随机失败，
         # 可重试重放；模板兜底仍由 compose_question 内部先承担（degraded 留痕）。
         "QUESTION_MODEL_OUTPUT_INVALID",
@@ -1760,10 +1762,14 @@ def _merge_category_into_delta(
     merged_sources = delta.source_message_ids
     if category_obs.source_message_id not in merged_sources:
         merged_sources = merged_sources + (category_obs.source_message_id,)
+    # 2c 修复: 分类合并给空 delta 补上 observations 后,必须清掉 intake_noop artifact
+    # (reducer 禁止事实与工件混合变更 MIXED_FACT_AND_ARTIFACT_CHANGE——
+    # 空提取时 _intake_output_to_delta 产 noop artifact,合并 category 后 facts 非空)。
     new_delta = delta.model_copy(
         update={
             "observations": delta.observations + (category_obs,),
             "source_message_ids": merged_sources,
+            "artifact_revisions": () if not delta.observations else delta.artifact_revisions,
         }
     )
     new_context = _verification_context(
@@ -1893,6 +1899,8 @@ async def _compute_intake_from_claim(
             domain_snapshot=_completeness_snapshot(next_state),
             triage_gate=triage_result.gate_result,
             progress=progress,
+            # 2c 灰度: 槽位口径 covered 判定由 settings 开关驱动(默认关闭=现状认键)。
+            slot_based=get_settings().intake_slot_path_enabled,
         )
     )
     return _IntakeComputation(
@@ -2189,6 +2197,10 @@ def _gate_refs(*gates: GateResultSchema) -> list[dict[str, Any]]:
 
 def _route_for_disposition(disposition: CompletenessDisposition) -> str:
     if disposition is CompletenessDisposition.READY:
+        return INTAKE_ROUTE_READY
+    # 2d(决策 11 A 为主): PARTIAL 与 READY 同路由推进(带 partial 标记随 dossier 走,
+    # 下游辨证降置信不跳过);安全项 cap 到仍走 STAGNATED → MANUAL。
+    if disposition is CompletenessDisposition.PARTIAL:
         return INTAKE_ROUTE_READY
     if disposition is CompletenessDisposition.INCOMPLETE:
         return INTAKE_ROUTE_INCOMPLETE
@@ -2966,6 +2978,8 @@ def _session_updates(
     if disposition is CompletenessDisposition.READY or disposition in {
         CompletenessDisposition.INCOMPLETE,
         CompletenessDisposition.CONFLICT,
+        # 2d(决策 11): PARTIAL 落库推进,不阻断(partial 缺口随快照走)。
+        CompletenessDisposition.PARTIAL,
     }:
         current_stage = "inquiry"
         status = "active"
@@ -3022,6 +3036,12 @@ def _session_updates(
             "progress": progress.model_dump(mode="json"),
             "dialogue_status": dialogue_status,
             "pending_safety_dimensions": [item.value for item in pending_safety_dimensions],
+            # 2d(决策 11): PARTIAL 落库推进时带缺口列表,下游辨证降置信不跳过。
+            "partial_dimensions": (
+                sorted(missing_required)
+                if disposition is CompletenessDisposition.PARTIAL
+                else None
+            ),
             "trace_id": trace_id,
         },
     }

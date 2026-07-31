@@ -82,6 +82,9 @@ class CompletenessDisposition(StrEnum):
     CONFLICT = "conflict"
     STAGNATED = "stagnated"
     TRIAGE_BLOCKED = "triage_blocked"
+    # 2d(决策 11 A 为主): 追问 cap 到且缺的是非安全维度 → 强行落 partial 并推进
+    # (带缺口列表),下游辨证降置信不跳过;安全项 cap 到仍走 STAGNATED 转人工(B 兜底)。
+    PARTIAL = "partial"
 
 
 class ApplicabilityStatus(StrEnum):
@@ -192,6 +195,11 @@ class CompletenessPolicyInput(BaseModel):
     domain_snapshot: CompletenessDomainSnapshot
     triage_gate: TriageGateResult
     progress: CompletenessProgress = Field(default_factory=CompletenessProgress)
+    # 2c: 槽位口径灰度开关——开启后 covered 判定认「粗槽位齐」(keyset 内已采键数
+    # ≥ 阈值,单一真源 MATURITY_KEY_THRESHOLDS),关闭维持「任一 keyset 键命中即
+    # covered」(现状)。安全维度不走槽位(仍认 collection_status)。
+    # 由调用方按 settings.intake_slot_path_enabled 传入,纯函数不读全局。
+    slot_based: bool = False
 
     @model_validator(mode="after")
     def state_version_matches_snapshot(self) -> CompletenessPolicyInput:
@@ -228,6 +236,8 @@ class CompletenessStagnationResult(_CompletenessModel):
     no_new_facts_rounds: int = Field(ge=0)
     followup_rounds: int = Field(ge=0)
     reason_codes: tuple[StagnationReasonCode, ...] = Field(default=())
+    # 2d(决策 11): cap 到且缺的是非安全维度 → 落 partial 推进;安全项仍转人工。
+    partial_required: bool = Field(default=False)
 
 
 class CompletenessApplicabilityResult(_CompletenessModel):
@@ -285,6 +295,8 @@ class CompletenessPolicyResult(_CompletenessModel):
             CompletenessDisposition.CONFLICT: GateDecision.FAILED,
             CompletenessDisposition.STAGNATED: GateDecision.BLOCKED,
             CompletenessDisposition.TRIAGE_BLOCKED: GateDecision.BLOCKED,
+            # 2d(决策 11): PARTIAL 与 READY 同权——落库推进(带缺口),不阻断。
+            CompletenessDisposition.PARTIAL: GateDecision.PASSED,
         }
         if self.gate_result.decision is not decision_by_disposition[self.disposition]:
             raise ValueError("completeness gate decision does not match disposition")

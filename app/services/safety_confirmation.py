@@ -18,6 +18,7 @@ from app.agent_runtime.completeness_policy import (
     evaluate_completeness_policy,
 )
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
+from app.core.config import get_settings
 from app.agent_runtime.repository import SafetyFactAssertionSpec, SafetyFactEvidenceSpec
 from app.agent_runtime.triage_policy import evaluate_triage_policy, to_gate_result_schema
 from app.agents.question_composer import compose_question
@@ -727,6 +728,8 @@ class SafetyConfirmationService:
                 domain_snapshot=domain_snapshot,
                 triage_gate=triage_result.gate_result,
                 progress=progress,
+                # 2c 灰度: 槽位口径与主路径一致。
+                slot_based=get_settings().intake_slot_path_enabled,
             )
         )
         pending_dimensions = await self._pending_safety_dimensions(session.id)

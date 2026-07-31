@@ -413,6 +413,8 @@ def _completeness_result_is_internally_consistent(result: CompletenessPolicyResu
         (CompletenessDisposition.CONFLICT, GateDecision.FAILED),
         (CompletenessDisposition.STAGNATED, GateDecision.BLOCKED),
         (CompletenessDisposition.TRIAGE_BLOCKED, GateDecision.BLOCKED),
+        # 2d(决策 11): PARTIAL 与 READY 同权(落库推进不阻断)。
+        (CompletenessDisposition.PARTIAL, GateDecision.PASSED),
     )
     return any(
         result.disposition is disposition and result.gate_result.decision is decision

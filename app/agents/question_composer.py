@@ -579,6 +579,9 @@ async def _model_result(
         if exc.code in {
             RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID,
             RuntimeErrorCode.OUTPUT_SCHEMA_INVALID,
+            # 0d-1: max_tokens 截断属模型输出问题(可重试),归 MODEL_OUTPUT_INVALID
+            # 走模板兜底,而非误判 RUNTIME_CONTRACT_MISMATCH。
+            RuntimeErrorCode.MODEL_OUTPUT_TRUNCATED,
         }:
             return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
         return _failed(QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH)

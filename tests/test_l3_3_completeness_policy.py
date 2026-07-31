@@ -596,8 +596,9 @@ def test_no_new_facts_at_threshold_is_stagnated_and_blocked() -> None:
         )
     )
 
-    assert result.disposition is CompletenessDisposition.STAGNATED
-    assert result.gate_result.decision is GateDecision.BLOCKED
+    assert result.disposition is CompletenessDisposition.PARTIAL
+    assert result.gate_result.decision is GateDecision.PASSED
+    assert result.stagnation.partial_required is True
     assert result.stagnation.reason_codes == (StagnationReasonCode.NO_NEW_FACTS_THRESHOLD,)
 
 
@@ -616,7 +617,9 @@ def test_max_followup_rounds_boundary_behavior() -> None:
     )
 
     assert before.disposition is CompletenessDisposition.READY
-    assert at_threshold.disposition is CompletenessDisposition.STAGNATED
+    # 2d(决策 11): cap 到且缺非安全维度 → PARTIAL(落库推进),不再一律 STAGNATED。
+    assert at_threshold.disposition is CompletenessDisposition.PARTIAL
+    assert at_threshold.stagnation.partial_required is True
     assert at_threshold.stagnation.reason_codes == (StagnationReasonCode.MAX_FOLLOWUP_ROUNDS,)
 
 

@@ -23,6 +23,7 @@ from app.agent_runtime.completeness_policy import (
     evaluate_completeness_policy,
 )
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
+from app.core.config import get_settings
 from app.agent_runtime.triage_policy import to_gate_result_schema
 from app.agents.question_composer import compose_question
 from app.models.audit import AuditEvent
@@ -135,6 +136,8 @@ async def create_initial_intake_question(
             domain_snapshot=_domain_snapshot(session, seed),
             triage_gate=triage_result.gate_result,
             progress=progress,
+            # 2c 灰度: 槽位口径与主路径一致(默认关闭=现状认键)。
+            slot_based=get_settings().intake_slot_path_enabled,
         )
     )
     # 1b: 首问主诉驱动——传 run_spec 开模型调用(生成贴合主诉的首问),

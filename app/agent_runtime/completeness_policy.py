@@ -28,7 +28,11 @@ from app.schemas.completeness import (
     InquiryDimension,
     StagnationReasonCode,
 )
-from app.agent_runtime.intake_dimension_mapping import derived_coverage_for_fact_keys
+from app.agent_runtime.intake_dimension_mapping import (
+    derived_coverage_for_fact_keys,
+    dimension_acquired_key_count,
+    slot_threshold_for,
+)
 from app.schemas.domain import CollectionStatus, GateDecision, GateResultSchema, ObservationStatus
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION, TriageDisposition
 
@@ -380,7 +384,9 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
     required = _required_dimensions(policy_input, facts_by_dimension, current_facts, applicability)
     missing_required = tuple(sorted((dim for dim in required if dim not in covered), key=lambda item: item.value))
     missing_optional = _missing_optional_dimensions(covered)
-    stagnation = _stagnation(policy_input.progress)
+    # 2d(决策 11): cap 到分流——缺安全维度 → 转人工(铁律 9),否则落 partial 推进。
+    safety_missing = any(_is_safety_dimension(dim) for dim in missing_required)
+    stagnation = _stagnation(policy_input.progress, safety_missing=safety_missing)
     rule_outcomes = _rule_outcomes(required, covered, conflicts)
     disposition = _disposition(policy_input, stagnation, conflicts, missing_required)
     decision = _decision_for_disposition(disposition)
@@ -543,24 +549,56 @@ def _conflict_dimension_for_fact_key(fact_key: str) -> InquiryDimension | None:
     return None
 
 
+# 2d(决策 11): 安全三项 + 妊娠/哺乳——cap 到仍转人工(铁律 9),不进 partial 推进。
+_SAFETY_DIMENSIONS = frozenset(
+    {
+        InquiryDimension.ALLERGY_STATUS,
+        InquiryDimension.PREGNANCY_STATUS,
+        InquiryDimension.LACTATION_STATUS,
+        InquiryDimension.MEDICATION_STATUS,
+        InquiryDimension.MAJOR_CONDITION_STATUS,
+    }
+)
+
+
+def _is_safety_dimension(dimension: InquiryDimension) -> bool:
+    return dimension in _SAFETY_DIMENSIONS
+
+
 def _covered_dimensions(
     current_facts: tuple[CompletenessObservationFact, ...],
     facts_by_dimension: tuple[tuple[InquiryDimension, tuple[CompletenessObservationFact, ...]], ...],
     policy_input: CompletenessPolicyInput,
 ) -> tuple[InquiryDimension, ...]:
-    covered = {dimension for dimension, facts in facts_by_dimension if facts}
-    # 维度覆盖键桥（D1 厚真源）：抽取层对同一临床语义会产出多种 fact_key（如寒热落
-    # present_illness.chills/fever、现病落 present_illness.cough/symptom.* 等），而 canonical
-    # ``COMPLETENESS_DIMENSION_RULES[dimension].fact_keys`` 只认窄键集。键不命中 → 维度永远
-    # missing → gap_selector 永远选同一维度 → 命中写死模板 → 问诊死循环（trigger session
-    # 63e78741 寒热、d8ba36ae 现病变化）。
-    # 此处用 ``DIMENSION_KEYSETS`` 真源对当前 active 事实做覆盖派生：任一 keyset 键命中即该
-    # 维度 covered。仅对已 active（非 retracted/corrected-out）事实做派生；安全维度不参与
-    # （仍走下方 safety 分支）。覆盖 ≠ 成熟：覆盖派生只解"答到没"，B maturity 在 D2 闸门再判
-    # "答得够不够（关键键齐全）"，两层分离防放水。
     active_fact_keys = frozenset(item.fact_key for item in current_facts)
-    for dimension in derived_coverage_for_fact_keys(active_fact_keys):
-        covered.add(dimension)
+    if policy_input.slot_based:
+        # 2c 槽位口径(灰度): covered 认「粗槽位齐」——两种满足方式:
+        # ① canonical 整维键命中(如 ten_questions.cold_heat 是模型对寒热的整维回答,
+        #    含多语义,按现状「任一命中即 covered」判定,避免合键漏判);
+        # ② 无整维键时,keyset 内细分键(如 present_illness.chills/fever)已采数 ≥ 阈值
+        #    (单一真源 MATURITY_KEY_THRESHOLDS,无阈值默认 1)。
+        # 修复问题 6「一键即过」:细分键只采 1 项(如只有怕冷)不再 covered,
+        # 需怕冷+发热两语义项齐才算;同时不误伤模型合键输出的整维回答。
+        covered = set()
+        for dimension in COMPLETENESS_DIMENSION_RULES:
+            canonical_keys = COMPLETENESS_DIMENSION_RULES[dimension].fact_keys
+            if any(key in active_fact_keys for key in canonical_keys):
+                covered.add(dimension)
+            elif dimension_acquired_key_count(dimension, active_fact_keys) >= slot_threshold_for(dimension):
+                covered.add(dimension)
+    else:
+        covered = {dimension for dimension, facts in facts_by_dimension if facts}
+        # 维度覆盖键桥（D1 厚真源）：抽取层对同一临床语义会产出多种 fact_key（如寒热落
+        # present_illness.chills/fever、现病落 present_illness.cough/symptom.* 等），而 canonical
+        # ``COMPLETENESS_DIMENSION_RULES[dimension].fact_keys`` 只认窄键集。键不命中 → 维度永远
+        # missing → gap_selector 永远选同一维度 → 命中写死模板 → 问诊死循环（trigger session
+        # 63e78741 寒热、d8ba36ae 现病变化）。
+        # 此处用 ``DIMENSION_KEYSETS`` 真源对当前 active 事实做覆盖派生：任一 keyset 键命中即该
+        # 维度 covered。仅对已 active（非 retracted/corrected-out）事实做派生；安全维度不参与
+        # （仍走下方 safety 分支）。覆盖 ≠ 成熟：覆盖派生只解"答到没"，B maturity 在 D2 闸门再判
+        # "答得够不够（关键键齐全）"，两层分离防放水。
+        for dimension in derived_coverage_for_fact_keys(active_fact_keys):
+            covered.add(dimension)
     safety = policy_input.domain_snapshot.safety_profile
     if safety is not None:
         if _collection_complete(safety.allergy_collection_status):
@@ -647,16 +685,25 @@ def _missing_optional_dimensions(covered: tuple[InquiryDimension, ...]) -> tuple
     )
 
 
-def _stagnation(progress: CompletenessProgress) -> CompletenessStagnationResult:
+def _stagnation(
+    progress: CompletenessProgress,
+    *,
+    safety_missing: bool = False,
+) -> CompletenessStagnationResult:
     reasons: list[StagnationReasonCode] = []
     if progress.no_new_facts_rounds >= COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold:
         reasons.append(StagnationReasonCode.NO_NEW_FACTS_THRESHOLD)
     if progress.followup_rounds >= COMPLETENESS_POLICY_CONFIG.max_followup_rounds:
         reasons.append(StagnationReasonCode.MAX_FOLLOWUP_ROUNDS)
     stagnated = bool(reasons)
+    # 2d(决策 11): cap 到后的分流——缺安全维度 → 转人工(铁律 9);
+    # 缺非安全维度 → 落 partial 推进(A 为主)。
+    manual_handoff_required = stagnated and safety_missing
+    partial_required = stagnated and not safety_missing
     return CompletenessStagnationResult(
         stagnated=stagnated,
-        manual_handoff_required=stagnated,
+        manual_handoff_required=manual_handoff_required,
+        partial_required=partial_required,
         no_new_facts_rounds=progress.no_new_facts_rounds,
         followup_rounds=progress.followup_rounds,
         reason_codes=tuple(reasons),
@@ -696,6 +743,12 @@ def _disposition(
     if not _triage_allows_ready(policy_input):
         return CompletenessDisposition.TRIAGE_BLOCKED
     if stagnation.stagnated:
+        # 2d(决策 11): 安全项 cap 到 → STAGNATED 转人工(B 兜底);
+        # 非安全缺口 cap 到 → PARTIAL 落库推进(A 为主)。
+        if stagnation.manual_handoff_required:
+            return CompletenessDisposition.STAGNATED
+        if stagnation.partial_required:
+            return CompletenessDisposition.PARTIAL
         return CompletenessDisposition.STAGNATED
     if conflicts:
         return CompletenessDisposition.CONFLICT
@@ -706,6 +759,9 @@ def _disposition(
 
 def _decision_for_disposition(disposition: CompletenessDisposition) -> GateDecision:
     if disposition is CompletenessDisposition.READY:
+        return GateDecision.PASSED
+    # 2d(决策 11): PARTIAL 落库推进不阻断(与 READY 同权)。
+    if disposition is CompletenessDisposition.PARTIAL:
         return GateDecision.PASSED
     if disposition in {CompletenessDisposition.INCOMPLETE, CompletenessDisposition.CONFLICT}:
         return GateDecision.FAILED
