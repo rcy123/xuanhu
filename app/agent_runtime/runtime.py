@@ -23,7 +23,10 @@ from app.core.exceptions import (
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient, StructuredChatResponse
 
-from .context import contains_model_input_identity_sequence
+from .context import (
+    ContextBuilderError,
+    project_model_input_identity_sequences,
+)
 from .intake_verifier import INTAKE_AGENT_NAME
 from .specs import (
     AgentSpec,
@@ -422,24 +425,9 @@ class AgentRuntime:
 
     async def _call_gateway(self, agent_spec: AgentSpec, run_spec: RunSpec, messages: list[dict[str, Any]]) -> Any:
         if agent_spec.name == INTAKE_AGENT_NAME:
-            rejected = False
-            contents: list[str] = []
-            try:
-                for message in messages:
-                    if not isinstance(message, Mapping):
-                        raise TypeError
-                    content = message["content"]
-                    if not isinstance(content, str):
-                        raise TypeError
-                    contents.append(content)
-                rejected = contains_model_input_identity_sequence(tuple(contents))
-            except Exception:
-                rejected = True
-            if rejected:
-                raise RuntimeErrorBase(
-                    RuntimeErrorCode.MODEL_INPUT_PRIVACY_VIOLATION,
-                    "model input privacy guard rejected request",
-                ) from None
+            messages, incident = await self._apply_intake_privacy_mask(messages)
+            if incident is not None:
+                self._log_guard_incident(run_spec, incident)
 
         kwargs: dict[str, Any] = {
             "model": agent_spec.model_policy.model,
@@ -458,6 +446,62 @@ class AgentRuntime:
         if self._accepts_max_requests(method):
             kwargs["max_requests"] = 1
         return await method(messages, agent_spec.output_schema, **kwargs)
+
+    @staticmethod
+    async def _apply_intake_privacy_mask(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """对 intake 输入做软遮罩：命中身份序列即等长遮成 █ 后放行，永不阻塞。
+
+        返回 (遮罩后的 messages, incident)；incident 非 None 表示发生了需要留痕的
+        事件（命中遮罩 / 输入畸形 / scanner 内部错误），None 表示无状可记。
+        guard 失败一律放行原 messages，绝不 raise。
+        """
+        contents: list[str] = []
+        try:
+            for message in messages:
+                if not isinstance(message, Mapping):
+                    raise TypeError("intake message is not a mapping")
+                content = message["content"]
+                if not isinstance(content, str):
+                    raise TypeError("intake message content is not a string")
+                contents.append(content)
+        except Exception as exc:
+            # 输入畸形：留痕后放行原 messages（网关侧 prompt 已把不可信数据降为
+            # user 层，模型按 untrusted data 处理，不会注入）。
+            return messages, {"tag": "input_shape_invalid", "reason": type(exc).__name__}
+        try:
+            projected = project_model_input_identity_sequences(tuple(contents))
+        except ContextBuilderError as exc:
+            # guard 内部崩溃：留痕（带原始异常类型/消息，不含 PII 原文）后放行。
+            return messages, {
+                "tag": "scanner_internal_error",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        if projected == tuple(contents):
+            return messages, None  # 无命中，原样放行
+        masked = [{**message, "content": projected[index]} for index, message in enumerate(messages)]
+        return masked, {"tag": "masked_identity_sequence"}
+
+    def _log_guard_incident(self, run_spec: RunSpec, incident: dict[str, Any]) -> None:
+        """留痕 guard 事件，只记 tag/reason，绝不含 PII 原文。
+
+        将事件挂到 run_spec 的 side channel，供 intake 服务层在 claim
+        intermediate_payload 落库（见 langgraph_intake 改动3）。此处不直接 IO，
+        避免 guard 路径依赖运行时 async recorder 而引入新的阻塞点。
+        """
+        # tag/reason 均为不含 PII 的元数据（type 名、异常类型名、原因字符串中
+        # 不含原 message 内容）。
+        store = getattr(run_spec, "_intake_privacy_guard_incidents", None)
+        if store is None:
+            store = []
+            # RunSpec 是 frozen pydantic 模型，不能setattr；用对象私有属性侧挂。
+            try:
+                object.__setattr__(run_spec, "_intake_privacy_guard_incidents", store)
+            except (AttributeError, TypeError):
+                # frozen / __slots__ 不允许侧挂；降级为 best-effort 静默
+                return
+        store.append({"run_id": str(run_spec.run_id), **incident})
 
     @staticmethod
     def _accepts_max_requests(method: Any) -> bool:

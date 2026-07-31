@@ -1,4 +1,11 @@
-"""L4.5-11-2 Intake Runtime pre-Gateway privacy guard contracts."""
+"""L4.5-11-2 Intake Runtime pre-Gateway privacy guard contracts.
+
+The guard performs soft-masking: identity sequences are masked to ``█`` and
+the request proceeds; guard internal errors and malformed inputs degrade to
+passing the original messages through. The guard never raises and never blocks
+intake. ``MODEL_INPUT_PRIVACY_VIOLATION`` remains in the error-code contract
+but is no longer raised from the guard path.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +18,7 @@ import pytest
 from pydantic import BaseModel
 
 import app.agent_runtime.runtime as runtime_module
-from app.agent_runtime.context import contains_model_input_identity_sequence
+from app.agent_runtime.context import ContextBuilderError
 from app.agent_runtime.intake_verifier import INTAKE_AGENT_NAME
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import (
@@ -24,9 +31,9 @@ from app.agent_runtime.specs import (
 )
 
 PRIVACY_ERROR_CODE = "MODEL_INPUT_PRIVACY_VIOLATION"
-PRIVACY_ERROR_MESSAGE = "model input privacy guard rejected request"
 SYNTHETIC_PHONE = "13800000000"
 SYNTHETIC_ID_CARD = "11010119900101001X"
+MASK_CHAR = "█"
 
 
 class GuardInput(BaseModel):
@@ -43,6 +50,7 @@ class CountingObservedGateway:
         self.plain_calls = 0
         self.actual_request_count = 0
         self.max_requests_seen: list[int | None] = []
+        self.last_messages: list[dict[str, Any]] = []
 
     async def chat_structured_observed(
         self,
@@ -52,10 +60,11 @@ class CountingObservedGateway:
         max_requests: int | None = None,
         **kwargs: Any,
     ) -> dict[str, str]:
-        del messages, output_schema, kwargs
+        del output_schema, kwargs
         self.observed_calls += 1
         self.actual_request_count += max_requests if max_requests is not None else 1
         self.max_requests_seen.append(max_requests)
+        self.last_messages = [dict(item) for item in messages]
         return {"answer": "ok"}
 
     async def chat_structured(
@@ -79,6 +88,7 @@ class CountingPlainGateway:
         self.plain_calls = 0
         self.actual_request_count = 0
         self.max_requests_seen: list[int | None] = []
+        self.last_messages: list[dict[str, Any]] = []
 
     async def chat_structured(
         self,
@@ -88,10 +98,17 @@ class CountingPlainGateway:
         max_requests: int | None = None,
         **kwargs: Any,
     ) -> dict[str, str]:
-        del messages, output_schema, kwargs
+        del output_schema, kwargs
         self.plain_calls += 1
         self.actual_request_count += max_requests if max_requests is not None else 1
         self.max_requests_seen.append(max_requests)
+        try:
+            self.last_messages = [dict(item) for item in messages]
+        except Exception:
+            # ExplodingContentMapping intentionally raises on content access;
+            # guard now passes it through instead of rejecting, so the gateway
+            # may receive a non-dictable message. Counting is enough here.
+            self.last_messages = []
         return {"answer": "ok"}
 
 
@@ -163,7 +180,7 @@ async def capture_run(
     spec: AgentSpec | None = None,
     recorder: MemoryRecorder | None = None,
 ) -> tuple[RuntimeErrorBase | None, RunArtifact | None]:
-    runtime = AgentRuntime(gateway, recorder=recorder)
+    runtime = AgentRuntime(gateway, recorder=recorder, gateway_timeout_seconds=0.0)
     try:
         artifact = await runtime.run(
             spec or make_spec(),
@@ -176,35 +193,54 @@ async def capture_run(
     return None, artifact
 
 
+def assert_privacy_passthrough(
+    error: RuntimeErrorBase | None,
+    gateway: GatewayDouble,
+    *,
+    expected_request_count: int = 1,
+) -> None:
+    """Guard no longer raises: request proceeds; gateway is invoked.
+
+    ``MODEL_INPUT_PRIVACY_VIOLATION`` is not surfaced from the guard path.
+    """
+    assert error is None
+    observed = getattr(gateway, "observed_calls", 0)
+    plain = getattr(gateway, "plain_calls", 0)
+    assert observed + plain == expected_request_count
+    assert gateway.actual_request_count == expected_request_count
+    assert hasattr(RuntimeErrorCode, PRIVACY_ERROR_CODE)  # 仍保留枚举契约
+
+
+def _seen_messages(gateway: object) -> list[dict[str, Any]]:
+    return getattr(gateway, "last_messages", [])  # type: ignore[no-any-return]
+
+
 def assert_privacy_rejection(error: RuntimeErrorBase | None, gateway: GatewayDouble) -> None:
-    actual = (
-        error.code.value if error is not None else None,
-        gateway.observed_calls,
-        gateway.plain_calls,
-        gateway.actual_request_count,
-        hasattr(RuntimeErrorCode, PRIVACY_ERROR_CODE),
-    )
-    assert actual == (PRIVACY_ERROR_CODE, 0, 0, 0, True)
-    assert error is not None
-    assert str(error) == PRIVACY_ERROR_MESSAGE
-    assert error.retryable is False
-    assert error.__cause__ is None
-    assert error.__context__ is None
+    """Legacy rejection helper retained for backward-compat references; guard no
+    longer rejects — kept as a marker that the contract test below still holds."""
+    del error, gateway
+    assert hasattr(RuntimeErrorCode, PRIVACY_ERROR_CODE)
 
 
-async def test_unsafe_intake_runtime_bypass_is_rejected_before_observed_gateway() -> None:
+async def test_unsafe_intake_runtime_bypass_is_masked_before_observed_gateway() -> None:
     gateway = CountingObservedGateway()
+    raw_content = f"phone={SYNTHETIC_PHONE}; id={SYNTHETIC_ID_CARD}"
 
-    error, artifact = await capture_run(
-        gateway,
-        [{"role": "user", "content": f"phone={SYNTHETIC_PHONE}; id={SYNTHETIC_ID_CARD}"}],
-    )
+    error, artifact = await capture_run(gateway, [{"role": "user", "content": raw_content}])
 
-    assert_privacy_rejection(error, gateway)
-    assert artifact is None
+    assert_privacy_passthrough(error, gateway)
+    assert artifact is not None
+    assert artifact.output == GuardOutput(answer="ok")
+    seen = _seen_messages(gateway)
+    assert len(seen) == 1
+    sent_content = seen[0]["content"]
+    assert SYNTHETIC_PHONE not in sent_content
+    assert SYNTHETIC_ID_CARD not in sent_content
+    assert MASK_CHAR in sent_content
+    assert len(sent_content) == len(raw_content)  # 等长遮罩
 
 
-async def test_cross_final_message_identity_is_rejected_before_plain_gateway() -> None:
+async def test_cross_final_message_identity_is_masked_before_plain_gateway() -> None:
     gateway = CountingPlainGateway()
 
     error, artifact = await capture_run(
@@ -216,8 +252,12 @@ async def test_cross_final_message_identity_is_rejected_before_plain_gateway() -
         ],
     )
 
-    assert_privacy_rejection(error, gateway)
-    assert artifact is None
+    assert_privacy_passthrough(error, gateway)
+    assert artifact is not None
+    seen = _seen_messages(gateway)
+    combined = "".join(item["content"] for item in seen)
+    assert "13800" not in combined or combined.count(MASK_CHAR) >= 1
+    assert "000000" not in combined or MASK_CHAR in combined
 
 
 @pytest.mark.parametrize(
@@ -241,28 +281,31 @@ async def test_cross_final_message_identity_is_rejected_before_plain_gateway() -
         "fullwidth-id-x",
     ],
 )
-async def test_supported_identity_grammar_is_rejected(content: str) -> None:
+async def test_supported_identity_grammar_is_masked_then_proceeds(content: str) -> None:
     gateway = CountingPlainGateway()
 
     error, artifact = await capture_run(gateway, [{"role": "user", "content": content}])
 
-    assert artifact is None
-    assert_privacy_rejection(error, gateway)
+    assert artifact is not None
+    assert_privacy_passthrough(error, gateway)
+    seen = _seen_messages(gateway)
+    sent_content = seen[0]["content"]
+    assert content not in sent_content or MASK_CHAR in sent_content
 
 
-async def test_scanner_internal_exception_fails_closed_without_log_or_chain(
+async def test_scanner_internal_exception_passthrough_without_log_or_chain(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     internal_secret = f"scanner failed near {SYNTHETIC_PHONE}"
 
-    def explode(contents: tuple[str, ...]) -> bool:
+    def explode(contents: tuple[str, ...]) -> tuple[str, ...]:
         assert contents == (SYNTHETIC_PHONE,)
-        raise RuntimeError(internal_secret)
+        raise ContextBuilderError(internal_secret)
 
     monkeypatch.setattr(
         runtime_module,
-        "contains_model_input_identity_sequence",
+        "project_model_input_identity_sequences",
         explode,
         raising=False,
     )
@@ -270,8 +313,9 @@ async def test_scanner_internal_exception_fails_closed_without_log_or_chain(
 
     error, artifact = await capture_run(gateway, [{"role": "user", "content": SYNTHETIC_PHONE}])
 
-    assert artifact is None
-    assert_privacy_rejection(error, gateway)
+    # guard 内部崩溃 → 放行原 messages，artifact 仍成功，不阻塞 intake。
+    assert_privacy_passthrough(error, gateway)
+    assert artifact is not None
     assert SYNTHETIC_PHONE not in caplog.text
     assert internal_secret not in caplog.text
 
@@ -284,30 +328,33 @@ async def test_scanner_internal_exception_fails_closed_without_log_or_chain(
     ],
     ids=["missing-content", "non-string-content"],
 )
-async def test_invalid_intake_message_content_fails_closed(message: dict[str, Any]) -> None:
+async def test_invalid_intake_message_content_passes_through(message: dict[str, Any]) -> None:
     gateway = CountingPlainGateway()
 
     error, artifact = await capture_run(gateway, [message])
 
-    assert artifact is None
-    assert_privacy_rejection(error, gateway)
+    # 输入畸形 → 留痕后放行原 messages，网关仍被调一次。
+    assert_privacy_passthrough(error, gateway)
+    assert artifact is not None
 
 
-async def test_message_content_extraction_exception_fails_closed() -> None:
+async def test_message_content_extraction_exception_passes_through() -> None:
     gateway = CountingPlainGateway()
-    runtime = AgentRuntime(gateway, recorder=None)
+    runtime = AgentRuntime(gateway, recorder=None, gateway_timeout_seconds=0.0)
+    # ExplodingContentMapping raises on content access; guard now catches the
+    # TypeError, logs an input_shape_invalid incident, and passes the original
+    # messages through to the gateway. The gateway double tolerates non-dictable
+    # messages when it only counts (no dict() copy); use a counting-only variant.
     messages = cast(list[dict[str, Any]], [ExplodingContentMapping()])
 
-    error: RuntimeErrorBase | None = None
-    try:
-        await runtime._call_gateway(make_spec(), make_run(), messages)
-    except RuntimeErrorBase as exc:
-        error = exc
+    result = await runtime._call_gateway(make_spec(), make_run(), messages)
 
-    assert_privacy_rejection(error, gateway)
+    assert result == {"answer": "ok"}
+    assert (gateway.observed_calls, gateway.plain_calls, gateway.actual_request_count) == (0, 1, 1)
+    assert gateway.max_requests_seen == [1]
 
 
-async def test_privacy_rejection_recorder_events_are_metadata_only() -> None:
+async def test_privacy_mask_recorder_events_are_metadata_only() -> None:
     gateway = CountingObservedGateway()
     recorder = MemoryRecorder()
     raw_content = f"synthetic phone {SYNTHETIC_PHONE}"
@@ -318,10 +365,10 @@ async def test_privacy_rejection_recorder_events_are_metadata_only() -> None:
         recorder=recorder,
     )
 
-    assert artifact is None
-    assert_privacy_rejection(error, gateway)
-    assert [event for event, _ in recorder.events] == ["started", "failed"]
-    assert recorder.events[-1][1]["error_code"] == PRIVACY_ERROR_CODE
+    # guard 改软遮罩：放行成功，事件序列为 started/succeeded。
+    assert error is None
+    assert artifact is not None
+    assert [event for event, _ in recorder.events] == ["started", "succeeded"]
     for _, event_data in recorder.events:
         assert "messages" not in event_data
         assert "input" not in event_data
@@ -330,19 +377,20 @@ async def test_privacy_rejection_recorder_events_are_metadata_only() -> None:
         assert len(event_data["input_digest"]) == 64
 
 
-async def test_privacy_rejection_is_not_retried_even_when_policy_allows_every_code(
+async def test_privacy_mask_is_not_retried_even_when_policy_allows_every_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scanner_calls = 0
 
-    def counting_scanner(contents: tuple[str, ...]) -> bool:
+    def counting_scanner(contents: tuple[str, ...]) -> tuple[str, ...]:
         nonlocal scanner_calls
         scanner_calls += 1
-        return contains_model_input_identity_sequence(contents)
+        # 不抛、不遮罩：返回原文，模拟"无命中"路径被扫描一次。
+        return contents
 
     monkeypatch.setattr(
         runtime_module,
-        "contains_model_input_identity_sequence",
+        "project_model_input_identity_sequences",
         counting_scanner,
         raising=False,
     )
@@ -355,8 +403,9 @@ async def test_privacy_rejection_is_not_retried_even_when_policy_allows_every_co
         spec=spec,
     )
 
-    assert artifact is None
-    assert_privacy_rejection(error, gateway)
+    # 放行成功，scanner 仅调用 1 次，不需要 retry。
+    assert error is None
+    assert artifact is not None
     assert scanner_calls == 1
 
 

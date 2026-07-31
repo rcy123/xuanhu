@@ -27,6 +27,7 @@ from app.schemas.completeness import (
     InquiryDimension,
     StagnationReasonCode,
 )
+from app.agent_runtime.intake_dimension_mapping import derived_coverage_for_fact_keys
 from app.schemas.domain import CollectionStatus, GateDecision, GateResultSchema, ObservationStatus
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION, TriageDisposition
 
@@ -373,7 +374,7 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
     current_facts = _current_facts(policy_input.domain_snapshot.observations)
     facts_by_dimension = _facts_by_dimension(current_facts)
     conflicts = _conflicts_by_dimension(current_facts)
-    covered = _covered_dimensions(facts_by_dimension, policy_input)
+    covered = _covered_dimensions(current_facts, facts_by_dimension, policy_input)
     applicability = _applicability(facts_by_dimension)
     required = _required_dimensions(policy_input, facts_by_dimension, current_facts, applicability)
     missing_required = tuple(sorted((dim for dim in required if dim not in covered), key=lambda item: item.value))
@@ -542,10 +543,23 @@ def _conflict_dimension_for_fact_key(fact_key: str) -> InquiryDimension | None:
 
 
 def _covered_dimensions(
+    current_facts: tuple[CompletenessObservationFact, ...],
     facts_by_dimension: tuple[tuple[InquiryDimension, tuple[CompletenessObservationFact, ...]], ...],
     policy_input: CompletenessPolicyInput,
 ) -> tuple[InquiryDimension, ...]:
     covered = {dimension for dimension, facts in facts_by_dimension if facts}
+    # 维度覆盖键桥（D1 厚真源）：抽取层对同一临床语义会产出多种 fact_key（如寒热落
+    # present_illness.chills/fever、现病落 present_illness.cough/symptom.* 等），而 canonical
+    # ``COMPLETENESS_DIMENSION_RULES[dimension].fact_keys`` 只认窄键集。键不命中 → 维度永远
+    # missing → gap_selector 永远选同一维度 → 命中写死模板 → 问诊死循环（trigger session
+    # 63e78741 寒热、d8ba36ae 现病变化）。
+    # 此处用 ``DIMENSION_KEYSETS`` 真源对当前 active 事实做覆盖派生：任一 keyset 键命中即该
+    # 维度 covered。仅对已 active（非 retracted/corrected-out）事实做派生；安全维度不参与
+    # （仍走下方 safety 分支）。覆盖 ≠ 成熟：覆盖派生只解"答到没"，B maturity 在 D2 闸门再判
+    # "答得够不够（关键键齐全）"，两层分离防放水。
+    active_fact_keys = frozenset(item.fact_key for item in current_facts)
+    for dimension in derived_coverage_for_fact_keys(active_fact_keys):
+        covered.add(dimension)
     safety = policy_input.domain_snapshot.safety_profile
     if safety is not None:
         if _collection_complete(safety.allergy_collection_status):

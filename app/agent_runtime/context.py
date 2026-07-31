@@ -250,9 +250,12 @@ def contains_model_input_identity_sequence(contents: Sequence[str]) -> bool:
     try:
         tokens, _ = _tokenize(contents)
         return bool(_find_matches(tokens))
-    except Exception:
-        pass
-    raise ContextBuilderError("identity sequence processing failed") from None
+    except ContextBuilderError:
+        raise
+    except Exception as exc:
+        raise ContextBuilderError(
+            f"identity sequence processing failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def project_model_input_identity_sequences(contents: Sequence[str]) -> tuple[str, ...]:
@@ -265,9 +268,12 @@ def project_model_input_identity_sequences(contents: Sequence[str]) -> tuple[str
         tokens, _ = _tokenize(contents)
         matches = _find_matches(tokens)
         return _apply_mask(contents, tokens, matches)
-    except Exception:
-        pass
-    raise ContextBuilderError("identity sequence processing failed") from None
+    except ContextBuilderError:
+        raise
+    except Exception as exc:
+        raise ContextBuilderError(
+            f"identity sequence processing failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 

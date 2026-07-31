@@ -30,6 +30,13 @@ from app.agent_runtime.completeness_policy import completeness_to_gate_result_sc
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
+from app.agent_runtime.intake_fact_key_legality import (
+    NormalizedObservation,
+    RejectedObservation,
+    filter_legal_observations,
+    normalized_observations_to_payload,
+    rejected_observations_to_payload,
+)
 from app.agent_runtime.intake_verifier import (
     INTAKE_AGENT_NAME,
     INTAKE_AGENT_VERSION,
@@ -131,7 +138,14 @@ INTAKE_MESSAGE_CREATED = "intake.message_created.v1"
 INTAKE_COMMAND_COMPLETED = "intake.command_completed.v1"
 STALE_CLAIM_AFTER_SECONDS = 60
 RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
-    {"MODEL_GATEWAY_TIMEOUT", "MODEL_GATEWAY_UNAVAILABLE"}
+    {
+        "MODEL_GATEWAY_TIMEOUT",
+        "MODEL_GATEWAY_UNAVAILABLE",
+        # guard 改软遮罩后应几乎不出现；留作兜底，降级走模板 follow-up 而非整条 failed。
+        "MODEL_INPUT_PRIVACY_VIOLATION",
+        # 网关超时的伴生情况（外层 RunSpec 先放弃）：降级而不硬停整条问诊。
+        "RUN_DEADLINE_EXCEEDED",
+    }
 )
 INTAKE_ROUTE_READY = "ready"
 INTAKE_ROUTE_INCOMPLETE = "incomplete"
@@ -1118,6 +1132,8 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                     "last_step": "extract_intake",
                     "model_run_id": str(run_id),
                     "model_agent_name": INTAKE_AGENT_NAME,
+                    "degraded": True,
+                    "last_failure_code": code,
                 },
             )
             return _sanitized_graph_error(state, code, "intake extraction failed")
@@ -1404,6 +1420,8 @@ async def _compute_intake_from_claim(
     domain_state = await repository.get_state(claim.session_id)
     output = await _load_or_retry_intake_output(claim, patient_message, domain_state, trace_id)
     precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
+    rejected_observations: list[RejectedObservation] = []
+    normalized_observations: list[NormalizedObservation] = []
     delta = _intake_output_to_delta(
         run_id=claim.run_id,
         session_id=claim.session_id,
@@ -1412,7 +1430,24 @@ async def _compute_intake_from_claim(
         state=domain_state,
         observations=output.observations,
         safety_delta=output.patient_safety_delta,
+        rejected_observations=rejected_observations,
+        normalized_observations=normalized_observations,
     )
+    if rejected_observations or normalized_observations:
+        extraction_trace: dict[str, Any] = {}
+        if rejected_observations:
+            extraction_trace["rejected_observations"] = rejected_observations_to_payload(
+                rejected_observations
+            )
+        if normalized_observations:
+            extraction_trace["normalized_observations"] = normalized_observations_to_payload(
+                normalized_observations
+            )
+        await _save_intermediate(
+            claim.id,
+            {"extraction": extraction_trace},
+            step="fact_key_legality_e1",
+        )
     context = _verification_context(
         delta=delta,
         state=domain_state,
@@ -1721,6 +1756,8 @@ def _reply_binding_extraction_metadata(
     }
     if fallback_error_code is not None:
         metadata["fallback_error_code"] = fallback_error_code
+        metadata["degraded"] = True
+        metadata["last_failure_code"] = fallback_error_code
     return metadata
 
 
@@ -2230,7 +2267,13 @@ def _gateway_bound_reply_fallback_output(
     input_payload: IntakeExtractionInput,
     failure_code: str,
 ) -> IntakeExtractionOutput | None:
-    """Fallback only for the two allowlisted transient gateway failures."""
+    """Fallback for allowlisted transient gateway/privacy/deadline failures.
+
+    These codes degrade to a template follow-up question instead of failing the
+    whole intake claim, so the conversation never blocks on a transient or
+    guard-side failure. The degradation fact is recorded by the caller into the
+    claim ``intermediate_payload`` (see ``_degraded_extraction_metadata``).
+    """
 
     if failure_code not in RETRYABLE_INTAKE_FAILURE_CODES:
         return None
@@ -2243,6 +2286,22 @@ def _is_social_acknowledgement(content: str) -> bool:
     return _SOCIAL_ACKNOWLEDGEMENT_PATTERN.fullmatch(content) is not None
 
 
+def _active_observation_ids_by_fact_key(
+    state: DomainState,
+) -> dict[str, frozenset[str]]:
+    """Index active observation ids by fact_key for E1 correction/retract降级判定。
+
+    E1 闸门对越界 CORRECT/RETRACT 键会判断 ``target_observation_id`` 是否命中当前 state 里的
+    active 事实——若命中则降级为伪 RETRACT 清掉历史畸键。本函数提供该索引（fact_key →
+    active observation_id 集合）。
+    """
+
+    index: dict[str, frozenset[str]] = {}
+    for item in _current_observations(state.observations):
+        index[item.fact_key] = index.get(item.fact_key, frozenset()) | {str(item.observation_id)}
+    return index
+
+
 def _intake_output_to_delta(
     *,
     run_id: uuid.UUID,
@@ -2252,7 +2311,30 @@ def _intake_output_to_delta(
     state: DomainState,
     observations: tuple[Any, ...],
     safety_delta: PatientSafetyDelta,
+    rejected_observations: list[RejectedObservation] | None = None,
+    normalized_observations: list[NormalizedObservation] | None = None,
 ) -> DomainDelta:
+    # E1 fact_key 合法性闸门：在落库前过滤越界畸键。抽取模型对同一临床语义会漂移出
+    # schema 越界的 fact_key（trigger session d449735a 实测 ``symptom.cold_heat``、
+    # 282a985a ``fever``/``symptom`` 裸键），这类畸键喂不进任何 canonical 维度也不命中 D1
+    # 派生覆盖 → 对应维度永远 missing → gap_selector 锁死同一维度 → 命中写死模板 → 死循环。
+    # 键桥再厚也追不上随机换键名的模型，故在抽取产出之后立 deterministic 闸门处置畸键：
+    # ① ADD 命中 ``DERIVED_KEY_NORMALIZATION`` 归一 → 改写键名透传落库（b7bdf5ab 复现：
+    #    ``symptom.chills``/``symptom.fever`` 若直接 reject 则寒热维度永采不到键 → 死循环；
+    #    归一为 ``present_illness.chills``/``present_illness.fever`` 落库，D1 立判寒热覆盖）。
+    # ② ADD 不命中归一表 → reject 留痕（d449735a / 282a985a 路径）。
+    # ③ CORRECT/RETRACT 越界键 target 命中 active 畸键 → 降级伪 RETRACT 清历史脏（d449735a
+    #    第 3 轮自治愈）。
+    # reject / 归一留痕均回传调用方写进 claim intermediate_payload（与 D5 可观测铁律一致）。
+    filter_result = filter_legal_observations(
+        tuple(observations),
+        active_observation_ids_by_fact_key=_active_observation_ids_by_fact_key(state),
+    )
+    legal_observations = filter_result.kept + filter_result.downgraded
+    if rejected_observations is not None:
+        rejected_observations.extend(filter_result.rejected)
+    if normalized_observations is not None:
+        normalized_observations.extend(filter_result.normalized)
     observation_schemas = tuple(
         ObservationSchema(
             observation_id=uuid.uuid5(
@@ -2269,12 +2351,12 @@ def _intake_output_to_delta(
             supersedes_observation_id=item.target_observation_id,
             created_at=datetime.now(UTC),
         )
-        for index, item in enumerate(observations)
+        for index, item in enumerate(legal_observations)
     )
     # High-risk model output is candidate-only.  It is persisted separately as
     # SafetyFactAssertion(proposed) and can reach SafetyProfile only through an
     # explicit, evidence-verified confirmation transition.
-    del state, safety_delta
+    del safety_delta
     if not observation_schemas:
         artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-empty:{run_id}")
         artifact_revisions: tuple[ArtifactRevisionSchema, ...] = (

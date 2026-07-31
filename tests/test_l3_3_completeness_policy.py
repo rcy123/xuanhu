@@ -740,3 +740,311 @@ def test_output_does_not_contain_clinical_text_identity_prompt_or_raw_model_outp
     assert "raw_model_output" not in encoded
     assert "头痛" not in encoded
     assert "prompt" not in encoded
+
+
+# ---------------------------------------------------------------------------
+# D1: 派生覆盖映射——抽取层把寒热落到 present_illness.{chills,fever} 时仍视为
+# 十问寒热维度已覆盖（解 trigger session 63e78741 死循环根因）。
+# ---------------------------------------------------------------------------
+
+
+def _ten_question_cold_heat_facts_only_chills_fever() -> tuple[CompletenessObservationFact, ...]:
+    """复现 trigger session 的真实事实面：只在 present_illness.* 上有寒热，无 ten_questions.*。"""
+    return (
+        fact("chief_complaint.category", "general"),
+        fact("chief_complaint.symptom", "headache"),
+        fact("chief_complaint.course", "two_days"),
+        fact("present_illness.change", "stable"),
+        fact("present_illness.chills", "mild"),
+        fact("present_illness.fever", "mild"),
+        fact("ten_questions.stool_urine", "normal"),
+        fact("ten_questions.sleep", "normal"),
+        fact("patient.sex", "male"),
+    )
+
+
+def test_present_illness_chills_fever_derives_cold_heat_coverage() -> None:
+    """D1：present_illness.{chills,fever} 有值 → cold_heat 判 covered、移出 missing_required。"""
+
+    result = evaluate_completeness_policy(
+        policy_input(
+            *_ten_question_cold_heat_facts_only_chills_fever(),
+            safety_profile=safety(),
+        )
+    )
+
+    assert InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions
+    assert InquiryDimension.TEN_COLD_HEAT not in result.missing_required
+
+
+def test_present_illness_chills_alone_derives_cold_heat_coverage() -> None:
+    """D1：派生键集任一命中即覆盖——单条 present_illness.chills 也足够。"""
+
+    facts = tuple(
+        item for item in _ten_question_cold_heat_facts_only_chills_fever()
+        if item.fact_key != "present_illness.fever"
+    )
+
+    result = evaluate_completeness_policy(policy_input(*facts, safety_profile=safety()))
+
+    assert InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions
+    assert InquiryDimension.TEN_COLD_HEAT not in result.missing_required
+
+
+def test_no_derivation_without_present_illness_temperature_facts() -> None:
+    """D1：无派生键命中时 cold_heat 仍判缺失（覆盖派生不凭空加分）。"""
+
+    facts = tuple(
+        item
+        for item in _ten_question_cold_heat_facts_only_chills_fever()
+        if item.fact_key not in {"present_illness.chills", "present_illness.fever"}
+    )
+
+    result = evaluate_completeness_policy(policy_input(*facts, safety_profile=safety()))
+
+    assert InquiryDimension.TEN_COLD_HEAT not in result.covered_dimensions
+    assert InquiryDimension.TEN_COLD_HEAT in result.missing_required
+
+
+def test_canonical_ten_questions_cold_heat_still_covers() -> None:
+    """D1：canonical 路径不变——ten_questions.cold_heat 有值仍覆盖（回归保护）。"""
+
+    facts = tuple(
+        item for item in complete_general_facts() if item.fact_key != "ten_questions.cold_heat"
+    ) + (fact("ten_questions.cold_heat", "none"),)
+
+    result = evaluate_completeness_policy(policy_input(*facts))
+
+    assert InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions
+    assert InquiryDimension.TEN_COLD_HEAT not in result.missing_required
+
+
+def test_derivation_does_not_back_propagate_to_present_illness_dimension() -> None:
+    """D1：单向覆盖——派生只把 present→ten 兜上来，不会把 ten_questions.* 派生到
+    PRESENT_ILLNESS_CHANGE，也不会删掉 canonical 现性维度事实。"""
+
+    facts = _ten_question_cold_heat_facts_only_chills_fever()
+
+    result = evaluate_completeness_policy(policy_input(*facts, safety_profile=safety()))
+
+    # canonical PRESENT_ILLNESS_CHANGE 仍由 present_illness.change 命中——保留原有覆盖，
+    # 派生没有把它"偷放"或"没收"。
+    assert InquiryDimension.PRESENT_ILLNESS_CHANGE in result.covered_dimensions
+    # 派生键 present_illness.chills/fever 本身不是任何 canonical 规则的 fact_keys，因此不
+    # 会额外产生 PRESENT_ILLNESS_CHANGE 之外的 canonical 维度重复计数或冲突。
+    assert all(
+        item.dimension is not InquiryDimension.PRESENT_ILLNESS_CHANGE
+        for item in result.conflicting_dimensions
+    )
+
+
+# ---------------------------------------------------------------------------
+# D1 厚真源：present_illness.cough / symptom.* 等具体现病症状键现在也覆盖
+# PRESENT_ILLNESS_CHANGE（解 trigger session d8ba36ae 现病变化维度永远 missing 的死循环）。
+# 覆盖 ≠ 成熟——成熟度（KEY_THRESHOLDS / 趋势键）在 D2 闸门再判，此处只测覆盖层。
+# ---------------------------------------------------------------------------
+
+
+def _d8ba36ae_face_seed_plus_cough_fever() -> tuple[CompletenessObservationFact, ...]:
+    """复现 trigger session d8ba36ae 第 2 轮后的事实面：seed + 抽取产出 cough/fever，
+    **无** present_illness.change / associated_symptom。值用 ascii 占位码（schema 要求
+    normalized_code 仅含 ascii）。"""
+    return (
+        fact("chief_complaint.category", "respiratory"),
+        fact("chief_complaint.symptom", "cold_one_week"),
+        fact("chief_complaint.course", "one_week"),
+        fact("present_illness.cough", "cough"),
+        fact("present_illness.fever", "low_fever"),
+        fact("patient.sex", "male"),
+    )
+
+
+def test_present_illness_cough_derives_change_coverage_breaks_d8ba36ae_loop() -> None:
+    """D1 厚：present_illness.cough 覆盖 PRESENT_ILLNESS_CHANGE → change 移出 missing_required
+    → gap_selector 选下一维度而非锁死 change 命中同一写死模板。"""
+
+    result = evaluate_completeness_policy(
+        policy_input(*_d8ba36ae_face_seed_plus_cough_fever(), safety_profile=safety())
+    )
+
+    assert InquiryDimension.PRESENT_ILLNESS_CHANGE in result.covered_dimensions
+    assert InquiryDimension.PRESENT_ILLNESS_CHANGE not in result.missing_required
+
+
+def test_present_illness_symptom_subprefix_derives_coverage() -> None:
+    """D1 厚：抽取常漂移到 present_illness.symptom.<sub> 子前缀（67e04fc4 实测），子前缀键
+    也覆盖对应维度。"""
+
+    result = evaluate_completeness_policy(
+        policy_input(
+            fact("chief_complaint.category", "respiratory"),
+            fact("chief_complaint.symptom", "cold_one_week"),
+            fact("chief_complaint.course", "one_week"),
+            fact("present_illness.symptom.cough", "cough_worsening"),
+            fact("present_illness.symptom.fever", "low_grade_fever"),
+            fact("patient.sex", "male"),
+            safety_profile=safety(),
+        )
+    )
+
+    # 子前缀 cough/fever 既覆盖现病变化，又覆盖寒热、呼吸。
+    assert InquiryDimension.PRESENT_ILLNESS_CHANGE in result.covered_dimensions
+    assert InquiryDimension.TEN_COLD_HEAT in result.covered_dimensions
+    assert InquiryDimension.TEN_RESPIRATORY in result.covered_dimensions
+
+
+def test_ten_stool_urine_subprefix_keys_cover_boundary_dimension() -> None:
+    """D1 厚：抽取漂移到 ten_questions.stool_urine.stool / .urine 子前缀键（1b89a179 实测
+    canonical ten_questions.stool_urine 的别名键）也覆盖 TEN_STOOL_URINE。"""
+
+    result = evaluate_completeness_policy(
+        policy_input(
+            fact("chief_complaint.category", "digestive"),
+            fact("chief_complaint.symptom", "abdominal_pain"),
+            fact("chief_complaint.course", "three_days"),
+            fact("present_illness.change", "stable"),
+            fact("ten_questions.stool_urine.stool", "soft_stool"),
+            fact("ten_questions.stool_urine.urine", "yellow_urine"),
+            fact("ten_questions.cold_heat", "none"),
+            fact("ten_questions.sleep", "normal"),
+            fact("patient.sex", "male"),
+            safety_profile=safety(),
+        )
+    )
+
+    assert InquiryDimension.TEN_STOOL_URINE in result.covered_dimensions
+    assert InquiryDimension.TEN_STOOL_URINE not in result.missing_required
+
+
+def test_coverage_bool_breaks_d8ba36ae_loop() -> None:
+    """端到端：d8ba36ae 事实面经厚 D1 后，gap_selector 不再选 PRESENT_ILLNESS_CHANGE
+    （priority 120），改选下一缺失维度——解死循环。"""
+
+    from app.agent_runtime.gap_selector import select_gap
+
+    result = evaluate_completeness_policy(
+        policy_input(*_d8ba36ae_face_seed_plus_cough_fever(), safety_profile=safety())
+    )
+    gap = select_gap(result)
+
+    assert gap.selected_dimension is not InquiryDimension.PRESENT_ILLNESS_CHANGE
+    assert gap.selection_kind.value == "required"
+
+
+# ---------------------------------------------------------------------------
+# D1 厚真源：键桥真源方法 + 成熟度计数/趋势访问器（D2 的契约预留，单元固化）。
+# ---------------------------------------------------------------------------
+
+
+def test_dimension_keysets_are_exhaustive_and_cover_all_dimensions() -> None:
+    """D1 厚：DIMENSION_KEYSETS 覆盖所有完整体维度（缺一项 D2 maturity 计数会 KeyError）。"""
+
+    from app.agent_runtime.intake_dimension_mapping import DIMENSION_KEYSETS
+
+    expected = set(InquiryDimension)
+    assert set(DIMENSION_KEYSETS) == expected
+
+
+def test_safety_dimensions_have_empty_keysets_never_derived() -> None:
+    """D1 厚：安全维度 keyset 留空占位——派生永不碰安全维度（仍由 safety_profile 决定）。"""
+
+    from app.agent_runtime.intake_dimension_mapping import derived_coverage_for_fact_keys
+
+    safety_dims = (
+        InquiryDimension.ALLERGY_STATUS,
+        InquiryDimension.MEDICATION_STATUS,
+        InquiryDimension.MAJOR_CONDITION_STATUS,
+        InquiryDimension.PREGNANCY_STATUS,
+        InquiryDimension.LACTATION_STATUS,
+    )
+    # 即使把安全维度的 canonical 键喂进 active，派生也不返回它。
+    derived = derived_coverage_for_fact_keys(
+        frozenset(
+            key
+            for d in safety_dims
+            for key in (d.value,)
+        )
+    )
+    assert all(d not in derived for d in safety_dims)
+
+
+def test_dimension_acquired_key_count_treats_canonical_and_derived_equally() -> None:
+    """D1 厚：成熟度计数对 canonical 与派生键等权——doctor 答到的都算"采到关键键"。"""
+
+    from app.agent_runtime.intake_dimension_mapping import dimension_acquired_key_count
+
+    # 只派生键（无 canonical）→ acquired 2。
+    assert (
+        dimension_acquired_key_count(
+            InquiryDimension.TEN_COLD_HEAT,
+            frozenset({"present_illness.chills", "present_illness.fever"}),
+        )
+        == 2
+    )
+    # canonical + 派生混采 → 全计。
+    assert (
+        dimension_acquired_key_count(
+            InquiryDimension.TEN_COLD_HEAT,
+            frozenset({"ten_questions.cold_heat", "present_illness.chills"}),
+        )
+        == 2
+    )
+    # 无命中 → 0。
+    assert (
+        dimension_acquired_key_count(
+            InquiryDimension.TEN_COLD_HEAT, frozenset({"patient.age"})
+        )
+        == 0
+    )
+
+
+def test_dimension_acquired_key_count_filters_to_active_only() -> None:
+    """D1 厚：corrected/retracted 的事实不应计入 acquired——调用方传 active_keys 已过滤，
+    此处固化契约：函数本身只看传入集合，重复键不双计。"""
+
+    from app.agent_runtime.intake_dimension_mapping import dimension_acquired_key_count
+
+    # 同一 keyset 键即使集合里出现一次也只计一。
+    assert (
+        dimension_acquired_key_count(
+            InquiryDimension.TEN_COLD_HEAT,
+            frozenset({"present_illness.chills"}),
+        )
+        == 1
+    )
+
+
+def test_dimension_has_trend_key_for_change_requires_trend_semantics() -> None:
+    """D1 厚（D2 预留）：PRESENT_ILLNESS_CHANGE 仅有具体症状键（cough）时无趋势 → trend=False，
+    D2 据此追问"加重/减轻/稳定"；有 canonical 趋势键时 trend=True。"""
+
+    from app.agent_runtime.intake_dimension_mapping import (
+        MATURITY_TREND_KEYS,
+        dimension_has_trend_key,
+    )
+
+    assert InquiryDimension.PRESENT_ILLNESS_CHANGE in MATURITY_TREND_KEYS
+
+    # 只有具体症状键 → 无趋势。
+    assert (
+        dimension_has_trend_key(
+            InquiryDimension.PRESENT_ILLNESS_CHANGE,
+            frozenset({"present_illness.cough", "present_illness.fever"}),
+        )
+        is False
+    )
+    # 含 canonical 趋势键 → 有趋势。
+    assert (
+        dimension_has_trend_key(
+            InquiryDimension.PRESENT_ILLNESS_CHANGE,
+            frozenset({"present_illness.change"}),
+        )
+        is True
+    )
+    # 无趋势要求的维度（如十问寒热）恒 True。
+    assert (
+        dimension_has_trend_key(
+            InquiryDimension.TEN_COLD_HEAT, frozenset({"present_illness.chills"})
+        )
+        is True
+    )
