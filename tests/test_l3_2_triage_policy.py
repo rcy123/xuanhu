@@ -97,7 +97,7 @@ def test_no_candidates_is_the_only_continue_and_passed_path() -> None:
         (RedFlagCategory.SEVERE_BLEEDING, TriageDisposition.EMERGENCY_REFERRAL),
         (RedFlagCategory.NEUROLOGIC_DEFICIT, TriageDisposition.EMERGENCY_REFERRAL),
         (RedFlagCategory.HIGH_FEVER, TriageDisposition.EMERGENCY_REFERRAL),
-        (RedFlagCategory.OTHER, TriageDisposition.MANUAL_REVIEW),
+        (RedFlagCategory.OTHER, TriageDisposition.RISK_NOTE),
     ],
 )
 def test_every_red_flag_category_has_explicit_deterministic_mapping(
@@ -108,14 +108,21 @@ def test_every_red_flag_category_has_explicit_deterministic_mapping(
 
     result = evaluate_triage_policy(triage_input(candidate(category)))
 
+    # 0d-3 风险三级化：紧急类别（HIGH/高置信）→ 阻断；OTHER → RISK_NOTE 不阻断。
+    expected_decision = (
+        GateDecision.BLOCKED
+        if expected_disposition is TriageDisposition.EMERGENCY_REFERRAL
+        else GateDecision.PASSED
+    )
     assert result.disposition is expected_disposition
-    assert result.gate_result.decision is GateDecision.BLOCKED
+    assert result.gate_result.decision is expected_decision
     assert result.rule_outcomes[0].category == category.value
     assert result.rule_outcomes[0].disposition is expected_disposition
     assert result.rule_outcomes[0].rule_id == TRIAGE_RED_FLAG_RULES[category].rule_id
 
 
-def test_high_risk_category_cannot_be_downgraded_by_model_metadata() -> None:
+def test_high_risk_category_downgraded_by_low_severity_metadata() -> None:
+    # 0d-3：低危/低置信的 LLM 候选不触发紧急阻断，降级 RISK_NOTE 留痕继续。
     result = evaluate_triage_policy(
         triage_input(
             candidate(
@@ -126,15 +133,31 @@ def test_high_risk_category_cannot_be_downgraded_by_model_metadata() -> None:
         )
     )
 
+    assert result.disposition is TriageDisposition.RISK_NOTE
+    assert result.gate_result.decision is GateDecision.PASSED
+
+
+def test_high_severity_candidate_triggers_emergency_referral() -> None:
+    result = evaluate_triage_policy(
+        triage_input(
+            candidate(
+                RedFlagCategory.BREATHING_DIFFICULTY,
+                severity=CandidateSeverity.HIGH,
+                confidence=0.9,
+            )
+        )
+    )
+
     assert result.disposition is TriageDisposition.EMERGENCY_REFERRAL
     assert result.gate_result.decision is GateDecision.BLOCKED
 
 
-def test_other_candidate_enters_manual_review_and_never_passes() -> None:
+def test_other_candidate_enters_risk_note_and_never_blocks() -> None:
     result = evaluate_triage_policy(triage_input(candidate(RedFlagCategory.OTHER)))
 
-    assert result.disposition is TriageDisposition.MANUAL_REVIEW
-    assert result.gate_result.decision is GateDecision.BLOCKED
+    assert result.disposition is TriageDisposition.RISK_NOTE
+    assert result.gate_result.decision is GateDecision.PASSED
+    assert result.gate_result.details.risk_level == "noted"
 
 
 def test_emergency_referral_takes_precedence_over_manual_review() -> None:
@@ -253,8 +276,8 @@ def test_gate_decision_and_disposition_matrix_is_fixed() -> None:
         TriageDisposition.CONTINUE,
     )
     assert (manual.gate_result.decision, manual.disposition) == (
-        GateDecision.BLOCKED,
-        TriageDisposition.MANUAL_REVIEW,
+        GateDecision.PASSED,
+        TriageDisposition.RISK_NOTE,
     )
     assert (emergency.gate_result.decision, emergency.disposition) == (
         GateDecision.BLOCKED,

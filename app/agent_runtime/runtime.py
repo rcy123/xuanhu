@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ValidationError
 
 from app.core.exceptions import (
+    ChatOutputTruncatedError,
     ChatStructuredParseError,
     ModelGatewayTimeoutError,
     ModelGatewayUnavailableError,
@@ -417,6 +418,18 @@ class AgentRuntime:
                 RuntimeErrorBase(
                     RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID,
                     "structured output invalid",
+                    retryable=True,
+                ),
+            )
+        except ChatOutputTruncatedError:
+            # 0d-1: max_tokens 截断显式归因（finish_reason=length），与坏 JSON 区分。
+            # 截断是长度预算问题，可重试（同输入重试可能成功），留痕可区分两类失败。
+            return (
+                None,
+                None,
+                RuntimeErrorBase(
+                    RuntimeErrorCode.MODEL_OUTPUT_TRUNCATED,
+                    "model output truncated (finish_reason=length)",
                     retryable=True,
                 ),
             )

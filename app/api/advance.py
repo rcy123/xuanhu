@@ -463,6 +463,12 @@ async def _mark_advance_failed(
         if graph_run is not None and graph_run.status != "completed":
             graph_run.status = "failed"
             graph_run.completed_at = func.now()
+        # 0d-2：失败可见可恢复——置 session.recovery_status=manual_required，
+        # 使 /recover 能接管（仅放行 manual_required/recovering）。
+        session = await db.get(ConsultSession, session_id, with_for_update=True)
+        if session is not None and session.status == "active" and session.recovery_status == "normal":
+            session.recovery_status = "manual_required"
+            session.updated_at = func.now()
 
 
 async def _run_langgraph_advance(

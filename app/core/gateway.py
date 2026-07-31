@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.config import get_settings
 from app.core.exceptions import (
+    ChatOutputTruncatedError,
     ChatStructuredParseError,
     EmbeddingDimensionMismatchError,
     EmbeddingUnavailableError,
@@ -461,6 +462,11 @@ class ModelGatewayClient:
 
             data = response.json()
 
+            # 0d-1: finish_reason=length 是 max_tokens 截断信号——tool_calls 可能缺失、
+            # content 可能是残缺 XML。显式归因 MODEL_OUTPUT_TRUNCATED（调用方 runtime
+            # 捕获 ChatOutputTruncatedError 后映射），与「返回了坏 JSON」区分。
+            finish_reason = data.get("choices", [{}])[0].get("finish_reason")
+
             # 尝试从 tool_calls 提取结构化输出
             try:
                 tool_calls = data["choices"][0]["message"].get("tool_calls", [])
@@ -495,8 +501,13 @@ class ModelGatewayClient:
                     )
                     return self._observed_result(result, data) if capture_observation else result
 
+                if finish_reason == "length":
+                    raise ChatOutputTruncatedError()
                 last_parse_error = "模型返回内容为空"
             except (json.JSONDecodeError, KeyError, IndexError, ValidationError) as exc:
+                # 0d-1: content/tool_calls 解析失败但 finish_reason=length → 截断而非格式漂移。
+                if finish_reason == "length":
+                    raise ChatOutputTruncatedError() from exc
                 last_parse_error = f"结构化输出解析失败: {type(exc).__name__}"
                 logger.warning(
                     "chat_structured 解析失败: schema=%s, trace_id=%s, attempt=%d/%d, error=%s",

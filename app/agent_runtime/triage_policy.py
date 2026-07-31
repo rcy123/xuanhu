@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.schemas.domain import GateDecision, GateResultSchema
-from app.schemas.intake import RedFlagCategory
+from app.schemas.intake import CandidateSeverity, RedFlagCategory
 from app.schemas.triage import (
     TRIAGE_GATE_NAME,
     TRIAGE_POLICY_VERSION,
@@ -113,9 +113,9 @@ TRIAGE_RED_FLAG_RULES: Mapping[RedFlagCategory, TriageRule] = FrozenTriageRuleRe
             disposition=TriageDisposition.EMERGENCY_REFERRAL,
         ),
         TriageRule(
-            rule_id="red_flag.other.manual_review.v1",
+            rule_id="red_flag.other.risk_note.v1",
             category=RedFlagCategory.OTHER,
-            disposition=TriageDisposition.MANUAL_REVIEW,
+            disposition=TriageDisposition.RISK_NOTE,
         ),
     )
 )
@@ -139,12 +139,20 @@ def canonicalize_triage_input(input_payload: object) -> TriagePolicyInput:
 
 
 def evaluate_triage_policy(input_payload: object) -> TriagePolicyResult:
-    """Return a deterministic authoritative triage GateResult."""
+    """Return a deterministic authoritative triage GateResult.
+
+    0d-3 风险三级化：RISK_NOTE 不阻断（decision=PASSED，留痕继续问诊）；
+    仅 EMERGENCY_REFERRAL 阻断（decision=BLOCKED）。
+    """
 
     triage_input = canonicalize_triage_input(input_payload)
     outcomes = _rule_outcomes(triage_input)
     disposition = _overall_disposition(outcomes)
-    decision = GateDecision.PASSED if disposition is TriageDisposition.CONTINUE else GateDecision.BLOCKED
+    decision = (
+        GateDecision.BLOCKED
+        if disposition is TriageDisposition.EMERGENCY_REFERRAL
+        else GateDecision.PASSED
+    )
     details = _gate_details(disposition, outcomes)
     gate_result = TriageGateResult(
         gate_name=TRIAGE_GATE_NAME,
@@ -186,24 +194,43 @@ def to_gate_result_schema(result: TriagePolicyResult | TriageGateResult) -> Gate
             "rule_ids": list(details.rule_ids),
             "rules": [item.model_dump(mode="json") for item in details.rules],
             "source_message_ids": list(details.source_message_ids),
+            "risk_level": details.risk_level,
         },
     )
 
 
 def _rule_outcomes(triage_input: TriagePolicyInput) -> tuple[TriageRuleOutcome, ...]:
-    source_ids_by_category: dict[RedFlagCategory, set[str]] = {}
+    """0d-3 分级判定：同一类别下按候选严重度裁定。
+
+    - 紧急类别（EMERGENCY_REFERRAL 规则）的候选：仅当 severity=high 且
+      confidence≥0.8 才触发紧急阻断（确定性 precheck 命中天然 HIGH/1.0，
+      即"代码硬规则 → 阻断"）；低/中危候选降级 RISK_NOTE（不阻断、留痕）。
+    - OTHER 类别一律 RISK_NOTE（语义模糊，不阻断）。
+    """
+    by_category: dict[RedFlagCategory, list[RedFlagCandidate]] = {}
     for candidate in triage_input.red_flag_candidates:
-        source_ids_by_category.setdefault(candidate.category, set()).add(str(candidate.source_message_id))
+        by_category.setdefault(candidate.category, []).append(candidate)
 
     outcomes: list[TriageRuleOutcome] = []
-    for category in sorted(source_ids_by_category, key=lambda item: item.value):
+    for category in sorted(by_category, key=lambda item: item.value):
         rule = TRIAGE_RED_FLAG_RULES[category]
-        source_ids = tuple(sorted(source_ids_by_category[category]))
+        candidates = by_category[category]
+        if rule.disposition is TriageDisposition.EMERGENCY_REFERRAL:
+            escalated = any(
+                candidate.severity is CandidateSeverity.HIGH and candidate.confidence >= 0.8
+                for candidate in candidates
+            )
+            disposition = (
+                TriageDisposition.EMERGENCY_REFERRAL if escalated else TriageDisposition.RISK_NOTE
+            )
+        else:
+            disposition = TriageDisposition.RISK_NOTE
+        source_ids = tuple(sorted({str(candidate.source_message_id) for candidate in candidates}))
         outcomes.append(
             TriageRuleOutcome(
                 rule_id=rule.rule_id,
                 category=category.value,
-                disposition=rule.disposition,
+                disposition=disposition,
                 candidate_count=len(source_ids),
                 source_message_ids=source_ids,
             )
@@ -216,7 +243,7 @@ def _overall_disposition(outcomes: tuple[TriageRuleOutcome, ...]) -> TriageDispo
         return TriageDisposition.CONTINUE
     if any(outcome.disposition is TriageDisposition.EMERGENCY_REFERRAL for outcome in outcomes):
         return TriageDisposition.EMERGENCY_REFERRAL
-    return TriageDisposition.MANUAL_REVIEW
+    return TriageDisposition.RISK_NOTE
 
 
 def _gate_details(
@@ -230,6 +257,13 @@ def _gate_details(
     source_message_ids = tuple(
         sorted({source for outcome in outcomes for source in outcome.source_message_ids})
     )
+    risk_level = (
+        "emergency"
+        if disposition is TriageDisposition.EMERGENCY_REFERRAL
+        else "noted"
+        if disposition is TriageDisposition.RISK_NOTE
+        else "none"
+    )
     return TriageGateDetails(
         disposition=disposition,
         candidate_count=sum(outcome.candidate_count for outcome in outcomes),
@@ -237,6 +271,7 @@ def _gate_details(
         rule_ids=tuple(outcome.rule_id for outcome in outcomes),
         rules=outcomes,
         source_message_ids=source_message_ids,
+        risk_level=risk_level,
     )
 
 

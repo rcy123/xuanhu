@@ -778,6 +778,18 @@ def _triage_gate_is_internally_consistent(gate: Any) -> bool:
         and details.source_message_ids == source_message_ids
     )
     if details.disposition is TriageDisposition.CONTINUE or gate.decision is GateDecision.PASSED:
+        # 0d-3：RISK_NOTE 也是 PASSED（不阻断），但允许有候选（留痕继续问诊）。
+        if details.disposition is TriageDisposition.RISK_NOTE:
+            return (
+                gate.decision is GateDecision.PASSED
+                and details.candidate_count >= 1
+                and bool(details.category_counts)
+                and bool(details.rule_ids)
+                and bool(details.rules)
+                and bool(details.source_message_ids)
+                and counts_match
+                and details.risk_level == "noted"
+            )
         return (
             gate.decision is GateDecision.PASSED
             and details.disposition is TriageDisposition.CONTINUE
@@ -786,6 +798,7 @@ def _triage_gate_is_internally_consistent(gate: Any) -> bool:
             and details.rule_ids == ()
             and details.rules == ()
             and details.source_message_ids == ()
+            and details.risk_level == "none"
         )
     return (
         gate.decision is GateDecision.BLOCKED
@@ -796,6 +809,7 @@ def _triage_gate_is_internally_consistent(gate: Any) -> bool:
         and bool(details.rules)
         and bool(details.source_message_ids)
         and counts_match
+        and details.risk_level == "emergency"
     )
 
 

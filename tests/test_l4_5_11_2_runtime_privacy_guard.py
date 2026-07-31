@@ -467,6 +467,8 @@ def test_runtime_error_code_contract_adds_only_privacy_violation() -> None:
         "MODEL_GATEWAY_UNAVAILABLE",
         "MODEL_INPUT_PRIVACY_VIOLATION",
         "STRUCTURED_OUTPUT_INVALID",
+        # 0d-1: max_tokens 截断显式归因（finish_reason=length），与坏 JSON 区分。
+        "MODEL_OUTPUT_TRUNCATED",
         "RUN_DEADLINE_EXCEEDED",
         "ATTEMPT_BUDGET_EXHAUSTED",
         "RECORDER_ASYNC_REQUIRED",

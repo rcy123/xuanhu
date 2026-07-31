@@ -81,14 +81,23 @@ class _FakeAsyncSession:
     def begin(self) -> _FakeAsyncSession:
         return self
 
-    async def get(self, _model: object, _claim_id: uuid.UUID, **_kwargs: object) -> Any:
+    async def get(self, model: object, _claim_id: uuid.UUID, **_kwargs: object) -> Any:
+        # 0d-2: _mark_claim_failed 会查询 ConsultSession 以写入 recovery_status。
+        if getattr(model, "__name__", None) == "ConsultSession":
+            return SimpleNamespace(status="active", recovery_status="normal", updated_at=None)
         return self.claim
 
 
 @pytest.mark.asyncio
 async def test_failed_intake_claim_releases_ephemeral_output() -> None:
     claim_id = uuid.uuid4()
-    claim = SimpleNamespace(status="running", error_code=None, updated_at=None, run_id=uuid.uuid4())
+    claim = SimpleNamespace(
+        status="running",
+        error_code=None,
+        updated_at=None,
+        run_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+    )
     db = _FakeAsyncSession(claim)
     intake_module._INTAKE_OUTPUT_CACHE[claim_id] = object()  # type: ignore[assignment]
 

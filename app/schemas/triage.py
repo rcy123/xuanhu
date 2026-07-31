@@ -30,6 +30,8 @@ class _TriageModel(BaseModel):
 
 class TriageDisposition(StrEnum):
     CONTINUE = "continue"
+    # 0d-3：有风险但不到紧急——不阻断（decision=PASSED）、留痕、继续问诊。
+    RISK_NOTE = "risk_note"
     EMERGENCY_REFERRAL = "emergency_referral"
     MANUAL_REVIEW = "manual_review"
 
@@ -66,6 +68,8 @@ class TriageGateDetails(_TriageModel):
     rule_ids: tuple[str, ...] = Field(default=())
     rules: tuple[TriageRuleOutcome, ...] = Field(default=())
     source_message_ids: tuple[str, ...] = Field(default=())
+    # 0d-3 风险三级化：none（无风险）/ noted（有风险·不阻断·留痕）/ emergency（重大风险·阻断）。
+    risk_level: str = Field(default="none", pattern=r"^(none|noted|emergency)$")
 
 
 class TriageGateResult(_TriageModel):

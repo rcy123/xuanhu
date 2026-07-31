@@ -257,6 +257,20 @@ class ChatStructuredParseError(ModelGatewayError):
         super().__init__(message, retryable=False)
 
 
+class ChatOutputTruncatedError(ModelGatewayError):
+    """模型结构化输出被 max_tokens 截断（finish_reason=length）。
+
+    与「返回了坏 JSON」区分：截断是输出长度预算问题（调大 max_tokens /
+    重试可能成功），坏 JSON 是模型格式漂移。留痕可据此区分两类失败。
+    """
+
+    def __init__(
+        self,
+        message: str = "模型结构化输出被截断（finish_reason=length）",
+    ) -> None:
+        super().__init__(message, retryable=True)
+
+
 # ---------------------------------------------------------------------------
 # P3-4 恢复与健康检查异常
 # ---------------------------------------------------------------------------

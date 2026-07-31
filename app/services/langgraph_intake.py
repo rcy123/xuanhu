@@ -146,6 +146,35 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
         "MODEL_INPUT_PRIVACY_VIOLATION",
         # 网关超时的伴生情况（外层 RunSpec 先放弃）：降级而不硬停整条问诊。
         "RUN_DEADLINE_EXCEEDED",
+        # 0d-2：模型输出坏 JSON / 截断属于「同输入重放可能成功」的随机失败，
+        # 加入可重试集，使同一幂等键重放自动重开 claim（_reset_retryable_failed_claim），
+        # 不再「previous intake command failed」永久拒绝。模型持续失败时仍会走到
+        # recovery_status=manual_required → recover 转人工兜底，不会无限重试。
+        "STRUCTURED_OUTPUT_INVALID",
+        "MODEL_OUTPUT_TRUNCATED",
+        "INTAKE_GROUNDING_SPAN_INVALID",
+        "INTAKE_GROUNDING_VALUE_MISMATCH",
+        # 0d-2：composer 模型失败（自由措辞生成失败）同属随机失败，
+        # 可重试重放；模板兜底仍由 compose_question 内部先承担（degraded 留痕）。
+        "QUESTION_MODEL_OUTPUT_INVALID",
+        "QUESTION_MODEL_UNAVAILABLE",
+        "QUESTION_SINGLE_QUESTION_INVALID",
+        "QUESTION_COMPOSER_FAILED",
+        # 图级兜底错误码：底层多为节点级模型随机失败（last_failure_code 保留在
+        # failure 上下文），同键重放大概率成功；manual_required 兜底防无限重试。
+        "RUNNER_EXECUTION_FAILED",
+    }
+)
+
+# 0d-2：静默降级（extract 失败 → 模板 follow-up，不打断对话）只限瞬时网关/守卫类失败。
+# 模型输出问题（坏 JSON / 截断 / span 不匹配）不静默掩盖（0a 留痕原则），走 failed +
+# RETRYABLE_INTAKE_FAILURE_CODES 可重试路径，让同一幂等键重放有机会成功。
+_INTAKE_SILENT_DEGRADE_CODES = frozenset(
+    {
+        "MODEL_GATEWAY_TIMEOUT",
+        "MODEL_GATEWAY_UNAVAILABLE",
+        "MODEL_INPUT_PRIVACY_VIOLATION",
+        "RUN_DEADLINE_EXCEEDED",
     }
 )
 INTAKE_ROUTE_READY = "ready"
@@ -309,27 +338,53 @@ class LangGraphIntakeMessageRunner:
             run_id=str(claim.claim.run_id),
         )
         config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
-        if self._shared_runtime is not None:
-            runner = self._shared_runtime.runner(timeout_seconds=60)
-            await runner.ainvoke(dict(graph_state), config=config)
-        elif self._allow_request_local_runtime:
-            # Explicit fallback for direct service/integration-test invocation.
-            # Production HTTP requests always receive the lifespan-owned state
-            # and therefore never enter this branch.
-            async with postgres_checkpointer(get_settings().database_url) as saver:
-                graph = build_main_graph(checkpointer=saver)
-                runner = GraphRunner(graph, timeout_seconds=60)
+        try:
+            if self._shared_runtime is not None:
+                runner = self._shared_runtime.runner(timeout_seconds=60)
                 await runner.ainvoke(dict(graph_state), config=config)
-        else:
+            elif self._allow_request_local_runtime:
+                # Explicit fallback for direct service/integration-test invocation.
+                # Production HTTP requests always receive the lifespan-owned state
+                # and therefore never enter this branch.
+                async with postgres_checkpointer(get_settings().database_url) as saver:
+                    graph = build_main_graph(checkpointer=saver)
+                    runner = GraphRunner(graph, timeout_seconds=60)
+                    await runner.ainvoke(dict(graph_state), config=config)
+            else:
+                await self._mark_claim_failed(
+                    claim.claim.id,
+                    "LANGGRAPH_RUNTIME_UNAVAILABLE",
+                )
+                raise AgentTriggerFailedError(
+                    detail="shared LangGraph runtime is unavailable",
+                    agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
+                    retryable=True,
+                )
+        except AgentTriggerFailedError:
+            raise
+        except Exception as exc:
+            # 0d-2：图级异常（GraphRunnerError 等）也必须落 claim=failed，
+            # 否则 claim 永远 running → 会话永久 SESSION_BUSY 且 recover 无入口。
+            # 错误码优先取节点层已写的 last_failure_code（如 INTAKE_GROUNDING_*，
+            # 可重试），图级 code（RUNNER_EXECUTION_FAILED）仅作兜底上下文。
+            payload = claim.claim.intermediate_payload if isinstance(claim.claim.intermediate_payload, dict) else {}
+            node_failure_code = None
+            if isinstance(payload.get("failure"), dict):
+                node_failure_code = payload["failure"].get("last_failure_code")
+            graph_code = getattr(exc, "code", None) or type(exc).__name__.upper()[:64]
+            code = node_failure_code or graph_code
             await self._mark_claim_failed(
                 claim.claim.id,
-                "LANGGRAPH_RUNTIME_UNAVAILABLE",
+                code,
+                failure_context={
+                    "last_step": "graph_ainvoke",
+                    "error_code": code,
+                    "failed_node": "graph",
+                    "exception_type": type(exc).__name__,
+                    "graph_error_code": graph_code,
+                },
             )
-            raise AgentTriggerFailedError(
-                detail="shared LangGraph runtime is unavailable",
-                agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
-                retryable=True,
-            )
+            raise
         return await self._wait_for_completed_claim(sid, command_key, payload_digest)
 
     async def _claim_or_replay(
@@ -789,8 +844,17 @@ class LangGraphIntakeMessageRunner:
                 ) from exc
             raise
         except Exception as exc:
-            if not isinstance(exc, AgentTriggerFailedError | InvalidStateVersionError):
-                await self._mark_claim_failed(claim.id, type(exc).__name__.upper()[:64])
+            # 0d-2：compose 等软失败 raise AgentTriggerFailedError 时也必须落 claim=failed，
+            # 否则 claim 永远 running → 会话永久 SESSION_BUSY 且 recover 无入口。
+            if not isinstance(exc, InvalidStateVersionError):
+                await self._mark_claim_failed(
+                    claim.id,
+                    (
+                        exc.agent_error_code
+                        if isinstance(exc, AgentTriggerFailedError)
+                        else type(exc).__name__.upper()[:64]
+                    ),
+                )
             raise
 
     async def _next_progress(
@@ -956,12 +1020,17 @@ class LangGraphIntakeMessageRunner:
             claim = await self._db.get(IntakeCommandClaim, claim_id, with_for_update=True)
             if claim is not None and claim.status != "completed":
                 claim.status = "failed"
-                claim.error_code = error_code[:64]
+                # 0d-2: 节点层已写过具体错误码(如 INTAKE_GROUNDING_SPAN_INVALID)时
+                # 不覆盖——图级兜底(如 RUNNER_EXECUTION_FAILED)只补上下文,
+                # 保留可重试判定需要的精确错误码。
+                if claim.error_code is None:
+                    claim.error_code = error_code[:64]
                 if failure_context:
                     payload = dict(claim.intermediate_payload or {})
                     failure = dict(payload.get("failure") or {})
                     failure.update(failure_context)
-                    failure["error_code"] = error_code[:64]
+                    if claim.error_code is None:
+                        failure["error_code"] = error_code[:64]
                     payload["failure"] = failure
                     claim.intermediate_payload = payload
                 claim.updated_at = func.now()
@@ -969,6 +1038,13 @@ class LangGraphIntakeMessageRunner:
                 if graph_run is not None and graph_run.status == "running":
                     graph_run.status = "failed"
                     graph_run.completed_at = func.now()
+                # 0d-2：intake 失败 → session 进入可恢复状态（manual_required），
+                # /recover 才能接管（recover 仅放行 manual_required/recovering）；
+                # 重放成功路径 _complete_claim 会把它清回 normal。
+                session = await self._db.get(ConsultSession, claim.session_id, with_for_update=True)
+                if session is not None and session.status == "active" and session.recovery_status == "normal":
+                    session.recovery_status = "manual_required"
+                    session.updated_at = func.now()
         _INTAKE_OUTPUT_CACHE.pop(claim_id, None)
 
 
@@ -2528,7 +2604,7 @@ def _gateway_bound_reply_fallback_output(
     claim ``intermediate_payload`` (see ``_degraded_extraction_metadata``).
     """
 
-    if failure_code not in RETRYABLE_INTAKE_FAILURE_CODES:
+    if failure_code not in _INTAKE_SILENT_DEGRADE_CODES:
         return None
     return _bound_required_reply_fallback_output(input_payload)
 
