@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 
 from app.schemas.completeness import InquiryDimension
 
@@ -53,9 +54,7 @@ from app.schemas.completeness import InquiryDimension
 #: 67e04fc4 / 1b89a179 实采 fact_key 面）。
 DIMENSION_KEYSETS: Mapping[InquiryDimension, tuple[str, ...]] = {
     # --- 主诉 / 现病（canonical + 现性派生） ---
-    InquiryDimension.CHIEF_COMPLAINT_SYMPTOM: (
-        "chief_complaint.symptom",
-    ),
+    InquiryDimension.CHIEF_COMPLAINT_SYMPTOM: ("chief_complaint.symptom",),
     InquiryDimension.BASIC_COURSE: (
         "chief_complaint.course",
         "chief_complaint.duration",
@@ -81,7 +80,6 @@ DIMENSION_KEYSETS: Mapping[InquiryDimension, tuple[str, ...]] = {
         "present_illness.nasal_congestion",
         "present_illness.shortness_of_breath",
     ),
-
     # --- 十问歌（canonical ten_questions.* + present_illness.* 现性派生） ---
     InquiryDimension.TEN_COLD_HEAT: (
         "ten_questions.cold_heat",
@@ -167,31 +165,21 @@ DIMENSION_KEYSETS: Mapping[InquiryDimension, tuple[str, ...]] = {
         "patient.sex",
         "patient.gender",
     ),
-    InquiryDimension.PATIENT_AGE: (
-        "patient.age",
-    ),
+    InquiryDimension.PATIENT_AGE: ("patient.age",),
     InquiryDimension.MENOPAUSE_STATUS: (
         "patient.menopause",
         "patient.menopause_status",
     ),
-    InquiryDimension.PREGNANCY_APPLICABILITY_FLAG: (
-        "patient.pregnancy_applicable",
-    ),
-    InquiryDimension.LACTATION_APPLICABILITY_FLAG: (
-        "patient.lactation_applicable",
-    ),
+    InquiryDimension.PREGNANCY_APPLICABILITY_FLAG: ("patient.pregnancy_applicable",),
+    InquiryDimension.LACTATION_APPLICABILITY_FLAG: ("patient.lactation_applicable",),
     # 可选汇报维度（canonical 已认，不设派生）。
-    InquiryDimension.PAST_HISTORY: (
-        "past_history",
-    ),
+    InquiryDimension.PAST_HISTORY: ("past_history",),
     InquiryDimension.FOUR_DIAGNOSIS: (
         "four_diagnosis.inspection",
         "four_diagnosis.palpation",
     ),
     # 主诉类别仅冲突维度、无覆盖键（canonical COMPLETENESS_AUXILIARY_FACT_DIMENSIONS 处理）。
-    InquiryDimension.CHIEF_COMPLAINT_CATEGORY: (
-        "chief_complaint.category",
-    ),
+    InquiryDimension.CHIEF_COMPLAINT_CATEGORY: ("chief_complaint.category",),
     # 安全维度不在键桥内——由 safety_profile.collection_status 决定，留空占位以防误用派生。
     InquiryDimension.ALLERGY_STATUS: (),
     InquiryDimension.MEDICATION_STATUS: (),
@@ -381,3 +369,92 @@ def dimension_has_trend_key(
     if trend_keys is None:
         return True
     return any(key in active_fact_keys for key in trend_keys)
+
+
+def slot_threshold_for(dimension: InquiryDimension) -> int:
+    """2a: 粗槽位阈值(决策 12)——采到 N 项语义即齐。
+
+    单一真源 :data:`MATURITY_KEY_THRESHOLDS`(寒热≥2/二便≥2/现病变化≥1);
+    无阈值维度默认 1(覆盖即齐,与现状「一键即过」下限对齐,阶段 2c 起
+    covered 判定从「认键」迁移为「认槽位齐」时保持判定不变——改容器不改判定)。
+    """
+
+    return MATURITY_KEY_THRESHOLDS.get(dimension, 1)
+
+
+def dimension_slot_satisfied(
+    dimension: InquiryDimension,
+    slot_count: int,
+    *,
+    llm_signal: str | None = None,
+) -> bool:
+    """2a: 槽位齐判定(确定性闸门,铁律 10 + 决策 25)。
+
+    - llm_signal=complete: LLM 判齐,代码按粗槽位阈值复核(LLM 不能输出"放过"突破下限);
+    - llm_signal=partial: LLM 主导——语义缺口存在,即使槽位数达标也继续追问(决策 25);
+    - llm_signal 缺失/unknown: 代码兜底,退回粗槽位阈值判定(采到 N 项即齐)。
+    """
+
+    threshold = slot_threshold_for(dimension)
+    if llm_signal == "partial":
+        return False
+    if llm_signal == "complete":
+        return slot_count >= threshold
+    return slot_count >= threshold
+
+
+def derive_dimension_slots(
+    active_facts: tuple[Any, ...],
+    *,
+    dimensions: frozenset[InquiryDimension],
+    max_slots_per_dimension: int = 8,
+) -> tuple[dict[str, Any], ...]:
+    """2b: 从已验证 observations 派生粗槽位快照(JSON-safe dict,可入 Graph State)。
+
+    设计(决策 12「改容器不改判定」+ 2.5a 灰度):
+    - 不做模型契约变更——槽位对象由确定性代码从 E1/D1 已验证的 observations
+      按 ``DIMENSION_KEYSETS`` 归属派生,落库单元仍是裸键(过渡期,E1/D1 保留);
+    - 每个维度一个快照:slots = 该维度 keyset 内已采到的 (fact_key, value) 语义项,
+      completeness 按粗槽位阈值判定(complete / partial),missing_slots 列阈值缺口;
+    - 灰度关闭时 covered 判定仍认键(现状);开启时认槽位齐(阶段 2c 接入),
+      两个口径的判定阈值同源(``MATURITY_KEY_THRESHOLDS``),迁移不改变判定结果。
+    """
+
+    from app.schemas.intake import DimensionSlotSnapshot, DimensionSlotValue, SlotCompleteness
+
+    by_dimension: dict[InquiryDimension, list[Any]] = {d: [] for d in dimensions}
+    for fact in active_facts:
+        key = getattr(fact, "fact_key", None)
+        if not isinstance(key, str):
+            continue
+        for dimension in dimensions:
+            if key in DIMENSION_KEYSETS.get(dimension, ()):
+                by_dimension[dimension].append(fact)
+                break
+
+    snapshots: list[dict[str, Any]] = []
+    for dimension in sorted(dimensions, key=lambda item: item.value):
+        facts = by_dimension[dimension][:max_slots_per_dimension]
+        slot_count = len(facts)
+        satisfied = dimension_slot_satisfied(dimension, slot_count)
+        threshold = slot_threshold_for(dimension)
+        missing = ()
+        if not satisfied and slot_count < threshold:
+            missing = (f"还需采集 {threshold - slot_count} 项该维度语义",)
+        snapshots.append(
+            DimensionSlotSnapshot(
+                dimension=dimension.value,
+                slots=tuple(
+                    DimensionSlotValue(
+                        slot_name=fact.fact_key,
+                        value=(fact.normalized_value if fact.normalized_value is not None else fact.value),
+                        source_message_id=fact.source_message_id,
+                        confidence=fact.confidence if fact.confidence is not None else 0.9,
+                    )
+                    for fact in facts
+                ),
+                completeness=(SlotCompleteness.COMPLETE if satisfied else SlotCompleteness.PARTIAL),
+                missing_slots=missing,
+            ).model_dump(mode="json")
+        )
+    return tuple(snapshots)

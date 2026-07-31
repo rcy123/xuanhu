@@ -188,12 +188,14 @@ def test_contract_is_versioned_strict_serializable_and_output_has_only_five_fiel
     source = uuid4()
     output = extracted(source)
     assert output.schema_version == "intake-extraction.v2"
+    # 2a: 新增 dimension_slots(槽位对象,灰度开关控制),共 6 字段。
     assert set(IntakeExtractionOutput.model_fields) == {
         "decision",
         "observations",
         "patient_safety_delta",
         "red_flag_candidates",
         "ambiguities",
+        "dimension_slots",
     }
     assert IntakeExtractionOutput.model_validate_json(output.model_dump_json()) == output
     with pytest.raises(ValidationError):

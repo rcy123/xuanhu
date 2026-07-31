@@ -163,6 +163,14 @@ class Settings(BaseSettings):
         validation_alias="XUANHU_LANGGRAPH_PUBLIC_ENABLED",
         description="允许公共会话创建 API 新建 LangGraph 会话；默认关闭并失败封闭",
     )
+    # 2a/2.5a: 采集范式灰度开关。开启后新 session 的 intake_extraction 产出
+    # 槽位对象(dimension_slots),covered 判定认槽位齐;关闭则维持裸 fact_key 路径。
+    # 灰度观察期稳定后切主路径(2.5a),裸键旁路仅历史 session 兼容读。
+    intake_slot_path_enabled: bool = Field(
+        default=False,
+        validation_alias="XUANHU_INTAKE_SLOT_PATH_ENABLED",
+        description="新会话走槽位采集范式(阶段 2 灰度);默认关闭,转正后置 true",
+    )
     agent_runtime_rollout_phase: Literal[
         "legacy",
         "development",

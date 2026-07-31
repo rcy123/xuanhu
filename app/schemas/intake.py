@@ -316,6 +316,70 @@ class IntakeExtractionOutput(_IntakeModel):
     patient_safety_delta: PatientSafetyDelta = Field(default_factory=PatientSafetyDelta)
     red_flag_candidates: tuple[RedFlagCandidate, ...] = Field(default=(), max_length=16)
     ambiguities: tuple[Ambiguity, ...] = Field(default=(), max_length=16)
+    # 2a/2b: 槽位对象(粗槽位,决策 12)——程序定义的维度槽位快照,模型把语义填进
+    # 预定义槽位而非自创 fact_key。灰度开关(settings.intake_slot_path_enabled)控制
+    # 是否要求模型产出;关闭时恒为空,维持裸 fact_key 路径。完整性信号(complete/
+    # partial + missing_slots)为决策 25 的 LLM 主导判定提供语义缺口。
+    dimension_slots: tuple[DimensionSlotSnapshot, ...] = Field(default=(), max_length=16)
+
+
+class SlotCompleteness(StrEnum):
+    """2a: 维度槽位完整性信号(决策 25,LLM 主导 + 代码兜底)。
+
+    - COMPLETE: 槽位齐,可落库(代码还按粗槽位阈值复核,铁律 10 兜底)。
+    - PARTIAL: 有语义缺口(missing_slots 列缺口),驱动下一轮追问。
+    - UNKNOWN: 未采集/模型未判定——代码退回粗槽位阈值判定。
+    """
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+
+class DimensionSlotValue(_IntakeModel):
+    """2a: 一条粗槽位语义项(决策 12:采到 N 项即齐,槽位名程序定义)。
+
+    槽位名与取值均为程序/模型契约:模型只能填,不能自创槽位名。
+    """
+
+    slot_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    value: Any = Field(...)
+    source_message_id: UUID | None = Field(default=None)
+    confidence: float = Field(default=0.9, ge=0, le=1)
+
+    @field_validator("confidence")
+    @classmethod
+    def finite_confidence(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("confidence must be finite")
+        return value
+
+
+class DimensionSlotSnapshot(_IntakeModel):
+    """2a: 程序定义的维度槽位快照(粗槽位容器)。
+
+    - dimension: 程序定义维度枚举值(InquiryDimension),模型不能自创维度。
+    - slots: 已采到的语义项(粗槽位:N 项即齐,阈值见
+      ``app.agent_runtime.intake_dimension_mapping.slot_threshold_for``)。
+    - completeness / missing_slots: 决策 25 的 LLM 完整性信号;
+      确定性层(铁律 10)按粗槽位阈值复核,LLM 信号缺失时退回阈值判定。
+    """
+
+    dimension: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    slots: tuple[DimensionSlotValue, ...] = Field(default=(), max_length=16)
+    completeness: SlotCompleteness = SlotCompleteness.UNKNOWN
+    missing_slots: tuple[str, ...] = Field(default=(), max_length=16)
+
+    @field_validator("dimension")
+    @classmethod
+    def dimension_must_be_known(cls, value: str) -> str:
+        # 延迟导入避免 schemas.intake ↔ schemas.completeness 导入环(与
+        # ComplaintClassificationOutput.category 的 Any 处理同因)。
+        from app.schemas.completeness import InquiryDimension
+
+        if value not in {item.value for item in InquiryDimension}:
+            raise ValueError(f"dimension must be a known InquiryDimension, got {value!r}")
+        return value
 
 
 # 1a 主诉大类归集：独立一步把 chief_complaint 归到 ComplaintCategory 枚举之一。
