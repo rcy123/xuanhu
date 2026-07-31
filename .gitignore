@@ -48,6 +48,7 @@ coverage.xml
 
 # Local reacceptance artifacts
 .codex_tmp/
+.reasonix
 
 # Node (frontend, if any)
 node_modules/
