@@ -132,11 +132,13 @@ class GraphRunner:
         except CheckpointConfigMismatchError:
             # 校验错误直接传播，不包装
             raise
-        except Exception:
+        except Exception as exc:
             # 不读取或链式保留底层异常；异常文本可能包含密钥、prompt 或患者信息。
+            # 仅携带异常类型名(不含文本)便于定位节点级逃逸,如 "ValueError"/"IntegrityError"。
             execution_error = GraphRunnerError(
                 "Graph execution failed",
                 code="RUNNER_EXECUTION_FAILED",
+                exception_type=type(exc).__name__,
             )
 
         if execution_error is not None:

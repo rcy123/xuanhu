@@ -84,8 +84,10 @@ class GraphRunnerError(GraphStateError):
     消息不得包含完整 state、prompt、模型原始输出、密钥或患者身份。
     """
 
-    def __init__(self, message: str, *, code: str) -> None:
+    def __init__(self, message: str, *, code: str, exception_type: str | None = None) -> None:
         super().__init__(message, code=code)
+        # 仅异常类型名(如 "ValueError"/"IntegrityError"),不含任何文本,用于定位节点级逃逸。
+        self.exception_type = exception_type
 
 
 class GraphRunnerTimeoutError(GraphRunnerError):

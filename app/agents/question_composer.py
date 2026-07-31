@@ -32,6 +32,7 @@ from app.schemas.question import (
     QuestionComposerModelInput,
     QuestionComposerModelOutput,
     QuestionComposerResult,
+    QuestionComposerTurn,
     QuestionCompositionOutcome,
     QuestionCompositionStatus,
     QuestionSource,
@@ -316,6 +317,10 @@ def build_question_context(
             "selection_kind",
             "safety_instruction",
             "clinical_context",
+            "recent_turns",
+            "chief_complaint",
+            "activated_dimensions",
+            "missing_slot",
         },
         token_limit=QUESTION_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
@@ -331,6 +336,9 @@ def build_question_context(
             {
                 "selected_dimension": input_payload.selected_dimension.value,
                 "selection_kind": input_payload.selection_kind.value,
+                "chief_complaint": input_payload.chief_complaint,
+                "activated_dimensions": list(input_payload.activated_dimensions),
+                "missing_slot": input_payload.missing_slot,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -349,6 +357,11 @@ async def compose_question(
     run_spec: RunSpec | None = None,
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
+    # 1b: 对话历史/主诉/激活维度集/缺口提示(槽位缺口暂从 missing_required 派生)
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
+    chief_complaint: str | None = None,
+    activated_dimensions: tuple[str, ...] = (),
+    missing_slot: str | None = None,
 ) -> QuestionCompositionOutcome:
     """Compose zero or one question without writing state or changing gates."""
 
@@ -374,6 +387,10 @@ async def compose_question(
         prompt_loader=prompt_loader,
         template_registry=_QUESTION_TEMPLATES_AUTHORITY,
         clinical_context=clinical_context,
+        recent_turns=recent_turns,
+        chief_complaint=chief_complaint,
+        activated_dimensions=activated_dimensions,
+        missing_slot=missing_slot,
     )
 
 
@@ -386,6 +403,10 @@ async def _compose_question_with_template_registry(
     prompt_loader: PromptLoader | None = None,
     template_registry: Mapping[tuple[InquiryDimension, GapSelectionKind], QuestionTemplate],
     clinical_context: tuple[QuestionComposerClinicalFact, ...] = (),
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
+    chief_complaint: str | None = None,
+    activated_dimensions: tuple[str, ...] = (),
+    missing_slot: str | None = None,
 ) -> QuestionCompositionOutcome:
     """Compose with the model when runtime provenance is available.
 
@@ -406,9 +427,7 @@ async def _compose_question_with_template_registry(
     template_key = (selection.selected_dimension, selection.selection_kind)
     template = template_registry.get(template_key)
     template_outcome = (
-        _template_result(selection, template, template_key=template_key)
-        if template is not None
-        else None
+        _template_result(selection, template, template_key=template_key) if template is not None else None
     )
     if template_outcome is not None and template_outcome.status is not QuestionCompositionStatus.SUCCEEDED:
         return template_outcome
@@ -422,18 +441,18 @@ async def _compose_question_with_template_registry(
         agent_spec=agent_spec or build_question_composer_agent_spec(),
         prompt_loader=prompt_loader,
         clinical_context=clinical_context,
+        recent_turns=recent_turns,
+        chief_complaint=chief_complaint,
+        activated_dimensions=activated_dimensions,
+        missing_slot=missing_slot,
     )
     if model_outcome.status is QuestionCompositionStatus.SUCCEEDED:
         return model_outcome
-    if (
-        template_outcome is not None
-        and model_outcome.failure_code
-        in {
-            QuestionComposerFailureCode.MODEL_UNAVAILABLE,
-            QuestionComposerFailureCode.MODEL_OUTPUT_INVALID,
-            QuestionComposerFailureCode.SINGLE_QUESTION_INVALID,
-        }
-    ):
+    if template_outcome is not None and model_outcome.failure_code in {
+        QuestionComposerFailureCode.MODEL_UNAVAILABLE,
+        QuestionComposerFailureCode.MODEL_OUTPUT_INVALID,
+        QuestionComposerFailureCode.SINGLE_QUESTION_INVALID,
+    }:
         # 软失败回模板：携带退化信号（degraded + last_failure_code），让 intake 节点把
         # "本轮为什么回落到模板"写进 intermediate_payload["question_composer"] 可被查询。
         return template_outcome.model_copy(
@@ -510,6 +529,10 @@ async def _model_result(
     agent_spec: AgentSpec,
     prompt_loader: PromptLoader | None,
     clinical_context: tuple[QuestionComposerClinicalFact, ...],
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
+    chief_complaint: str | None = None,
+    activated_dimensions: tuple[str, ...] = (),
+    missing_slot: str | None = None,
 ) -> QuestionCompositionOutcome:
     assert selection.selected_dimension is not None
     input_payload = QuestionComposerModelInput(
@@ -517,6 +540,10 @@ async def _model_result(
         selection_kind=selection.selection_kind,
         safety_instruction=QUESTION_SAFETY_INSTRUCTION,
         clinical_context=clinical_context,
+        recent_turns=recent_turns,
+        chief_complaint=chief_complaint,
+        activated_dimensions=activated_dimensions,
+        missing_slot=missing_slot,
     )
     try:
         input_payload = _canonicalize_model_input(input_payload)
@@ -716,17 +743,11 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 raw_keys.update(extra)
             if raw_keys - allowed:
                 return True
-            return any(
-                _has_undeclared_fields(getattr(raw, name, None), getattr(canonical, name))
-                for name in allowed
-            )
+            return any(_has_undeclared_fields(getattr(raw, name, None), getattr(canonical, name)) for name in allowed)
         if isinstance(raw, dict):
             if set(raw) - allowed:
                 return True
-            return any(
-                _has_undeclared_fields(raw.get(name), getattr(canonical, name))
-                for name in allowed
-            )
+            return any(_has_undeclared_fields(raw.get(name), getattr(canonical, name)) for name in allowed)
         return True
     if isinstance(canonical, (list, tuple)):
         if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):

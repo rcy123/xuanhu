@@ -137,11 +137,62 @@ async def create_initial_intake_question(
             progress=progress,
         )
     )
-    outcome = await compose_question(completeness_result=completeness)
+    # 1b: 首问主诉驱动——传 run_spec 开模型调用(生成贴合主诉的首问),
+    # 失败自动回模板兜底(degraded 留痕),不阻塞会话创建。
+    chief_complaint = next(
+        (
+            item.value
+            for item in seed.observations
+            if item.fact_key == "chief_complaint.symptom" and isinstance(item.value, str)
+        ),
+        None,
+    )
+    from datetime import timedelta
+
+    from app.agent_runtime.runtime import AgentRuntime
+    from app.agent_runtime.specs import RunSpec
+    from app.agents.question_composer import (
+        QUESTION_COMPOSER_AGENT_VERSION,
+        QUESTION_COMPOSER_POLICY_VERSION,
+        QUESTION_COMPOSER_PROMPT_VERSION,
+    )
+
+    run_spec = RunSpec(
+        run_id=_stable_id(session.id, "question-run"),
+        session_id=session.id,
+        state_version=session.state_version,
+        stage="intake_question",
+        agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
+        prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
+        policy_version=QUESTION_COMPOSER_POLICY_VERSION,
+        deadline_at=datetime.now(UTC) + timedelta(seconds=90),
+        total_attempt_budget=1,
+        idempotency_key=f"bootstrap:{session.id}:question",
+        trace_id=trace_id,
+    )
+    outcome = await compose_question(
+        completeness_result=completeness,
+        run_spec=run_spec,
+        # 创建会话事务未提交时 model_run_audits 外键不可写(required recorder 会
+        # raise ModelRunAuditUnavailableError),故首问路径跳过审计——首问留痕在
+        # structured_delta 中,后续轮次恢复正常 recorder。
+        runtime=AgentRuntime(recorder=None),
+        chief_complaint=chief_complaint,
+        activated_dimensions=tuple(
+            sorted(
+                {
+                    getattr(dim, "value", str(dim))
+                    for dim in tuple(completeness.covered_dimensions) + tuple(completeness.missing_required)
+                }
+            )
+        ),
+    )
     if outcome.status is QuestionCompositionStatus.NO_QUESTION:
         return None
     if outcome.status is not QuestionCompositionStatus.SUCCEEDED or outcome.result is None:
-        raise RuntimeError("initial intake question composition failed")
+        raise RuntimeError(
+            f"initial intake question composition failed: {outcome.failure_code}"
+        )
 
     question_result = outcome.result
     message = ConsultMessage(

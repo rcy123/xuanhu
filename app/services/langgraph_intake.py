@@ -28,6 +28,7 @@ from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.completeness_policy import completeness_to_gate_result_schema, evaluate_completeness_policy
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
+from app.agent_runtime.context import project_model_input_identity_sequences
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.intake_fact_key_legality import (
@@ -44,7 +45,7 @@ from app.agent_runtime.intake_verifier import (
     INTAKE_PROMPT_VERSION,
 )
 from app.agent_runtime.lifecycle import SharedLangGraphRuntime
-from app.agent_runtime.reducer import DomainDelta, DomainState, reduce_domain_state
+from app.agent_runtime.reducer import DomainDelta, DomainReducerError, DomainState, reduce_domain_state
 from app.agent_runtime.repository import (
     ConsultMessageSpec,
     GraphStepSpec,
@@ -125,6 +126,7 @@ from app.schemas.question import (
     QUESTION_COMPOSER_AGENT_VERSION,
     QUESTION_COMPOSER_PROMPT_VERSION,
     QuestionComposerClinicalFact,
+    QuestionComposerTurn,
     QuestionCompositionOutcome,
     QuestionCompositionStatus,
 )
@@ -210,6 +212,8 @@ _BOUND_REQUIRED_OBSERVATION_DIMENSIONS = frozenset(
         InquiryDimension.TEN_RESPIRATORY,
     }
 )
+
+
 class _EmptyOutput(BaseModel):
     ok: bool = True
 
@@ -380,7 +384,7 @@ class LangGraphIntakeMessageRunner:
                     "last_step": "graph_ainvoke",
                     "error_code": code,
                     "failed_node": "graph",
-                    "exception_type": type(exc).__name__,
+                    "exception_type": getattr(exc, "exception_type", None) or type(exc).__name__,
                     "graph_error_code": graph_code,
                 },
             )
@@ -427,10 +431,7 @@ class LangGraphIntakeMessageRunner:
                         )
                     if existing.status == "completed" and existing.response_payload is not None:
                         return _ClaimResult(existing, None, _response_from_payload(existing.response_payload))
-                    if (
-                        existing.status == "failed"
-                        and existing.error_code in RETRYABLE_INTAKE_FAILURE_CODES
-                    ):
+                    if existing.status == "failed" and existing.error_code in RETRYABLE_INTAKE_FAILURE_CODES:
                         retry_message = await self._reset_retryable_failed_claim(existing)
                         if retry_message is not None:
                             return _ClaimResult(existing, retry_message)
@@ -914,16 +915,40 @@ class LangGraphIntakeMessageRunner:
             clinical_context=_question_clinical_context(domain_state),
             runtime=AgentRuntime(),
             run_spec=run_spec,
+            # 1b: 对话历史/主诉/激活维度集/缺口提示——writer 承接前文、贴合主诉、自由措辞
+            recent_turns=await _recent_question_turns(self._db, session_id),
+            chief_complaint=_chief_complaint_text(domain_state),
+            activated_dimensions=_activated_dimension_values(completeness_result),
+            missing_slot=_missing_slot_text(completeness_result),
         )
         if outcome.status is QuestionCompositionStatus.NO_QUESTION:
             return None
         if outcome.status is not QuestionCompositionStatus.SUCCEEDED or outcome.result is None:
+            # 1b: compose 硬失败(模板缺失/契约不匹配)不再 raise 崩图——
+            # 留痕 degraded 后本轮不追问(claim 正常 completed,下一轮再问)。
             code = str(outcome.failure_code or "QUESTION_COMPOSER_FAILED")
-            raise AgentTriggerFailedError(
-                detail=f"session_id={session_id} question composition failed code={code}",
-                agent_error_code=code,
-                retryable=False,
+            await _save_intermediate(
+                claim_id,
+                {
+                    "question_composer": {
+                        "source": "template",
+                        "degraded": True,
+                        "source_kind": "question_composer",
+                        "agent_run_id": str(run_spec.run_id),
+                        "prompt_version": None,
+                        "selection_kind": str(
+                            getattr(outcome.result, "selection_kind", "") or ""
+                        ),
+                        "template_version": None,
+                        "selected_dimension": str(
+                            getattr(outcome.result, "selected_dimension", "") or ""
+                        ),
+                        "last_failure_code": code,
+                    }
+                },
+                step="question_compose",
             )
+            return None
         # 0a 模板兜底留痕：对称记录模型成功 / 模板退化，便于事后查"为什么这一轮是模板句"。
         await _save_intermediate(
             claim_id,
@@ -1258,6 +1283,21 @@ async def run_intake_verify_node(state: XuanhuGraphState) -> dict[str, Any]:
             computation = await _compute_intake_from_claim(claim, patient_message, _node_trace_id(state))
         except KeyError:
             return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+        except AgentTriggerFailedError as exc:
+            # 0d-2/1b: verify 校验失败(如 INTAKE_GROUNDING_VALUE_MISMATCH)不能 raise 崩图——
+            # 标记 claim=failed(具体错误码,可重试)并走 sanitized 路由,同 extract 失败路径。
+            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "verify_intake",
+                    "last_step": "verify_intake",
+                    "degraded": True,
+                    "last_failure_code": code,
+                },
+            )
+            return _sanitized_graph_error(state, code, "intake verification failed")
         except RepositoryError as exc:
             await runner._mark_claim_failed(claim.id, exc.code.value)  # noqa: SLF001
             raise
@@ -1289,6 +1329,20 @@ async def run_intake_reduce_node(state: XuanhuGraphState) -> dict[str, Any]:
             computation = await _compute_intake_from_claim(claim, patient_message, _node_trace_id(state))
         except KeyError:
             return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+        except AgentTriggerFailedError as exc:
+            # 0d-2/1b: verify 校验失败不能 raise 崩图——标记 claim=failed(具体码可重试)。
+            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "verify_intake",
+                    "last_step": "verify_intake",
+                    "degraded": True,
+                    "last_failure_code": code,
+                },
+            )
+            return _sanitized_graph_error(state, code, "intake verification failed")
         await _save_intermediate(
             claim.id,
             {
@@ -1321,6 +1375,20 @@ async def run_intake_gates_node(state: XuanhuGraphState) -> dict[str, Any]:
             computation = await _compute_intake_from_claim(claim, patient_message, _node_trace_id(state), runner=runner)
         except KeyError:
             return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+        except AgentTriggerFailedError as exc:
+            # 0d-2/1b: verify 校验失败不能 raise 崩图——标记 claim=failed(具体码可重试)。
+            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "verify_intake",
+                    "last_step": "verify_intake",
+                    "degraded": True,
+                    "last_failure_code": code,
+                },
+            )
+            return _sanitized_graph_error(state, code, "intake verification failed")
         intake_route = _route_for_disposition(computation.completeness_result.disposition)
         await _save_intermediate(
             claim.id,
@@ -1396,12 +1464,28 @@ async def run_recoverable_intake_node(state: XuanhuGraphState) -> dict[str, Any]
         patient_message = await db.get(ConsultMessage, claim.patient_message_id)
         if patient_message is None:
             return _sanitized_graph_error(state, "INTAKE_MESSAGE_NOT_FOUND", "intake patient message was not found")
-        update, _ = await runner._execute_after_claim(  # noqa: SLF001
-            claim=claim,
-            patient_message=patient_message,
-            trace_id=state.get("run_id") or command_id,
-            state=state,
-        )
+        try:
+            update, _ = await runner._execute_after_claim(  # noqa: SLF001
+                claim=claim,
+                patient_message=patient_message,
+                trace_id=state.get("run_id") or command_id,
+                state=state,
+            )
+        except AgentTriggerFailedError as exc:
+            # 0d-2/1b: _execute_after_claim 内 verify/reduce 失败(AgentTriggerFailedError)
+            # 不能 raise 崩图——标记 claim=failed(具体码可重试)并 sanitized 收尾。
+            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "finalize_intake",
+                    "last_step": "finalize_intake",
+                    "degraded": True,
+                    "last_failure_code": code,
+                },
+            )
+            return _sanitized_graph_error(state, code, "intake finalize failed")
         return update
 
 
@@ -1633,7 +1717,9 @@ async def _classify_and_merge_category(
         source = "model_degraded"
         degraded = True
         failure_code = (
-            result.failure_code.value if result.failure_code is not None else ComplaintClassifierFailureCode.MODEL_OUTPUT_INVALID.value
+            result.failure_code.value
+            if result.failure_code is not None
+            else ComplaintClassifierFailureCode.MODEL_OUTPUT_INVALID.value
         )
 
     category_obs = _build_category_observation(
@@ -1686,7 +1772,15 @@ def _merge_category_into_delta(
         trace_id=trace_id,
         idempotency_key=idempotency_key,
     )
-    new_next_state = reduce_domain_state(domain_state, new_delta, new_context)
+    try:
+        new_next_state = reduce_domain_state(domain_state, new_delta, new_context)
+    except DomainReducerError as exc:
+        # 0d-2: 分类合并后的 reduce 冲突同属模型输出问题,转 AgentTriggerFailedError。
+        raise AgentTriggerFailedError(
+            detail=f"intake category merge reduce failed code={exc.code.value}",
+            agent_error_code=exc.code.value,
+            retryable=False,
+        ) from None
     return new_delta, new_next_state, new_context
 
 
@@ -1717,13 +1811,9 @@ async def _compute_intake_from_claim(
     if rejected_observations or normalized_observations:
         extraction_trace: dict[str, Any] = {}
         if rejected_observations:
-            extraction_trace["rejected_observations"] = rejected_observations_to_payload(
-                rejected_observations
-            )
+            extraction_trace["rejected_observations"] = rejected_observations_to_payload(rejected_observations)
         if normalized_observations:
-            extraction_trace["normalized_observations"] = normalized_observations_to_payload(
-                normalized_observations
-            )
+            extraction_trace["normalized_observations"] = normalized_observations_to_payload(normalized_observations)
         await _save_intermediate(
             claim.id,
             {"extraction": extraction_trace},
@@ -1735,7 +1825,17 @@ async def _compute_intake_from_claim(
         trace_id=trace_id,
         idempotency_key=claim.idempotency_key,
     )
-    next_state = reduce_domain_state(domain_state, delta, context)
+    try:
+        next_state = reduce_domain_state(domain_state, delta, context)
+    except DomainReducerError as exc:
+        # 0d-2: reducer 冲突(如模型重复提取同键不同值 OBSERVATION_SOURCE_CONFLICT)
+        # 是模型输出质量问题——统一转 AgentTriggerFailedError(带具体码),由各节点
+        # catch 标记 claim=failed + sanitized,不再崩图/污染 checkpoint。
+        raise AgentTriggerFailedError(
+            detail=f"intake domain reduce failed code={exc.code.value}",
+            agent_error_code=exc.code.value,
+            retryable=False,
+        ) from None
     # 1a 主诉大类归集并入终端单 commit：在 evaluate_completeness_policy 之前把
     # chief_complaint.category 作为一条 ADD observation 追加进 delta，重算一次
     # reduce_domain_state 得到含 category 的最终 next_state。这样下游
@@ -1844,11 +1944,7 @@ async def _pending_safety_dimensions(
             pending_fields.add(field_name)
     return tuple(
         sorted(
-            {
-                field_to_dimension[field_name]
-                for field_name in pending_fields
-                if field_name in field_to_dimension
-            },
+            {field_to_dimension[field_name] for field_name in pending_fields if field_name in field_to_dimension},
             key=lambda item: item.value,
         )
     )
@@ -2130,6 +2226,20 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
             )
         except KeyError:
             return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+        except AgentTriggerFailedError as exc:
+            # 0d-2/1b: verify 校验失败不能 raise 崩图——标记 claim=failed(具体码可重试)。
+            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+            await runner._mark_claim_failed(  # noqa: SLF001
+                claim.id,
+                code,
+                failure_context={
+                    "failed_node": "verify_intake",
+                    "last_step": "verify_intake",
+                    "degraded": True,
+                    "last_failure_code": code,
+                },
+            )
+            return _sanitized_graph_error(state, code, "intake verification failed")
         disposition = computation.completeness_result.disposition
         if _route_for_disposition(disposition) != expected_route:
             return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "intake route does not match recomputed gate")
@@ -2383,10 +2493,7 @@ async def resolve_durable_intake_message_response(
         if claim.payload_digest != payload_digest:
             raise IdempotencyConflictError(
                 message="相同幂等键不能复用不同消息",
-                detail=(
-                    f"session_id={session_id} command_id={command_key} "
-                    "payload_digest_mismatch"
-                ),
+                detail=(f"session_id={session_id} command_id={command_key} payload_digest_mismatch"),
                 retryable=False,
             )
         if claim.status == "completed" and isinstance(claim.response_payload, dict):
@@ -2577,11 +2684,7 @@ def _bound_required_reply_fallback_output(
     """
 
     context = input_payload.reply_context
-    if (
-        context is None
-        or context.selection_kind != "required"
-        or len(input_payload.current_messages) != 1
-    ):
+    if context is None or context.selection_kind != "required" or len(input_payload.current_messages) != 1:
         return None
     try:
         selected_dimension = InquiryDimension(context.selected_dimension)
@@ -2881,16 +2984,12 @@ def _session_updates(
         blocked_at = _naive_now()
 
     completeness_details = completeness_gate.details or {}
-    missing_required = {
-        str(item) for item in completeness_details.get("missing_required") or ()
-    }
+    missing_required = {str(item) for item in completeness_details.get("missing_required") or ()}
     pending_values = {item.value for item in pending_safety_dimensions}
     awaiting_safety_confirmation = bool(missing_required) and missing_required <= pending_values
     dialogue_status = (
         "awaiting_safety_confirmation"
-        if disposition is CompletenessDisposition.INCOMPLETE
-        and agent_item is None
-        and awaiting_safety_confirmation
+        if disposition is CompletenessDisposition.INCOMPLETE and agent_item is None and awaiting_safety_confirmation
         else "questioning"
         if agent_item is not None
         else "complete"
@@ -2965,6 +3064,105 @@ def _question_clinical_context(state: DomainState) -> tuple[QuestionComposerClin
         if len(facts) == 24:
             break
     return tuple(facts)
+
+
+# 1b: 维度 → 中文缺口提示(槽位缺口暂从 missing_required 派生,阶段 2 换槽位对象)
+_DIMENSION_MISSING_HINTS: dict[str, str] = {
+    "chief_complaint.symptom": "最主要的不适具体是什么",
+    "basic_course": "主要不适已持续多久",
+    "present_illness.change": "症状近期如何变化",
+    "ten_questions.cold_heat": "怕冷、发热的情况",
+    "ten_questions.sweat": "出汗情况",
+    "ten_questions.head_body": "头身感受",
+    "ten_questions.stool_urine": "二便情况",
+    "ten_questions.diet": "饮食情况",
+    "ten_questions.chest_abdomen": "胸腹部感受",
+    "ten_questions.thirst": "口渴情况",
+    "ten_questions.sleep": "睡眠情况",
+    "ten_questions.menses_leukorrhea": "经带情况",
+    "ten_questions.pain": "疼痛情况",
+    "ten_questions.respiratory": "呼吸情况",
+    "safety.allergy_status": "药物/食物过敏史",
+    "safety.pregnancy_status": "是否处于妊娠状态",
+    "safety.lactation_status": "是否处于哺乳期",
+    "safety.medication_status": "当前用药情况",
+    "safety.major_condition_status": "重要疾病史",
+    "past_history": "既往病史",
+    "four_diagnosis": "四诊信息",
+    "patient.sex": "性别",
+    "patient.age": "年龄",
+}
+
+
+def _missing_slot_text(completeness_result: object) -> str | None:
+    """1b: 从 completeness 的 missing_required 派生缺哪个槽位(首个缺口)。"""
+    missing = getattr(completeness_result, "missing_required", ())
+    if not missing:
+        return None
+    dimension = missing[0]
+    value = getattr(dimension, "value", str(dimension))
+    return _DIMENSION_MISSING_HINTS.get(value, value)
+
+
+def _activated_dimension_values(completeness_result: object) -> tuple[str, ...]:
+    """1b: 激活维度集 = covered + missing_required(全部 required 维度)。
+
+    给 writer 作提案边界:只能在激活集内自然引导,安全项恒优先。
+    """
+    values: set[str] = set()
+    for dim in getattr(completeness_result, "covered_dimensions", ()):
+        values.add(getattr(dim, "value", str(dim)))
+    for dim in getattr(completeness_result, "missing_required", ()):
+        values.add(getattr(dim, "value", str(dim)))
+    return tuple(sorted(values))
+
+
+def _chief_complaint_text(state: DomainState) -> str | None:
+    """1b: 主诉原文(chief_complaint.symptom 的 value),供首问/追问贴合主诉。"""
+    for item in _current_observations(state.observations):
+        if item.fact_key == "chief_complaint.symptom" and isinstance(item.value, str) and item.value.strip():
+            return item.value.strip()[:2000]
+    return None
+
+
+async def _recent_question_turns(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    limit: int = 6,
+) -> tuple[QuestionComposerTurn, ...]:
+    """1b: 最近 limit 条医患消息(agent 问句 + doctor/patient_proxy 回答)。
+
+    身份遮罩后传给 writer,使其能承接前文、避免原话重复。
+    """
+    from sqlalchemy import select as _select
+
+    rows = (
+        (
+            await db.execute(
+                _select(ConsultMessage)
+                .where(
+                    ConsultMessage.session_id == session_id,
+                    ConsultMessage.role.in_(("agent", "doctor", "patient_proxy")),
+                )
+                .order_by(ConsultMessage.created_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ordered = list(reversed(rows))
+    contents = [item.content for item in ordered]
+    masked = project_model_input_identity_sequences(contents)
+    turns: list[QuestionComposerTurn] = []
+    for item, masked_content in zip(ordered, masked, strict=False):
+        if not masked_content or not masked_content.strip():
+            continue
+        role = "patient" if item.role in {"doctor", "patient_proxy"} else "doctor"
+        turns.append(QuestionComposerTurn(role=role, content=masked_content.strip()[:1000]))
+        if len(turns) == 8:
+            break
+    return tuple(turns)
 
 
 def _graph_steps(disposition: CompletenessDisposition) -> tuple[GraphStepSpec, ...]:

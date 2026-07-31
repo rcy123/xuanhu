@@ -5,19 +5,15 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.completeness import InquiryDimension
 
 GAP_SELECTION_INPUT_SCHEMA_VERSION: Literal["gap-selection-input.v1"] = "gap-selection-input.v1"
 GAP_SELECTION_RESULT_SCHEMA_VERSION: Literal["gap-selection-result.v1"] = "gap-selection-result.v1"
 GAP_SELECTOR_POLICY_VERSION: Literal["gap-selector-policy.v1"] = "gap-selector-policy.v1"
-QUESTION_MODEL_OUTPUT_SCHEMA_VERSION: Literal["question-composer-model-output.v1"] = (
-    "question-composer-model-output.v1"
-)
-QUESTION_MODEL_INPUT_SCHEMA_VERSION: Literal["question-composer-model-input.v2"] = (
-    "question-composer-model-input.v2"
-)
+QUESTION_MODEL_OUTPUT_SCHEMA_VERSION: Literal["question-composer-model-output.v1"] = "question-composer-model-output.v1"
+QUESTION_MODEL_INPUT_SCHEMA_VERSION: Literal["question-composer-model-input.v2"] = "question-composer-model-input.v2"
 QUESTION_RESULT_SCHEMA_VERSION: Literal["question-composer-result.v1"] = "question-composer-result.v1"
 QUESTION_COMPOSER_AGENT_NAME: Literal["question_composer"] = "question_composer"
 QUESTION_COMPOSER_AGENT_VERSION: Literal["question-composer-agent.v2"] = "question-composer-agent.v2"
@@ -104,9 +100,8 @@ class GapSelectionResult(_QuestionModel):
             InquiryDimension.PREGNANCY_STATUS,
             InquiryDimension.LACTATION_STATUS,
         }
-        if (
-            len(self.deferred_dimensions) != len(set(self.deferred_dimensions))
-            or any(item not in safety_dimensions for item in self.deferred_dimensions)
+        if len(self.deferred_dimensions) != len(set(self.deferred_dimensions)) or any(
+            item not in safety_dimensions for item in self.deferred_dimensions
         ):
             raise ValueError("only unique pending safety dimensions may be deferred")
         if self.disposition is GapSelectionDisposition.SELECTED:
@@ -146,12 +141,36 @@ class QuestionComposerClinicalFact(_QuestionModel):
         return self
 
 
+class QuestionComposerTurn(_QuestionModel):
+    """1b: 一轮医患对话(医生问句或患者回答的原文,做身份遮罩后传入)。
+
+    用于让 writer 承接前文——识别已问过的问题避免原话重复、承接患者
+    抗议/澄清,而不是逐字重复模板句。
+    """
+
+    role: Literal["doctor", "patient"]
+    content: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("content")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("turn content must not be blank")
+        return value
+
+
 class QuestionComposerModelInput(_QuestionModel):
     schema_version: Literal["question-composer-model-input.v2"] = QUESTION_MODEL_INPUT_SCHEMA_VERSION
     selected_dimension: InquiryDimension
     selection_kind: GapSelectionKind
     safety_instruction: str = Field(min_length=1, max_length=800)
     clinical_context: tuple[QuestionComposerClinicalFact, ...] = Field(default=(), max_length=24)
+    # 1b: 对话历史(最近 N 轮)、主诉原文、激活维度集、缺口提示。
+    # 槽位缺口暂从 completeness 的 missing_required 派生(阶段 2 换槽位对象)。
+    recent_turns: tuple[QuestionComposerTurn, ...] = Field(default=(), max_length=8)
+    chief_complaint: str | None = Field(default=None, min_length=1, max_length=2_000)
+    activated_dimensions: tuple[str, ...] = Field(default=(), max_length=16)
+    missing_slot: str | None = Field(default=None, min_length=1, max_length=240)
 
     @model_validator(mode="after")
     def model_input_requires_selected_kind(self) -> QuestionComposerModelInput:
@@ -181,9 +200,7 @@ class QuestionComposerResult(_QuestionModel):
             self.template_version is None or self.prompt_version is not None
         ):
             raise ValueError("template result requires only template_version")
-        if self.source is QuestionSource.MODEL and (
-            self.prompt_version is None or self.template_version is not None
-        ):
+        if self.source is QuestionSource.MODEL and (self.prompt_version is None or self.template_version is not None):
             raise ValueError("model result requires only prompt_version")
         return self
 
