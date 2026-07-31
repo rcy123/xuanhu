@@ -24,3 +24,24 @@
 - 妊娠和哺乳状态：除 unknown 外的所有 delta 均须包含 span。pregnant/lactating（妊娠中/哺乳中）要求当前已确认的文本；not_pregnant/not_lactating（未妊娠/非哺乳）和 explicitly_none 要求显式的、范围明确的否定；possible pregnancy（可能妊娠）要求当前明确的不确定性表述。
 - 否定和对比的作用范围是局部的。例如，"无胸痛，但呼吸困难"仅支持"呼吸困难"的提取，不支持"胸痛"，也不能建立全局的 explicitly_none 安全字段。
 - 精确的 span 匹配和高风险语义将在模型响应后由确定性程序校验。任何不匹配均视为硬性失败，相应候选信息不会进入状态归约。
+
+## 事实键（fact_key）命名契约
+`observations` 中每条 `ObservationDelta.fact_key` **必须**使用下列合法前缀之一，严禁自创 `symptoms.*`/裸 `symptom`/裸 `fever` 等漂移键名（越界键会被 E1 闸门 reject，等价于该轮该事实丢失）。
+
+- **主诉**（患者本轮自述的核心不适，取主诉原文）：
+  - `chief_complaint.symptom` —— 主诉症状原词（例"咳嗽三天""受凉后鼻塞流涕"）。
+  - `chief_complaint.course` —— 主诉病程/起病时序（例"三天""反复一周""受凉后加重"）。
+- **现病史**（主诉之外本轮新出现的具体症状/体征/变化）：
+  - 现性具体症状键：`present_illness.cough`、`present_illness.sputum`、`present_illness.rhinorrhea`、`present_illness.sore_throat`、`present_illness.nasal_congestion`、`present_illness.shortness_of_breath`、`present_illness.chills`、`present_illness.fever`、`present_illness.aversion_cold`、`present_illness.sweat`、`present_illness.head_body`、`present_illness.body_ache`、`present_illness.chest`、`present_illness.abdomen`、`present_illness.distension`、`present_illness.thirst`、`present_illness.appetite`、`present_illness.diet`、`present_illness.sleep`、`present_illness.insomnia`、`present_illness.pain`、`present_illness.stool`、`present_illness.urine`。
+  - `present_illness.change` —— 现病的变化趋势（加重/减轻/时发时止）。
+  - `present_illness.associated_symptom` —— 伴随症状。
+- **十问歌**（医生已问过的系统维度，仅当本轮医生就该维度提问且回答有据时才落）：
+  - `ten_questions.cold_heat`、`ten_questions.sweat`、`ten_questions.head_body`、`ten_questions.stool_urine`、`ten_questions.diet`、`ten_questions.chest_abdomen`、`ten_questions.thirst`、`ten_questions.sleep`、`ten_questions.menses_leukorrhea`、`ten_questions.pain`、`ten_questions.respiratory`。
+- **过往史/四诊**：`past_history`、`four_diagnosis.inspection`、`four_diagnosis.palpation`。
+- **患者人口学**：`patient.sex`、`patient.age`、`patient.menopause`、`patient.pregnancy_applicable`、`patient.lactation_applicable`。
+
+键名命名规则：
+- 前缀只能从上面列出的合法键里选；**不得**把 `symptom` 改成复数 `symptoms`、**不得**加 `symptoms.throat.itch` 这类子点、**不得**产出裸 `symptom`/`fever`/`cough`。
+- 同一句话含多个具体症状 → 拆成多条 ADD observation，每条各占一个上面列出的现性键，不要塞进一个键。
+- 用户说"咳嗽伴白痰" → 落 `present_illness.cough` + `present_illness.sputum` 两条，不要落 `symptoms.cough` 一条。
+- 不确定这条信息属于哪个键时，宁可返回空观察集 + `ambiguities`，也不要自创新键名。

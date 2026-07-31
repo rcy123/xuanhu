@@ -318,6 +318,39 @@ class IntakeExtractionOutput(_IntakeModel):
     ambiguities: tuple[Ambiguity, ...] = Field(default=(), max_length=16)
 
 
+# 1a 主诉大类归集：独立一步把 chief_complaint 归到 ComplaintCategory 枚举之一。
+# 归集节点产出的 category 经 intake 落库成 chief_complaint.category，驱动十问动态维度激活。
+# schema 版本独立于 intake 抽取（INTAKE_SCHEMA_VERSION），用同一 _IntakeModel 基类拿到 frozen/forbid。
+COMPLAINT_CLASSIFICATION_INPUT_SCHEMA_VERSION: str = "complaint-classification-input.v1"
+COMPLAINT_CLASSIFICATION_OUTPUT_SCHEMA_VERSION: str = "complaint-classification-output.v1"
+
+
+class ComplaintClassificationInput(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal["complaint-classification-input.v1"] = COMPLAINT_CLASSIFICATION_INPUT_SCHEMA_VERSION
+    chief_complaint_text: str = Field(min_length=1, max_length=4_000)
+    patient_sex: str | None = Field(default=None, max_length=16)
+    patient_age: int | None = Field(default=None, ge=0, le=150)
+
+
+class ComplaintClassificationOutput(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal["complaint-classification-output.v1"] = COMPLAINT_CLASSIFICATION_OUTPUT_SCHEMA_VERSION
+    # category/evidence 用 Any 是因为 schemas.completeness ↔ schemas.intake 存在导入环
+    # （completeness → triage → intake）；类型重建由 complaint_classifier._canonicalize_output
+    # 显式完成（roundtrip 后 Any 字段会退化成 dict/str，必须重建为 ComplaintCategory/EvidenceSpan）。
+    category: Any = Field(...)
+    evidence: Any = Field(...)
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("confidence")
+    @classmethod
+    def finite_confidence(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("confidence must be finite")
+        return value
+
+
 def _validate_scalar_safety(
     status: CollectionStatus,
     value: object | None,

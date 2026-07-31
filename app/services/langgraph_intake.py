@@ -125,6 +125,7 @@ from app.schemas.question import (
     QUESTION_COMPOSER_AGENT_VERSION,
     QUESTION_COMPOSER_PROMPT_VERSION,
     QuestionComposerClinicalFact,
+    QuestionCompositionOutcome,
     QuestionCompositionStatus,
 )
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
@@ -222,6 +223,16 @@ _INTAKE_OUTPUT_CACHE: BoundedTTLCache[uuid.UUID, IntakeExtractionOutput] = Bound
     ttl_seconds=300,
 )
 
+# 1a 主诉大类归集——并入终端单 commit。``_compute_intake_from_claim`` 在一个 claim
+# 上会被 reduce / gates / terminal 多次调用，每次都要靠 `_classify_and_merge_category`
+# 做一次决策。为避免重复消耗 complaint_classifier 模型调用（gate 一致性也要求每次复
+# 判得到同一 category），首次决策的 (trace, category_observation) 进程内缓存以
+# claim.id 为 key，TTL 与 _INTAKE_OUTPUT_CACHE 对齐（300s 覆盖 claim 生命周期）。
+_CLASSIFY_TRACE_CACHE: BoundedTTLCache[uuid.UUID, tuple[Any, ObservationSchema]] = BoundedTTLCache(
+    max_size=256,
+    ttl_seconds=300,
+)
+
 
 @dataclass(frozen=True)
 class _IntakeComputation:
@@ -238,6 +249,7 @@ class _IntakeComputation:
     completeness_result: Any
     triage_gate: GateResultSchema
     completeness_gate: GateResultSchema
+    classify_trace_payload: dict[str, Any] | None
 
 
 class LangGraphIntakeMessageRunner:
@@ -675,6 +687,7 @@ class LangGraphIntakeMessageRunner:
                     computation.next_state,
                     trace_id,
                     claim.idempotency_key,
+                    claim.id,
                 )
                 if question is not None:
                     question_message_id = uuid.uuid4()
@@ -814,27 +827,29 @@ class LangGraphIntakeMessageRunner:
         domain_state: DomainState,
         trace_id: str,
         command_key: str,
+        claim_id: uuid.UUID,
     ) -> dict[str, Any] | None:
+        run_spec = RunSpec(
+            run_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-question:{session_id}:{command_key}"),
+            session_id=session_id,
+            state_version=completeness_result.input_state_version,
+            stage="intake_question",
+            agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
+            prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
+            policy_version=QUESTION_COMPOSER_POLICY_VERSION,
+            # intake 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
+            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；保留余量给 recorder/console。
+            deadline_at=_deadline(90),
+            total_attempt_budget=1,
+            idempotency_key=f"{command_key}:question",
+            trace_id=trace_id,
+        )
         outcome = await compose_question(
             completeness_result=completeness_result,
             pending_safety_dimensions=pending_safety_dimensions,
             clinical_context=_question_clinical_context(domain_state),
             runtime=AgentRuntime(),
-            run_spec=RunSpec(
-                run_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-question:{session_id}:{command_key}"),
-                session_id=session_id,
-                state_version=completeness_result.input_state_version,
-                stage="intake_question",
-                agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
-                prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
-                policy_version=QUESTION_COMPOSER_POLICY_VERSION,
-                # intake 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
-                # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；保留余量给 recorder/console。
-                deadline_at=_deadline(90),
-                total_attempt_budget=1,
-                idempotency_key=f"{command_key}:question",
-                trace_id=trace_id,
-            ),
+            run_spec=run_spec,
         )
         if outcome.status is QuestionCompositionStatus.NO_QUESTION:
             return None
@@ -845,6 +860,12 @@ class LangGraphIntakeMessageRunner:
                 agent_error_code=code,
                 retryable=False,
             )
+        # 0a 模板兜底留痕：对称记录模型成功 / 模板退化，便于事后查"为什么这一轮是模板句"。
+        await _save_intermediate(
+            claim_id,
+            {"question_composer": _question_composer_metadata(outcome, str(run_spec.run_id))},
+            step="question_compose",
+        )
         return outcome.result.model_dump(mode="json")
 
     async def _complete_claim(
@@ -1409,6 +1430,190 @@ async def _save_intermediate(
             claim.updated_at = func.now()
 
 
+async def _classify_and_merge_category(
+    *,
+    claim: IntakeCommandClaim,
+    domain_state: DomainState,
+    delta: DomainDelta,
+    next_state: DomainState,
+    context: VerificationContext,
+    trace_id: str,
+) -> tuple[Any, DomainDelta, DomainState, VerificationContext]:
+    """1a 主诉大类归集：读 next_state 里的 active symptom → 调 complaint_classifier
+    归大类 → 把 category 作为一条 ADD observation 并入同一个 delta，重算
+    reduce_domain_state 得到含 category 的最终 next_state。
+
+    返回 (trace, new_delta, new_next_state, new_context)。不落库、不 commit——
+    交给路由终端 _finalize_intake_route 一次 commit 同时落 symptom + category。
+
+    幂等（三档，按优先级）：
+      1. 进程内 ``_CLASSIFY_TRACE_CACHE`` 命中：复用首决策的 (trace, category_obs)，
+         仍把 category_obs 并入 delta（本轮 ``_compute_intake_from_claim`` 被多次调用，
+         每次都要让 next_state 含 category 才能 completeness 一致）。source="cache"。
+      2. next_state.observations 已有 active ``chief_complaint.category``（极少见，
+         仅当 seed domain_state 已含 category）：skip 模型，不并入 delta。source="cache"
+         + skipped=True。
+      3. next_state.observations 无 active ``chief_complaint.symptom``（red_flag 短路
+         或纯社交寒暄）：skip_no_symptom，不并入 delta，不调模型。
+
+    模型失败一律 fail-safe 降级 ComplaintCategory.GENERAL + degraded=True 留痕，
+    category obs 仍并入 delta（让下游十问退回 general 档而不是拿不到 category）。
+    """
+    from app.services.intake_classify_pipeline import (
+        COMPLAINT_CLASSIFY_POLICY_VERSION,
+        COMPLAINT_CLASSIFY_DELTA_RUN_SPEC_STAGE,
+        _ClassificationTrace,
+        _build_category_observation,
+        _build_classification_input,
+        _chief_complaint_symptom_fact,
+        _classification_run_id,
+        _existing_category_observations,
+    )
+    from app.agents.complaint_classifier import (
+        COMPLAINT_CLASSIFIER_AGENT_VERSION,
+        COMPLAINT_CLASSIFIER_PROMPT_VERSION,
+        ComplaintClassifierFailureCode,
+        ComplaintClassificationStatus,
+        build_complaint_classifier_agent_spec,
+        execute_complaint_classification,
+    )
+    from app.schemas.completeness import ComplaintCategory
+
+    cached = _CLASSIFY_TRACE_CACHE.get(claim.id)
+    if cached is not None:
+        trace, category_obs = cached
+        return (trace, *_merge_category_into_delta(delta, domain_state, category_obs, trace_id, claim.idempotency_key))
+
+    if _existing_category_observations(next_state):
+        trace = _ClassificationTrace(
+            category=str(_existing_category_observations(next_state)[0].normalized_value or ""),
+            source="cache",
+            degraded=False,
+            last_failure_code=None,
+            agent_run_id=None,
+            confidence=_existing_category_observations(next_state)[0].confidence,
+            skipped=True,
+        )
+        return trace, delta, next_state, context
+
+    symptom_facts = _chief_complaint_symptom_fact(next_state)
+    if not symptom_facts:
+        trace = _ClassificationTrace(
+            category=ComplaintCategory.GENERAL.value,
+            source="skip_no_symptom",
+            degraded=False,
+            last_failure_code=None,
+            agent_run_id=None,
+            confidence=None,
+            skipped=True,
+        )
+        return trace, delta, next_state, context
+
+    classification_input = _build_classification_input(symptom_facts[0], next_state)
+    if classification_input is None:
+        trace = _ClassificationTrace(
+            category=ComplaintCategory.GENERAL.value,
+            source="skip_no_symptom",
+            degraded=False,
+            last_failure_code=None,
+            agent_run_id=None,
+            confidence=None,
+            skipped=True,
+        )
+        return trace, delta, next_state, context
+
+    run_id = _classification_run_id(claim.session_id, claim.idempotency_key)
+    run_spec = RunSpec(
+        run_id=run_id,
+        session_id=claim.session_id,
+        state_version=claim.input_state_version,
+        stage=COMPLAINT_CLASSIFY_DELTA_RUN_SPEC_STAGE,
+        agent_spec_version=COMPLAINT_CLASSIFIER_AGENT_VERSION,
+        prompt_version=COMPLAINT_CLASSIFIER_PROMPT_VERSION,
+        policy_version=COMPLAINT_CLASSIFY_POLICY_VERSION,
+        # 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
+        # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；与 question_composer 惯例对齐（90s），
+        # 保留余量给 recorder/console，避免网关配置变化时 deadline 先触发误归因降级。
+        deadline_at=_deadline(90),
+        total_attempt_budget=1,
+        idempotency_key=f"{claim.idempotency_key}:classify",
+        trace_id=trace_id,
+    )
+    result = await execute_complaint_classification(
+        runtime=AgentRuntime(),
+        run_spec=run_spec,
+        input_payload=classification_input,
+    )
+    if result.status is ComplaintClassificationStatus.SUCCEEDED and result.output is not None:
+        category = result.output.category
+        confidence = float(result.output.confidence)
+        source = "model"
+        degraded = False
+        failure_code: str | None = None
+    else:
+        # fail-safe：模型不可用/输出非法/grounding 失败一律降级 general，仍并入 delta。
+        category = ComplaintCategory.GENERAL
+        confidence = 0.0
+        source = "model_degraded"
+        degraded = True
+        failure_code = (
+            result.failure_code.value if result.failure_code is not None else ComplaintClassifierFailureCode.MODEL_OUTPUT_INVALID.value
+        )
+
+    category_obs = _build_category_observation(
+        run_id=run_id,
+        session_id=claim.session_id,
+        category=category,
+        source_message_id=symptom_facts[0].source_message_id,
+        confidence=confidence,
+    )
+    trace = _ClassificationTrace(
+        category=category.value,
+        source=source,
+        degraded=degraded,
+        last_failure_code=failure_code,
+        agent_run_id=str(run_spec.run_id),
+        confidence=confidence,
+        skipped=False,
+    )
+    _CLASSIFY_TRACE_CACHE[claim.id] = (trace, category_obs)
+    return (trace, *_merge_category_into_delta(delta, domain_state, category_obs, trace_id, claim.idempotency_key))
+
+
+def _merge_category_into_delta(
+    delta: DomainDelta,
+    domain_state: DomainState,
+    category_obs: ObservationSchema,
+    trace_id: str,
+    idempotency_key: str,
+) -> tuple[DomainDelta, DomainState, VerificationContext]:
+    """把 category observation 追加进 delta.observations，扩 source_message_ids，
+    重建 verification context，重算 reduce_domain_state 得到含 category 的 next_state。
+
+    reducer 第 187-189 行要求每条 observation 的 source_message_id 必须在
+    ``delta.source_message_ids`` 集合内。category 的 source 复用 symptom 的
+    source_message_id（与主诉同源 seed 消息）；若该 seed 不在本轮 delta.source_message_ids
+    内（复诊场景），需先并进去才能通过 OBSERVATION_SOURCE_UNDECLARED 校验。
+    """
+    merged_sources = delta.source_message_ids
+    if category_obs.source_message_id not in merged_sources:
+        merged_sources = merged_sources + (category_obs.source_message_id,)
+    new_delta = delta.model_copy(
+        update={
+            "observations": delta.observations + (category_obs,),
+            "source_message_ids": merged_sources,
+        }
+    )
+    new_context = _verification_context(
+        delta=new_delta,
+        state=domain_state,
+        trace_id=trace_id,
+        idempotency_key=idempotency_key,
+    )
+    new_next_state = reduce_domain_state(domain_state, new_delta, new_context)
+    return new_delta, new_next_state, new_context
+
+
 async def _compute_intake_from_claim(
     claim: IntakeCommandClaim,
     patient_message: ConsultMessage,
@@ -1455,6 +1660,20 @@ async def _compute_intake_from_claim(
         idempotency_key=claim.idempotency_key,
     )
     next_state = reduce_domain_state(domain_state, delta, context)
+    # 1a 主诉大类归集并入终端单 commit：在 evaluate_completeness_policy 之前把
+    # chief_complaint.category 作为一条 ADD observation 追加进 delta，重算一次
+    # reduce_domain_state 得到含 category 的最终 next_state。这样下游
+    # `_complaint_category()` 能读到真实 category（respiratory 等），动态十问维度
+    # 才会按真实大类激活而非一律退回 general 档 4 维；终端 repository.commit 一次
+    # 同时落 symptom + category，避免子图内部多一次 commit 带来的状态版本协调成本。
+    classify_trace, delta, next_state, context = await _classify_and_merge_category(
+        claim=claim,
+        domain_state=domain_state,
+        delta=delta,
+        next_state=next_state,
+        context=context,
+        trace_id=trace_id,
+    )
     # An unconfirmed candidate is conversational progress, but it is not an
     # authoritative SafetyProfile fact and therefore is absent from ``delta``.
     new_fact_count = len(delta.observations) + (1 if output.patient_safety_delta.has_candidate() else 0)
@@ -1514,6 +1733,7 @@ async def _compute_intake_from_claim(
         completeness_result=completeness_result,
         triage_gate=to_gate_result_schema(triage_result),
         completeness_gate=completeness_to_gate_result_schema(completeness_result),
+        classify_trace_payload=classify_trace.to_payload(),
     )
 
 
@@ -1761,6 +1981,28 @@ def _reply_binding_extraction_metadata(
     return metadata
 
 
+def _question_composer_metadata(outcome: QuestionCompositionOutcome, agent_run_id: str | None) -> dict[str, Any]:
+    """0a 模板兜底留痕：把 composer outcome 的源 / 退化信号投影成可查询的 intermediate_payload 片段。
+
+    - source: model/template —— omniscient 落库后事后可查"这一轮是模型直接的还是退到模板"
+    - degraded + last_failure_code: 模板退化时记录模型那次失败的 failure code
+      （归因 bug 修复后真实区分 UNAVAILABLE/OUTPUT_INVALID/SINGLE_QUESTION_INVALID/RUNTIME_CONTRACT 等）
+    """
+    result = outcome.result
+    assert result is not None  # noqa: S101 - SUCCEEDED path only
+    return {
+        "source": result.source.value,
+        "source_kind": "question_composer",
+        "degraded": outcome.degraded,
+        "last_failure_code": outcome.last_failure_code.value if outcome.last_failure_code is not None else None,
+        "selected_dimension": result.selected_dimension.value,
+        "selection_kind": result.selection_kind.value,
+        "template_version": result.template_version,
+        "prompt_version": result.prompt_version,
+        "agent_run_id": agent_run_id,
+    }
+
+
 def _gate_refs(*gates: GateResultSchema) -> list[dict[str, Any]]:
     return [
         {
@@ -1815,6 +2057,16 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
         disposition = computation.completeness_result.disposition
         if _route_for_disposition(disposition) != expected_route:
             return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "intake route does not match recomputed gate")
+        # 1a 主诉大类归集留痕：归集决策已并入 _compute_intake_from_claim（终端单 commit 内联），
+        # 在此消费 computation.classify_trace_payload 把 category/source/degraded/agent_run_id
+        # 写进 intermediate_payload["classify_complaint"]（steps["classify_complaint"]="completed"），
+        # 与 0a 的 question_composer 留痕同构，事后可查"本轮主诉归到了哪类/是否退化"。
+        if computation.classify_trace_payload is not None:
+            await _save_intermediate(
+                claim.id,
+                {"classify_complaint": computation.classify_trace_payload},
+                step="classify_complaint",
+            )
 
         question_message_id: uuid.UUID | None = None
         question_spec: ConsultMessageSpec | None = None
@@ -1828,6 +2080,7 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                 computation.next_state,
                 _node_trace_id(state),
                 claim.idempotency_key,
+                claim.id,
             )
             if question is not None:
                 question_message_id = uuid.uuid4()
@@ -2644,6 +2897,7 @@ def _graph_steps(disposition: CompletenessDisposition) -> tuple[GraphStepSpec, .
         for name in (
             "persist_message",
             "triage_precheck",
+            "classify_complaint",
             "build_intake_context",
             "extract_intake",
             "verify_intake",

@@ -274,6 +274,38 @@ DERIVED_KEY_NORMALIZATION: Mapping[str, str] = {
     "symptom.pain": "present_illness.pain",
     "symptom.stool": "present_illness.stool",
     "symptom.urine": "present_illness.urine",
+    # 1f8240c7 真实端到端实跑实测：模型把"咳嗽三天伴白痰咽痒鼻塞流涕"一律漂成
+    # symptoms.*（复数前缀 + 子点细分）。前缀归一到单数 symptom.* 后再走上面的现性键映射；
+    # 子点细分（symptoms.cough.duration / symptoms.throat.itch 等）无对应 canonical 单键，
+    # 归一到最接近的现性键，避免 chief_complaint.symptom 维度因越界键整轮丢失。
+    "symptoms.cough": "present_illness.cough",
+    "symptoms.cough.duration": "chief_complaint.course",
+    "symptoms.cough.type": "present_illness.cough",
+    "symptoms.cough.worsening": "present_illness.change",
+    "symptoms.phlegm": "present_illness.sputum",
+    "symptoms.sputum": "present_illness.sputum",
+    "symptoms.throat.itch": "present_illness.sore_throat",
+    "symptoms.sore_throat": "present_illness.sore_throat",
+    "symptoms.nasal.congestion": "present_illness.nasal_congestion",
+    "symptoms.nasal_congestion": "present_illness.nasal_congestion",
+    "symptoms.rhinorrhea": "present_illness.rhinorrhea",
+    "symptoms.sleep.disturbance": "present_illness.sleep",
+    "symptoms.sleep": "present_illness.sleep",
+    "symptoms.shortness_of_breath": "present_illness.shortness_of_breath",
+    "symptoms.chills": "present_illness.chills",
+    "symptoms.fever": "present_illness.fever",
+    "symptoms.sweat": "present_illness.sweat",
+    "symptoms.head_body": "present_illness.head_body",
+    "symptoms.body_ache": "present_illness.body_ache",
+    "symptoms.chest": "present_illness.chest",
+    "symptoms.abdomen": "present_illness.abdomen",
+    "symptoms.distension": "present_illness.distension",
+    "symptoms.thirst": "present_illness.thirst",
+    "symptoms.appetite": "present_illness.appetite",
+    "symptoms.diet": "present_illness.diet",
+    "symptoms.pain": "present_illness.pain",
+    "symptoms.stool": "present_illness.stool",
+    "symptoms.urine": "present_illness.urine",
 }
 
 

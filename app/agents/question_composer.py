@@ -434,7 +434,14 @@ async def _compose_question_with_template_registry(
             QuestionComposerFailureCode.SINGLE_QUESTION_INVALID,
         }
     ):
-        return template_outcome
+        # 软失败回模板：携带退化信号（degraded + last_failure_code），让 intake 节点把
+        # "本轮为什么回落到模板"写进 intermediate_payload["question_composer"] 可被查询。
+        return template_outcome.model_copy(
+            update={
+                "degraded": True,
+                "last_failure_code": model_outcome.failure_code,
+            }
+        )
     return model_outcome
 
 
@@ -533,13 +540,21 @@ async def _model_result(
         )
         model_output = _canonicalize_model_output(artifact.output)
     except RuntimeErrorBase as exc:
+        # 按 exc.code 精确归因（trigger：原实现把所有非网关 RuntimeErrorBase 一律压成
+        # MODEL_OUTPUT_INVALID，丢掉真实 exc.code，下游看不到	RuntimeErrorBase 的契约/infra
+        # 根因——只能看到"模型输出越界"，无法区分 spec 不匹配 / 隐私命中 / 预算耗尽等）。
         if exc.code in {
             RuntimeErrorCode.MODEL_GATEWAY_TIMEOUT,
             RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE,
             RuntimeErrorCode.RUN_DEADLINE_EXCEEDED,
         }:
             return _failed(QuestionComposerFailureCode.MODEL_UNAVAILABLE)
-        return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
+        if exc.code in {
+            RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID,
+            RuntimeErrorCode.OUTPUT_SCHEMA_INVALID,
+        }:
+            return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
+        return _failed(QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH)
     except QuestionModelOutputBoundaryError:
         return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
 

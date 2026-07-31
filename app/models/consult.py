@@ -30,6 +30,11 @@ class ConsultSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     chief_complaint: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="inquiry")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    # 0c 单一后端收敛（docs/02_agent逻辑优化/0c_单一后端收敛边界.md）：本字段自大改起
+    # 降级为【仅历史 session 兼容读】——新 session 一律创建为 "langgraph"，统一后端路径。
+    # 字段本身保留（老 session 数据仍可读），但不参与新 session 路由；legacy 路径代码
+    # 冻结不演进，阶段 3d 收口后删除（supervisor.py 等）。不得再新增任何按本字段分叉的
+    # 业务路由；分叉点清单见 0c 文档"分叉点现状"节。
     agent_runtime: Mapped[str] = mapped_column(String(16), nullable=False, default="legacy")
     pending_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     rollback_counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

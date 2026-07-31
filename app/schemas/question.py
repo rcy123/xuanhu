@@ -192,14 +192,28 @@ class QuestionCompositionOutcome(_QuestionModel):
     status: QuestionCompositionStatus
     result: QuestionComposerResult | None = None
     failure_code: QuestionComposerFailureCode | None = None
+    # 0a 模板兜底留痕：模板成功但曾发生模型软失败（网关/输出/单问句校验等）时携带信号。
+    # 退化路径下 ``degraded=True`` 且 ``last_failure_code`` 记录模型那次失败码，便于事后定位
+    # "为什么这一轮回落到模板"。非退化（纯模板命中 / 模型直接成功）保持 ``degraded=False``、
+    # ``failure_code=None``。
+    degraded: bool = False
+    last_failure_code: QuestionComposerFailureCode | None = None
 
     @model_validator(mode="after")
     def outcome_is_consistent(self) -> QuestionCompositionOutcome:
         if self.status is QuestionCompositionStatus.SUCCEEDED:
-            if self.result is None or self.failure_code is not None:
-                raise ValueError("successful composition requires a result and no failure code")
+            if self.result is None:
+                raise ValueError("successful composition requires a result")
+            if self.failure_code is not None:
+                raise ValueError("successful composition must not carry a failure code")
+            if self.degraded and self.last_failure_code is None:
+                raise ValueError("degraded successful composition requires a last failure code")
+            if not self.degraded and self.last_failure_code is not None:
+                raise ValueError("non-degraded successful composition must not carry a last failure code")
         elif self.result is not None:
             raise ValueError("non-successful composition must not carry a result")
+        elif self.degraded or self.last_failure_code is not None:
+            raise ValueError("only successful composition may carry degraded signals")
         elif self.status is QuestionCompositionStatus.FAILED and self.failure_code is None:
             raise ValueError("failed composition requires a fixed failure code")
         elif self.status is QuestionCompositionStatus.NO_QUESTION and self.failure_code is not None:

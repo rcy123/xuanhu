@@ -39,10 +39,11 @@ from app.models.domain import (
     SafetyFactAssertion,
 )
 from app.models.http_command import HttpCommandClaim
-from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
+from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION, ComplaintCategory
 from app.schemas.domain import CollectionStatus
 from app.schemas.intake import (
     CandidateSeverity,
+    ComplaintClassificationOutput,
     EvidenceSpan,
     IntakeExtractionDecision,
     IntakeExtractionOutput,
@@ -111,6 +112,22 @@ class _E2EFakeGateway:
             return _intake_output(self.mode, source_id, content)
         if output_schema is QuestionComposerModelOutput:
             return QuestionComposerModelOutput(question="请结合患者目前情况补充这一项信息？")
+        if output_schema is ComplaintClassificationOutput:
+            # 1a 主诉大类归集 fake：默认归 respiratory，evidence 引用 chief_complaint_text 首段。
+            # complaint_classifier 的消息最后一层是 user 层，content 即主诉纯文本
+            # （system/developer/context/user 四层，非 JSON payload）。
+            chief_text = str(messages[-1].get("content") or "")
+            quote = chief_text[: min(4, len(chief_text))] if chief_text else ""
+            return ComplaintClassificationOutput(
+                category=ComplaintCategory.RESPIRATORY,
+                evidence=EvidenceSpan(
+                    source_message_id=uuid.uuid4(),
+                    start_char=0,
+                    end_char=len(quote),
+                    quote=quote,
+                ),
+                confidence=0.9,
+            )
         raise AssertionError(f"unexpected output schema: {output_schema}")
 
     @property
@@ -120,6 +137,10 @@ class _E2EFakeGateway:
     @property
     def question_model_calls(self) -> int:
         return sum(1 for item in self.calls if item["output_schema"] is QuestionComposerModelOutput)
+
+    @property
+    def classify_calls(self) -> int:
+        return sum(1 for item in self.calls if item["output_schema"] is ComplaintClassificationOutput)
 
 
 class _UnavailableOnceGateway(_E2EFakeGateway):
@@ -208,6 +229,10 @@ def _intake_output(mode: str, source: uuid.UUID, text: str) -> IntakeExtractionO
                 _observation(source, "ten_questions.diet", "normal"),
                 _observation(source, "ten_questions.sleep", "normal"),
                 _observation(source, "ten_questions.stool_urine", "normal"),
+                # 1a 主诉大类归集后 fake 恒定归 respiratory → 动态十问激活
+                # (cold_heat, respiratory, sleep)，必须采齐 respiratory 档才维持
+                # "只差 safety 确认、不再追问"的测试语义。
+                _observation(source, "ten_questions.respiratory", "normal"),
             ),
             patient_safety_delta=_safety_none(source, text),
         )
@@ -382,6 +407,7 @@ async def test_langgraph_messages_e2e_incomplete_uses_model_question_and_one_int
     assert set(claim.intermediate_payload["steps"]) >= {
         "persist_message",
         "triage_precheck",
+        "classify_complaint",
         "build_intake_context",
         "extract_intake",
         "verify_intake",
@@ -389,6 +415,27 @@ async def test_langgraph_messages_e2e_incomplete_uses_model_question_and_one_int
         "gates_and_route",
     }
     assert claim.intermediate_payload["gates"]["route"] == "incomplete"
+    # 0a 模板兜底留痕：question_composer 顶层 key 必存在，source 与 degraded 字段类型正确
+    composer_trace = claim.intermediate_payload["question_composer"]
+    assert composer_trace["source"] in {"template", "model"}
+    assert isinstance(composer_trace["degraded"], bool)
+    assert composer_trace["source_kind"] == "question_composer"
+    # 1a 主诉大类归集：respiratory 已落库，呼吸维度被激活而非 general 档 4 维
+    assert gateway.classify_calls == 1
+    classify_trace = claim.intermediate_payload["classify_complaint"]
+    assert classify_trace["category"] == "respiratory"
+    assert classify_trace["source"] == "model"
+    assert classify_trace["degraded"] is False
+    async with db_factory() as db:
+        category_obs = await db.scalar(
+            text(
+                "SELECT normalized_value FROM observations "
+                "WHERE session_id = :sid AND fact_key = 'chief_complaint.category' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            params={"sid": session_id},
+        )
+    assert category_obs == "respiratory"
 
 
 @pytest.mark.asyncio

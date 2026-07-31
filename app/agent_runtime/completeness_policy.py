@@ -12,6 +12,7 @@ from app.schemas.completeness import (
     COMPLETENESS_GATE_NAME,
     COMPLETENESS_POLICY_VERSION,
     ApplicabilityStatus,
+    ComplaintCategory,
     CompletenessApplicabilityResult,
     CompletenessConflict,
     CompletenessDimensionRule,
@@ -60,7 +61,7 @@ class CompletenessPolicyConfig(BaseModel):
 class ComplaintTenQuestionRule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    complaint_category: str = Field(min_length=1, max_length=64)
+    complaint_category: ComplaintCategory
     rule_id: str = Field(min_length=1, max_length=96)
     dimensions: tuple[InquiryDimension, ...] = Field(min_length=1)
 
@@ -248,7 +249,7 @@ COMPLETENESS_DIMENSION_RULES: Mapping[InquiryDimension, CompletenessDimensionRul
 
 COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] = (
     ComplaintTenQuestionRule(
-        complaint_category="respiratory",
+        complaint_category=ComplaintCategory.RESPIRATORY,
         rule_id="completeness.dynamic_ten_questions.respiratory.v1",
         dimensions=(
             InquiryDimension.TEN_COLD_HEAT,
@@ -257,7 +258,7 @@ COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] 
         ),
     ),
     ComplaintTenQuestionRule(
-        complaint_category="digestive",
+        complaint_category=ComplaintCategory.DIGESTIVE,
         rule_id="completeness.dynamic_ten_questions.digestive.v1",
         dimensions=(
             InquiryDimension.TEN_STOOL_URINE,
@@ -266,7 +267,7 @@ COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] 
         ),
     ),
     ComplaintTenQuestionRule(
-        complaint_category="pain",
+        complaint_category=ComplaintCategory.PAIN,
         rule_id="completeness.dynamic_ten_questions.pain.v1",
         dimensions=(
             InquiryDimension.TEN_COLD_HEAT,
@@ -275,7 +276,7 @@ COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] 
         ),
     ),
     ComplaintTenQuestionRule(
-        complaint_category="gynecologic",
+        complaint_category=ComplaintCategory.GYNECOLOGIC,
         rule_id="completeness.dynamic_ten_questions.gynecologic.v1",
         dimensions=(
             InquiryDimension.TEN_MENSES_LEUKORRHEA,
@@ -284,12 +285,12 @@ COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] 
         ),
     ),
     ComplaintTenQuestionRule(
-        complaint_category="urinary",
+        complaint_category=ComplaintCategory.URINARY,
         rule_id="completeness.dynamic_ten_questions.urinary.v1",
         dimensions=(InquiryDimension.TEN_STOOL_URINE, InquiryDimension.TEN_COLD_HEAT),
     ),
     ComplaintTenQuestionRule(
-        complaint_category="general",
+        complaint_category=ComplaintCategory.GENERAL,
         rule_id="completeness.dynamic_ten_questions.general.v1",
         dimensions=(
             InquiryDimension.TEN_COLD_HEAT,
@@ -612,21 +613,24 @@ def _dynamic_ten_question_dimensions(
 
 def _complaint_category(
     current_facts: tuple[CompletenessObservationFact, ...],
-) -> str:
+) -> ComplaintCategory:
     category_facts = tuple(
         item
         for item in current_facts
         if item.fact_key == "chief_complaint.category" and item.normalized_code is not None
     )
     if not category_facts:
-        return "general"
+        return ComplaintCategory.GENERAL
     categories = tuple(sorted(frozenset(item.normalized_code for item in category_facts if item.normalized_code)))
     if len(categories) != 1:
-        return "general"
+        return ComplaintCategory.GENERAL
     category = categories[0]
-    if category in {rule.complaint_category for rule in COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES}:
-        return category
-    return "general"
+    if category in {rule.complaint_category.value for rule in COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES}:
+        try:
+            return ComplaintCategory(category)
+        except ValueError:
+            return ComplaintCategory.GENERAL
+    return ComplaintCategory.GENERAL
 
 
 def _missing_optional_dimensions(covered: tuple[InquiryDimension, ...]) -> tuple[InquiryDimension, ...]:

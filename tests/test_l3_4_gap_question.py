@@ -22,7 +22,7 @@ from app.agent_runtime.gap_selector import (
     _select_gap_with_priority_registry,
     select_gap,
 )
-from app.agent_runtime.runtime import AgentRuntime
+from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import Capability, FailurePolicy, RunSpec, RuntimeErrorCode
 from app.agent_runtime.triage_policy import evaluate_triage_policy
 from app.agents.question_composer import (
@@ -625,6 +625,10 @@ async def test_template_hit_generates_one_question_and_zero_model_requests() -> 
     assert outcome.result.template_version == "question-template-registry.v1"
     assert outcome.result.question.count("？") == 1
     assert gateway.actual_request_count == 0
+    # 纯模板命中（不调模型）不是退化
+    assert outcome.degraded is False
+    assert outcome.last_failure_code is None
+    assert outcome.failure_code is None
 
 
 @pytest.mark.asyncio
@@ -676,6 +680,9 @@ async def test_public_composer_does_not_accept_replacement_template_registry_or_
     assert outcome.result is not None
     assert outcome.result.source is QuestionSource.MODEL
     assert gateway.actual_request_count == 1
+    # 模型直接成功不是退化
+    assert outcome.degraded is False
+    assert outcome.last_failure_code is None
 
 
 @pytest.mark.asyncio
@@ -694,6 +701,92 @@ async def test_invalid_model_wording_falls_back_to_validated_template() -> None:
     assert outcome.result is not None
     assert outcome.result.source is QuestionSource.TEMPLATE
     assert gateway.actual_request_count == 1
+    # 模型软失败回模板：携带退化信号 + last_failure_code（越界文案 → SINGLE_QUESTION_INVALID）
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+    assert outcome.failure_code is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code, expected_failure_code",
+    [
+        (RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID, QuestionComposerFailureCode.MODEL_OUTPUT_INVALID),
+        (RuntimeErrorCode.OUTPUT_SCHEMA_INVALID, QuestionComposerFailureCode.MODEL_OUTPUT_INVALID),
+        (RuntimeErrorCode.AGENT_SPEC_VERSION_MISMATCH, QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH),
+        (RuntimeErrorCode.INPUT_SCHEMA_INVALID, QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH),
+        (RuntimeErrorCode.MODEL_INPUT_PRIVACY_VIOLATION, QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH),
+        (RuntimeErrorCode.ATTEMPT_BUDGET_EXHAUSTED, QuestionComposerFailureCode.RUNTIME_CONTRACT_MISMATCH),
+    ],
+)
+async def test_model_result_attributes_runtime_errors_by_code(
+    error_code: RuntimeErrorCode,
+    expected_failure_code: QuestionComposerFailureCode,
+) -> None:
+    """0a-1 归因 bug 回归：RuntimeErrorBase 必须按 exc.code 分桶，不再一律 MODEL_OUTPUT_INVALID。
+
+    这些 error_code 均不在软失败回模板白名单内（仅 MODEL_UNAVAILABLE / OUTPUT_INVALID /
+    SINGLE_QUESTION_INVALID 回模板），故 outcome 为 FAILED，failure_code 是精确归因结果。
+    用空 registry 确保即便误判也不会回模板，outcome 归因直接暴露。
+    """
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    gateway = FakeGateway([RuntimeErrorBase(error_code, "simulated runtime failure")])
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=FrozenQuestionTemplateRegistry(()),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.FAILED
+    assert outcome.failure_code is expected_failure_code
+    assert outcome.degraded is False
+    assert outcome.last_failure_code is None
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_falls_back_to_template_with_degraded_signal() -> None:
+    """网关类 RuntimeErrorBase → MODEL_UNAVAILABLE → 软失败回模板，退化留痕 last_failure_code。"""
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    gateway = FakeGateway(
+        [RuntimeErrorBase(RuntimeErrorCode.MODEL_GATEWAY_UNAVAILABLE, "gateway unavailable")]
+    )
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=QUESTION_TEMPLATES,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.MODEL_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_structured_output_invalid_falls_back_to_template_with_output_invalid_signal() -> None:
+    """STRUCTURED_OUTPUT_INVALID → MODEL_OUTPUT_INVALID → 软失败回模板。"""
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    gateway = FakeGateway(
+        [RuntimeErrorBase(RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID, "parse failed")]
+    )
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=QUESTION_TEMPLATES,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.MODEL_OUTPUT_INVALID
 
 
 def test_question_context_rejects_identity_dimensions() -> None:

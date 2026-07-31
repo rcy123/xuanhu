@@ -50,6 +50,7 @@ class SessionListItem(BaseModel):
     chief_complaint: str | None
     current_stage: str
     status: str
+    # 0c：仅历史 session 兼容读标识（见 app/models/consult.py 同名字段注释）；新 session 一律 "langgraph"。
     agent_runtime: Literal["legacy", "langgraph"]
     pending_review: bool
     created_by: str | None
@@ -62,6 +63,8 @@ class SessionCreateRequest(BaseModel):
 
     patient_info: PatientInfo = Field(default_factory=PatientInfo)
     chief_complaint: str | None = Field(default=None, max_length=2000)
+    # 0c：创建侧仍允许显式指定以兼容老客户端，但默认/发布态一律 langgraph
+    # （受 AGENT_RUNTIME_VERSION + runtime.switched 发布审计控制，见 app/services/session.py:92）。
     agent_runtime: Literal["legacy", "langgraph"] | None = Field(default=None)
 
 

@@ -60,6 +60,22 @@ class InquiryDimension(StrEnum):
     LACTATION_APPLICABILITY_FLAG = "patient.lactation_applicability"
 
 
+class ComplaintCategory(StrEnum):
+    """主诉大类枚举——驱动十问动态维度激活（COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES）。
+
+    1a 前 6 大类只在硬表与 ``_complaint_category`` fallback 以散落字符串形式存在，无统一常量。
+    归集节点产出 ``chief_complaint.category`` 的 normalized_value 必须取此枚举之一，
+    经 ``_normalized_code`` 正规化后 ``_complaint_category()`` 才能读到非 None。
+    """
+
+    RESPIRATORY = "respiratory"
+    DIGESTIVE = "digestive"
+    PAIN = "pain"
+    GYNECOLOGIC = "gynecologic"
+    URINARY = "urinary"
+    GENERAL = "general"
+
+
 class CompletenessDisposition(StrEnum):
     READY = "ready"
     INCOMPLETE = "incomplete"

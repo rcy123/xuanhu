@@ -10,3 +10,4 @@ prescription: prescription_v1.jinja2
 modification: modification_v1.jinja2
 safety: safety_v1.jinja2
 record: record_v1.jinja2
+complaint_classifier: complaint_classifier_v1.jinja2
