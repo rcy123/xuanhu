@@ -35,6 +35,7 @@ import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { stageLabel } from '@/utils/stage'
+import { langGraphDisposition } from '@/utils/agent'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
@@ -254,6 +255,18 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     && hasPendingSafety
     && !replyToQuestionId,
   )
+  // 问诊采集完整（completeness=ready）时，聊天区不应再无意义地接收新输入；
+  // 下一步操作在右侧诊疗摘要的「进入辨证开方」按钮上，自动打开该面板避免流程断掉。
+  const intakeReady = Boolean(
+    detail?.agent_runtime === 'langgraph'
+    && detail.current_stage === 'inquiry'
+    && detail.status === 'active'
+    && langGraphDisposition(detail) === 'ready',
+  )
+
+  useEffect(() => {
+    if (intakeReady) setContextOpen(true)
+  }, [intakeReady])
 
   const handleSafetyConfirmationChanged = useCallback(async () => {
     await refreshDetail()
@@ -526,6 +539,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     ? (
         detail.current_stage === 'inquiry'
         && !waitingOnlyForSafetyConfirmation
+        && !intakeReady
         && pendingSubmission == null
       )
     : false
@@ -668,8 +682,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 submitting={submitting}
                 error={submitError}
                 disabled={detail != null && !canSubmit}
-                disabledReason={waitingOnlyForSafetyConfirmation
-                  ? '请先完成上方安全信息确认，系统随后会继续问诊'
+                disabledReason={intakeReady
+                  ? '问诊要素已采集完整，请点击右侧「进入辨证开方」进入下一步'
+                  : waitingOnlyForSafetyConfirmation
+                    ? '请先完成上方安全信息确认，系统随后会继续问诊'
                   : pendingSubmission
                     ? '上一条消息结果尚未确认，请先使用错误提示中的重试'
                     : undefined}
