@@ -14,6 +14,8 @@ from app.schemas.intake import (
     IntakeReplyContext,
 )
 from app.services.langgraph_intake import (
+    _INTAKE_RETRYABLE_MODEL_CODES,
+    _INTAKE_SILENT_DEGRADE_CODES,
     _bound_required_reply_fallback_output,
     _bound_social_reply_output,
     _gateway_bound_reply_fallback_output,
@@ -71,7 +73,11 @@ def test_bound_required_reply_gateway_fallback_keeps_dimension_incomplete() -> N
     assert output.observations == ()
 
 
-def test_model_quality_extraction_failure_degrades_to_abstain() -> None:
+@pytest.mark.parametrize(
+    "failure_code",
+    ("STRUCTURED_OUTPUT_INVALID", "INTAKE_IDENTITY_FACT_FORBIDDEN"),
+)
+def test_model_quality_extraction_failure_degrades_to_abstain(failure_code: str) -> None:
     """真实后端复盘: grounding/结构化输出失败若整轮 503,安全项采集会被模型随机性卡死;
     改为退 ABSTAINED 追问,不再硬失败。"""
     unbound = IntakeExtractionInput(
@@ -85,11 +91,18 @@ def test_model_quality_extraction_failure_degrades_to_abstain() -> None:
     )
     output = _gateway_bound_reply_fallback_output(
         unbound,
-        "STRUCTURED_OUTPUT_INVALID",
+        failure_code,
     )
     assert output is not None
     assert output.decision is IntakeExtractionDecision.ABSTAINED
     assert output.observations == ()
+
+
+def test_identity_authority_model_failures_are_retryable_and_degradable() -> None:
+    """33377ef6 复盘: 模型幻觉身份字段属可重试软失败,重试仍失败时降级而非 503。"""
+    for code in ("INTAKE_IDENTITY_FACT_FORBIDDEN", "INTAKE_AUTHORITY_FIELD_FORBIDDEN"):
+        assert code in _INTAKE_RETRYABLE_MODEL_CODES
+        assert code in _INTAKE_SILENT_DEGRADE_CODES
 
 
 def test_model_quality_failure_bound_reply_keeps_focused_followup() -> None:

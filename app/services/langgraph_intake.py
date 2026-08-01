@@ -200,6 +200,9 @@ _INTAKE_SILENT_DEGRADE_CODES = frozenset(
         "INTAKE_GROUNDING_CONTEXT_UNSAFE",
         "INTAKE_DECISION_CONTENT_MISMATCH",
         "INTAKE_SAFETY_SEMANTICS_INVALID",
+        # 模型幻觉身份/权威字段(如 patient.name)输出会被丢弃,不必 503 整轮。
+        "INTAKE_IDENTITY_FACT_FORBIDDEN",
+        "INTAKE_AUTHORITY_FIELD_FORBIDDEN",
     }
 )
 # 模型质量类失败：同输入重放一次大概率成功(输出随机)，两次仍失败再降级。
@@ -212,6 +215,8 @@ _INTAKE_RETRYABLE_MODEL_CODES = frozenset(
         "INTAKE_GROUNDING_CONTEXT_UNSAFE",
         "INTAKE_DECISION_CONTENT_MISMATCH",
         "INTAKE_SAFETY_SEMANTICS_INVALID",
+        "INTAKE_IDENTITY_FACT_FORBIDDEN",
+        "INTAKE_AUTHORITY_FIELD_FORBIDDEN",
     }
 )
 INTAKE_ROUTE_READY = "ready"
@@ -662,14 +667,17 @@ class LangGraphIntakeMessageRunner:
                 retryable=True,
             )
 
+        # 2026-08 复盘(33377ef6): 重开 claim 必须换新 run_id。稳定 extraction run_id
+        # 由 (claim.run_id, idempotency_key) 派生;沿用旧 run_id 会让自动重试第二次跑图
+        # 撞上首轮已终态的 model_run_audits 记录(ModelRunAuditAlreadyFinalizedError),
+        # 整轮 503。旧 graph_run 保留 failed 作为历史,重放成功路径以新 run_id 新建 commit。
         claim.status = "running"
         claim.error_code = None
         claim.question_message_id = None
         claim.output_state_version = None
         claim.response_payload = cast(Any, sql_null())
+        claim.run_id = uuid.uuid4()
         claim.updated_at = func.now()
-        graph_run.status = "running"
-        graph_run.completed_at = None
         _INTAKE_OUTPUT_CACHE.pop(claim.id, None)
         await self._db.flush()
         return patient_message
