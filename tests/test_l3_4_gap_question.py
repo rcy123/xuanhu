@@ -32,6 +32,7 @@ from app.agents.question_composer import (
     QuestionTemplate,
     build_question_composer_agent_spec,
     compose_question,
+    slot_followup_text,
     validate_single_question_text,
 )
 from app.schemas.completeness import (
@@ -62,6 +63,7 @@ from app.schemas.question import (
     QuestionComposerFailureCode,
     QuestionComposerModelInput,
     QuestionComposerModelOutput,
+    QuestionComposerTurn,
     QuestionCompositionStatus,
     QuestionSource,
 )
@@ -1088,3 +1090,40 @@ def test_output_does_not_contain_clinical_text_identity_prompt_or_raw_model_outp
     assert "raw_model_output" not in encoded
     assert "头痛" not in encoded
     assert "prompt" not in encoded.lower()
+
+
+def test_slot_followup_text_targets_the_missing_sub_slot() -> None:
+    cold_only = (
+        QuestionComposerTurn(role="doctor", content="患者近期寒热情况怎样？"),
+        QuestionComposerTurn(role="patient", content="怕冷不明显，有点怕风"),
+    )
+    assert (
+        slot_followup_text(InquiryDimension.TEN_COLD_HEAT, cold_only)
+        == "患者已提到怕冷、怕风情况，请补充发热情况？"
+    )
+
+    heat_only = (
+        QuestionComposerTurn(role="patient", content="发烧38度"),
+    )
+    assert (
+        slot_followup_text(InquiryDimension.TEN_COLD_HEAT, heat_only)
+        == "患者已提到发热情况，请补充怕冷、怕风情况？"
+    )
+
+    both = (
+        QuestionComposerTurn(role="patient", content="怕冷不明显，有点怕风，没有发热"),
+    )
+    assert slot_followup_text(InquiryDimension.TEN_COLD_HEAT, both) is None
+
+    stool_only = (
+        QuestionComposerTurn(role="patient", content="大便一天一次成形"),
+    )
+    assert (
+        slot_followup_text(InquiryDimension.TEN_STOOL_URINE, stool_only)
+        == "患者已提到大便情况，请补充小便情况？"
+    )
+
+    unrelated = (
+        QuestionComposerTurn(role="patient", content="睡得不太好"),
+    )
+    assert slot_followup_text(InquiryDimension.TEN_COLD_HEAT, unrelated) is None

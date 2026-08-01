@@ -66,8 +66,16 @@ from app.agent_runtime.triage_precheck import (
     merge_red_flag_candidates,
 )
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
-from app.agents.intake_extraction import IntakeExecutionStatus, execute_intake_extraction
-from app.agents.question_composer import QUESTION_COMPOSER_POLICY_VERSION, compose_question
+from app.agents.intake_extraction import (
+    IntakeExecutionResult,
+    IntakeExecutionStatus,
+    execute_intake_extraction,
+)
+from app.agents.question_composer import (
+    QUESTION_COMPOSER_POLICY_VERSION,
+    compose_question,
+    slot_followup_text,
+)
 from app.core.config import get_settings
 from app.core.exceptions import (
     AgentTriggerFailedError,
@@ -174,15 +182,36 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
     }
 )
 
-# 0d-2：静默降级（extract 失败 → 模板 follow-up，不打断对话）只限瞬时网关/守卫类失败。
-# 模型输出问题（坏 JSON / 截断 / span 不匹配）不静默掩盖（0a 留痕原则），走 failed +
-# RETRYABLE_INTAKE_FAILURE_CODES 可重试路径，让同一幂等键重放有机会成功。
+# 0d-2 + 真实后端复盘(2026-08): 静默降级=「整轮不 503、退回 ABSTAINED/模板追问」。
+# 瞬时网关/守卫类失败与模型输出质量失败(坏 JSON/截断/grounding span/decision 空)同属
+# 单轮可重试或可退让的软失败——硬 503 会让安全项采集被模型随机性卡死。降级前先重试一次
+# (见 _execute_intake_extraction_with_retry)，失败现场经 fallback_error_code 留痕，
+# 不丢对话连续性；确定性硬风险阻断路径不受影响。
 _INTAKE_SILENT_DEGRADE_CODES = frozenset(
     {
         "MODEL_GATEWAY_TIMEOUT",
         "MODEL_GATEWAY_UNAVAILABLE",
         "MODEL_INPUT_PRIVACY_VIOLATION",
         "RUN_DEADLINE_EXCEEDED",
+        "STRUCTURED_OUTPUT_INVALID",
+        "MODEL_OUTPUT_TRUNCATED",
+        "INTAKE_GROUNDING_SPAN_INVALID",
+        "INTAKE_GROUNDING_VALUE_MISMATCH",
+        "INTAKE_GROUNDING_CONTEXT_UNSAFE",
+        "INTAKE_DECISION_CONTENT_MISMATCH",
+        "INTAKE_SAFETY_SEMANTICS_INVALID",
+    }
+)
+# 模型质量类失败：同输入重放一次大概率成功(输出随机)，两次仍失败再降级。
+_INTAKE_RETRYABLE_MODEL_CODES = frozenset(
+    {
+        "STRUCTURED_OUTPUT_INVALID",
+        "MODEL_OUTPUT_TRUNCATED",
+        "INTAKE_GROUNDING_SPAN_INVALID",
+        "INTAKE_GROUNDING_VALUE_MISMATCH",
+        "INTAKE_GROUNDING_CONTEXT_UNSAFE",
+        "INTAKE_DECISION_CONTENT_MISMATCH",
+        "INTAKE_SAFETY_SEMANTICS_INVALID",
     }
 )
 INTAKE_ROUTE_READY = "ready"
@@ -918,6 +947,7 @@ class LangGraphIntakeMessageRunner:
             idempotency_key=f"{command_key}:question",
             trace_id=trace_id,
         )
+        recent_turns = await _recent_question_turns(self._db, session_id)
         outcome = await compose_question(
             completeness_result=completeness_result,
             pending_safety_dimensions=pending_safety_dimensions,
@@ -925,10 +955,10 @@ class LangGraphIntakeMessageRunner:
             runtime=AgentRuntime(),
             run_spec=run_spec,
             # 1b: 对话历史/主诉/激活维度集/缺口提示——writer 承接前文、贴合主诉、自由措辞
-            recent_turns=await _recent_question_turns(self._db, session_id),
+            recent_turns=recent_turns,
             chief_complaint=_chief_complaint_text(domain_state),
             activated_dimensions=_activated_dimension_values(completeness_result),
-            missing_slot=_missing_slot_text(completeness_result),
+            missing_slot=_missing_slot_text(completeness_result, recent_turns),
         )
         if outcome.status is QuestionCompositionStatus.NO_QUESTION:
             return None
@@ -1214,24 +1244,11 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             )
             return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
         run_id = _stable_intake_extraction_run_id(claim)
-        intake_result = await execute_intake_extraction(
-            runtime=AgentRuntime(),
-            run_spec=RunSpec(
-                run_id=run_id,
-                session_id=claim.session_id,
-                state_version=claim.input_state_version,
-                stage="inquiry",
-                agent_spec_version=INTAKE_AGENT_VERSION,
-                prompt_version=INTAKE_PROMPT_VERSION,
-                policy_version=INTAKE_POLICY_VERSION,
-                # 节点级 RunSpec deadline 需 > INTAKE AgentSpec ModelPolicy.timeout(75s) 且
-                # > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，否则外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
-                deadline_at=_deadline(90),
-                total_attempt_budget=1,
-                idempotency_key=f"{claim.idempotency_key}:intake",
-                trace_id=_node_trace_id(state),
-            ),
-            input_payload=intake_input,
+        intake_result, success_run_id = await _execute_intake_extraction_with_retry(
+            claim=claim,
+            intake_input=intake_input,
+            run_id=run_id,
+            trace_id=_node_trace_id(state),
         )
         if intake_result.status is not IntakeExecutionStatus.SUCCEEDED or intake_result.output is None:
             code = str(intake_result.failure_code or "INTAKE_FAILED")
@@ -1257,7 +1274,7 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                 failure_context={
                     "failed_node": "extract_intake",
                     "last_step": "extract_intake",
-                    "model_run_id": str(run_id),
+                    "model_run_id": str(success_run_id),
                     "model_agent_name": INTAKE_AGENT_NAME,
                     "degraded": True,
                     "last_failure_code": code,
@@ -1267,7 +1284,7 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
         _INTAKE_OUTPUT_CACHE[claim.id] = intake_result.output
         await _save_intermediate(
             claim.id,
-            {"extraction": _extraction_metadata(run_id, intake_result.output, claim.input_state_version)},
+            {"extraction": _extraction_metadata(success_run_id, intake_result.output, claim.input_state_version)},
             step="extract_intake",
         )
         return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
@@ -1996,56 +2013,12 @@ async def _load_or_retry_intake_output(
             step="extract_intake",
         )
         return bound_output
-    intake_result = await execute_intake_extraction(
-        runtime=AgentRuntime(),
-        run_spec=RunSpec(
-            run_id=run_id,
-            session_id=claim.session_id,
-            state_version=claim.input_state_version,
-            stage="inquiry",
-            agent_spec_version=INTAKE_AGENT_VERSION,
-            prompt_version=INTAKE_PROMPT_VERSION,
-            policy_version=INTAKE_POLICY_VERSION,
-            deadline_at=_deadline(90),  # 与主路径对齐：> INTAKE ModelPolicy(75s) & 网关 60s
-            total_attempt_budget=1,
-            idempotency_key=f"{claim.idempotency_key}:intake",
-            trace_id=trace_id,
-        ),
-        input_payload=intake_input,
+    intake_result, success_run_id = await _execute_intake_extraction_with_retry(
+        claim=claim,
+        intake_input=intake_input,
+        run_id=run_id,
+        trace_id=trace_id,
     )
-    # 4bc10ac review should-fix: 审计 run_id 需指向实际成功的调用。
-    success_run_id = run_id
-    # 2.5a: 模型随机失败(坏 JSON/grounding span 不匹配/decision 空)自动重试一次——
-    # 同输入重试成功率可观(实测输出随机),避免安全项采集被模型随机性卡死。
-    if intake_result.status is not IntakeExecutionStatus.SUCCEEDED:
-        retry_code = str(intake_result.failure_code or "")
-        if retry_code in {
-            "STRUCTURED_OUTPUT_INVALID",
-            "MODEL_OUTPUT_TRUNCATED",
-            "INTAKE_GROUNDING_SPAN_INVALID",
-            "INTAKE_GROUNDING_VALUE_MISMATCH",
-            "INTAKE_DECISION_CONTENT_MISMATCH",
-        }:
-            retry_run_id = uuid.uuid4()
-            intake_result = await execute_intake_extraction(
-                runtime=AgentRuntime(),
-                run_spec=RunSpec(
-                    run_id=retry_run_id,
-                    session_id=claim.session_id,
-                    state_version=claim.input_state_version,
-                    stage="inquiry",
-                    agent_spec_version=INTAKE_AGENT_VERSION,
-                    prompt_version=INTAKE_PROMPT_VERSION,
-                    policy_version=INTAKE_POLICY_VERSION,
-                    deadline_at=_deadline(150),  # 重试预算: 首轮90s + 重试60s
-                    total_attempt_budget=1,
-                    idempotency_key=f"{claim.idempotency_key}:intake:retry",
-                    trace_id=trace_id,
-                ),
-                input_payload=intake_input,
-            )
-            if intake_result.status is IntakeExecutionStatus.SUCCEEDED:
-                success_run_id = retry_run_id
     if intake_result.status is not IntakeExecutionStatus.SUCCEEDED or intake_result.output is None:
         failure_code = str(intake_result.failure_code or "INTAKE_FAILED")
         fallback_output = _gateway_bound_reply_fallback_output(intake_input, failure_code)
@@ -2080,6 +2053,57 @@ async def _load_or_retry_intake_output(
 
 def _stable_intake_extraction_run_id(claim: IntakeCommandClaim) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-extraction:{claim.run_id}:{claim.idempotency_key}")
+
+
+async def _execute_intake_extraction_with_retry(
+    *,
+    claim: IntakeCommandClaim,
+    intake_input: IntakeExtractionInput,
+    run_id: uuid.UUID,
+    trace_id: str,
+) -> tuple[IntakeExecutionResult, uuid.UUID]:
+    """Run intake extraction once, then retry once on model-quality failures.
+
+    Returns ``(result, success_run_id)``; ``success_run_id`` points at the call
+    that actually succeeded (4bc10ac review should-fix), so the audited run id
+    never references a failed attempt when a later retry succeeded.
+    """
+
+    def _run_spec(attempt_run_id: uuid.UUID, *, deadline_seconds: int, retry: bool) -> RunSpec:
+        return RunSpec(
+            run_id=attempt_run_id,
+            session_id=claim.session_id,
+            state_version=claim.input_state_version,
+            stage="inquiry",
+            agent_spec_version=INTAKE_AGENT_VERSION,
+            prompt_version=INTAKE_PROMPT_VERSION,
+            policy_version=INTAKE_POLICY_VERSION,
+            deadline_at=_deadline(deadline_seconds),
+            total_attempt_budget=1,
+            idempotency_key=(
+                f"{claim.idempotency_key}:intake:retry" if retry else f"{claim.idempotency_key}:intake"
+            ),
+            trace_id=trace_id,
+        )
+
+    first = await execute_intake_extraction(
+        runtime=AgentRuntime(),
+        run_spec=_run_spec(run_id, deadline_seconds=90, retry=False),
+        input_payload=intake_input,
+    )
+    if first.status is IntakeExecutionStatus.SUCCEEDED:
+        return first, run_id
+    if str(first.failure_code or "") not in _INTAKE_RETRYABLE_MODEL_CODES:
+        return first, run_id
+    retry_run_id = uuid.uuid4()
+    retried = await execute_intake_extraction(
+        runtime=AgentRuntime(),
+        run_spec=_run_spec(retry_run_id, deadline_seconds=150, retry=True),
+        input_payload=intake_input,
+    )
+    if retried.status is IntakeExecutionStatus.SUCCEEDED:
+        return retried, retry_run_id
+    return retried, run_id
 
 
 def _safety_assertion_specs(
@@ -2178,11 +2202,16 @@ def _reply_binding_extraction_metadata(
     *,
     fallback_error_code: str | None = None,
 ) -> dict[str, Any]:
+    """Trace metadata for deterministic/fallback extraction outputs.
+
+    Reply-bound fallbacks keep the reply binding details; unbound degraded
+    fallbacks (ABSTAINED after a model-quality failure) record the failure
+    without pretending a reply binding exists.
+    """
     context = input_payload.reply_context
-    assert context is not None
     metadata = {
-        "source": "deterministic_reply_binding",
-        "policy_version": INTAKE_REPLY_BINDING_VERSION,
+        "source": "deterministic_reply_binding" if context is not None else "degraded_fallback",
+        "policy_version": INTAKE_REPLY_BINDING_VERSION if context is not None else "intake-degraded.v1",
         "input_state_version": input_state_version,
         "output_digest": _fingerprint(output.model_dump(mode="json")),
         "decision": output.decision.value,
@@ -2190,9 +2219,10 @@ def _reply_binding_extraction_metadata(
         "red_flag_candidate_count": len(output.red_flag_candidates),
         "ambiguity_count": len(output.ambiguities),
         "safety_delta_present": output.patient_safety_delta.has_candidate(),
-        "reply_question_message_id": str(context.question_message_id),
-        "reply_dimension": context.selected_dimension,
     }
+    if context is not None:
+        metadata["reply_question_message_id"] = str(context.question_message_id)
+        metadata["reply_dimension"] = context.selected_dimension
     if fallback_error_code is not None:
         metadata["fallback_error_code"] = fallback_error_code
         metadata["degraded"] = True
@@ -2750,17 +2780,23 @@ def _gateway_bound_reply_fallback_output(
     input_payload: IntakeExtractionInput,
     failure_code: str,
 ) -> IntakeExtractionOutput | None:
-    """Fallback for allowlisted transient gateway/privacy/deadline failures.
+    """Fallback for allowlisted soft intake failures (gateway/model quality).
 
-    These codes degrade to a template follow-up question instead of failing the
-    whole intake claim, so the conversation never blocks on a transient or
-    guard-side failure. The degradation fact is recorded by the caller into the
-    claim ``intermediate_payload`` (see ``_degraded_extraction_metadata``).
+    Degrade to a focused follow-up instead of failing the whole intake claim:
+    - when the reply is bound to a required observation dimension, keep the
+      existing NEEDS_CLARIFICATION template follow-up;
+    - otherwise abstain (no facts are inferred, no safety/red-flag signal is
+      fabricated) and let the completeness gate drive the next question.
+    The degradation fact is recorded by the caller into the claim
+    ``intermediate_payload`` (``fallback_error_code`` / ``degraded``).
     """
 
     if failure_code not in _INTAKE_SILENT_DEGRADE_CODES:
         return None
-    return _bound_required_reply_fallback_output(input_payload)
+    bound = _bound_required_reply_fallback_output(input_payload)
+    if bound is not None:
+        return bound
+    return IntakeExtractionOutput(decision=IntakeExtractionDecision.ABSTAINED)
 
 
 def _is_social_acknowledgement(content: str) -> bool:
@@ -3154,14 +3190,26 @@ _DIMENSION_MISSING_HINTS: dict[str, str] = {
 }
 
 
-def _missing_slot_text(completeness_result: object) -> str | None:
-    """1b: 从 completeness 的 missing_required 派生缺哪个槽位(首个缺口)。"""
+def _missing_slot_text(
+    completeness_result: object,
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
+) -> str | None:
+    """1b: 从 completeness 的 missing_required 派生缺哪个槽位(首个缺口)。
+
+    最近一轮患者回答已覆盖该维度部分子槽位时,优先给出「还缺哪一项」的精确提示,
+    避免整维原句重复(真实后端 d190 复盘: 患者答过怕冷/怕风/发热仍被整维追问)。
+    """
     missing = getattr(completeness_result, "missing_required", ())
     if not missing:
         return None
     dimension = missing[0]
     value = getattr(dimension, "value", str(dimension))
-    return _DIMENSION_MISSING_HINTS.get(value, value)
+    base = _DIMENSION_MISSING_HINTS.get(value, value)
+    if recent_turns:
+        targeted = slot_followup_text(dimension, recent_turns)
+        if targeted:
+            return targeted
+    return base
 
 
 def _activated_dimension_values(completeness_result: object) -> tuple[str, ...]:

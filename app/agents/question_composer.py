@@ -427,7 +427,14 @@ async def _compose_question_with_template_registry(
     template_key = (selection.selected_dimension, selection.selection_kind)
     template = template_registry.get(template_key)
     template_outcome = (
-        _template_result(selection, template, template_key=template_key) if template is not None else None
+        _template_result(
+            selection,
+            template,
+            template_key=template_key,
+            recent_turns=recent_turns,
+        )
+        if template is not None
+        else None
     )
     if template_outcome is not None and template_outcome.status is not QuestionCompositionStatus.SUCCEEDED:
         return template_outcome
@@ -490,11 +497,59 @@ def validate_single_question_text(question: str) -> QuestionComposerFailureCode 
     return None
 
 
+# 2.5/P1-2: 模板兜底从「整维原句」细化为「还缺哪个子槽位」。
+# 以最近一轮患者回答为措辞线索(不作抽取事实),避免 composer 模型失败时对患者已答过的
+# 维度整句重复。无对应缺口时返回 None,沿用注册表原句。
+_SLOT_FOLLOWUP_RULES: tuple[tuple[InquiryDimension, tuple[str, ...], tuple[str, ...], str, str], ...] = (
+    (
+        InquiryDimension.TEN_COLD_HEAT,
+        ("怕冷", "怕风", "畏寒", "发冷", "觉得冷"),
+        ("发热", "发烧", "发烫"),
+        "患者已提到怕冷、怕风情况，请补充发热情况？",
+        "患者已提到发热情况，请补充怕冷、怕风情况？",
+    ),
+    (
+        InquiryDimension.TEN_STOOL_URINE,
+        ("大便", "排便", "便秘", "腹泻", "拉稀"),
+        ("小便", "排尿", "夜尿"),
+        "患者已提到大便情况，请补充小便情况？",
+        "患者已提到小便情况，请补充大便情况？",
+    ),
+)
+
+
+def slot_followup_text(
+    dimension: InquiryDimension,
+    recent_turns: tuple[QuestionComposerTurn, ...],
+) -> str | None:
+    """Return a slot-level follow-up sentence when the last patient turn already
+    covered one sub-slot of ``dimension`` but not the other."""
+    patient_contents = [
+        turn.content
+        for turn in recent_turns
+        if turn.role == "patient" and turn.content and turn.content.strip()
+    ]
+    if not patient_contents:
+        return None
+    latest = patient_contents[-1]
+    for rule_dimension, first_terms, second_terms, first_missing, second_missing in _SLOT_FOLLOWUP_RULES:
+        if rule_dimension is not dimension:
+            continue
+        has_first = any(term in latest for term in first_terms)
+        has_second = any(term in latest for term in second_terms)
+        if has_first and not has_second:
+            return first_missing
+        if has_second and not has_first:
+            return second_missing
+    return None
+
+
 def _template_result(
     selection: GapSelectionResult,
     template: QuestionTemplate,
     *,
     template_key: tuple[InquiryDimension, GapSelectionKind],
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
 ) -> QuestionCompositionOutcome:
     if selection.selected_dimension is None:
         return _failed(QuestionComposerFailureCode.SELECTION_REQUIRED)
@@ -505,7 +560,12 @@ def _template_result(
         or template.template_version != QUESTION_TEMPLATE_REGISTRY_VERSION
     ):
         return _failed(QuestionComposerFailureCode.TEMPLATE_CONTRACT_MISMATCH)
-    failure = validate_single_question_text(template.question)
+    question = template.question
+    if recent_turns and selection.selection_kind is GapSelectionKind.REQUIRED:
+        targeted = slot_followup_text(selection.selected_dimension, recent_turns)
+        if targeted:
+            question = targeted
+    failure = validate_single_question_text(question)
     if failure is not None:
         return _failed(failure)
     return QuestionCompositionOutcome(
@@ -514,7 +574,7 @@ def _template_result(
             input_state_version=selection.input_state_version,
             selected_dimension=selection.selected_dimension,
             selection_kind=selection.selection_kind,
-            question=template.question,
+            question=question,
             source=QuestionSource.TEMPLATE,
             template_version=template.template_version,
         ),

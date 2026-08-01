@@ -8,6 +8,7 @@ import pytest
 from app.schemas.intake import (
     IntakeExtractionDecision,
     IntakeExtractionInput,
+    IntakeExtractionOutput,
     IntakeMessage,
     IntakeMessageRole,
     IntakeReplyContext,
@@ -17,6 +18,7 @@ from app.services.langgraph_intake import (
     _bound_social_reply_output,
     _gateway_bound_reply_fallback_output,
     _is_social_acknowledgement,
+    _reply_binding_extraction_metadata,
 )
 
 
@@ -69,14 +71,59 @@ def test_bound_required_reply_gateway_fallback_keeps_dimension_incomplete() -> N
     assert output.observations == ()
 
 
-def test_non_gateway_extraction_failure_is_not_masked() -> None:
-    assert (
-        _gateway_bound_reply_fallback_output(
-            _bound_input("咳嗽、发烧"),
-            "STRUCTURED_OUTPUT_INVALID",
-        )
-        is None
+def test_model_quality_extraction_failure_degrades_to_abstain() -> None:
+    """真实后端复盘: grounding/结构化输出失败若整轮 503,安全项采集会被模型随机性卡死;
+    改为退 ABSTAINED 追问,不再硬失败。"""
+    unbound = IntakeExtractionInput(
+        current_messages=(
+            IntakeMessage(
+                message_id=uuid.uuid4(),
+                role=IntakeMessageRole.PATIENT,
+                content="胸口有点闷，疼得厉害",
+            ),
+        ),
     )
+    output = _gateway_bound_reply_fallback_output(
+        unbound,
+        "STRUCTURED_OUTPUT_INVALID",
+    )
+    assert output is not None
+    assert output.decision is IntakeExtractionDecision.ABSTAINED
+    assert output.observations == ()
+
+
+def test_model_quality_failure_bound_reply_keeps_focused_followup() -> None:
+    output = _gateway_bound_reply_fallback_output(
+        _bound_input("咳嗽、发烧"),
+        "INTAKE_GROUNDING_VALUE_MISMATCH",
+    )
+    assert output is not None
+    assert output.decision is IntakeExtractionDecision.NEEDS_CLARIFICATION
+    assert output.observations == ()
+
+
+def test_degraded_unbound_fallback_metadata_does_not_require_reply_binding() -> None:
+    """真实后端 recover 重放复盘: 未绑定 reply_context 的 ABSTAINED 降级输出
+    必须能安全写留痕元数据,不能因断言 reply binding 而整轮崩溃。"""
+    unbound = IntakeExtractionInput(
+        current_messages=(
+            IntakeMessage(
+                message_id=uuid.uuid4(),
+                role=IntakeMessageRole.PATIENT,
+                content="胸口有点闷，疼得厉害",
+            ),
+        ),
+    )
+    output = IntakeExtractionOutput(decision=IntakeExtractionDecision.ABSTAINED)
+    metadata = _reply_binding_extraction_metadata(
+        output,
+        3,
+        unbound,
+        fallback_error_code="INTAKE_GROUNDING_VALUE_MISMATCH",
+    )
+    assert metadata["source"] == "degraded_fallback"
+    assert metadata["degraded"] is True
+    assert metadata["last_failure_code"] == "INTAKE_GROUNDING_VALUE_MISMATCH"
 
 
 def test_uninformative_bound_reply_remains_a_followup_gap() -> None:

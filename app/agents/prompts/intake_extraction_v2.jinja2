@@ -35,7 +35,7 @@
   - 现性具体症状键：`present_illness.cough`、`present_illness.sputum`、`present_illness.rhinorrhea`、`present_illness.sore_throat`、`present_illness.nasal_congestion`、`present_illness.shortness_of_breath`、`present_illness.chills`、`present_illness.fever`、`present_illness.aversion_cold`、`present_illness.sweat`、`present_illness.head_body`、`present_illness.body_ache`、`present_illness.chest`、`present_illness.abdomen`、`present_illness.distension`、`present_illness.thirst`、`present_illness.appetite`、`present_illness.diet`、`present_illness.sleep`、`present_illness.insomnia`、`present_illness.pain`、`present_illness.stool`、`present_illness.urine`。
   - `present_illness.change` —— 现病的变化趋势（加重/减轻/时发时止）。
   - `present_illness.associated_symptom` —— 伴随症状。
-- **十问歌**（医生已问过的系统维度，仅当本轮医生就该维度提问且回答有据时才落）：
+- **十问歌**（当本轮患者回答中出现该维度明确信息时即可落，不必等医生本轮专门提问；回答必须明确支持该维度语义）：
   - `ten_questions.cold_heat`、`ten_questions.sweat`、`ten_questions.head_body`、`ten_questions.stool_urine`、`ten_questions.diet`、`ten_questions.chest_abdomen`、`ten_questions.thirst`、`ten_questions.sleep`、`ten_questions.menses_leukorrhea`、`ten_questions.pain`、`ten_questions.respiratory`。
 - **过往史/四诊**：`past_history`、`four_diagnosis.inspection`、`four_diagnosis.palpation`。
 - **患者人口学**：`patient.sex`、`patient.age`、`patient.menopause`、`patient.pregnancy_applicable`、`patient.lactation_applicable`。

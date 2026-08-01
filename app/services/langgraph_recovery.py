@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,7 +57,7 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.db.session import get_session_factory
-from app.models.consult import ConsultSession
+from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
     ArtifactRevision,
     ArtifactRevisionPayload,
@@ -78,6 +79,8 @@ from app.services.langgraph_review import (
     _payload_spec,
     _verification_context,
 )
+
+logger = logging.getLogger("xuanhu.langgraph_recovery")
 
 RECOVERY_CONTROL_ARTIFACT_TYPE = "recovery_control"
 RECOVERY_CONTROL_SCHEMA_VERSION = "langgraph-recovery-control.v1"
@@ -824,6 +827,9 @@ class LangGraphRecoveryService:
                 detail=f"session_id={meta.session_id} LangGraph recovery execution failed",
                 retryable=False,
             ) from None
+        # P1-1: 恢复控制落库后,把最近一条 retryable 失败 intake 消息重放一遍,
+        # 让恢复不只清状态、还能推进对话(重放失败不影响本次恢复结果)。
+        await _replay_failed_intake_message(meta.session_id, trace_id=trace_id)
         return await _load_recovery_response(meta.session_id, command_key, request_digest)
 
 
@@ -1103,6 +1109,148 @@ async def _recover_committed_claim(
         "pending_interrupt": None,
         "last_error": None,
     }
+
+
+async def _replay_failed_intake_message(
+    session_id: uuid.UUID,
+    *,
+    trace_id: str,
+) -> str | None:
+    """Best-effort replay of the latest failed retryable intake patient message.
+
+    The recovery control commit already advanced the session state, so the
+    replay creates a fresh durable intake claim against the existing patient
+    message at the current state version and runs it through the same intake
+    path.  On success the agent reply is persisted and the failed message
+    becomes consumed; replay failures are logged and never roll back the
+    recovery itself.
+    """
+    from app.services.langgraph_intake import (
+        RETRYABLE_INTAKE_FAILURE_CODES,
+        LangGraphIntakeMessageRunner,
+    )
+
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        if (
+            session is None
+            or session.status != "active"
+            or session.current_stage != "inquiry"
+        ):
+            return None
+        failed = await db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.status == "failed",
+                IntakeCommandClaim.error_code.in_(tuple(RETRYABLE_INTAKE_FAILURE_CODES)),
+            )
+            .order_by(IntakeCommandClaim.updated_at.desc())
+            .limit(1)
+        )
+        if (
+            failed is None
+            or failed.patient_message_id is None
+            or failed.idempotency_key.startswith(("recover:", "replay:"))
+        ):
+            return None
+        committed = await db.scalar(
+            select(DomainCommandCommit.id).where(DomainCommandCommit.graph_run_id == failed.run_id)
+        )
+        if committed is not None:
+            return None
+        patient_message = await db.get(ConsultMessage, failed.patient_message_id)
+        if patient_message is None:
+            return None
+        replay_key = f"replay:{failed.idempotency_key}"
+        existing_replay_id = await db.scalar(
+            select(IntakeCommandClaim.id).where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == replay_key,
+            )
+        )
+        # Snapshot plain values before any rollback/commit; SQLAlchemy async
+        # sessions cannot lazy-load expired ORM attributes outside a greenlet.
+        state_version = session.state_version
+        source_claim_id = failed.id
+        source_error_code = failed.error_code
+        message_id = patient_message.id
+        payload_digest = failed.payload_digest
+        if db.in_transaction():
+            await db.rollback()
+        async with db.begin():
+            if existing_replay_id is not None:
+                existing_replay = await db.get(IntakeCommandClaim, existing_replay_id, with_for_update=True)
+                if existing_replay is None or existing_replay.status == "completed":
+                    return None
+                if existing_replay.status == "running":
+                    return None
+                existing_replay.status = "running"
+                existing_replay.error_code = None
+                existing_replay.response_payload = None
+                existing_replay.output_state_version = None
+                existing_replay.input_state_version = state_version
+                # A fresh run id keeps extraction audit provenance unique across
+                # replay attempts (stable run id + new trace id would conflict).
+                existing_replay.run_id = uuid.uuid4()
+                existing_replay.updated_at = func.now()
+                replay_id = existing_replay.id
+                replay_run_id = existing_replay.run_id
+            else:
+                replay_claim = IntakeCommandClaim(
+                    id=uuid.uuid4(),
+                    session_id=session_id,
+                    idempotency_key=replay_key,
+                    run_id=uuid.uuid4(),
+                    input_state_version=state_version,
+                    payload_digest=payload_digest,
+                    status="running",
+                    patient_message_id=message_id,
+                    intermediate_payload={
+                        "kind": "intake_replay",
+                        "source_claim_id": str(source_claim_id),
+                        "source_error_code": source_error_code,
+                        "trace_id": trace_id,
+                    },
+                )
+                db.add(replay_claim)
+                await db.flush()
+                replay_id = replay_claim.id
+                replay_run_id = replay_claim.run_id
+        # The begin() commit expired every loaded ORM attribute; re-fetch the
+        # replay claim and patient message so _execute_after_claim sees loaded
+        # instances (async sessions cannot lazy-load expired attributes).
+        replay_claim = await db.get(IntakeCommandClaim, replay_id)
+        patient_message = await db.get(ConsultMessage, message_id)
+        if replay_claim is None or patient_message is None:
+            return None
+        state = default_state(
+            session_id=str(session_id),
+            command=XuanhuCommand.MESSAGE.value,
+            command_id=replay_key,
+            graph_version=DEFAULT_GRAPH_VERSION,
+            run_id=str(replay_run_id),
+        )
+        try:
+            runner = LangGraphIntakeMessageRunner(db)
+            _, response = await runner._execute_after_claim(  # noqa: SLF001
+                claim=replay_claim,
+                patient_message=patient_message,
+                trace_id=trace_id,
+                state=state,
+            )
+        except Exception:
+            logger.exception(
+                "intake replay after recovery failed session_id=%s claim=%s",
+                session_id,
+                replay_id,
+            )
+            return None
+        agent_message = response.agent_message
+        if agent_message is not None:
+            return agent_message.content
+        return None
 
 
 async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
