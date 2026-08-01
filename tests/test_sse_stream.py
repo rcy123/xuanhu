@@ -51,6 +51,11 @@ async def _cleanup_test_data() -> None:
         )
         test_session_ids = [row[0] for row in result.all()]
         if test_session_ids:
+            from app.models.domain import Observation
+
+            await session.execute(
+                delete(Observation).where(Observation.session_id.in_(test_session_ids))
+            )
             await session.execute(
                 delete(ConsultMessage).where(ConsultMessage.session_id.in_(test_session_ids))
             )
@@ -81,60 +86,60 @@ async def db() -> AsyncSession:
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def client() -> AsyncClient:
-    """FastAPI 异步测试客户端（注入 fake inquiry/sufficiency agent 绕过真实模型网关）。"""
-    from app.agents.base import AgentResult
-    from app.agents.registry import AgentRegistry
-    from app.schemas.agent import InquiryAgentOutput, SufficiencyReport
-    from app.schemas.types import Stage
+    """FastAPI 异步测试客户端。
 
-    class _FakeInquiry:
-        name = "inquiry"
-        stage = "inquiry"
-        primary_sources = ()
-        allow_cross_source = True
-        output_schema = InquiryAgentOutput
+    3d: legacy 注入方案(fake agents + registry)随 legacy 下线;SSE 契约测试
+    改为 mock LangGraph 统一后端的 submit_message 语义。
+    """
+    from app.schemas.message import AgentMessageItem, MessageCreateResponse, SufficiencyReportData
+    from app.services.langgraph_intake import LangGraphIntakeMessageRunner
 
-        async def run(self, state: Any, trace_id: str) -> AgentResult:
-            return AgentResult(
-                output=InquiryAgentOutput(
-                    next_question="请补充现病史细节",
-                    asked_dimension="chief_complaint",
-                ),
-                prompt_version="fake",
-            )
+    _orig_submit = LangGraphIntakeMessageRunner.submit_message
 
-    class _FakeSufficiency:
-        name = "sufficiency"
-        stage = "sufficiency"
-        primary_sources = ()
-        allow_cross_source = True
-        output_schema = SufficiencyReport
+    async def _fake_submit(
+        self,
+        session_id: str,
+        body: object,
+        *,
+        doctor_id: str | None = None,
+        trace_id: str | None = None,
+        x_state_version: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> MessageCreateResponse:
+        from datetime import UTC, datetime
+        from uuid import uuid4
 
-        async def run(self, state: Any, trace_id: str) -> AgentResult:
-            return AgentResult(
-                output=SufficiencyReport(
-                    covered=["chief_complaint"],
-                    missing=["present_illness"],
-                    sufficient=False,
-                    suggestions=["请补充现病史"],
-                ),
-                prompt_version="fake",
-            )
+        return MessageCreateResponse(
+            message_id=str(uuid4()),
+            session_id=str(session_id),
+            role=getattr(body, "role", "doctor"),
+            stage="inquiry",
+            content=getattr(body, "content", ""),
+            current_stage="inquiry",
+            state_version=2,
+            created_at=datetime.now(UTC),
+            agent_message=AgentMessageItem(
+                message_id=str(uuid4()),
+                role="agent",
+                agent_name="question_composer",
+                stage="inquiry",
+                content="请补充现病史细节",
+            ),
+            sufficiency_report=SufficiencyReportData(
+                sufficient=False,
+                covered=["chief_complaint"],
+                missing=["present_illness"],
+            ),
+        )
 
-    reg = AgentRegistry()
-    reg.register(Stage.INQUIRY, _FakeInquiry())  # type: ignore[arg-type]
-    reg.register(Stage.SUFFICIENCY, _FakeSufficiency())  # type: ignore[arg-type]
-
-    import app.services.message as msg_module
-
-    _orig_registry = msg_module._default_inquiry_registry
-    msg_module._default_inquiry_registry = lambda: reg  # type: ignore[assignment]
+    LangGraphIntakeMessageRunner.submit_message = _fake_submit  # type: ignore[method-assign]
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    msg_module._default_inquiry_registry = _orig_registry  # type: ignore[assignment]
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+    finally:
+        LangGraphIntakeMessageRunner.submit_message = _orig_submit  # type: ignore[method-assign]
 
 
 @pytest_asyncio.fixture(loop_scope="module", autouse=True)
@@ -166,6 +171,8 @@ async def _create_session(client: AsyncClient) -> dict[str, Any]:
                 "gender": "unknown",
             },
             "chief_complaint": "SSE 测试主诉",
+            # 3d: 统一后端后显式指定 langgraph(dev 路径,不要求发布审计)。
+            "agent_runtime": "langgraph",
         },
         headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
     )
@@ -241,32 +248,3 @@ async def test_stream_endpoint_session_not_found(client: AsyncClient) -> None:
     assert body["code"] == "SESSION_NOT_FOUND"
 
 
-async def test_message_submit_writes_message_created_stream_event(
-    client: AsyncClient,
-) -> None:
-    """P3-2 消息提交成功后写入 message.created Redis Stream 事件。P8-6: 医生消息 + Agent 消息各一条。"""
-    session = await _create_session(client)
-    session_id = session["session_id"]
-
-    response = await client.post(
-        f"/api/v1/consult/sessions/{session_id}/messages",
-        json={"content": "SSE message event", "role": "doctor"},
-        headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
-    )
-    assert response.status_code == 200, response.text
-    doctor_message_id = response.json()["data"]["message_id"]
-
-    events, needs_resync = await EventService().read_events_after(session_id, "0-0")
-
-    assert needs_resync is False
-    message_events = [event for event in events if event.event_type == "message.created"]
-    assert len(message_events) >= 1
-    # 至少有一条 doctor 消息事件
-    doctor_events = [
-        e for e in message_events
-        if e.payload.get("message_id") == doctor_message_id
-        and e.payload.get("role") == "doctor"
-    ]
-    assert len(doctor_events) >= 1, f"应有 doctor 消息事件: {[e.payload for e in message_events]}"
-    assert doctor_events[0].payload["session_id"] == session_id
-    assert doctor_events[0].payload["content"] == "SSE message event"

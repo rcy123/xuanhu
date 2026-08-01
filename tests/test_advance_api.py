@@ -164,6 +164,7 @@ async def test_advance_sufficiency_to_syndrome_success(
                 "age": 30,
             },
             "chief_complaint": "头痛",
+            "agent_runtime": "langgraph",
         },
         stage="sufficiency",
     )
@@ -214,6 +215,7 @@ async def test_advance_from_inquiry_insufficient(client: AsyncClient, db: AsyncS
                 "age": 30,
             },
             "chief_complaint": "头痛",
+            "agent_runtime": "langgraph",
         },
         stage="inquiry",
     )
@@ -262,6 +264,7 @@ async def test_advance_from_review_rejected(client: AsyncClient, db: AsyncSessio
                 "age": 30,
             },
             "chief_complaint": "头痛",
+            "agent_runtime": "langgraph",
         },
         stage="review",
     )
@@ -288,6 +291,7 @@ async def test_advance_from_done_rejected(client: AsyncClient, db: AsyncSession)
                 "age": 30,
             },
             "chief_complaint": "头痛",
+            "agent_runtime": "langgraph",
         },
         stage="done",
     )
@@ -309,6 +313,7 @@ async def test_advance_from_blocked_rejected(client: AsyncClient, db: AsyncSessi
                 "age": 30,
             },
             "chief_complaint": "头痛",
+            "agent_runtime": "langgraph",
         },
         stage="blocked",
     )

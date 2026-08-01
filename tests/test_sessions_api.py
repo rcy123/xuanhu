@@ -165,6 +165,7 @@ async def test_create_session_success(client: AsyncClient, db: AsyncSession) -> 
             "pregnancy_status": "unknown",
         },
         "chief_complaint": "模拟主诉：头痛一天",
+            "agent_runtime": "langgraph",
     }
     response = await client.post("/api/v1/consult/sessions", json=payload)
     assert response.status_code == 201
@@ -199,6 +200,7 @@ async def test_create_session_writes_audit_event(
             "gender": "unknown",
         },
         "chief_complaint": "audit test",
+            "agent_runtime": "langgraph",
     }
     data = await _create_session(client, payload, headers={"X-Doctor-Id": "doctor_p3"})
     session_id = data["session_id"]
@@ -234,6 +236,7 @@ async def test_create_langgraph_session_seeds_identity_free_domain_state(
         {
             "agent_runtime": "langgraph",
             "chief_complaint": "反复头痛",
+            "agent_runtime": "langgraph",
             "patient_info": {
                 "name": identity_name,
                 "patient_ref": identity_ref,
@@ -297,6 +300,7 @@ async def test_create_langgraph_session_persists_first_question_without_extra_us
         {
             "agent_runtime": "langgraph",
             "chief_complaint": "感冒三天",
+            "agent_runtime": "langgraph",
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}AUTO-FIRST"},
         },
     )
@@ -371,6 +375,7 @@ async def test_create_langgraph_session_red_flag_chief_complaint_blocks_immediat
         {
             "agent_runtime": "langgraph",
             "chief_complaint": "突然胸痛并且呼吸困难",
+            "agent_runtime": "langgraph",
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}SEED-RED-FLAG"},
         },
     )
@@ -472,6 +477,7 @@ async def test_list_sessions_pagination_and_sort(client: AsyncClient, db: AsyncS
         {
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}PAGE001"},
             "chief_complaint": "first",
+            "agent_runtime": "langgraph",
         },
     )
     s2 = await _create_session(
@@ -479,6 +485,7 @@ async def test_list_sessions_pagination_and_sort(client: AsyncClient, db: AsyncS
         {
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}PAGE002"},
             "chief_complaint": "second",
+            "agent_runtime": "langgraph",
         },
     )
 
@@ -571,6 +578,7 @@ async def test_get_session_detail_success(client: AsyncClient, db: AsyncSession)
             "age": 30,
         },
         "chief_complaint": "detail test",
+            "agent_runtime": "langgraph",
     }
     created = await _create_session(client, payload)
 

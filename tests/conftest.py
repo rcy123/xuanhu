@@ -40,9 +40,11 @@ def _set_test_defaults() -> None:
     # Runtime rollout is part of the test boundary too.  Never let a local
     # shell or settings file silently turn historical Legacy API fixtures into
     # public LangGraph requests; individual tests opt in explicitly.
-    os.environ["AGENT_RUNTIME_VERSION"] = "legacy"
+    # 3d: 统一后端后测试会话一律 langgraph(legacy 不再创建)。
+    os.environ["AGENT_RUNTIME_VERSION"] = "langgraph"
     os.environ["AGENT_RUNTIME_ROLLOUT_PHASE"] = "legacy"
-    os.environ["XUANHU_LANGGRAPH_PUBLIC_ENABLED"] = "false"
+    # 3d: 统一后端后 langgraph 是唯一会话路径,测试默认开启公共创建。
+    os.environ["XUANHU_LANGGRAPH_PUBLIC_ENABLED"] = "true"
     os.environ["XUANHU_LANGGRAPH_PRODUCT_READY"] = "false"
     # 2a/2.5: 测试环境默认关闭槽位灰度(除非用例显式 monkeypatch),
     # 避免 .env 的 XUANHU_INTAKE_SLOT_PATH_ENABLED 污染单元测试。

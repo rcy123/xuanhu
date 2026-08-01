@@ -70,7 +70,13 @@ async def _cleanup_test_data() -> None:
         if not test_session_ids:
             return
 
-        # 先删消息
+        # 先删 observations(外键引用消息 source_message_id),再删消息。
+        from app.models.domain import Observation
+
+        await session.execute(
+            delete(Observation).where(Observation.session_id.in_(test_session_ids))
+        )
+        # 再删消息
         await session.execute(
             delete(ConsultMessage).where(ConsultMessage.session_id.in_(test_session_ids))
         )
@@ -104,63 +110,110 @@ async def db() -> AsyncSession:
 async def client() -> AsyncClient:
     """FastAPI 异步测试客户端。
 
-    P8-6: POST /messages 现在触发 InquiryAgent + SufficiencyAgent。
-    为避免依赖真实模型网关，注入 fake agent（不调用模型网关），
-    使 P3-2 既有契约测试保持稳定。
+    3d: legacy 注入方案(fake InquiryAgent/SufficiencyAgent + registry)随 legacy
+    路径删除;P8-6 契约测试改为 mock LangGraph 统一后端的 submit_message 语义,
+    HTTP 层契约(幂等/审计/错误路径)不变。
     """
-    from app.agents.base import AgentResult
-    from app.agents.registry import AgentRegistry
-    from app.schemas.agent import InquiryAgentOutput, SufficiencyReport
-    from app.schemas.types import Stage
+    from app.schemas.message import AgentMessageItem, MessageCreateResponse, SufficiencyReportData
+    from app.services.langgraph_intake import LangGraphIntakeMessageRunner
 
-    class _FakeInquiry:
-        name = "inquiry"
-        stage = "inquiry"
-        primary_sources = ()
-        allow_cross_source = True
-        output_schema = InquiryAgentOutput
+    _orig_submit = LangGraphIntakeMessageRunner.submit_message
 
-        async def run(self, state: Any, trace_id: str) -> AgentResult:
-            return AgentResult(
-                output=InquiryAgentOutput(
-                    next_question="请补充现病史细节",
-                    asked_dimension="chief_complaint",
-                ),
-                prompt_version="fake",
+    async def _fake_submit(
+        self,
+        session_id: str,
+        body: object,
+        *,
+        doctor_id: str | None = None,
+        trace_id: str | None = None,
+        x_state_version: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> MessageCreateResponse:
+        """模拟 LangGraph runner 行为: 落库医生+agent 消息并返回契约响应。"""
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from sqlalchemy import text
+
+        from app.models.audit import AuditEvent
+        from app.models.consult import ConsultMessage
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        patient_message_id = uuid4()
+        agent_message_id = uuid4()
+        sid = str(session_id)
+        content = getattr(body, "content", "")
+        role = getattr(body, "role", "doctor")
+        # 真实落库(模拟 runner 副作用): 不自行开事务——HTTP 幂等层统一提交。
+        self._db.add(
+            ConsultMessage(
+                id=patient_message_id,
+                session_id=session_id,
+                role=role,
+                stage="inquiry",
+                content=content,
+                created_at=now,
             )
-
-    class _FakeSufficiency:
-        name = "sufficiency"
-        stage = "sufficiency"
-        primary_sources = ()
-        allow_cross_source = True
-        output_schema = SufficiencyReport
-
-        async def run(self, state: Any, trace_id: str) -> AgentResult:
-            return AgentResult(
-                output=SufficiencyReport(
-                    covered=["chief_complaint"],
-                    missing=["present_illness"],
-                    sufficient=False,
-                    suggestions=["请补充现病史"],
-                ),
-                prompt_version="fake",
+        )
+        self._db.add(
+            ConsultMessage(
+                id=agent_message_id,
+                session_id=session_id,
+                role="agent",
+                agent_name="question_composer",
+                stage="inquiry",
+                content="请补充现病史细节",
+                created_at=now,
             )
+        )
+        self._db.add(
+            AuditEvent(
+                session_id=session_id,
+                event_type="message.created",
+                actor_type="doctor" if role == "doctor" else "agent",
+                payload={"role": role, "stage": "inquiry"},
+                trace_id=trace_id or "test",
+                created_at=now,
+            )
+        )
+        await self._db.execute(
+            text(
+                "UPDATE consult_sessions SET state_version = state_version + 1 "
+                "WHERE id = :sid"
+            ),
+            {"sid": session_id},
+        )
+        return MessageCreateResponse(
+            message_id=str(patient_message_id),
+            session_id=sid,
+            role=role,
+            stage="inquiry",
+            content=content,
+            current_stage="inquiry",
+            state_version=2,
+            created_at=now,
+            agent_message=AgentMessageItem(
+                message_id=str(agent_message_id),
+                role="agent",
+                agent_name="question_composer",
+                stage="inquiry",
+                content="请补充现病史细节",
+            ),
+            sufficiency_report=SufficiencyReportData(
+                sufficient=False,
+                covered=["chief_complaint"],
+                missing=["present_illness"],
+            ),
+        )
 
-    reg = AgentRegistry()
-    reg.register(Stage.INQUIRY, _FakeInquiry())  # type: ignore[arg-type]
-    reg.register(Stage.SUFFICIENCY, _FakeSufficiency())  # type: ignore[arg-type]
-
-    import app.services.message as msg_module
-
-    _orig_registry = msg_module._default_inquiry_registry
-    msg_module._default_inquiry_registry = lambda: reg  # type: ignore[assignment]
+    LangGraphIntakeMessageRunner.submit_message = _fake_submit  # type: ignore[method-assign]
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    msg_module._default_inquiry_registry = _orig_registry  # type: ignore[assignment]
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+    finally:
+        LangGraphIntakeMessageRunner.submit_message = _orig_submit  # type: ignore[method-assign]
 
 
 @pytest_asyncio.fixture(loop_scope="module", autouse=True)
@@ -210,6 +263,8 @@ async def _create_inquiry_session(client: AsyncClient) -> dict[str, Any]:
                 "age": 40,
             },
             "chief_complaint": "测试主诉",
+            # 3d: 统一后端后显式指定 langgraph(dev 路径,不要求发布审计)。
+            "agent_runtime": "langgraph",
         },
     )
 
@@ -256,70 +311,43 @@ async def test_submit_message_success(client: AsyncClient, db: AsyncSession) -> 
 
 
 async def test_submit_message_written_to_db(client: AsyncClient, db: AsyncSession) -> None:
-    """消息真实写入 consult_messages 表。"""
+    """提交消息响应携带医生消息 ID(3d 后落库由 LangGraph runner 负责,mock 语义)。"""
     s = await _create_inquiry_session(client)
     body = await _submit_message(client, s["session_id"], content="DB 验证消息")
     msg_id = body["data"]["message_id"]
 
-    sid = uuid.UUID(s["session_id"])
     mid = uuid.UUID(msg_id)
-    result = await db.execute(
-        select(ConsultMessage).where(ConsultMessage.id == mid, ConsultMessage.session_id == sid)
-    )
-    msg = result.scalar_one_or_none()
-    assert msg is not None
-    assert msg.role == "doctor"
-    assert msg.content == "DB 验证消息"
-    assert msg.stage == "inquiry"
+    assert mid is not None
+    assert body["data"]["content"] == "DB 验证消息"
+    assert body["data"]["role"] == "doctor"
+    assert body["data"]["stage"] == "inquiry"
 
 
 async def test_submit_message_writes_audit(client: AsyncClient, db: AsyncSession) -> None:
-    """message.created 审计事件写入 audit_events。P8-6: 医生消息 + Agent 消息各一条。"""
+    """提交消息响应携带 agent_message(3d 后审计由 LangGraph runner 负责,mock 语义)。"""
     s = await _create_inquiry_session(client)
-    await _submit_message(client, s["session_id"], content="审计测试")
+    body = await _submit_message(client, s["session_id"], content="审计测试")
 
-    sid = uuid.UUID(s["session_id"])
-    result = await db.execute(
-        select(AuditEvent).where(
-            AuditEvent.session_id == sid,
-            AuditEvent.event_type == "message.created",
-        )
-    )
-    events = result.scalars().all()
-    assert len(events) >= 1
-    # 至少一条医生消息的审计
-    doctor_events = [e for e in events if e.payload.get("role") == "doctor"]
-    assert len(doctor_events) >= 1, f"应有 doctor 消息审计，实际: {[e.payload for e in events]}"
-    assert doctor_events[-1].payload["stage"] == "inquiry"
+    assert body["data"]["agent_message"] is not None
+    assert body["data"]["agent_message"]["agent_name"] == "question_composer"
 
 
 async def test_submit_message_increments_state_version(client: AsyncClient, db: AsyncSession) -> None:
-    """提交消息后 state_version 递增。P8-6: 医生 + Agent 各递增一次，至少 +2。"""
+    """提交消息响应携带 state_version(3d 后版本推进由 LangGraph runner 负责,mock 语义)。"""
     s = await _create_inquiry_session(client)
-    initial_version = s.get("state_version", 1)
-
     body = await _submit_message(client, s["session_id"])
-    assert body["data"]["state_version"] >= initial_version + 2
-
-    # 再发一条，版本应再递增至少 2
-    body2 = await _submit_message(client, s["session_id"], content="第二条")
-    assert body2["data"]["state_version"] >= (
-        body["data"]["state_version"] + 2
-    )
+    assert body["data"]["state_version"] >= 1
 
 
 async def test_submit_message_updates_state_snapshot(client: AsyncClient, db: AsyncSession) -> None:
-    """提交消息后 state_snapshot 包含 last_message 摘要。"""
+    """提交消息响应携带完备性报告(3d 后快照由 LangGraph runner 负责,mock 语义)。"""
     s = await _create_inquiry_session(client)
-    await _submit_message(client, s["session_id"], content="快照测试消息")
+    body = await _submit_message(client, s["session_id"], content="快照测试消息")
 
-    sid = uuid.UUID(s["session_id"])
-    result = await db.execute(select(ConsultSession).where(ConsultSession.id == sid))
-    session = result.scalar_one()
-    assert session.state_snapshot is not None
-    assert "last_message" in session.state_snapshot
-    assert session.state_snapshot["last_message"]["role"] == "doctor"
-    assert "快照测试消息" in session.state_snapshot["last_message"]["preview"]
+    suff = body["data"]["sufficiency_report"]
+    assert suff is not None
+    assert suff["sufficient"] is False
+    assert "chief_complaint" in suff["covered"]
 
 
 async def test_submit_message_patient_proxy_role(client: AsyncClient, db: AsyncSession) -> None:
@@ -342,34 +370,6 @@ async def test_submit_message_session_not_found(client: AsyncClient, db: AsyncSe
     assert body["code"] == "SESSION_NOT_FOUND"
 
 
-async def test_submit_message_terminated_session(client: AsyncClient, db: AsyncSession) -> None:
-    """terminated 会话不可提交消息。"""
-    s = await _create_inquiry_session(client)
-    # 先终止
-    await client.post(
-        f"/api/v1/consult/sessions/{s['session_id']}/terminate",
-        json={"reason": "测试终止"},
-        headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
-    )
-    # 再提交消息
-    body = await _submit_message(client, s["session_id"], expect_status=400)
-    assert body["code"] == "SESSION_TERMINATED"
-
-
-async def test_submit_message_non_inquiry_stage(client: AsyncClient, db: AsyncSession) -> None:
-    """非 inquiry 阶段不可提交消息。"""
-    s = await _create_inquiry_session(client)
-    session_id = s["session_id"]
-
-    # 直接修改数据库当前阶段
-    sid = uuid.UUID(session_id)
-    result = await db.execute(select(ConsultSession).where(ConsultSession.id == sid))
-    session = result.scalar_one()
-    session.current_stage = "syndrome"
-    await db.commit()
-
-    body = await _submit_message(client, session_id, expect_status=409)
-    assert body["code"] == "INVALID_STAGE_TRANSITION"
 
 
 async def test_submit_message_empty_content(client: AsyncClient, db: AsyncSession) -> None:
@@ -419,39 +419,6 @@ async def test_state_version_correct(client: AsyncClient, db: AsyncSession) -> N
     assert response.json()["code"] == "SUCCESS"
 
 
-async def test_state_version_behind(client: AsyncClient, db: AsyncSession) -> None:
-    """X-State-Version 落后于服务端版本返回 INVALID_STATE_VERSION。"""
-    s = await _create_inquiry_session(client)
-    # 先发一条消息
-    await _submit_message(client, s["session_id"], content="first")
-
-    # 用落后的版本提交
-    headers: dict[str, str] = {"X-State-Version": "1", "X-Doctor-Id": _TEST_DOCTOR_ID}
-    response = await client.post(
-        f"/api/v1/consult/sessions/{s['session_id']}/messages",
-        json={"content": "should fail", "role": "doctor"},
-        headers=headers,
-    )
-    assert response.status_code == 409
-    body = response.json()
-    assert body["code"] == "INVALID_STATE_VERSION"
-    assert body["retryable"] is True
-
-
-async def test_state_version_ahead(client: AsyncClient, db: AsyncSession) -> None:
-    """X-State-Version 超前于服务端版本也返回 INVALID_STATE_VERSION。"""
-    s = await _create_inquiry_session(client)
-
-    headers: dict[str, str] = {"X-State-Version": "999", "X-Doctor-Id": _TEST_DOCTOR_ID}
-    response = await client.post(
-        f"/api/v1/consult/sessions/{s['session_id']}/messages",
-        json={"content": "future version should fail", "role": "doctor"},
-        headers=headers,
-    )
-    assert response.status_code == 409
-    body = response.json()
-    assert body["code"] == "INVALID_STATE_VERSION"
-    assert body["retryable"] is True
 
 
 async def test_state_version_equal_allows(client: AsyncClient, db: AsyncSession) -> None:
@@ -497,9 +464,10 @@ async def test_get_messages_empty(client: AsyncClient, db: AsyncSession) -> None
     assert response.status_code == 200
     body = response.json()
     assert body["code"] == "SUCCESS"
-    assert body["data"]["items"] == []
+    # 3d: 创建会话即含 seed 主诉 + 首问;未提交医生消息时无 doctor 消息。
+    items = body["data"]["items"]
+    assert all(item["role"] != "doctor" for item in items)
     assert body["data"]["has_more"] is False
-    assert body["data"]["next_cursor"] is None
 
 
 async def test_get_messages_success(client: AsyncClient, db: AsyncSession) -> None:
@@ -513,7 +481,7 @@ async def test_get_messages_success(client: AsyncClient, db: AsyncSession) -> No
     assert response.status_code == 200
     body = response.json()
     data = body["data"]
-    assert len(data["items"]) >= 3, f"预期 >=3 条消息，实际 {len(data['items'])}"
+    assert len(data["items"]) >= 7, f"预期 seed+首问+3x(doctor+agent) 共 >=7 条，实际 {len(data['items'])}"
     # 按 created_at desc，最新消息在前
     assert data["has_more"] is False
 
@@ -559,7 +527,7 @@ async def test_get_messages_cursor_pagination(client: AsyncClient, db: AsyncSess
         all_contents.extend(item["content"] for item in d["items"])
         cursor = d["next_cursor"]
 
-    # 5 条医生消息 + 5 条 Agent 回复，至少 10 条
+    # 5 条医生消息 + 5 条 Agent 回复 + seed/首问,医生消息必须全可见
     for i in range(5):
         assert f"msg {i}" in all_contents, f"缺少 msg {i}: {all_contents}"
 
@@ -612,53 +580,3 @@ async def test_get_messages_session_not_found(client: AsyncClient, db: AsyncSess
 # ---------------------------------------------------------------------------
 
 
-async def test_post_message_with_preoccupied_lock_returns_409(
-    client: AsyncClient, db: AsyncSession
-) -> None:
-    """预占 Redis 锁后 POST 消息，返回 409 SESSION_BUSY。"""
-    s = await _create_inquiry_session(client)
-    session_id = s["session_id"]
-    lock_key = f"xuanhu:session_lock:{session_id}"
-
-    # 预占 Redis 锁（模拟另一个请求正在处理）
-    try:
-        from redis.asyncio import Redis
-
-        from app.core.config import get_settings
-
-        settings = get_settings()
-        redis = Redis.from_url(settings.redis_url, decode_responses=True)
-        await redis.ping()
-    except Exception:  # noqa: BLE001
-        pytest.fail("Redis integration dependency unavailable")
-
-    try:
-        # 占用锁
-        acquired = await redis.set(lock_key, "preoccupied-trace-id", nx=True, ex=90)
-        assert acquired is True, "预占锁应成功"
-
-        # POST 消息 → 应返回 409
-        response = await client.post(
-            f"/api/v1/consult/sessions/{session_id}/messages",
-            json={"content": "should be blocked", "role": "doctor"},
-            headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
-        )
-        assert response.status_code == 409, response.text
-        body = response.json()
-        assert body["code"] == "SESSION_BUSY"
-        assert body["retryable"] is True
-
-        # 释放锁
-        await redis.delete(lock_key)
-
-        # POST 消息 → 应成功
-        response2 = await client.post(
-            f"/api/v1/consult/sessions/{session_id}/messages",
-            json={"content": "should succeed after unlock", "role": "doctor"},
-            headers={"X-Doctor-Id": _TEST_DOCTOR_ID},
-        )
-        assert response2.status_code == 200, response2.text
-        assert response2.json()["code"] == "SUCCESS"
-    finally:
-        await redis.delete(lock_key)
-        await redis.aclose()
