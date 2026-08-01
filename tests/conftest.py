@@ -44,6 +44,9 @@ def _set_test_defaults() -> None:
     os.environ["AGENT_RUNTIME_ROLLOUT_PHASE"] = "legacy"
     os.environ["XUANHU_LANGGRAPH_PUBLIC_ENABLED"] = "false"
     os.environ["XUANHU_LANGGRAPH_PRODUCT_READY"] = "false"
+    # 2a/2.5: 测试环境默认关闭槽位灰度(除非用例显式 monkeypatch),
+    # 避免 .env 的 XUANHU_INTAKE_SLOT_PATH_ENABLED 污染单元测试。
+    os.environ["XUANHU_INTAKE_SLOT_PATH_ENABLED"] = "false"
     os.environ.setdefault("MODEL_GATEWAY_BASE_URL", "http://localhost:8080/v1")
     os.environ.setdefault("MODEL_GATEWAY_API_KEY", "sk-test-placeholder")
     os.environ.setdefault("CHAT_MODEL", "test-chat-model")

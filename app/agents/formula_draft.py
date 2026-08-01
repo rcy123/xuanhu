@@ -12,6 +12,7 @@ import json
 import weakref
 from collections.abc import Callable
 from enum import StrEnum
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
@@ -154,8 +155,7 @@ def build_formula_context(
             for claim in syndrome.syndrome_basis
         ],
         "differential": [
-            {"claim": claim.claim, "fact_ids": [str(fid) for fid in claim.fact_ids]}
-            for claim in syndrome.differential
+            {"claim": claim.claim, "fact_ids": [str(fid) for fid in claim.fact_ids]} for claim in syndrome.differential
         ],
     }
     builder = ContextBuilder(
@@ -440,6 +440,29 @@ def _authoritative_input(
 
 
 def _context_from_domain_state(domain_state: DomainState) -> tuple[SyndromeObservationContext, ...]:
+    # 3a(灰度): 下游输入投影槽位对象列表(问题 22),与 syndrome_draft 同口径。
+    if get_settings().intake_slot_path_enabled:
+        from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+        from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+
+        rows = derive_slot_context_rows(
+            domain_state.observations,
+            dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+            state_version=domain_state.state_version,
+            session_id=domain_state.session_id,
+        )
+        return tuple(
+            SyndromeObservationContext(
+                observation_id=UUID(item["observation_id"]),
+                session_id=domain_state.session_id,
+                state_version=item["state_version"],
+                fact_key=item["fact_key"],
+                value=item["value"],
+                normalized_value=None,
+                status=ObservationStatus.ACTIVE,
+            )
+            for item in rows
+        )
     return tuple(
         SyndromeObservationContext(
             observation_id=item.observation_id,

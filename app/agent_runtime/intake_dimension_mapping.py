@@ -458,3 +458,49 @@ def derive_dimension_slots(
             ).model_dump(mode="json")
         )
     return tuple(snapshots)
+
+
+def derive_slot_context_rows(
+    observations: tuple[Any, ...],
+    *,
+    dimensions: frozenset[InquiryDimension],
+    state_version: int,
+    session_id: Any,
+    max_rows: int = 32,
+) -> tuple[dict[str, Any], ...]:
+    """3a: 槽位投影行(每维度一行,JSON-safe dict,供下游 context_observations)。
+
+    灰度开启时下游辨证/开方 prompt 看到规整的维度槽位对象,而非裸 fact_key
+    列表(问题 22)。行结构对齐 SyndromeObservationContext 可映射形状:
+    - fact_key = 维度枚举值(程序定义,无漂移键)
+    - value = 槽位快照(JSON-safe:dimension/slots/completeness/missing_slots)
+    - 无槽位(空提取)的维度不产行;observation_id 用稳定 uuid5(session_id, dimension)。
+
+    适配说明(review nit):入参 observations 为 DomainState 的 ObservationSchema
+    (有 value/normalized_value/source_message_id/confidence);若从 completeness
+    snapshot 传入 CompletenessObservationFact 需先做字段适配。
+    """
+    from uuid import NAMESPACE_URL, uuid5
+
+    from app.schemas.domain import ObservationStatus
+
+    active = tuple(item for item in observations if getattr(item, "status", None) is ObservationStatus.ACTIVE)
+    snapshots = derive_dimension_slots(active, dimensions=dimensions)
+    rows: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        if not snapshot.get("slots"):
+            continue
+        rows.append(
+            {
+                "observation_id": str(uuid5(NAMESPACE_URL, f"xuanhu:slot:{session_id}:{snapshot['dimension']}")),
+                "session_id": str(session_id),
+                "state_version": state_version,
+                "fact_key": snapshot["dimension"],
+                "value": snapshot,
+                "normalized_value": None,
+                "status": "active",
+            }
+        )
+        if len(rows) >= max_rows:
+            break
+    return tuple(rows)

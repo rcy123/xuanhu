@@ -351,3 +351,96 @@ def test_stagnation_cap_partial_vs_manual_handoff() -> None:
     )
     # 未到 cap → 正常 INCOMPLETE 继续追问。
     assert run("chief_complaint.symptom", "patient.sex", no_new_facts_rounds=0) == "incomplete"
+
+
+def test_derive_slot_context_rows_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """3a: 下游投影槽位对象(问题 22)——灰度开启时辨证/开方输入为规整维度行。"""
+    from datetime import UTC, datetime
+    from uuid import UUID, uuid4
+
+    from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+    from app.schemas.domain import ObservationSchema, ObservationStatus
+
+    session_id = uuid4()
+    now = datetime.now(UTC)
+    facts = (
+        ObservationSchema(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="present_illness.chills",
+            value="怕冷不明显",
+            normalized_value=None,
+            source_message_id=uuid4(),
+            status=ObservationStatus.ACTIVE,
+            created_at=now,
+        ),
+        ObservationSchema(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="present_illness.fever",
+            value="不发烧",
+            normalized_value=None,
+            source_message_id=uuid4(),
+            status=ObservationStatus.ACTIVE,
+            created_at=now,
+        ),
+        ObservationSchema(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="ten_questions.cold_heat",
+            value="怕冷,不发烧",
+            normalized_value=None,
+            source_message_id=uuid4(),
+            status=ObservationStatus.ACTIVE,
+            created_at=now,
+        ),
+        ObservationSchema(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="chief_complaint.symptom",
+            value="咳嗽三天",
+            normalized_value=None,
+            source_message_id=uuid4(),
+            status=ObservationStatus.ACTIVE,
+            created_at=now,
+        ),
+        # 非 active 不投影
+        ObservationSchema(
+            observation_id=uuid4(),
+            session_id=session_id,
+            fact_key="ten_questions.sleep",
+            value="差",
+            normalized_value=None,
+            source_message_id=uuid4(),
+            status=ObservationStatus.RETRACTED,
+            supersedes_observation_id=uuid4(),
+            created_at=now,
+        ),
+    )
+    rows = derive_slot_context_rows(
+        facts,
+        dimensions=frozenset(
+            {
+                InquiryDimension.TEN_COLD_HEAT,
+                InquiryDimension.CHIEF_COMPLAINT_SYMPTOM,
+                InquiryDimension.TEN_SLEEP,
+            }
+        ),
+        state_version=3,
+        session_id=session_id,
+    )
+    by_key = {row["fact_key"]: row for row in rows}
+    # 寒热维度一行: fact_key=维度枚举(无漂移键),value=槽位快照(JSON-safe)。
+    cold_heat = by_key["ten_questions.cold_heat"]
+    assert cold_heat["value"]["dimension"] == "ten_questions.cold_heat"
+    assert len(cold_heat["value"]["slots"]) >= 1
+    assert cold_heat["state_version"] == 3
+    # 主诉行存在。
+    assert "chief_complaint.symptom" in by_key
+    # 非 active 观察不产行。
+    assert "ten_questions.sleep" not in by_key
+    # 行可 JSON 序列化(下游 prompt 投影用)。
+    import json as _json
+
+    for row in rows:
+        _json.dumps(row, ensure_ascii=False)

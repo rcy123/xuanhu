@@ -18,11 +18,11 @@ from app.agent_runtime.completeness_policy import (
     evaluate_completeness_policy,
 )
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
-from app.core.config import get_settings
 from app.agent_runtime.repository import SafetyFactAssertionSpec, SafetyFactEvidenceSpec
 from app.agent_runtime.triage_policy import evaluate_triage_policy, to_gate_result_schema
 from app.agents.question_composer import compose_question
 from app.api.request_context import WriteRequestContext
+from app.core.config import get_settings
 from app.core.exceptions import (
     IdempotencyConflictError,
     InvalidStageTransitionError,
@@ -305,12 +305,8 @@ def build_intake_safety_assertion_specs(
             uuid.NAMESPACE_URL,
             f"xuanhu:safety-assertion:{session_id}:{fingerprint}",
         )
-        audit_actor_type: Literal["agent", "system"] = (
-            "agent" if source_kind == "model_extraction" else "system"
-        )
-        proposed_by_actor_type: Literal["model", "system"] = (
-            "model" if source_kind == "model_extraction" else "system"
-        )
+        audit_actor_type: Literal["agent", "system"] = "agent" if source_kind == "model_extraction" else "system"
+        proposed_by_actor_type: Literal["model", "system"] = "model" if source_kind == "model_extraction" else "system"
         specs.append(
             SafetyFactAssertionSpec(
                 assertion_id=assertion_id,
@@ -412,10 +408,7 @@ class SafetyConfirmationService:
                 source_message_id=spec.source_message_id,
                 extraction_run_id=spec.extraction_run_id,
                 template_version=spec.template_version,
-                evidence_spans=[
-                    item.model_dump(mode="json", exclude_none=True)
-                    for item in spec.evidence_spans
-                ],
+                evidence_spans=[item.model_dump(mode="json", exclude_none=True) for item in spec.evidence_spans],
                 evidence_digest=spec.evidence_digest,
                 proposed_by_actor_type=spec.proposed_by_actor_type,
                 proposed_by_actor_id=spec.proposed_by_actor_id,
@@ -560,9 +553,7 @@ class SafetyConfirmationService:
         actor_id = actor_id.strip()
         if not actor_id or len(actor_id) > 128:
             raise ValidationError(detail="X-Doctor-Id is required and must be at most 128 characters")
-        session = await self._db.scalar(
-            select(ConsultSession).where(ConsultSession.id == session_id).with_for_update()
-        )
+        session = await self._db.scalar(select(ConsultSession).where(ConsultSession.id == session_id).with_for_update())
         if session is None or session.agent_runtime != "langgraph":
             raise SessionNotFoundError(detail="LangGraph session was not found")
         if session.status != "active" or session.current_stage != "inquiry":
@@ -746,10 +737,7 @@ class SafetyConfirmationService:
                 question_result = outcome.result
             elif outcome.status is not QuestionCompositionStatus.NO_QUESTION:
                 raise ValidationError(
-                    detail=(
-                        "safety confirmation question composition failed: "
-                        f"{outcome.failure_code or 'unknown'}"
-                    )
+                    detail=(f"safety confirmation question composition failed: {outcome.failure_code or 'unknown'}")
                 )
 
         triage_gate = to_gate_result_schema(triage_result)
@@ -818,9 +806,7 @@ class SafetyConfirmationService:
             )
             for row in observation_rows
         )
-        profile = await self._db.scalar(
-            select(SafetyProfile).where(SafetyProfile.session_id == session.id)
-        )
+        profile = await self._db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session.id))
         safety_profile = (
             None
             if profile is None
@@ -832,13 +818,9 @@ class SafetyConfirmationService:
                 lactation_collection_status=CollectionStatus(profile.lactation_collection_status),
                 medications_collection_status=CollectionStatus(profile.medications_collection_status),
                 medication_count=len(profile.medications or ()),
-                major_conditions_collection_status=CollectionStatus(
-                    profile.major_conditions_collection_status
-                ),
+                major_conditions_collection_status=CollectionStatus(profile.major_conditions_collection_status),
                 major_condition_count=len(profile.major_conditions or ()),
-                contraindications_collection_status=CollectionStatus(
-                    profile.contraindications_collection_status
-                ),
+                contraindications_collection_status=CollectionStatus(profile.contraindications_collection_status),
                 contraindication_count=len(profile.contraindications or ()),
             )
         )
@@ -866,8 +848,7 @@ class SafetyConfirmationService:
                 {
                     dimension
                     for field_name in pending_fields
-                    if (dimension := _SAFETY_FIELD_DIMENSIONS.get(SafetyFactField(field_name)))
-                    is not None
+                    if (dimension := _SAFETY_FIELD_DIMENSIONS.get(SafetyFactField(field_name))) is not None
                 },
                 key=lambda item: item.value,
             )
@@ -1016,9 +997,7 @@ class SafetyConfirmationService:
                     "state_version": session.state_version,
                     "triage_disposition": triage_disposition.value,
                     "completeness_disposition": completeness_disposition.value,
-                    "question_message_id": (
-                        str(question_message.id) if question_message is not None else None
-                    ),
+                    "question_message_id": (str(question_message.id) if question_message is not None else None),
                 },
                 trace_id=context.trace_id[:64],
             )
@@ -1040,9 +1019,7 @@ class SafetyConfirmationService:
                     "action": action,
                     "assertion_id": str(assertion.id),
                     "completeness_disposition": completeness_disposition.value,
-                    "question_message_id": (
-                        str(question_message.id) if question_message is not None else None
-                    ),
+                    "question_message_id": (str(question_message.id) if question_message is not None else None),
                 },
                 status="pending",
                 attempt_count=0,
@@ -1165,11 +1142,7 @@ class SafetyConfirmationService:
             raise ValidationError(detail="deterministic safety reply field is not bindable")
         question_ids = {item.reply_to_question_message_id for item in refs}
         dimensions = {item.reply_dimension for item in refs}
-        if (
-            len(question_ids) != 1
-            or None in question_ids
-            or dimensions != {expected_dimension.value}
-        ):
+        if len(question_ids) != 1 or None in question_ids or dimensions != {expected_dimension.value}:
             raise ValidationError(detail="deterministic safety reply evidence binding is inconsistent")
         question_id = next(iter(question_ids))
         assert question_id is not None
@@ -1282,6 +1255,8 @@ def _apply_recompute_session_state(
         CompletenessDisposition.READY,
         CompletenessDisposition.INCOMPLETE,
         CompletenessDisposition.CONFLICT,
+        # 2d(决策 11): PARTIAL 落库推进不阻断——与主路径(_session_updates)一致。
+        CompletenessDisposition.PARTIAL,
     }
     if completeness_disposition in routable:
         session.current_stage = "inquiry"
@@ -1309,11 +1284,14 @@ def _apply_recompute_session_state(
         and bool(missing_required)
         and missing_required <= pending_values
     )
+    # 2d(决策 11): PARTIAL 用独立标记(非 manual_required),读模型不会误显示人工接管。
     dialogue_status = (
         "awaiting_safety_confirmation"
         if awaiting_confirmation
         else "questioning"
         if active_question_message_id is not None
+        else "partial"
+        if completeness_disposition is CompletenessDisposition.PARTIAL
         else "complete"
         if completeness_disposition is CompletenessDisposition.READY
         else "manual_required"
@@ -1401,7 +1379,9 @@ def _apply_assertion(values: dict[str, Any], field: SafetyFactField, assertion_v
         status = CollectionStatus(assertion_value["collection_status"])
     except (KeyError, ValueError, TypeError) as exc:
         raise ValidationError(detail="safety assertion collection status is invalid") from exc
-    raw_value = assertion_value.get("values" if field not in {SafetyFactField.PREGNANCY, SafetyFactField.LACTATION} else "value")
+    raw_value = assertion_value.get(
+        "values" if field not in {SafetyFactField.PREGNANCY, SafetyFactField.LACTATION} else "value"
+    )
     values[status_column] = status.value
     values[value_column] = raw_value if status is CollectionStatus.COLLECTED else None
 

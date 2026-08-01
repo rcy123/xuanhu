@@ -167,6 +167,8 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
         # 图级兜底错误码：底层多为节点级模型随机失败（last_failure_code 保留在
         # failure 上下文），同键重放大概率成功；manual_required 兜底防无限重试。
         "RUNNER_EXECUTION_FAILED",
+        # 图级总超时(60s 预算内两段模型调用未完成)——重放(120s 预算)大概率成功。
+        "RUNNER_TIMEOUT",
     }
 )
 
@@ -344,9 +346,12 @@ class LangGraphIntakeMessageRunner:
             run_id=str(claim.claim.run_id),
         )
         config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
+        # 3a/2.5: 单轮问诊串行 intake_extraction(35-55s)+ question_composer(5-35s),
+        # 图级总超时需覆盖两段模型调用(60s 会 RUNNER_TIMEOUT);120s 留余量。
+        INTAKE_GRAPH_TIMEOUT_SECONDS = 120
         try:
             if self._shared_runtime is not None:
-                runner = self._shared_runtime.runner(timeout_seconds=60)
+                runner = self._shared_runtime.runner(timeout_seconds=INTAKE_GRAPH_TIMEOUT_SECONDS)
                 await runner.ainvoke(dict(graph_state), config=config)
             elif self._allow_request_local_runtime:
                 # Explicit fallback for direct service/integration-test invocation.
@@ -354,7 +359,7 @@ class LangGraphIntakeMessageRunner:
                 # and therefore never enter this branch.
                 async with postgres_checkpointer(get_settings().database_url) as saver:
                     graph = build_main_graph(checkpointer=saver)
-                    runner = GraphRunner(graph, timeout_seconds=60)
+                    runner = GraphRunner(graph, timeout_seconds=INTAKE_GRAPH_TIMEOUT_SECONDS)
                     await runner.ainvoke(dict(graph_state), config=config)
             else:
                 await self._mark_claim_failed(
@@ -938,13 +943,9 @@ class LangGraphIntakeMessageRunner:
                         "source_kind": "question_composer",
                         "agent_run_id": str(run_spec.run_id),
                         "prompt_version": None,
-                        "selection_kind": str(
-                            getattr(outcome.result, "selection_kind", "") or ""
-                        ),
+                        "selection_kind": str(getattr(outcome.result, "selection_kind", "") or ""),
                         "template_version": None,
-                        "selected_dimension": str(
-                            getattr(outcome.result, "selected_dimension", "") or ""
-                        ),
+                        "selected_dimension": str(getattr(outcome.result, "selected_dimension", "") or ""),
                         "last_failure_code": code,
                     }
                 },
@@ -1621,25 +1622,24 @@ async def _classify_and_merge_category(
     模型失败一律 fail-safe 降级 ComplaintCategory.GENERAL + degraded=True 留痕，
     category obs 仍并入 delta（让下游十问退回 general 档而不是拿不到 category）。
     """
+    from app.agents.complaint_classifier import (
+        COMPLAINT_CLASSIFIER_AGENT_VERSION,
+        COMPLAINT_CLASSIFIER_PROMPT_VERSION,
+        ComplaintClassificationStatus,
+        ComplaintClassifierFailureCode,
+        execute_complaint_classification,
+    )
+    from app.schemas.completeness import ComplaintCategory
     from app.services.intake_classify_pipeline import (
-        COMPLAINT_CLASSIFY_POLICY_VERSION,
         COMPLAINT_CLASSIFY_DELTA_RUN_SPEC_STAGE,
-        _ClassificationTrace,
+        COMPLAINT_CLASSIFY_POLICY_VERSION,
         _build_category_observation,
         _build_classification_input,
         _chief_complaint_symptom_fact,
         _classification_run_id,
+        _ClassificationTrace,
         _existing_category_observations,
     )
-    from app.agents.complaint_classifier import (
-        COMPLAINT_CLASSIFIER_AGENT_VERSION,
-        COMPLAINT_CLASSIFIER_PROMPT_VERSION,
-        ComplaintClassifierFailureCode,
-        ComplaintClassificationStatus,
-        build_complaint_classifier_agent_spec,
-        execute_complaint_classification,
-    )
-    from app.schemas.completeness import ComplaintCategory
 
     cached = _CLASSIFY_TRACE_CACHE.get(claim.id)
     if cached is not None:
@@ -2011,6 +2011,35 @@ async def _load_or_retry_intake_output(
         ),
         input_payload=intake_input,
     )
+    # 2.5a: 模型随机失败(坏 JSON/grounding span 不匹配/decision 空)自动重试一次——
+    # 同输入重试成功率可观(实测输出随机),避免安全项采集被模型随机性卡死。
+    if intake_result.status is not IntakeExecutionStatus.SUCCEEDED:
+        retry_code = str(intake_result.failure_code or "")
+        if retry_code in {
+            "STRUCTURED_OUTPUT_INVALID",
+            "MODEL_OUTPUT_TRUNCATED",
+            "INTAKE_GROUNDING_SPAN_INVALID",
+            "INTAKE_GROUNDING_VALUE_MISMATCH",
+            "INTAKE_DECISION_CONTENT_MISMATCH",
+        }:
+            retry_run_id = uuid.uuid4()
+            intake_result = await execute_intake_extraction(
+                runtime=AgentRuntime(),
+                run_spec=RunSpec(
+                    run_id=retry_run_id,
+                    session_id=claim.session_id,
+                    state_version=claim.input_state_version,
+                    stage="inquiry",
+                    agent_spec_version=INTAKE_AGENT_VERSION,
+                    prompt_version=INTAKE_PROMPT_VERSION,
+                    policy_version=INTAKE_POLICY_VERSION,
+                    deadline_at=_deadline(150),  # 重试预算: 首轮90s + 重试60s
+                    total_attempt_budget=1,
+                    idempotency_key=f"{claim.idempotency_key}:intake:retry",
+                    trace_id=trace_id,
+                ),
+                input_payload=intake_input,
+            )
     if intake_result.status is not IntakeExecutionStatus.SUCCEEDED or intake_result.output is None:
         failure_code = str(intake_result.failure_code or "INTAKE_FAILED")
         fallback_output = _gateway_bound_reply_fallback_output(intake_input, failure_code)
@@ -3006,6 +3035,9 @@ def _session_updates(
         if disposition is CompletenessDisposition.INCOMPLETE and agent_item is None and awaiting_safety_confirmation
         else "questioning"
         if agent_item is not None
+        # 2d(决策 11): PARTIAL 用独立标记(读模型不会误显示人工接管)。
+        else "partial"
+        if disposition is CompletenessDisposition.PARTIAL
         else "complete"
         if disposition is CompletenessDisposition.READY
         else "manual_required"
@@ -3038,9 +3070,7 @@ def _session_updates(
             "pending_safety_dimensions": [item.value for item in pending_safety_dimensions],
             # 2d(决策 11): PARTIAL 落库推进时带缺口列表,下游辨证降置信不跳过。
             "partial_dimensions": (
-                sorted(missing_required)
-                if disposition is CompletenessDisposition.PARTIAL
-                else None
+                sorted(missing_required) if disposition is CompletenessDisposition.PARTIAL else None
             ),
             "trace_id": trace_id,
         },

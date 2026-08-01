@@ -551,6 +551,30 @@ def _authoritative_input(
 
 
 def _context_from_domain_state(domain_state: DomainState) -> tuple[SyndromeObservationContext, ...]:
+    # 3a(灰度): 下游输入投影槽位对象列表(问题 22——辨证不再吃脏 fact_key)。
+    # 关闭时维持裸键投影(现状,历史 session 兼容)。
+    if get_settings().intake_slot_path_enabled:
+        from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+        from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+
+        rows = derive_slot_context_rows(
+            domain_state.observations,
+            dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+            state_version=domain_state.state_version,
+            session_id=domain_state.session_id,
+        )
+        return tuple(
+            SyndromeObservationContext(
+                observation_id=UUID(item["observation_id"]),
+                session_id=domain_state.session_id,
+                state_version=item["state_version"],
+                fact_key=item["fact_key"],
+                value=item["value"],
+                normalized_value=None,
+                status=ObservationStatus.ACTIVE,
+            )
+            for item in rows
+        )
     return tuple(
         SyndromeObservationContext(
             observation_id=item.observation_id,
