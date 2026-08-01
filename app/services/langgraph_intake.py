@@ -2011,6 +2011,8 @@ async def _load_or_retry_intake_output(
         ),
         input_payload=intake_input,
     )
+    # 4bc10ac review should-fix: 审计 run_id 需指向实际成功的调用。
+    success_run_id = run_id
     # 2.5a: 模型随机失败(坏 JSON/grounding span 不匹配/decision 空)自动重试一次——
     # 同输入重试成功率可观(实测输出随机),避免安全项采集被模型随机性卡死。
     if intake_result.status is not IntakeExecutionStatus.SUCCEEDED:
@@ -2040,6 +2042,8 @@ async def _load_or_retry_intake_output(
                 ),
                 input_payload=intake_input,
             )
+            if intake_result.status is IntakeExecutionStatus.SUCCEEDED:
+                success_run_id = retry_run_id
     if intake_result.status is not IntakeExecutionStatus.SUCCEEDED or intake_result.output is None:
         failure_code = str(intake_result.failure_code or "INTAKE_FAILED")
         fallback_output = _gateway_bound_reply_fallback_output(intake_input, failure_code)
@@ -2062,7 +2066,11 @@ async def _load_or_retry_intake_output(
     _INTAKE_OUTPUT_CACHE[claim.id] = intake_result.output
     await _save_intermediate(
         claim.id,
-        {"extraction": _extraction_metadata(run_id, intake_result.output, claim.input_state_version)},
+        {
+            "extraction": _extraction_metadata(
+                success_run_id, intake_result.output, claim.input_state_version
+            )
+        },
         step="extract_intake",
     )
     return intake_result.output

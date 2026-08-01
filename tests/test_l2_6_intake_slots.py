@@ -149,18 +149,17 @@ def test_slot_based_covered_requires_slot_completeness() -> None:
     - slot_based=True: 寒热需 keyset 内 2 项(怕冷+发热)才 covered;1 项不齐。
     - 无阈值维度(如睡眠,阈值 1)两个口径一致。
     """
+    from uuid import uuid4
+
     from app.agent_runtime.completeness_policy import evaluate_completeness_policy
     from app.schemas.completeness import (
         CompletenessDomainSnapshot,
         CompletenessObservationFact,
         CompletenessPolicyInput,
         CompletenessProgress,
-        CompletenessSafetyProfile,
     )
-    from app.schemas.domain import GateDecision, GateResultSchema
+    from app.schemas.domain import GateDecision
     from app.schemas.triage import TriageGateDetails, TriageGateResult
-
-    from uuid import UUID, uuid4
 
     session_id = uuid4()
 
@@ -274,6 +273,8 @@ def test_slot_based_covered_requires_slot_completeness() -> None:
 
 def test_stagnation_cap_partial_vs_manual_handoff() -> None:
     """2d(决策 11): cap 到分流——缺非安全维度 → PARTIAL 推进;缺安全项 → STAGNATED 转人工。"""
+    from uuid import uuid4
+
     from app.agent_runtime.completeness_policy import evaluate_completeness_policy
     from app.schemas.completeness import (
         CompletenessDomainSnapshot,
@@ -282,9 +283,8 @@ def test_stagnation_cap_partial_vs_manual_handoff() -> None:
         CompletenessProgress,
         CompletenessSafetyProfile,
     )
-    from app.schemas.domain import GateDecision, GateResultSchema
+    from app.schemas.domain import GateDecision
     from app.schemas.triage import TriageGateDetails, TriageGateResult
-    from uuid import UUID, uuid4
 
     session_id = uuid4()
 
@@ -356,7 +356,7 @@ def test_stagnation_cap_partial_vs_manual_handoff() -> None:
 def test_derive_slot_context_rows_projection(monkeypatch: pytest.MonkeyPatch) -> None:
     """3a: 下游投影槽位对象(问题 22)——灰度开启时辨证/开方输入为规整维度行。"""
     from datetime import UTC, datetime
-    from uuid import UUID, uuid4
+    from uuid import uuid4
 
     from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
     from app.schemas.domain import ObservationSchema, ObservationStatus
@@ -444,3 +444,57 @@ def test_derive_slot_context_rows_projection(monkeypatch: pytest.MonkeyPatch) ->
 
     for row in rows:
         _json.dumps(row, ensure_ascii=False)
+
+
+def test_syndrome_context_slot_projection_when_gray_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """3a review should-fix: 灰度开启时 syndrome_draft 的 context_observations 投影槽位对象。"""
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from app.agent_runtime.reducer import DomainState
+    from app.agents.syndrome_draft import _context_from_domain_state
+    from app.core.config import get_settings
+    from app.schemas.domain import ObservationSchema, ObservationStatus
+
+    monkeypatch.setenv("XUANHU_INTAKE_SLOT_PATH_ENABLED", "true")
+    get_settings.cache_clear()
+
+    session_id = uuid4()
+    now = datetime.now(UTC)
+    state = DomainState(
+        session_id=session_id,
+        state_version=5,
+        observations=(
+            ObservationSchema(
+                observation_id=uuid4(),
+                session_id=session_id,
+                fact_key="present_illness.chills",
+                value="怕冷不明显",
+                normalized_value=None,
+                source_message_id=uuid4(),
+                status=ObservationStatus.ACTIVE,
+                created_at=now,
+            ),
+            ObservationSchema(
+                observation_id=uuid4(),
+                session_id=session_id,
+                fact_key="present_illness.fever",
+                value="不发烧",
+                normalized_value=None,
+                source_message_id=uuid4(),
+                status=ObservationStatus.ACTIVE,
+                created_at=now,
+            ),
+        ),
+    )
+    try:
+        rows = _context_from_domain_state(state)
+        assert len(rows) >= 1
+        cold_heat_rows = [row for row in rows if row.fact_key == "ten_questions.cold_heat"]
+        assert cold_heat_rows, "槽位投影应产出寒热维度行"
+        value = cold_heat_rows[0].value
+        assert value["dimension"] == "ten_questions.cold_heat"
+        assert len(value["slots"]) == 2
+    finally:
+        monkeypatch.delenv("XUANHU_INTAKE_SLOT_PATH_ENABLED")
+        get_settings.cache_clear()
