@@ -32,6 +32,11 @@ from app.core.exceptions import (
 from app.db.session import get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
+from app.services.intake_completion_notice import (
+    INTAKE_COMPLETE_NOTICE_TEXT,
+    intake_complete_notice_delta,
+    latest_agent_message_is_intake_complete,
+)
 from app.models.domain import (
     GateResult,
     GraphRun,
@@ -725,8 +730,13 @@ class SafetyConfirmationService:
         )
         pending_dimensions = await self._pending_safety_dimensions(session.id)
         outstanding_question = await self._outstanding_question(session)
+        completion_notice = (
+            completeness_result.disposition is CompletenessDisposition.READY
+            and outstanding_question is None
+            and not await latest_agent_message_is_intake_complete(self._db, session.id)
+        )
         question_result: QuestionComposerResult | None = None
-        if outstanding_question is None:
+        if outstanding_question is None and not completion_notice:
             outcome = await compose_question(
                 completeness_result=completeness_result,
                 pending_safety_dimensions=pending_dimensions,
@@ -756,6 +766,7 @@ class SafetyConfirmationService:
             pending_dimensions=pending_dimensions,
             question_result=question_result,
             outstanding_question=outstanding_question,
+            completion_notice=completion_notice,
         )
 
     async def _outstanding_question(self, session: ConsultSession) -> ConsultMessage | None:
@@ -870,6 +881,7 @@ class SafetyConfirmationService:
         pending_dimensions: tuple[InquiryDimension, ...],
         question_result: QuestionComposerResult | None,
         outstanding_question: ConsultMessage | None,
+        completion_notice: bool = False,
     ) -> None:
         run_id = _stable_transition_id(transition.id, "run")
         completed_at = datetime.now(UTC)
@@ -901,6 +913,19 @@ class SafetyConfirmationService:
                 trace_id=context.trace_id[:64],
             )
             self._db.add(question_message)
+        elif completion_notice:
+            question_id = _stable_transition_id(transition.id, "question")
+            question_message = ConsultMessage(
+                id=question_id,
+                session_id=session.id,
+                role="agent",
+                stage="inquiry",
+                agent_name="question_composer",
+                content=INTAKE_COMPLETE_NOTICE_TEXT,
+                structured_delta=intake_complete_notice_delta(),
+                trace_id=context.trace_id[:64],
+            )
+            self._db.add(question_message)
 
         step_names = (
             "safety_fact_transition",
@@ -908,6 +933,8 @@ class SafetyConfirmationService:
             "completeness_gate",
             "preserve_outstanding_question"
             if outstanding_question is not None
+            else "compose_question:intake_complete"
+            if completion_notice
             else "compose_question"
             if question_message is not None
             else "compose_question:no_question",
@@ -954,7 +981,9 @@ class SafetyConfirmationService:
             progress=next_progress,
             pending_dimensions=pending_dimensions,
             active_question_message_id=(
-                question_message.id
+                None
+                if completion_notice
+                else question_message.id
                 if question_message is not None
                 else outstanding_question.id
                 if outstanding_question is not None
@@ -963,7 +992,10 @@ class SafetyConfirmationService:
             trace_id=context.trace_id,
         )
 
-        if question_message is not None and question_result is not None:
+        if question_message is not None:
+            selected_dimension = (
+                question_result.selected_dimension.value if question_result is not None else None
+            )
             self._db.add(
                 AuditEvent(
                     session_id=session.id,
@@ -976,7 +1008,7 @@ class SafetyConfirmationService:
                         "agent_name": "question_composer",
                         "stage": "inquiry",
                         "content_length": len(question_message.content),
-                        "selected_dimension": question_result.selected_dimension.value,
+                        "selected_dimension": selected_dimension,
                         "state_version": session.state_version,
                         "trigger": SAFETY_RECOMPUTE_VERSION,
                     },

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 import app.agent_runtime.gap_selector as gap_selector
 import app.agents.question_composer as question_composer
 from app.agent_runtime.completeness_policy import evaluate_completeness_policy
+from app.agent_runtime.context import ContextBuilder
 from app.agent_runtime.gap_selector import (
     GAP_PRIORITY_RULES,
     FrozenGapPriorityRegistry,
@@ -30,6 +31,7 @@ from app.agents.question_composer import (
     QUESTION_TEMPLATES,
     FrozenQuestionTemplateRegistry,
     QuestionTemplate,
+    build_question_context,
     build_question_composer_agent_spec,
     compose_question,
     slot_followup_text,
@@ -167,8 +169,12 @@ def complete_general_facts() -> tuple[CompletenessObservationFact, ...]:
         fact("chief_complaint.course", "two_days"),
         fact("present_illness.change", "stable"),
         fact("ten_questions.cold_heat", "none"),
+        fact("ten_questions.sweat", "none"),
+        fact("ten_questions.head_body", "none"),
         fact("ten_questions.stool_urine", "normal"),
         fact("ten_questions.diet", "normal"),
+        fact("ten_questions.chest_abdomen", "none"),
+        fact("ten_questions.thirst", "none"),
         fact("ten_questions.sleep", "normal"),
         fact("patient.sex", "male"),
     )
@@ -732,6 +738,8 @@ async def test_model_result_attributes_runtime_errors_by_code(
     SINGLE_QUESTION_INVALID 回模板），故 outcome 为 FAILED，failure_code 是精确归因结果。
     用空 registry 确保即便误判也不会回模板，outcome 归因直接暴露。
     """
+    # NOTE: CONTEXT_BUILD_FAILED 已纳入软失败回模板（真实 a7c32b0b 复盘），
+    # 本测试用空 registry 所以这些“硬错误”仍保持 FAILED 归因，不受白名单变化影响。
     selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
     gateway = FakeGateway([RuntimeErrorBase(error_code, "simulated runtime failure")])
 
@@ -790,6 +798,65 @@ async def test_structured_output_invalid_falls_back_to_template_with_output_inva
     assert outcome.result.source is QuestionSource.TEMPLATE
     assert outcome.degraded is True
     assert outcome.last_failure_code is QuestionComposerFailureCode.MODEL_OUTPUT_INVALID
+
+
+@pytest.mark.asyncio
+async def test_context_build_failed_falls_back_to_template_with_degraded_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实复盘 a7c32b0b：上下文构建失败（token 超限）不得静默断链，必须回模板问题。"""
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    monkeypatch.setattr(question_composer, "QUESTION_CONTEXT_TOKEN_LIMIT", 50)
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(FakeGateway([]), recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=QUESTION_TEMPLATES,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.CONTEXT_BUILD_FAILED
+
+
+def test_question_context_budget_covers_maximal_schema_inputs() -> None:
+    """6000 token 预算必须容纳 schema 允许的最大输入（24 事实 + 8 轮长对话 + 主诉 + 32 激活维度）。"""
+    facts = tuple(
+        QuestionComposerClinicalFact(
+            fact_key=(
+                f"ten_questions.fact_{i:02d}"
+                if i < 22
+                else "past_history"
+                if i == 22
+                else "four_diagnosis"
+            ),
+            value="症" * 240,
+        )
+        for i in range(24)
+    )
+    turns = tuple(
+        QuestionComposerTurn(
+            role="doctor" if i % 2 == 0 else "patient",
+            content=("问诊内容" if i % 2 == 0 else "患者回答") * 250,
+        )
+        for i in range(8)
+    )
+    payload = QuestionComposerModelInput(
+        selected_dimension=InquiryDimension.TEN_COLD_HEAT,
+        selection_kind="required",
+        safety_instruction="s" * 800,
+        clinical_context=facts,
+        recent_turns=turns,
+        chief_complaint="感冒" * 1000,
+        activated_dimensions=tuple(f"ten_questions.dim_{i:02d}" for i in range(32)),
+        missing_slot="缺口" * 120,
+    )
+    packet, _ = build_question_context(payload)
+    used = sum(ContextBuilder.estimate_tokens(message.content) for message in packet.messages)
+    assert used <= question_composer.QUESTION_CONTEXT_TOKEN_LIMIT
 
 
 def test_question_context_rejects_identity_dimensions() -> None:

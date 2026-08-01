@@ -62,15 +62,19 @@ def test_clinical_or_ambiguous_turn_still_counts_for_progress(content: str) -> N
     assert _is_social_acknowledgement(content) is False
 
 
-def test_bound_required_reply_gateway_fallback_keeps_dimension_incomplete() -> None:
+def test_bound_required_reply_gateway_fallback_records_raw_observation() -> None:
     output = _gateway_bound_reply_fallback_output(
         _bound_input("咳嗽、发烧"),
         "MODEL_GATEWAY_TIMEOUT",
     )
 
     assert output is not None
-    assert output.decision is IntakeExtractionDecision.NEEDS_CLARIFICATION
-    assert output.observations == ()
+    assert output.decision is IntakeExtractionDecision.EXTRACTED
+    assert len(output.observations) == 1
+    observation = output.observations[0]
+    assert observation.fact_key == "present_illness.change"
+    assert observation.value == "咳嗽、发烧"
+    assert observation.confidence == 0.5
 
 
 @pytest.mark.parametrize(
@@ -105,14 +109,15 @@ def test_identity_authority_model_failures_are_retryable_and_degradable() -> Non
         assert code in _INTAKE_SILENT_DEGRADE_CODES
 
 
-def test_model_quality_failure_bound_reply_keeps_focused_followup() -> None:
+def test_model_quality_failure_bound_reply_records_raw_fact() -> None:
     output = _gateway_bound_reply_fallback_output(
         _bound_input("咳嗽、发烧"),
         "INTAKE_GROUNDING_VALUE_MISMATCH",
     )
     assert output is not None
-    assert output.decision is IntakeExtractionDecision.NEEDS_CLARIFICATION
-    assert output.observations == ()
+    assert output.decision is IntakeExtractionDecision.EXTRACTED
+    assert len(output.observations) == 1
+    assert output.observations[0].value == "咳嗽、发烧"
 
 
 def test_degraded_unbound_fallback_metadata_does_not_require_reply_binding() -> None:
@@ -139,12 +144,13 @@ def test_degraded_unbound_fallback_metadata_does_not_require_reply_binding() -> 
     assert metadata["last_failure_code"] == "INTAKE_GROUNDING_VALUE_MISMATCH"
 
 
-def test_uninformative_bound_reply_remains_a_followup_gap() -> None:
+def test_vague_bound_reply_records_verbatim_raw_fact() -> None:
     output = _bound_required_reply_fallback_output(_bound_input("不清楚"))
 
     assert output is not None
-    assert output.decision is IntakeExtractionDecision.NEEDS_CLARIFICATION
-    assert output.observations == ()
+    assert output.decision is IntakeExtractionDecision.EXTRACTED
+    assert len(output.observations) == 1
+    assert output.observations[0].value == "不清楚"
 
 
 def test_safety_or_conflict_reply_never_uses_raw_observation_fallback() -> None:

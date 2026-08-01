@@ -153,8 +153,12 @@ def complete_general_facts() -> tuple[CompletenessObservationFact, ...]:
         fact("chief_complaint.course", "two_days"),
         fact("present_illness.change", "stable"),
         fact("ten_questions.cold_heat", "none"),
+        fact("ten_questions.sweat", "none"),
+        fact("ten_questions.head_body", "none"),
         fact("ten_questions.stool_urine", "normal"),
         fact("ten_questions.diet", "normal"),
+        fact("ten_questions.chest_abdomen", "none"),
+        fact("ten_questions.thirst", "none"),
         fact("ten_questions.sleep", "normal"),
         fact("patient.sex", "male"),
     )
@@ -476,14 +480,21 @@ def test_complaint_category_selects_dynamic_ten_question_thresholds() -> None:
         fact("chief_complaint.course", "two_days"),
         fact("present_illness.change", "cough"),
         fact("ten_questions.cold_heat", "none"),
+        fact("ten_questions.sweat", "none"),
+        fact("ten_questions.head_body", "none"),
+        fact("ten_questions.stool_urine", "normal"),
+        fact("ten_questions.diet", "normal"),
+        fact("ten_questions.chest_abdomen", "none"),
+        fact("ten_questions.thirst", "none"),
         fact("ten_questions.sleep", "normal"),
+        fact("ten_questions.respiratory", "cough"),
         fact("patient.sex", "male"),
     )
 
     result = evaluate_completeness_policy(policy_input(*facts, safety_profile=safety()))
 
-    assert InquiryDimension.TEN_RESPIRATORY in result.missing_required
-    assert InquiryDimension.TEN_DIET not in result.missing_required
+    assert result.disposition is CompletenessDisposition.READY
+    assert result.missing_required == ()
 
 
 def test_triage_blocked_never_becomes_ready() -> None:

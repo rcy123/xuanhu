@@ -251,57 +251,51 @@ COMPLETENESS_DIMENSION_RULES: Mapping[InquiryDimension, CompletenessDimensionRul
     )
 )
 
+# 十问核心基座：所有主诉大类都至少采集寒热、汗出、头身、二便、饮食、胸腹、口渴、睡眠。
+# 分类专属维度（呼吸/疼痛/月经带下）在基座之上按大类追加。
+# 真实问诊复盘（session 69862530-...）：旧表仅激活 2-4 项十问维度，8 轮即 READY，
+# 汗出/头身/口渴/胸腹等十问要素全部漏采；此处按传统十问歌补全核心采集集。
+_TEN_QUESTION_BASE_CORE: tuple[InquiryDimension, ...] = (
+    InquiryDimension.TEN_COLD_HEAT,
+    InquiryDimension.TEN_SWEAT,
+    InquiryDimension.TEN_HEAD_BODY,
+    InquiryDimension.TEN_STOOL_URINE,
+    InquiryDimension.TEN_DIET,
+    InquiryDimension.TEN_CHEST_ABDOMEN,
+    InquiryDimension.TEN_THIRST,
+    InquiryDimension.TEN_SLEEP,
+)
+
 COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES: tuple[ComplaintTenQuestionRule, ...] = (
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.RESPIRATORY,
         rule_id="completeness.dynamic_ten_questions.respiratory.v1",
-        dimensions=(
-            InquiryDimension.TEN_COLD_HEAT,
-            InquiryDimension.TEN_RESPIRATORY,
-            InquiryDimension.TEN_SLEEP,
-        ),
+        dimensions=(*_TEN_QUESTION_BASE_CORE, InquiryDimension.TEN_RESPIRATORY),
     ),
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.DIGESTIVE,
         rule_id="completeness.dynamic_ten_questions.digestive.v1",
-        dimensions=(
-            InquiryDimension.TEN_STOOL_URINE,
-            InquiryDimension.TEN_DIET,
-            InquiryDimension.TEN_CHEST_ABDOMEN,
-        ),
+        dimensions=_TEN_QUESTION_BASE_CORE,
     ),
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.PAIN,
         rule_id="completeness.dynamic_ten_questions.pain.v1",
-        dimensions=(
-            InquiryDimension.TEN_COLD_HEAT,
-            InquiryDimension.TEN_PAIN,
-            InquiryDimension.TEN_SLEEP,
-        ),
+        dimensions=(*_TEN_QUESTION_BASE_CORE, InquiryDimension.TEN_PAIN),
     ),
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.GYNECOLOGIC,
         rule_id="completeness.dynamic_ten_questions.gynecologic.v1",
-        dimensions=(
-            InquiryDimension.TEN_MENSES_LEUKORRHEA,
-            InquiryDimension.TEN_COLD_HEAT,
-            InquiryDimension.TEN_STOOL_URINE,
-        ),
+        dimensions=(*_TEN_QUESTION_BASE_CORE, InquiryDimension.TEN_MENSES_LEUKORRHEA),
     ),
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.URINARY,
         rule_id="completeness.dynamic_ten_questions.urinary.v1",
-        dimensions=(InquiryDimension.TEN_STOOL_URINE, InquiryDimension.TEN_COLD_HEAT),
+        dimensions=_TEN_QUESTION_BASE_CORE,
     ),
     ComplaintTenQuestionRule(
         complaint_category=ComplaintCategory.GENERAL,
         rule_id="completeness.dynamic_ten_questions.general.v1",
-        dimensions=(
-            InquiryDimension.TEN_COLD_HEAT,
-            InquiryDimension.TEN_STOOL_URINE,
-            InquiryDimension.TEN_DIET,
-            InquiryDimension.TEN_SLEEP,
-        ),
+        dimensions=_TEN_QUESTION_BASE_CORE,
     ),
 )
 

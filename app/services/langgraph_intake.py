@@ -124,6 +124,7 @@ from app.schemas.intake import (
     IntakeMessageRole,
     IntakeReplyContext,
     LactationDelta,
+    ObservationDelta,
     ObservationOperation,
     PatientSafetyDelta,
     PregnancyDelta,
@@ -140,6 +141,11 @@ from app.schemas.question import (
 )
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
 from app.services.events import EventService
+from app.services.intake_completion_notice import (
+    INTAKE_COMPLETE_NOTICE_TEXT,
+    intake_complete_notice_delta,
+    latest_agent_message_is_intake_complete,
+)
 from app.services.safety_confirmation import build_intake_safety_assertion_specs
 from app.services.session_lock import SessionLock
 
@@ -252,6 +258,13 @@ _BOUND_REQUIRED_OBSERVATION_DIMENSIONS = frozenset(
         InquiryDimension.TEN_RESPIRATORY,
     }
 )
+
+# REAL-SESSION FIX (e8c4b380): during a model-gateway outage the old fallback
+# returned NEEDS_CLARIFICATION with zero observations, so the same question
+# looped until stagnation blocked the session. A bound required reply now
+# records the verbatim patient answer as a degraded low-confidence observation
+# (safety/conflict replies still deliberately remain outside this fallback).
+_DETERMINISTIC_REPLY_BINDING_CONFIDENCE = 0.5
 
 
 class _EmptyOutput(BaseModel):
@@ -811,6 +824,30 @@ class LangGraphIntakeMessageRunner:
                         created_at=None,
                     )
                     progress = progress.model_copy(update={"followup_rounds": progress.followup_rounds + 1})
+            elif completeness_result.disposition is CompletenessDisposition.READY:
+                already_noticed = await latest_agent_message_is_intake_complete(
+                    self._db,
+                    claim.session_id,
+                )
+                if not already_noticed:
+                    question_message_id = uuid.uuid4()
+                    question_spec = ConsultMessageSpec(
+                        message_id=question_message_id,
+                        role="agent",
+                        agent_name="question_composer",
+                        stage="inquiry",
+                        content=INTAKE_COMPLETE_NOTICE_TEXT,
+                        structured_delta=intake_complete_notice_delta(),
+                        trace_id=trace_id[:64],
+                    )
+                    agent_item = AgentMessageItem(
+                        message_id=str(question_message_id),
+                        role="agent",
+                        agent_name="question_composer",
+                        stage="inquiry",
+                        content=INTAKE_COMPLETE_NOTICE_TEXT,
+                        created_at=None,
+                    )
 
             session_updates = _session_updates(
                 completeness_result.disposition,
@@ -2377,6 +2414,30 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                     created_at=None,
                 )
                 progress = progress.model_copy(update={"followup_rounds": progress.followup_rounds + 1})
+        elif disposition is CompletenessDisposition.READY:
+            already_noticed = await latest_agent_message_is_intake_complete(
+                db,
+                claim.session_id,
+            )
+            if not already_noticed:
+                question_message_id = uuid.uuid4()
+                question_spec = ConsultMessageSpec(
+                    message_id=question_message_id,
+                    role="agent",
+                    agent_name="question_composer",
+                    stage="inquiry",
+                    content=INTAKE_COMPLETE_NOTICE_TEXT,
+                    structured_delta=intake_complete_notice_delta(),
+                    trace_id=_node_trace_id(state)[:64],
+                )
+                agent_item = AgentMessageItem(
+                    message_id=str(question_message_id),
+                    role="agent",
+                    agent_name="question_composer",
+                    stage="inquiry",
+                    content=INTAKE_COMPLETE_NOTICE_TEXT,
+                    created_at=None,
+                )
 
         session_updates = _session_updates(
             disposition,
@@ -2781,7 +2842,22 @@ def _bound_required_reply_fallback_output(
         return None
     if selected_dimension not in _BOUND_REQUIRED_OBSERVATION_DIMENSIONS:
         return None
-    return IntakeExtractionOutput(decision=IntakeExtractionDecision.NEEDS_CLARIFICATION)
+    message = input_payload.current_messages[0]
+    content = message.content.strip()
+    if not content or _is_social_acknowledgement(content):
+        return None
+    return IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        observations=(
+            ObservationDelta(
+                fact_key=context.selected_dimension,
+                value=content[:240],
+                source_message_id=message.message_id,
+                confidence=_DETERMINISTIC_REPLY_BINDING_CONFIDENCE,
+                operation=ObservationOperation.ADD,
+            ),
+        ),
+    )
 
 
 def _gateway_bound_reply_fallback_output(
@@ -3085,15 +3161,15 @@ def _session_updates(
     pending_values = {item.value for item in pending_safety_dimensions}
     awaiting_safety_confirmation = bool(missing_required) and missing_required <= pending_values
     dialogue_status = (
-        "awaiting_safety_confirmation"
+        "complete"
+        if disposition is CompletenessDisposition.READY
+        else "awaiting_safety_confirmation"
         if disposition is CompletenessDisposition.INCOMPLETE and agent_item is None and awaiting_safety_confirmation
         else "questioning"
         if agent_item is not None
         # 2d(决策 11): PARTIAL 用独立标记(读模型不会误显示人工接管)。
         else "partial"
         if disposition is CompletenessDisposition.PARTIAL
-        else "complete"
-        if disposition is CompletenessDisposition.READY
         else "manual_required"
     )
 
@@ -3108,7 +3184,11 @@ def _session_updates(
             "version": "intake-subgraph.v1",
             "last_run_id": str(run_id),
             "last_patient_message_id": str(patient_message.id),
-            "last_question_message_id": agent_item.message_id if agent_item else None,
+            "last_question_message_id": (
+                None
+                if disposition is CompletenessDisposition.READY
+                else agent_item.message_id if agent_item else None
+            ),
             "triage": {
                 "decision": triage_gate.decision.value,
                 "policy_version": triage_gate.policy_version,

@@ -135,8 +135,12 @@ _FINAL_INQUIRY_FACT_KEYS = (
     "chief_complaint.course",
     "present_illness.change",
     "ten_questions.cold_heat",
+    "ten_questions.sweat",
+    "ten_questions.head_body",
     "ten_questions.stool_urine",
     "ten_questions.diet",
+    "ten_questions.chest_abdomen",
+    "ten_questions.thirst",
     "ten_questions.sleep",
 )
 
@@ -314,6 +318,16 @@ async def test_final_confirmation_recomputes_gates_and_becomes_ready_without_pat
         assert intake["completeness"]["disposition"] == "ready"
         assert intake["dialogue_status"] == "complete"
         assert intake["last_question_message_id"] is None
+        notice = await db.scalar(
+            select(ConsultMessage).where(
+                ConsultMessage.session_id == session_id,
+                ConsultMessage.agent_name == "question_composer",
+            )
+        )
+        assert notice is not None
+        assert notice.structured_delta is not None
+        assert notice.structured_delta.get("kind") == "completion_notice"
+        assert notice.structured_delta.get("source") == "intake_complete"
         assert len(runs) == 1 and runs[0].status == "completed"
         assert {(gate.gate_name, gate.decision) for gate in gates} == {
             ("triage", "passed"),
@@ -322,7 +336,7 @@ async def test_final_confirmation_recomputes_gates_and_becomes_ready_without_pat
         assert len(steps) == 5
         assert event is not None
         assert event.payload["completeness_disposition"] == "ready"
-        assert event.payload["question_message_id"] is None
+        assert event.payload["question_message_id"] == str(notice.id)
 
 
 async def test_rejection_recomputes_and_asks_the_rejected_missing_dimension(

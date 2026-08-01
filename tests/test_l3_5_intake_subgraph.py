@@ -226,9 +226,13 @@ def _intake_output(mode: str, source: uuid.UUID, text: str) -> IntakeExtractionO
                 _observation(source, "chief_complaint.course", "three_days"),
                 _observation(source, "present_illness.change", "stable"),
                 _observation(source, "ten_questions.cold_heat", "none"),
+                _observation(source, "ten_questions.sweat", "none"),
+                _observation(source, "ten_questions.head_body", "none"),
                 _observation(source, "ten_questions.diet", "normal"),
                 _observation(source, "ten_questions.sleep", "normal"),
                 _observation(source, "ten_questions.stool_urine", "normal"),
+                _observation(source, "ten_questions.chest_abdomen", "none"),
+                _observation(source, "ten_questions.thirst", "none"),
                 # 1a 主诉大类归集后 fake 恒定归 respiratory → 动态十问激活
                 # (cold_heat, respiratory, sleep)，必须采齐 respiratory 档才维持
                 # "只差 safety 确认、不再追问"的测试语义。
@@ -1155,7 +1159,7 @@ async def test_messages_api_repairs_ambiguous_http_claim_from_completed_intake(
 
 
 @pytest.mark.asyncio
-async def test_messages_api_same_public_command_resumes_gateway_failed_intake_without_new_message(
+async def test_messages_api_same_public_command_replays_degraded_intake_without_new_message(
     db_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1179,24 +1183,24 @@ async def test_messages_api_same_public_command_resumes_gateway_failed_intake_wi
             json=request_body,
             headers=headers,
         )
-        assert first.status_code == 503, first.text
-        assert first.json()["code"] == "AGENT_TRIGGER_FAILED"
-        assert first.json()["agent_error_code"] == "MODEL_GATEWAY_UNAVAILABLE"
-        assert first.json()["retryable"] is True
+        # 0d-2（1dc4c45）：网关瞬时不可用不再硬 503，而是降级为 ABSTAINED 继续追问，
+        # 失败码写入 extraction 留痕；同幂等键重放直接回放完成响应，不新建消息。
+        assert first.status_code == 200, first.text
+        assert first.json()["data"]["agent_message"] is not None
 
         async with db_factory() as db:
-            failed_intake = await db.scalar(
+            degraded_intake = await db.scalar(
                 select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id)
             )
-            failed_http = await db.scalar(
+            degraded_http = await db.scalar(
                 select(HttpCommandClaim).where(
                     HttpCommandClaim.operation == "session.message.create.v1",
                     HttpCommandClaim.scope_key == f"session:{session_id}",
                 )
             )
-            assert failed_intake is not None
-            failed_run = await db.get(GraphRun, failed_intake.run_id)
-            message_count_after_failure = await db.scalar(
+            assert degraded_intake is not None
+            degraded_run = await db.get(GraphRun, degraded_intake.run_id)
+            message_count_after_degrade = await db.scalar(
                 select(func.count())
                 .select_from(ConsultMessage)
                 .where(
@@ -1204,23 +1208,19 @@ async def test_messages_api_same_public_command_resumes_gateway_failed_intake_wi
                     ConsultMessage.role == "patient_proxy",
                 )
             )
-        original_claim_id = failed_intake.id
-        original_message_id = failed_intake.patient_message_id
-        original_run_id = failed_intake.run_id
-        assert failed_intake.status == "failed"
-        assert failed_intake.error_code == "MODEL_GATEWAY_UNAVAILABLE"
-        assert failed_http is not None and failed_http.status == "failed"
-        assert failed_run is not None and failed_run.status == "failed"
-        assert failed_run.completed_at is not None
-        assert message_count_after_failure == 1
-
-        # Simulate legacy failure records written before GraphRun failure was
-        # persisted atomically with the internal intake claim.
-        async with db_factory() as db, db.begin():
-            legacy_run = await db.get(GraphRun, original_run_id, with_for_update=True)
-            assert legacy_run is not None
-            legacy_run.status = "running"
-            legacy_run.completed_at = None
+        original_claim_id = degraded_intake.id
+        original_message_id = degraded_intake.patient_message_id
+        original_run_id = degraded_intake.run_id
+        assert degraded_intake.status == "completed"
+        assert degraded_intake.error_code is None
+        assert degraded_intake.intermediate_payload is not None
+        extraction_trace = degraded_intake.intermediate_payload["extraction"]
+        assert extraction_trace["source"] == "degraded_fallback"
+        assert extraction_trace["decision"] == "abstained"
+        assert extraction_trace["last_failure_code"] == "MODEL_GATEWAY_UNAVAILABLE"
+        assert degraded_http is not None and degraded_http.status == "completed"
+        assert degraded_run is not None and degraded_run.status == "completed"
+        assert message_count_after_degrade == 1
 
         retry = await client.post(
             f"/api/v1/consult/sessions/{session_id}/messages",
@@ -1229,7 +1229,8 @@ async def test_messages_api_same_public_command_resumes_gateway_failed_intake_wi
         )
 
     assert retry.status_code == 200, retry.text
-    assert gateway.intake_calls == 2
+    assert retry.json()["data"] == first.json()["data"]
+    assert gateway.intake_calls == 1
     async with db_factory() as db:
         completed_intake = await db.scalar(
             select(IntakeCommandClaim).where(IntakeCommandClaim.session_id == session_id)

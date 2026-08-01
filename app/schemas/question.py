@@ -169,7 +169,8 @@ class QuestionComposerModelInput(_QuestionModel):
     # 槽位缺口暂从 completeness 的 missing_required 派生(阶段 2 换槽位对象)。
     recent_turns: tuple[QuestionComposerTurn, ...] = Field(default=(), max_length=8)
     chief_complaint: str | None = Field(default=None, min_length=1, max_length=2_000)
-    activated_dimensions: tuple[str, ...] = Field(default=(), max_length=16)
+    # 十问核心基座(8) + 分类专属维度 + 安全项 + 主诉/患者维度后,激活集可超过 16。
+    activated_dimensions: tuple[str, ...] = Field(default=(), max_length=32)
     missing_slot: str | None = Field(default=None, min_length=1, max_length=240)
 
     @model_validator(mode="after")

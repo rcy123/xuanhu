@@ -38,11 +38,15 @@ from app.schemas.question import (
     QuestionSource,
 )
 
-QUESTION_CONTEXT_TOKEN_LIMIT = 1_000
+# 真实会话复盘（a7c32b0b）：十问激活集扩全后，6 轮对话 + 最多 24 条事实 +
+# 主诉原文在 1000 token 预算下会顶满甚至超限，导致 CONTEXT_BUILD_FAILED 静默断链。
+# 放宽到 6000（与 intake_extraction 同级），并保留 CONTEXT_BUILD_FAILED 的模板兜底。
+QUESTION_CONTEXT_TOKEN_LIMIT = 6_000
 QUESTION_MODEL_TIMEOUT_SECONDS = 75  # >= MODEL_GATEWAY_TIMEOUT_SECONDS（60s），避免外层先判超时
 QUESTION_MODEL_MAX_TOKENS = 800
 QUESTION_MODEL_TEMPERATURE = 0.1
-QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v2"
+# v3: CONTEXT_BUILD_FAILED 纳入软失败回模板白名单，问诊节点不再因上下文构建失败静默断链。
+QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v3"
 QUESTION_COMPOSER_VERIFIER_CHAIN = ("question_schema", "single_question", "no_authority_fields")
 QUESTION_COMPOSER_TOOL_PERMISSIONS = frozenset({Capability.READ_STATE})
 QUESTION_COMPOSER_FAILURE_POLICY = FailurePolicy()
@@ -459,6 +463,7 @@ async def _compose_question_with_template_registry(
         QuestionComposerFailureCode.MODEL_UNAVAILABLE,
         QuestionComposerFailureCode.MODEL_OUTPUT_INVALID,
         QuestionComposerFailureCode.SINGLE_QUESTION_INVALID,
+        QuestionComposerFailureCode.CONTEXT_BUILD_FAILED,
     }:
         # 软失败回模板：携带退化信号（degraded + last_failure_code），让 intake 节点把
         # "本轮为什么回落到模板"写进 intermediate_payload["question_composer"] 可被查询。
