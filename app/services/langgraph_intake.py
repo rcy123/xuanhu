@@ -158,6 +158,8 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
         "INTAKE_GROUNDING_VALUE_MISMATCH",
         # 模型 decision=extracted 但候选为空(重复提取被拒/合键遗漏)属输出质量问题。
         "INTAKE_DECISION_CONTENT_MISMATCH",
+        # 模型偶发把身份类键(如 patient.name)当观察提取——重试大概率正常。
+        "INTAKE_IDENTITY_FACT_FORBIDDEN",
         # 0d-2：composer 模型失败（自由措辞生成失败）同属随机失败，
         # 可重试重放；模板兜底仍由 compose_question 内部先承担（degraded 留痕）。
         "QUESTION_MODEL_OUTPUT_INVALID",

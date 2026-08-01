@@ -1,27 +1,17 @@
 """共享枚举类型。
 
-这些枚举只定义跨 API、Agent、Supervisor、Safety 复用的稳定字面值，
+这些枚举只定义跨 API、Agent、Safety 复用的稳定字面值，
 不包含任何业务执行逻辑。
+
+3c/3d: legacy `Stage`(10 态)已随 legacy 路径下线删除——统一编排模型为
+langgraph 的 `command`(message/advance/review/recover)+ 粗 stage
+(`session.current_stage`)+ 子图 gate/route 细态,见
+`app/agent_runtime/commands.py`。
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-
-
-class Stage(StrEnum):
-    """问诊主流程阶段。"""
-
-    INQUIRY = "inquiry"
-    SUFFICIENCY = "sufficiency"
-    SYNDROME = "syndrome"
-    PRESCRIPTION = "prescription"
-    MODIFICATION = "modification"
-    SAFETY = "safety"
-    REVIEW = "review"
-    RECORD = "record"
-    DONE = "done"
-    BLOCKED = "blocked"
 
 
 class ReviewAction(StrEnum):

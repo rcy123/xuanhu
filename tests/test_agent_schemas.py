@@ -24,7 +24,7 @@ from app.schemas.agent import (
     XuanhuState,
     is_pregnancy_risk_status,
 )
-from app.schemas.types import PregnancyStatus, Severity, Stage
+from app.schemas.types import PregnancyStatus, Severity
 
 
 def _formula() -> FormulaResult:
@@ -147,21 +147,21 @@ def test_safety_issue_and_review_enums() -> None:
 def test_xuanhu_state_minimal_and_partial_update() -> None:
     """XuanhuState 最小状态可创建，并适合 Supervisor 局部更新。"""
     state = XuanhuState(session_id="sid-001")
-    updated = state.model_copy(update={"current_stage": Stage.SYNDROME, "state_version": 2})
+    updated = state.model_copy(update={"current_stage": "syndrome", "state_version": 2})
 
     assert state.current_stage == "inquiry"
     assert state.recovery_status == "normal"
     assert state.state_version == 1
-    assert updated.current_stage == Stage.SYNDROME
+    assert updated.current_stage == "syndrome"
     assert updated.state_version == 2
 
 
 def test_xuanhu_state_model_copy_update_validates_data() -> None:
-    """XuanhuState 的局部更新不得绕过 Stage 和 state_version 校验。"""
+    """XuanhuState 的局部更新不得绕过 current_stage(3d 后为 str 口径)和 state_version 校验。"""
     state = XuanhuState(session_id="sid-validated")
 
     with pytest.raises(ValidationError):
-        state.model_copy(update={"current_stage": "not_a_stage"})
+        state.model_copy(update={"current_stage": ""})
 
     with pytest.raises(ValidationError):
         state.model_copy(update={"state_version": 0})

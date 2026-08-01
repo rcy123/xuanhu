@@ -859,9 +859,3 @@ async def test_graph_state_checkpoint_contains_only_syndrome_artifact_reference(
     assert result["artifact_refs"][0]["kind"] == "syndrome_draft"
 
 
-def test_legacy_syndrome_agent_import_and_prompt_remain_available() -> None:
-    from app.agents.syndrome import SyndromeAgent
-
-    assert SyndromeAgent is not None
-    manifest = PromptLoader(MANIFEST)
-    assert manifest.load("syndrome").prompt_version == "syndrome_v1.jinja2"

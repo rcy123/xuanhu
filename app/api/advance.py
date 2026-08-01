@@ -3,7 +3,7 @@
 实现接口设计文档 §4.3.1：
 - POST /api/v1/consult/sessions/{session_id}/advance
 
-薄包装 Supervisor.advance()，并在调用前预校验：
+LangGraph 统一后端的 advance 入口(3d 后 legacy Supervisor 已下线)。
 - current_stage=inquiry 且 sufficiency_report.sufficient=false → INSUFFICIENT_INQUIRY
 - current_stage=review → PENDING_DOCTOR_REVIEW
 - current_stage=done/blocked → INVALID_STAGE_TRANSITION
@@ -37,10 +37,10 @@ from app.agent_runtime.lifecycle import (
 )
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.state import default_state
-from app.agents.supervisor import Supervisor, SupervisorResult
 from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
 from app.core.config import get_settings
 from app.core.exceptions import (
+    AgentTriggerFailedError,
     IdempotencyConflictError,
     InsufficientInquiryError,
     InvalidStageTransitionError,
@@ -120,41 +120,6 @@ async def _load_session_for_advance(
             retryable=False,
         )
     return session
-
-
-def _precheck_stage(session: ConsultSession, force: bool) -> None:
-    """调用 Supervisor 前的阶段预校验。
-
-    - review 阶段：必须挂起等待医师确认，不得 advance → PENDING_DOCTOR_REVIEW
-    - done/blocked：终态不可推进 → INVALID_STAGE_TRANSITION
-    - inquiry 阶段且未 force：要求 sufficiency_report.sufficient=true，
-      否则 INSUFFICIENT_INQUIRY
-    """
-    _require_normal_recovery(session)
-    stage = session.current_stage
-    if stage == "review":
-        raise PendingDoctorReviewError(
-            detail=(
-                f"session_id={session.id} current_stage=review "
-                f"pending_review={session.pending_review}，需先提交医师确认"
-            ),
-        )
-    if stage in ("done", "blocked"):
-        raise InvalidStageTransitionError(
-            message=f"当前阶段 {stage} 不可推进",
-            detail=f"session_id={session.id} current_stage={stage}",
-            retryable=False,
-        )
-    if stage == "inquiry" and not force:
-        snapshot = session.state_snapshot or {}
-        suff = snapshot.get("sufficiency_report")
-        sufficient = bool(suff.get("sufficient")) if isinstance(suff, dict) else False
-        if not sufficient:
-            raise InsufficientInquiryError(
-                detail=(
-                    f"session_id={session.id} current_stage=inquiry sufficient={sufficient}，问诊信息不充分，不能推进"
-                ),
-            )
 
 
 def _require_normal_recovery(session: ConsultSession) -> None:
@@ -834,7 +799,7 @@ async def advance_session(
 
     async def run_advance() -> dict[str, Any]:
         session = await _load_session_for_advance(db, session_id)
-        if getattr(session, "agent_runtime", "legacy") == "langgraph":
+        if getattr(session, "agent_runtime", "langgraph") == "langgraph":
             return await _run_langgraph_advance(
                 db,
                 session,
@@ -847,31 +812,12 @@ async def advance_session(
                 allow_request_local_runtime=test_runtime_fallback,
             )
 
-        _precheck_stage(session, body.force)
-        supervisor = Supervisor(db)
-        supervisor_result: SupervisorResult = await supervisor.advance(
-            session_id,
-            trace_id,
-            expected_state_version=state_version,
-            force=body.force,
+        # 3d: legacy 路径已下线——历史 legacy session 仅兼容读,不再推进。
+        raise AgentTriggerFailedError(
+            detail=f"session_id={session_id} legacy runtime has been decommissioned; session is read-only",
+            agent_error_code="LEGACY_RUNTIME_DECOMMISSIONED",
+            retryable=False,
         )
-        return {
-            "session_id": session_id,
-            "current_stage": (
-                supervisor_result.to_stage.value
-                if hasattr(supervisor_result.to_stage, "value")
-                else str(supervisor_result.to_stage)
-            ),
-            "from_stage": (
-                supervisor_result.from_stage.value
-                if hasattr(supervisor_result.from_stage, "value")
-                else str(supervisor_result.from_stage)
-            ),
-            "state_version": supervisor_result.state.state_version,
-            "blocked_reason": supervisor_result.blocked_reason,
-            "agent_name": supervisor_result.agent_name,
-            "trace_id": trace_id,
-        }
 
     scope = session_http_scope(session_id)
 

@@ -1217,21 +1217,6 @@ async def test_graph_state_checkpoint_contains_only_formula_artifact_reference()
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_prescription_and_modification_agents_remain_available() -> None:
-    from app.agents.modification import ModificationAgent
-    from app.agents.prescription import PrescriptionAgent
-
-    assert PrescriptionAgent is not None
-    assert ModificationAgent is not None
-    manifest = PromptLoader(MANIFEST)
-    assert manifest.load("prescription").prompt_version == "prescription_v1.jinja2"
-    assert manifest.load("modification").prompt_version == "modification_v1.jinja2"
-
-
-# ---------------------------------------------------------------------------
-# Additional boundary tests
-# ---------------------------------------------------------------------------
-
 
 def test_preflight_and_artifact_verifier_reject_missing_gate_authority() -> None:
     payload = _input()

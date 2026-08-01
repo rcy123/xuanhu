@@ -24,7 +24,6 @@ from app.schemas.types import (
     RollbackTarget,
     SafetyIssueType,
     Severity,
-    Stage,
     is_pregnancy_risk_status,
 )
 
@@ -297,7 +296,7 @@ class XuanhuState(BaseModel):
     doctor_review: dict[str, Any] | None = None
     medical_record: MedicalRecord | None = None
 
-    current_stage: Stage = Field(default=Stage.INQUIRY, validate_default=True)
+    current_stage: str = Field(default="inquiry", min_length=1, max_length=64)
     pending_review: bool = False
     rollback_counts: dict[str, int] = Field(default_factory=dict)
     blocked_reason: str | None = None
@@ -314,7 +313,7 @@ class XuanhuState(BaseModel):
         """返回经过完整 schema 校验的 State 副本。
 
         Pydantic v2 默认 `model_copy(update=...)` 不校验 update 数据。
-        XuanhuState 是状态机边界对象，局部更新必须重新校验 Stage、state_version
+        XuanhuState 是状态机边界对象，局部更新必须重新校验 current_stage、state_version
         等约束，避免 Supervisor 后续绕过 schema。
         """
         if update is None:
@@ -350,7 +349,6 @@ __all__ = [
     "SafetyReview",
     "SafetyRuleResult",
     "Severity",
-    "Stage",
     "SufficiencyReport",
     "SyndromeResult",
     "TenQuestions",
