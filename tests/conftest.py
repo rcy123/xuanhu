@@ -37,10 +37,8 @@ def _set_test_defaults() -> None:
     os.environ["DB_URL"] = "postgresql://unit:unit@127.0.0.1:1/xuanhu_unit_test"
     os.environ["REDIS_URL"] = "redis://:unit@127.0.0.1:1/15"
     os.environ["OUTBOX_PUBLISHER_ENABLED"] = "false"
-    # Runtime rollout is part of the test boundary too.  Never let a local
-    # shell or settings file silently turn historical Legacy API fixtures into
-    # public LangGraph requests; individual tests opt in explicitly.
-    # 3d: 统一后端后测试会话一律 langgraph(legacy 不再创建)。
+    # 3d: 统一后端后测试会话一律 langgraph(legacy 不再创建);
+    # 本地 shell/.env 不得把测试环境切回 legacy 路径。
     os.environ["AGENT_RUNTIME_VERSION"] = "langgraph"
     os.environ["AGENT_RUNTIME_ROLLOUT_PHASE"] = "legacy"
     # 3d: 统一后端后 langgraph 是唯一会话路径,测试默认开启公共创建。

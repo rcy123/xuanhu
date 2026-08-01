@@ -92,7 +92,6 @@ def test_gate_script_has_exact_unit_static_integration_and_frontend_commands() -
         (
             '"run", "--isolated", "--python", "3.12", "--locked", "pytest", '
             '"-o", "addopts=", "-m", "integration and performance", "--strict-markers", '
-            '"tests/golden/test_legacy_performance_baseline.py", '
             '"tests/golden/test_langgraph_performance_baseline.py"'
         ),
         (

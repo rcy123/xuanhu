@@ -362,11 +362,11 @@ Invoke-NativeGate -Command "uv" -Arguments @(
     "--strict-markers", "tests"
 ) -WorkingDirectory $RepoRoot
 
-Write-Host "==> Serial production-shaped Legacy and LangGraph performance baselines"
+# 3d: legacy 路径已下线,性能门禁仅保留统一后端(langgraph)基线。
+Write-Host "==> Serial production-shaped unified-backend performance baseline"
 Invoke-NativeGate -Command "uv" -Arguments @(
     "run", "--isolated", "--python", "3.12", "--locked", "pytest",
     "-o", "addopts=", "-m", "integration and performance", "--strict-markers",
-    "tests/golden/test_legacy_performance_baseline.py",
     "tests/golden/test_langgraph_performance_baseline.py"
 ) -WorkingDirectory $RepoRoot
 
