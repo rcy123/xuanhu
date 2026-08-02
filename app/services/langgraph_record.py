@@ -193,6 +193,9 @@ async def _load_doctor_review_authority(
         state.session_id,
         formula,
         state.safety_profile,
+        # 快照重算必须与写入侧同口径（含 domain observations 里的性别/年龄），
+        # 否则 PatientInfo 富集后的新旧快照不一致 → ARTIFACT_PAYLOAD_INVALID。
+        observations=state.observations,
     )
     if not safety_result.passed:
         raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
