@@ -68,7 +68,7 @@ from app.schemas.domain import (
 from app.schemas.formula import FormulaDraft, FormulaDraftDecision
 from app.schemas.review import FormulaOverride, ReviewRequest, ReviewResponse
 from app.schemas.session import PatientInfo
-from app.schemas.types import PregnancyStatus
+from app.schemas.types import Gender, PregnancyStatus
 
 FORMULA_ARTIFACT_TYPE = "formula_draft"
 REVIEWED_FORMULA_ARTIFACT_TYPE = "reviewed_formula"
@@ -109,6 +109,7 @@ class PreparedReview:
     safety_result: SafetyRuleResult
     safety_rule_run_id: uuid.UUID
     interrupt_payload: dict[str, str]
+    from_blocked_safety: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +137,7 @@ class _SessionMeta:
     state_version: int
     agent_runtime: str
     patient_info: dict[str, Any]
+    blocked_reason: str | None = None
 
 
 def _stable_id(session_id: uuid.UUID, kind: str) -> uuid.UUID:
@@ -186,6 +188,7 @@ async def _session_meta(session_id: uuid.UUID) -> _SessionMeta:
             state_version=row.state_version,
             agent_runtime=row.agent_runtime,
             patient_info=dict(row.patient_info or {}),
+            blocked_reason=row.blocked_reason,
         )
 
 
@@ -321,7 +324,29 @@ async def _load_formula_authority(
     return FormulaAuthority(draft, _formula_result_from_draft(draft))
 
 
-def _patient_info_from_domain(profile: SafetyProfileSchema) -> PatientInfo:
+def _patient_info_from_domain(
+    profile: SafetyProfileSchema,
+    observations: tuple[Any, ...] = (),
+) -> PatientInfo:
+    # 2026-08：PatientInfo 补充 domain observations 里的性别/年龄（patient.sex /
+    # patient.age）。安全引擎的妊娠/剂量检查依赖它们——缺省时妊娠未知警告在男性
+    # 患者上误报（真实会话 f6a5ffb7 复盘）。
+    gender = Gender.UNKNOWN
+    age: int | None = None
+    for item in observations:
+        key = getattr(item, "fact_key", None)
+        if key == "patient.sex":
+            raw = getattr(item, "normalized_value", None) or getattr(item, "value", None)
+            try:
+                gender = Gender(str(raw))
+            except (TypeError, ValueError):
+                pass
+        elif key == "patient.age" and age is None:
+            raw = getattr(item, "normalized_value", None) or getattr(item, "value", None)
+            try:
+                age = int(raw)
+            except (TypeError, ValueError, OverflowError):
+                pass
     pregnancy = (
         PregnancyStatus.PREGNANT
         if profile.pregnancy_value is PregnancyValue.PREGNANT
@@ -339,6 +364,8 @@ def _patient_info_from_domain(profile: SafetyProfileSchema) -> PatientInfo:
         else None
     )
     return PatientInfo(
+        gender=gender,
+        age=age,
         allergies=list(profile.allergens or ()),
         pregnancy_status=pregnancy,
         current_medications=list(profile.medications or ()),
@@ -599,6 +626,7 @@ async def _load_safety_authority(
     session_id: uuid.UUID,
     formula: FormulaAuthority,
     safety_profile: SafetyProfileSchema | None,
+    observations: tuple[Any, ...] = (),
 ) -> tuple[ArtifactPayloadRecord, SafetyRuleResult, uuid.UUID]:
     record = await repository.get_artifact_payload(
         session_id,
@@ -635,7 +663,9 @@ async def _load_safety_authority(
         raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID) from None
     if safety_profile is None:
         raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
-    patient_snapshot = _patient_info_from_domain(safety_profile).model_dump(
+    # 快照重算必须与写入侧同口径（含 domain observations 里的性别/年龄），
+    # 否则 2026-08 的 PatientInfo 富集会让新旧快照不一致 → ARTIFACT_PAYLOAD_INVALID。
+    patient_snapshot = _patient_info_from_domain(safety_profile, observations=observations).model_dump(
         mode="json",
         exclude={"name"},
     )
@@ -693,12 +723,25 @@ async def _prepared_from_current(session_id: uuid.UUID) -> PreparedReview:
     repository = PostgresDomainRepository(get_session_factory())
     state = await repository.get_state(session_id)
     meta = await _session_meta(session_id)
+    # 安全引擎拦截（HIGH/BLOCKER）后会话停在 blocked；此时医生仍应能 review
+    # 被拦方子（modify 调剂量 → 二次安全审核 → record），否则只能回滚重问。
+    # 仅 safety_rule_blocked 放行；triage_hold / intake / reasoning 类拦截不可 review。
+    blocked_safety = (
+        meta.current_stage == "blocked"
+        and meta.status == "blocked"
+        and meta.blocked_reason == "safety_rule_blocked"
+    )
     if (
         meta.agent_runtime != "langgraph"
-        or meta.current_stage != "review"
-        or meta.status != "pending_review"
-        or not meta.pending_review
         or meta.state_version != state.state_version
+        or not (
+            blocked_safety
+            or (
+                meta.current_stage == "review"
+                and meta.status == "pending_review"
+                and meta.pending_review
+            )
+        )
     ):
         raise InvalidStageTransitionError(
             message="当前会话没有待处理的 LangGraph Review interrupt",
@@ -711,12 +754,11 @@ async def _prepared_from_current(session_id: uuid.UUID) -> PreparedReview:
         session_id,
         formula,
         state.safety_profile,
+        observations=state.observations,
     )
-    if not safety_result.passed:
-        raise SafetyReviewBlockedError(
-            issues=[item.model_dump(mode="json") for item in safety_result.issues],
-            detail=f"session_id={session_id} current safety result is blocked",
-        )
+    # review 阶段但底层 safety 未通过（医生 modify 后被二次拦截的修正态）与
+    # blocked 同权：仍允许继续 modify 修正，但禁止 confirm 绕过安全门。
+    effective_blocked = blocked_safety or not safety_result.passed
     return PreparedReview(
         session_id=session_id,
         state_version=state.state_version,
@@ -732,6 +774,7 @@ async def _prepared_from_current(session_id: uuid.UUID) -> PreparedReview:
             "state_version": str(state.state_version),
             "resume_token_ref": "review_submission_ref",
         },
+        from_blocked_safety=effective_blocked,
     )
 
 
@@ -774,7 +817,10 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
 
     formula = await _load_formula_authority(repository, session_id)
     assert domain_state.safety_profile is not None
-    patient_info = _patient_info_from_domain(domain_state.safety_profile)
+    patient_info = _patient_info_from_domain(
+        domain_state.safety_profile,
+        observations=domain_state.observations,
+    )
     factory = get_session_factory()
     async with factory() as safety_db:
         result = await SafetyRuleEngine(safety_db).evaluate(formula.formula, patient_info)
@@ -1454,6 +1500,13 @@ class LangGraphReviewService:
         meta = await _session_meta(sid)
         if meta.status == "terminated":
             raise SessionTerminatedError(detail=f"session_id={session_id} terminated")
+        # 安全拦截（blocked）时 confirm 会绕过确定性安全门；医生必须 modify
+        # 调整剂量触发二次审核，或用 reject / request_more_info 回退重问。
+        if prepared.from_blocked_safety and request.action == "confirm":
+            raise SafetyReviewBlockedError(
+                issues=[item.model_dump(mode="json") for item in prepared.safety_result.issues],
+                detail=f"session_id={session_id} safety-blocked formula cannot be confirmed; use modify",
+            )
         if x_state_version is not None and x_state_version != meta.state_version:
             raise InvalidStateVersionError(
                 detail=f"session_id={session_id} client version {x_state_version} != server version {meta.state_version}",
@@ -1476,7 +1529,10 @@ class LangGraphReviewService:
             override_formula = _formula_from_override(request.formula_override)
             result = await SafetyRuleEngine(self._db).evaluate(
                 override_formula,
-                _patient_info_from_domain(cast(SafetyProfileSchema, domain_state.safety_profile)),
+                _patient_info_from_domain(
+                    cast(SafetyProfileSchema, domain_state.safety_profile),
+                    observations=domain_state.observations,
+                ),
             )
             # A blocked override must remain auditable without replacing the
             # last passed Formula/Safety authority.  Otherwise the next
@@ -1586,7 +1642,8 @@ class LangGraphReviewService:
                     patient_snapshot=cast(
                         dict[str, object],
                         _patient_info_from_domain(
-                            cast(SafetyProfileSchema, domain_state.safety_profile)
+                            cast(SafetyProfileSchema, domain_state.safety_profile),
+                            observations=domain_state.observations,
                         ).model_dump(mode="json", exclude={"name"}),
                     ),
                     rule_version=result.rule_version,
