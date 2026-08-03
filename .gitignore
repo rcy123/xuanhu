@@ -69,3 +69,5 @@ docs/*
 !docs/dev-handoff/
 docs/dev-handoff/*
 !docs/dev-handoff/agent-refactor-*.md
+
+/tmp

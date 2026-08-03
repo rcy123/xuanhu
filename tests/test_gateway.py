@@ -131,7 +131,7 @@ async def test_chat_normalizes_context_role_without_mutating_messages(
     outbound_messages = call_payloads[0]["messages"]
     assert [message["role"] for message in outbound_messages] == [
         "system",
-        "developer",
+        "system",
         "user",
         "user",
         "assistant",
@@ -140,8 +140,9 @@ async def test_chat_normalizes_context_role_without_mutating_messages(
     assert "<untrusted_context_data>" in outbound_messages[2]["content"]
     assert "Untrusted clinical context" in outbound_messages[2]["content"]
     assert "</untrusted_context_data>" in outbound_messages[2]["content"]
-    for index in (0, 1, 3, 4, 5):
+    for index in (0, 3, 4, 5):
         assert outbound_messages[index] == messages[index]
+    assert outbound_messages[1]["content"] == messages[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -338,6 +339,81 @@ async def test_chat_structured_parse_from_content(mock_settings: Settings) -> No
 
     assert result.name == "from-content"
     assert result.value == 50
+
+
+def test_structured_mode_auto_resolves_by_gateway_host() -> None:
+    """DeepSeek / dmxapi(Qwen) 主机自动走 json_object，其他网关保持 tools 契约。"""
+
+    class DeepSeekSettings:
+        model_gateway_structured_mode = "auto"
+        model_gateway_base_url = "https://api.deepseek.com"
+
+    class InternalSettings:
+        model_gateway_structured_mode = "auto"
+        model_gateway_base_url = "http://mimo-gateway:8080/v1"
+
+    class ExplicitSettings:
+        model_gateway_structured_mode = "json_object"
+        model_gateway_base_url = "http://mock-gateway:8080/v1"
+
+    class DmxApiSettings:
+        model_gateway_structured_mode = "auto"
+        model_gateway_base_url = "https://www.dmxapi.cn/v1"
+
+    assert ModelGatewayClient._resolve_structured_mode(DeepSeekSettings()) == "json_object"
+    assert ModelGatewayClient._resolve_structured_mode(DmxApiSettings()) == "json_object"
+    assert ModelGatewayClient._resolve_structured_mode(InternalSettings()) == "tools"
+    assert ModelGatewayClient._resolve_structured_mode(ExplicitSettings()) == "json_object"
+
+
+@pytest.mark.asyncio
+async def test_chat_structured_json_object_mode_builds_compatible_payload(
+    mock_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepSeek json_object 模式：无 tools/tool_choice，关闭 thinking，max_tokens 有下限。"""
+    monkeypatch.setenv("MODEL_GATEWAY_STRUCTURED_MODE", "json_object")
+    monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "https://api.deepseek.com")
+    get_settings.cache_clear()
+    client = ModelGatewayClient(get_settings())
+
+    with respx.mock:
+        route = respx.post("https://api.deepseek.com/chat/completions").mock(
+            return_value=Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps({"name": "json-mode", "value": 7})
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        result = await client.chat_structured(
+            messages=[{"role": "user", "content": "Generate"}],
+            output_schema=SampleOutput,
+            max_tokens=512,
+            trace_id="test-trace-json-object",
+        )
+
+    assert result == SampleOutput(name="json-mode", value=7)
+    payload = json.loads(route.calls[0].request.content.decode())
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["max_tokens"] >= 2_048
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["messages"][-1]["role"] == "system"
+    assert payload["messages"][-1]["content"] != ""
+    # json_object 主路径必须内嵌真实 JSON schema（runtime 限制 max_requests=1
+    # 时不会走到带 schema 的 fallback；缺少 schema 时 deepseek 按 prompt 散文契约
+    # 输出旧结构，抽取/出题会 100% 校验失败）。
+    suffix = payload["messages"][-1]["content"].split("JSON 必须符合这个 schema: ", 1)[1]
+    assert json.loads(suffix) == SampleOutput.model_json_schema()
 
 
 @pytest.mark.asyncio

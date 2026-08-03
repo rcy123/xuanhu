@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     model_gateway_route_profile: str = Field(
         default="default", description="网关路由 profile"
     )
+    model_gateway_structured_mode: Literal["auto", "tools", "json_object"] = Field(
+        default="auto",
+        description=(
+            "结构化输出模式：tools=工具强制 tool_choice（内网 mimo 等兼容网关）；"
+            "json_object=response_format JSON（DeepSeek 等 strict OpenAI 网关，"
+            "thinking 模型不支持强制 tool_choice）；auto=按网关域名自动选择"
+        ),
+    )
 
     # ---- Embedding 网关覆盖（可选，本地联调用） ----
     # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 embedding 调用
@@ -264,3 +272,17 @@ def get_settings() -> Settings:
     测试中可通过 ``get_settings.cache_clear()`` 清除缓存后重新加载。
     """
     return Settings()  # type: ignore[call-arg]  # 必填字段由环境变量/.env 提供
+
+
+# Agent 单次模型调用超时必须严格大于网关单请求超时
+# （``app.agent_runtime.runtime._validate_deadline_invariants`` 前置守卫强制：
+# 若 ModelPolicy.timeout < MODEL_GATEWAY_TIMEOUT_SECONDS，模型调用在发出前即被判
+# MODEL_GATEWAY_TIMEOUT，整体静默退回模板）。各 Agent 统一按“网关超时 + 余量”推导，
+# 避免调整 MODEL_GATEWAY_TIMEOUT_SECONDS 后 agent 在 preflight 秒退。
+AGENT_MODEL_TIMEOUT_MARGIN_SECONDS = 15
+
+
+def agent_model_timeout_seconds() -> int:
+    """Derive an Agent ModelPolicy timeout strictly above the gateway timeout."""
+
+    return get_settings().model_gateway_timeout_seconds + AGENT_MODEL_TIMEOUT_MARGIN_SECONDS

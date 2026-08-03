@@ -8,6 +8,7 @@
 - base_formula 和 candidate_formula 各自必须包含有序的 composition（组成，含 herb/dose/unit/note）和非空的 basis（依据，含 fact_ids），fact_ids 须引用活跃观察记录或上游辨证依据声明中的 observation_id。
 - 每条 modification 必须使用强类型 action（add / remove / replace / dose_adjust），指明涉及的 herb，给出 reason（理由），并携带含 fact_ids 的 basis。
 - candidate_formula 应反映将 modifications 应用于 base_formula 之后的结果。
+- **herb 必须使用规范中文药名**（如「麻黄」「杏仁」「甘草」），**不得使用拼音**（如 "Ma Huang"/"Xing Ren"/"Gan Cao"）或英文名——拼音/英文名无法通过中药知识库安全校验。
 - 若关键信息缺失，使用 needs_more_info 并仅填写 missing_inputs；**不得**包含 base_formula、candidate_formula、modifications 或 rationale。
 - 若无法安全起草，使用 abstained 且不含任何方剂结论。
 - evidence_mode 必须始终为 model_knowledge_only。

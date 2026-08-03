@@ -340,8 +340,10 @@ class AgentRuntime:
         RunSpec deadline.
 
         Production agents (intake/syndrome/formula/question) all set
-        ``ModelPolicy.timeout_seconds=75`` (>= gateway 60s) so the guard fires
-        naturally. Tests usually inject very short timeouts (e.g. ``timeout_seconds=0.005``)
+        ``ModelPolicy.timeout_seconds`` is derived from the configured gateway
+        timeout plus a margin (``agent_model_timeout_seconds()``), so the guard
+        fires naturally when a spec underrides it. Tests usually inject very
+        short timeouts (e.g. ``timeout_seconds=0.005``)
         to exercise ``_one_attempt``'s wait-for expiry; in that regime the guard
         is not the point of the test and would only mis-flag a legitimate setup
         as a config error. So we bypass when the chosen gateway_timeout baseline

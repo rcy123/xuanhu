@@ -559,7 +559,10 @@ def _check_pregnancy(
 
     仅当 pregnancy_status 为 ``pregnant`` 或 ``possible`` 时触发硬规则检查；
     ``unknown`` / ``null`` 生成 caution warning。
+    2026-08：男性患者妊娠不适用——跳过未知警告（真实会话 f6a5ffb7 复盘的误报）。
     """
+    if getattr(patient_info, "gender", None) == "male":
+        return []
     status = patient_info.pregnancy_status
     status_str = status.value if hasattr(status, "value") else str(status) if status else "unknown"
 
