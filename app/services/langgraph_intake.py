@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
@@ -45,14 +45,23 @@ from app.agent_runtime.intake_verifier import (
     INTAKE_PROMPT_VERSION,
 )
 from app.agent_runtime.lifecycle import SharedLangGraphRuntime
-from app.agent_runtime.reducer import DomainDelta, DomainReducerError, DomainState, reduce_domain_state
+from app.agent_runtime.reducer import (
+    DomainDelta,
+    DomainReducerError,
+    DomainState,
+    _observation_value_key,
+    reduce_domain_state,
+)
 from app.agent_runtime.repository import (
+    ArtifactPayloadSpec,
+    AuditEventSpec,
     ConsultMessageSpec,
     GraphStepSpec,
     PostgresDomainRepository,
     RepositoryError,
     RepositoryErrorCode,
     SafetyFactAssertionSpec,
+    artifact_payload_digest,
 )
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.runtime import AgentRuntime
@@ -66,6 +75,13 @@ from app.agent_runtime.triage_precheck import (
     merge_red_flag_candidates,
 )
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
+from app.agents.clarification import (
+    CLARIFICATION_AGENT_NAME,
+    CLARIFICATION_AGENT_VERSION,
+    CLARIFICATION_PROMPT_VERSION,
+    ClarificationInput,
+    execute_clarification,
+)
 from app.agents.intake_extraction import (
     IntakeExecutionResult,
     IntakeExecutionStatus,
@@ -97,6 +113,7 @@ from app.models.domain import (
     OutboxEvent,
     SafetyFactAssertion,
 )
+from app.schemas.clarification import CLARIFICATION_POLICY_VERSION
 from app.schemas.completeness import (
     CompletenessDisposition,
     CompletenessDomainSnapshot,
@@ -245,6 +262,9 @@ INTAKE_REPLY_BINDING_VERSION = "intake-reply-binding.v1"
 _BOUND_EXPLICIT_NONE_PATTERN = re.compile(
     r"^\s*(?:无|没有|否|不是|未有|none|no)\s*[。.!！]?\s*$",
     re.IGNORECASE,
+)
+_BOUND_REPLY_NORMAL_PATTERN = re.compile(
+    r"^\s*(?:正常|正常吧|正常啊|还好|还行|可以|没问题|没大碍|都正常|差不多|一般|无异常|没有不适|没什么不舒服|是的|对的|对，正常|是，正常|嗯|好)\s*[。.!！?？]*\s*$"
 )
 _SOCIAL_ACKNOWLEDGEMENT_PATTERN = re.compile(
     r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|谢谢|感谢)(?:呀|啊|哦|哈)?\s*[。.!！?？]*\s*$",
@@ -952,8 +972,198 @@ class LangGraphIntakeMessageRunner:
                 )
             raise
 
-    async def _next_progress(
+    async def _execute_clarification(
         self,
+        *,
+        claim: IntakeCommandClaim,
+        patient_message: ConsultMessage,
+        trace_id: str,
+        state: XuanhuGraphState,
+        trigger: str,
+    ) -> tuple[dict[str, Any], MessageCreateResponse]:
+        """L3-6 澄清回复：跑澄清 Agent，写回复消息，空 delta commit，完成 claim。
+
+        不抽取事实、不推进阶段、不改 completeness；回复后下一轮消息自然
+        路由回原问诊流程（原维度仍 missing，question_composer 会再问）。
+        澄清 Agent 软失败时用确定性兜底回复，保证问诊不卡死。
+        """
+        repository = PostgresDomainRepository(get_session_factory())
+        domain_state = await repository.get_state(claim.session_id)
+        session = await self._db.get(ConsultSession, claim.session_id)
+        if session is None:
+            raise SessionNotFoundError(detail=f"session_id={claim.session_id} not found", retryable=False)
+        question_text, dimension_name = await _latest_question_for_clarification(self._db, session)
+        clarification_input = ClarificationInput(
+            user_message=patient_message.content,
+            current_question=question_text,
+            dimension_name=dimension_name,
+            chief_complaint=_chief_complaint_text(domain_state),
+            trigger=trigger,
+        )
+        run_spec = RunSpec(
+            run_id=uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"xuanhu:clarify:{claim.session_id}:{claim.idempotency_key}",
+            ),
+            session_id=claim.session_id,
+            state_version=domain_state.state_version,
+            stage="intake_clarify",
+            agent_spec_version=CLARIFICATION_AGENT_VERSION,
+            prompt_version=CLARIFICATION_PROMPT_VERSION,
+            policy_version=CLARIFICATION_POLICY_VERSION,
+            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
+            total_attempt_budget=1,
+            idempotency_key=f"{claim.idempotency_key}:clarify",
+            trace_id=trace_id,
+        )
+        result = await execute_clarification(
+            runtime=AgentRuntime(),
+            run_spec=run_spec,
+            input_payload=clarification_input,
+        )
+        if result.status != "succeeded" or result.output is None:
+            reply = _clarification_fallback_reply(trigger, question_text, dimension_name)
+            failure_code = result.failure_code
+            prompt_version = None
+        else:
+            reply = result.output.reply
+            failure_code = None
+            prompt_version = result.prompt_version
+
+        message_id = uuid.uuid4()
+        clarify_spec = ConsultMessageSpec(
+            message_id=message_id,
+            role="agent",
+            agent_name=CLARIFICATION_AGENT_NAME,
+            stage="inquiry",
+            content=reply,
+            structured_delta={
+                "kind": "clarification_reply",
+                "trigger": trigger,
+                "schema_version": "clarification-reply.v1",
+                "prompt_version": prompt_version,
+                "failure_code": failure_code,
+            },
+            trace_id=trace_id[:64],
+        )
+        # 澄清 commit 不携带事实变更，但需要非空 delta：写入 control artifact 留痕。
+        control_artifact_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"xuanhu:clarification_control:{claim.session_id}",
+        )
+        latest = await repository.get_artifact_payload(
+            claim.session_id,
+            artifact_type="clarification_control",
+            artifact_id=control_artifact_id,
+            status=None,
+        )
+        control_artifact = ArtifactRevisionSchema(
+            artifact_id=control_artifact_id,
+            artifact_type="clarification_control",
+            revision=1 if latest is None else latest.revision + 1,
+            session_id=claim.session_id,
+            input_state_version=domain_state.state_version,
+            status=ArtifactStatus.CURRENT,
+            produced_by_run_id=claim.run_id,
+            parent_revision_id=None if latest is None else latest.artifact_revision_row_id,
+            parent_revision=None if latest is None else latest.revision,
+            created_at=datetime.now(UTC),
+        )
+        control_payload: dict[str, object] = {
+            "kind": "clarification_control",
+            "trigger": trigger,
+            "reply_digest": hashlib.sha256(reply.encode("utf-8")).hexdigest(),
+            "failure_code": failure_code,
+            "schema_version": "clarification-control.v1",
+        }
+        control_spec = ArtifactPayloadSpec(
+            session_id=claim.session_id,
+            artifact_id=control_artifact_id,
+            revision=control_artifact.revision,
+            payload_schema_version="clarification-control-payload.v1",
+            payload=control_payload,
+            content_digest=artifact_payload_digest(
+                "clarification-control-payload.v1",
+                control_payload,
+            ),
+        )
+        delta = DomainDelta(
+            delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:clarify:{claim.run_id}"),
+            run_id=claim.run_id,
+            session_id=claim.session_id,
+            expected_state_version=domain_state.state_version,
+            source_message_ids=(patient_message.id,),
+            artifact_revisions=(control_artifact,),
+        )
+        context = _verification_context(
+            delta=delta,
+            state=domain_state,
+            trace_id=trace_id,
+            idempotency_key=f"{claim.idempotency_key}:clarify:apply",
+        )
+        commit = await repository.commit(
+            delta,
+            context,
+            graph_version=DEFAULT_GRAPH_VERSION,
+            graph_steps=(
+                GraphStepSpec(
+                    step_name="clarify_reply",
+                    status="completed",
+                    metadata={
+                        "trigger": trigger,
+                        "failed": failure_code is not None,
+                        "failure_code": failure_code,
+                    },
+                ),
+            ),
+            artifact_payloads=(control_spec,),
+            consult_messages=(clarify_spec,),
+            audit_events=(
+                AuditEventSpec(
+                    event_id=uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"xuanhu:audit:clarification.replied:{claim.run_id}",
+                    ),
+                    session_id=claim.session_id,
+                    event_type="clarification.replied",
+                    actor_type="system",
+                    actor_id=None,
+                    payload={
+                        "trigger": trigger,
+                        "failure_code": failure_code,
+                        "input_state_version": domain_state.state_version,
+                        "output_state_version": domain_state.state_version + 1,
+                    },
+                    trace_id=trace_id,
+                ),
+            ),
+            outbox_event_type=INTAKE_COMMAND_COMPLETED,
+            outbox_payload={
+                "session_id": str(claim.session_id),
+                "command_id": claim.idempotency_key,
+                "input_state_version": domain_state.state_version,
+                "output_state_version": domain_state.state_version + 1,
+                "patient_message_id": str(patient_message.id),
+                "question_message_id": None,
+            },
+        )
+        agent_item = await _load_agent_item(self._db, message_id)
+        response = MessageCreateResponse(
+            message_id=str(patient_message.id),
+            session_id=str(claim.session_id),
+            role=patient_message.role,
+            stage=patient_message.stage,
+            content=patient_message.content,
+            current_stage=session.current_stage,
+            state_version=commit.output_state_version,
+            created_at=patient_message.created_at,
+            agent_message=agent_item,
+            sufficiency_report=None,
+        )
+        await self._complete_claim(claim.id, response, None, commit.output_state_version)
+        return _graph_update_from_response(response), response
+
+    async def _next_progress(        self,
         session_id: uuid.UUID,
         *,
         new_fact_count: int,
@@ -1195,6 +1405,70 @@ async def run_intake_persist_message_node(state: XuanhuGraphState) -> dict[str, 
         }
 
 
+async def run_intake_clarify_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
+    """L3-6 澄清预检：强信号（术语反问/流程疑问）命中即短路到澄清回复节点。
+
+    只做确定性正则判断，不调用模型；未命中走正常抽取流程。
+    """
+    loaded = await _load_running_intake_context(state)
+    if isinstance(loaded, dict):
+        return loaded
+    db, claim, patient_message, runner = loaded
+    try:
+        completed = await _completed_graph_update(runner, claim)
+        if completed is not None:
+            return completed
+        requested = _is_clarification_strong_signal(patient_message.content)
+        await _save_intermediate(
+            claim.id,
+            {"clarify_precheck": {"requested": requested}},
+            step="clarify_precheck",
+        )
+        return {
+            "route": NODE_INTAKE_SUBGRAPH_V1,
+            "clarify_requested": requested,
+            "last_error": None,
+        }
+    finally:
+        await db.close()
+
+
+async def run_intake_clarify_reply_node(state: XuanhuGraphState) -> dict[str, Any]:
+    """L3-6 澄清回复：执行澄清 Agent，写回复消息并完成 claim（不抽取/不推进）。"""
+    loaded = await _load_running_intake_context(state)
+    if isinstance(loaded, dict):
+        return loaded
+    db, claim, patient_message, runner = loaded
+    try:
+        completed = await _completed_graph_update(runner, claim)
+        if completed is not None:
+            return completed
+        trigger = "strong_signal" if state.get("clarify_requested") is True else "abstained"
+        update, _ = await runner._execute_clarification(  # noqa: SLF001
+            claim=claim,
+            patient_message=patient_message,
+            trace_id=_node_trace_id(state),
+            state=state,
+            trigger=trigger,
+        )
+        return update
+    except AgentTriggerFailedError as exc:
+        code = exc.agent_error_code or "CLARIFICATION_FAILED"
+        await runner._mark_claim_failed(  # noqa: SLF001
+            claim.id,
+            code,
+            failure_context={
+                "failed_node": "clarify_reply",
+                "last_step": "clarify_reply",
+                "degraded": True,
+                "last_failure_code": code,
+            },
+        )
+        return _sanitized_graph_error(state, code, "clarification failed")
+    finally:
+        await db.close()
+
+
 async def run_intake_triage_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
     loaded = await _load_running_intake_context(state)
     if isinstance(loaded, dict):
@@ -1268,7 +1542,11 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             return completed
         if claim.id in _INTAKE_OUTPUT_CACHE:
             await _save_intermediate_step(claim.id, "extract_intake")
-            return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
+            return {
+                "route": NODE_INTAKE_SUBGRAPH_V1,
+                "intake_decision": _INTAKE_OUTPUT_CACHE[claim.id].decision.value,
+                "last_error": None,
+            }
 
         precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
         if precheck.candidates:
@@ -1279,12 +1557,20 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                 {"extraction": _precheck_extraction_metadata(output, claim.input_state_version)},
                 step="extract_intake",
             )
-            return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
+            return {
+                "route": NODE_INTAKE_SUBGRAPH_V1,
+                "intake_decision": output.decision.value,
+                "last_error": None,
+            }
 
         repository = PostgresDomainRepository(get_session_factory())
         domain_state = await repository.get_state(claim.session_id)
         intake_input = _build_intake_input(domain_state, patient_message)
-        bound_output = _bound_explicit_none_output(intake_input) or _bound_social_reply_output(intake_input)
+        bound_output = (
+            _bound_explicit_none_output(intake_input)
+            or _bound_social_reply_output(intake_input)
+            or _bound_required_reply_normal_output(intake_input)
+        )
         if bound_output is not None:
             _INTAKE_OUTPUT_CACHE[claim.id] = bound_output
             await _save_intermediate(
@@ -1298,7 +1584,11 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
                 },
                 step="extract_intake",
             )
-            return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
+            return {
+                "route": NODE_INTAKE_SUBGRAPH_V1,
+                "intake_decision": bound_output.decision.value,
+                "last_error": None,
+            }
         run_id = _stable_intake_extraction_run_id(claim)
         intake_result, success_run_id = await _execute_intake_extraction_with_retry(
             claim=claim,
@@ -1343,7 +1633,11 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             {"extraction": _extraction_metadata(success_run_id, intake_result.output, claim.input_state_version)},
             step="extract_intake",
         )
-        return {"route": NODE_INTAKE_SUBGRAPH_V1, "last_error": None}
+        return {
+            "route": NODE_INTAKE_SUBGRAPH_V1,
+            "intake_decision": intake_result.output.decision.value,
+            "last_error": None,
+        }
     finally:
         await db.close()
 
@@ -1569,6 +1863,78 @@ async def run_recoverable_intake_node(state: XuanhuGraphState) -> dict[str, Any]
 
 def _node_trace_id(state: XuanhuGraphState) -> str:
     return state.get("run_id") or state.get("command_id") or ""
+
+
+# ---------------------------------------------------------------------------
+# L3-6 澄清（问诊元对话）：强信号检测 + 兜底回复 + 最近问题定位
+# ---------------------------------------------------------------------------
+
+_CLARIFY_STRONG_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"什么是|啥是|是什么"),
+    re.compile(r"什么意思|啥意思"),
+    re.compile(r"不懂|没听懂|不明白|不清楚"),
+    re.compile(r"解释|说明一下"),
+    re.compile(r"为什么问|为啥问|为什么要问"),
+    re.compile(r"换个问法|换一种问法|说人话|能再说一遍"),
+)
+
+
+def _is_clarification_strong_signal(text: str) -> bool:
+    """确定性强信号：术语反问 / 流程疑问 / 澄清请求。
+
+    保守设计：只命中明确的反问句式，正常回答（"没有""正常""有时发热"）绝不误伤。
+    """
+    if not text or not text.strip() or len(text) > 200:
+        return False
+    return any(pattern.search(text) for pattern in _CLARIFY_STRONG_SIGNAL_PATTERNS)
+
+
+def _clarification_fallback_reply(
+    trigger: str,
+    question_text: str | None,
+    dimension_name: str | None,
+) -> str:
+    """澄清 Agent 软失败时的确定性兜底回复（保证问诊不卡死）。"""
+    if trigger == "strong_signal" and dimension_name:
+        base = f"“{dimension_name}”是问诊中需要采集的一项信息。"
+    elif trigger == "strong_signal":
+        base = "抱歉，我刚才没有完全理解您的问题。"
+    else:
+        base = "抱歉，我没有理解这条消息的含义。"
+    if question_text:
+        return f"{base}请继续向患者询问：{question_text}"
+    return f"{base}请换一种方式描述患者的回答。"
+
+
+async def _latest_question_for_clarification(
+    db: AsyncSession,
+    session: ConsultSession,
+) -> tuple[str | None, str | None]:
+    """定位最近一次 question_composer 提问：返回 (问题原文, 维度中文名)。
+
+    仅取真正的追问（排除 intake 完成通知）；维度中文名取自
+    _DIMENSION_MISSING_HINTS，用于让澄清 Agent 解释术语。
+    """
+    snapshot = session.state_snapshot if isinstance(session.state_snapshot, dict) else {}
+    intake = snapshot.get("langgraph_intake")
+    question_id_raw = intake.get("last_question_message_id") if isinstance(intake, dict) else None
+    if not question_id_raw:
+        return None, None
+    try:
+        question_id = uuid.UUID(str(question_id_raw))
+    except ValueError:
+        return None, None
+    message = await db.get(ConsultMessage, question_id)
+    if message is None or message.agent_name != "question_composer":
+        return None, None
+    structured = message.structured_delta if isinstance(message.structured_delta, dict) else {}
+    if structured.get("kind") == "completion_notice":
+        return None, None
+    dimension_raw = structured.get("selected_dimension")
+    dimension_name = None
+    if isinstance(dimension_raw, str):
+        dimension_name = _DIMENSION_MISSING_HINTS.get(dimension_raw)
+    return message.content, dimension_name
 
 
 async def _load_intake_claim(
@@ -2840,6 +3206,52 @@ def _bound_explicit_none_output(
     )
 
 
+def _bound_required_reply_normal_output(
+    input_payload: IntakeExtractionInput,
+) -> IntakeExtractionOutput | None:
+    """2.8 简短回答归约：required 绑定的观察维度 + 明确简短回答时确定性归约。
+
+    与 _bound_explicit_none_output（安全维度）互补：对非安全观察维度，
+    “正常/没有/还好”这类明确简短回答直接落为该维度 observation，跳过模型
+    调用 —— 杜绝“正常”被模型判 needs_clarification 后同维度反复追问、
+    模型句重复触发模板兜底（REAL-SESSION 2ad4da6d 复现链）。
+
+    仅匹配否定类（无/没有/否）与正常/确认类两种白名单模式；其余输入一律
+    留给 intake_extraction 模型，不扩大确定性推断面。
+    """
+
+    context = input_payload.reply_context
+    if context is None or context.selection_kind != "required" or len(input_payload.current_messages) != 1:
+        return None
+    try:
+        selected_dimension = InquiryDimension(context.selected_dimension)
+    except ValueError:
+        return None
+    if selected_dimension not in _BOUND_REQUIRED_OBSERVATION_DIMENSIONS:
+        return None
+    message = input_payload.current_messages[0]
+    content = message.content.strip()
+    if not content or _is_social_acknowledgement(content):
+        return None
+    if (
+        _BOUND_EXPLICIT_NONE_PATTERN.fullmatch(content) is None
+        and _BOUND_REPLY_NORMAL_PATTERN.fullmatch(content) is None
+    ):
+        return None
+    return IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        observations=(
+            ObservationDelta(
+                fact_key=context.selected_dimension,
+                value=content[:240],
+                source_message_id=message.message_id,
+                confidence=_DETERMINISTIC_REPLY_BINDING_CONFIDENCE,
+                operation=ObservationOperation.ADD,
+            ),
+        ),
+    )
+
+
 def _bound_social_reply_output(
     input_payload: IntakeExtractionInput,
 ) -> IntakeExtractionOutput | None:
@@ -2934,6 +3346,46 @@ def _active_observation_ids_by_fact_key(
     return index
 
 
+def _drop_value_conflicting_adds(
+    observations: Sequence[ObservationDelta],
+    *,
+    state: DomainState,
+    rejected_observations: list[RejectedObservation] | None,
+) -> tuple[ObservationDelta, ...]:
+    """2.8：丢弃与活跃事实同键不同值的 ADD 候选（OBSERVATION_SOURCE_CONFLICT 根治）。
+
+    模型偶发把已有活跃事实键以不同表述重新 ADD（REAL-SESSION b801423b）时，
+    reducer 的保守冲突保护会整轮 FAILED。此处在 delta 构造前丢弃这类候选：
+    - 仅对 operation=ADD 生效（显式 CORRECT/RETRACT 保留原 reducer 语义）；
+    - 同键同值 → 保留（reducer 语义去重，无害）；
+    - 丢弃的候选写入 rejected_observations 留痕（reason=value_conflicts_active_fact），
+      旧活跃值保持不变，不丢任何已确认数据。
+    """
+
+    active_values_by_key: dict[str, set[str]] = {}
+    for item in _current_observations(state.observations):
+        active_values_by_key.setdefault(item.fact_key, set()).add(_observation_value_key(item))
+
+    kept: list[ObservationDelta] = []
+    for item in observations:
+        if item.operation is ObservationOperation.ADD:
+            active_values = active_values_by_key.get(item.fact_key)
+            if active_values is not None and _observation_value_key(item) not in active_values:
+                if rejected_observations is not None:
+                    rejected_observations.append(
+                        RejectedObservation(
+                            fact_key=item.fact_key,
+                            operation=item.operation.value,
+                            reason="value_conflicts_active_fact",
+                            target_observation_id=str(item.target_observation_id) if item.target_observation_id else None,
+                            value_preview=str(item.value)[:80] if item.value is not None else "",
+                        )
+                    )
+                continue
+        kept.append(item)
+    return tuple(kept)
+
+
 def _intake_output_to_delta(
     *,
     run_id: uuid.UUID,
@@ -2967,6 +3419,16 @@ def _intake_output_to_delta(
         rejected_observations.extend(filter_result.rejected)
     if normalized_observations is not None:
         normalized_observations.extend(filter_result.normalized)
+    # 2.8 冲突过滤（OBSERVATION_SOURCE_CONFLICT 根治）：模型偶发把已有活跃事实键
+    # 以不同值重新 ADD（REAL-SESSION b801423b：重复答"咳嗽，嗓子有痰"时模型把
+    # ten_questions.sleep 等已有键以变体表述重新提取）→ reducer 保守冲突保护会
+    # 整轮 FAILED。此处丢弃这类冲突候选（保留旧值，不丢数据），仅对 ADD 生效；
+    # 显式 CORRECT/RETRACT 仍走原 reducer 语义。留痕复用 rejected 管道。
+    legal_observations = _drop_value_conflicting_adds(
+        legal_observations,
+        state=state,
+        rejected_observations=rejected_observations,
+    )
     observation_schemas = tuple(
         ObservationSchema(
             observation_id=uuid.uuid5(

@@ -26,6 +26,7 @@ from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.formula_consistency import (
     FORMULA_CONSISTENCY_POLICY_VERSION,
+    FormulaConsistencyFailureCode,
     FormulaConsistencyReport,
     verify_trusted_formula_execution,
 )
@@ -43,7 +44,7 @@ from app.agent_runtime.reasoning_subgraph import (
     ROUTE_NEEDS_MORE_INFO,
     ROUTE_SYNDROME_COMPLETED,
 )
-from app.agent_runtime.reducer import DomainDelta, DomainState
+from app.agent_runtime.reducer import DomainDelta, DomainState, _current_observations
 from app.core.config import agent_model_timeout_seconds, get_settings
 from app.agent_runtime.repository import (
     AgentEvidenceSpec,
@@ -300,6 +301,9 @@ _REASONING_RETRYABLE_MODEL_CODES = frozenset(
         "MODEL_OUTPUT_TRUNCATED",
         "MODEL_GATEWAY_TIMEOUT",
         "MODEL_GATEWAY_UNAVAILABLE",
+        # 2.8 一致性校验失败（模型输出与基础方矛盾，如加减引用不存在的药）：
+        # 属模型随机质量问题，同输入重放大概率自愈；仍失败才 manual_required。
+        *(code.value for code in FormulaConsistencyFailureCode),
     }
 )
 
@@ -637,53 +641,76 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             agent_spec=build_formula_agent_spec(),
             retriever=_rag_retriever(),
         )
-        if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
-            code = str(result.failure_code or "FORMULA_FAILED")
-            retried = 0
-            if _reasoning_failure_is_retryable(code):
-                while retried < _REASONING_MAX_RETRIES:
-                    retried += 1
-                    retried_result = await _execute_formula(
-                        runtime=AgentRuntime(),
-                        repository=repository,
-                        run_spec=_reasoning_retry_spec(run_spec, suffix="formula", attempt=retried),
-                        input_payload=input_payload,
-                        syndrome_result=syndrome_result,
-                        agent_spec=build_formula_agent_spec(),
-                    )
-                    if retried_result.status is FormulaExecutionStatus.SUCCEEDED and retried_result.output is not None:
-                        result = retried_result
-                        code = None
-                        break
+        # 2.8 统一重试循环：执行失败（模型质量/网关）与一致性校验失败（加减引用
+        # 基础方不存在的药等，REAL-SESSION b801423b）都是模型随机质量问题，
+        # 同输入重放大概率自愈；两者共用 _REASONING_MAX_RETRIES 预算，
+        # 重试耗尽才 manual_required → 人工介入。
+        consistency = verify_trusted_formula_execution(result)
+        retried = 0
+        while True:
+            retry_code: str | None = None
+            if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
+                retry_code = str(result.failure_code or "FORMULA_FAILED")
+            elif result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
+                retry_code = str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED")
+            if retry_code is None:
+                break
+            if not _reasoning_failure_is_retryable(retry_code) or retried >= _REASONING_MAX_RETRIES:
+                await _save_intermediate(
+                    claim.id,
+                    {
+                        "formula": {
+                            "failure_code": retry_code,
+                            "retry_count": retried,
+                            "retried": False,
+                        },
+                        "formula_consistency": (
+                            {
+                                "passed": False,
+                                "failure_code": retry_code,
+                            }
+                            if result.status is FormulaExecutionStatus.SUCCEEDED
+                            and result.output is not None
+                            else None
+                        ),
+                    },
+                    step="draft_formula",
+                )
+                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+                return {
+                    "route": NODE_REASONING_SUBGRAPH_V1,
+                    "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                    "last_error": None,
+                }
+            retried += 1
+            retried_result = await _execute_formula(
+                runtime=AgentRuntime(),
+                repository=repository,
+                run_spec=_reasoning_retry_spec(run_spec, suffix="formula", attempt=retried),
+                input_payload=input_payload,
+                syndrome_result=syndrome_result,
+                agent_spec=build_formula_agent_spec(),
+            )
+            if retried_result.status is not FormulaExecutionStatus.SUCCEEDED or retried_result.output is None:
+                result = retried_result
+                consistency = FormulaConsistencyReport(
+                    passed=False,
+                    failure_code=None,
+                )
+                continue
+            result = retried_result
+            consistency = verify_trusted_formula_execution(result)
+        if retried:
             await _save_intermediate(
                 claim.id,
                 {
                     "formula": {
-                        "failure_code": code or "FORMULA_FAILED",
                         "retry_count": retried,
-                        "retried": code is None,
+                        "retried": True,
                     }
                 },
                 step="draft_formula",
             )
-            if code is not None:
-                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-                return {"route": NODE_REASONING_SUBGRAPH_V1, "reasoning_route": ROUTE_MANUAL_REQUIRED, "last_error": None}
-
-        consistency = verify_trusted_formula_execution(result)
-        if result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
-            await _save_intermediate(
-                claim.id,
-                {
-                    "formula_consistency": {
-                        "passed": False,
-                        "failure_code": str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED"),
-                    }
-                },
-                step="verify_formula_consistency",
-            )
-            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-            return {"route": NODE_REASONING_SUBGRAPH_V1, "reasoning_route": ROUTE_MANUAL_REQUIRED, "last_error": None}
         formula_missing_dimension = _formula_missing_dimension(result.output)
         if result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and formula_missing_dimension is None:
             await _save_intermediate(
@@ -1224,7 +1251,7 @@ async def _commit_needs_more_info(
 ) -> tuple[int, uuid.UUID, str]:
     state = await repository.get_state(claim.session_id)
     invalidations = tuple(item.artifact_id for item in state.artifacts if item.status is ArtifactStatus.CURRENT)
-    question = _question_from_intermediate(claim)
+    question = _question_from_intermediate(claim, state)
     question_id = uuid.uuid4()
     delta = DomainDelta(
         delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:{_commit_run_id(claim, 'needs_more_info')}"),
@@ -1587,19 +1614,49 @@ def _route_from_intermediate(claim: IntakeCommandClaim, section: str) -> str | N
     return None
 
 
-def _question_from_intermediate(claim: IntakeCommandClaim) -> str:
+def _question_from_intermediate(claim: IntakeCommandClaim, state: DomainState) -> str:
     payload = claim.intermediate_payload if isinstance(claim.intermediate_payload, dict) else {}
-    formula = payload.get("formula")
     syndrome = payload.get("syndrome")
-    dimension = None
+    formula = payload.get("formula")
+    model_missing = None
     if isinstance(formula, dict) and isinstance(formula.get("missing_dimension"), str):
-        dimension = formula["missing_dimension"]
-    if dimension is None and isinstance(syndrome, dict) and isinstance(syndrome.get("missing_dimension"), str):
-        dimension = syndrome["missing_dimension"]
+        model_missing = formula["missing_dimension"]
+    if model_missing is None and isinstance(syndrome, dict) and isinstance(syndrome.get("missing_dimension"), str):
+        model_missing = syndrome["missing_dimension"]
+    # 2.8 确定性缺失判定：模型报的 missing_dimension 可能与 context 中已存在的事实冲突
+    # （REAL-SESSION b801423b：模型误报 ten_questions.cold_heat/stool_urine 缺失，实际已在
+    # 观察表中）。只对真正缺失的维度生成回退问句，避免“已采集却被反复追问”的死循环。
+    true_missing = _true_missing_dimensions(state, model_missing)
+    dimension = true_missing[0] if true_missing else None
     question = _question_for_dimension(dimension)
     if validate_single_question_text(question) is not None:
         return "请补充一个关键问诊信息？"
     return question
+
+
+def _true_missing_dimensions(state: DomainState, model_missing: str | None) -> list[str]:
+    """2.8：确定性计算真实缺失的辨证维度（过滤模型误报）。
+
+    - four_diagnosis（舌脉）只要无 inspection/palpation 事实即视为缺失；
+    - 模型报的 missing_dimension 若其 keyset 在活跃观察中已命中，则视为误报剔除。
+    """
+    from app.agent_runtime.intake_dimension_mapping import DIMENSION_KEYSETS
+    from app.schemas.completeness import InquiryDimension
+
+    active_keys = {item.fact_key for item in _current_observations(state.observations)}
+    missing: list[str] = []
+    if not any(k in active_keys for k in ("four_diagnosis.inspection", "four_diagnosis.palpation")):
+        missing.append(InquiryDimension.FOUR_DIAGNOSIS.value)
+    if model_missing:
+        try:
+            dimension = InquiryDimension(model_missing)
+        except ValueError:
+            dimension = None
+        if dimension is not None and dimension.value not in missing:
+            keyset = DIMENSION_KEYSETS.get(dimension, (dimension.value,))
+            if not any(k in active_keys for k in keyset):
+                missing.append(dimension.value)
+    return missing
 
 
 def _question_for_dimension(raw_dimension: object) -> str:
@@ -1613,6 +1670,10 @@ def _question_for_dimension(raw_dimension: object) -> str:
             dimension = None
     if dimension is None:
         return "请补充一个关键问诊信息？"
+    # 2.8 舌脉采集：四诊为 optional 维度，question_composer 不主动问；
+    # 辨证需要时由 reasoning 回退引导用户直接输入舌脉描述。
+    if dimension is InquiryDimension.FOUR_DIAGNOSIS:
+        return "请提供患者舌脉情况：舌象（舌色、舌形、舌苔）与脉象？"
     template = QUESTION_TEMPLATES.get((dimension, GapSelectionKind.REQUIRED))
     return template.question if template is not None else "请补充一个关键问诊信息？"
 

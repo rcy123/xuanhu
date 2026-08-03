@@ -586,6 +586,61 @@ def _compute_aggregate_metrics(report: EvalReport) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 质量门禁（--gate）
+# ---------------------------------------------------------------------------
+
+QUALITY_GATE_THRESHOLDS: dict[str, float] = {
+    "topic_hit_rate": 0.80,
+    "source_type_hit_rate": 0.80,
+    "mrr": 0.70,
+    "recall_at_k": 0.60,
+    "pass_rate": 0.85,
+}
+
+
+def check_quality_gate(report: EvalReport, thresholds: dict[str, float] | None = None) -> tuple[bool, list[str]]:
+    """质量门禁判定：指标达标 + negative 零误召回。
+
+    达标线见 QUALITY_GATE_THRESHOLDS（可用 thresholds 覆盖）。
+    negative_case query 命中任一 forbidden topic/title 即误召回（硬门槛，不可放宽）。
+
+    Returns:
+        (是否通过, 未达标项说明列表)
+    """
+    limits = {**QUALITY_GATE_THRESHOLDS, **(thresholds or {})}
+    failures: list[str] = []
+
+    if report.ir_query_count == 0:
+        failures.append("IR 样本不足（无 expected_topics 的非 negative query），门禁无法判定")
+        return False, failures
+
+    checks = [
+        ("topic_hit_rate", report.topic_hit_rate, limits["topic_hit_rate"]),
+        ("source_type_hit_rate", report.source_type_hit_rate, limits["source_type_hit_rate"]),
+        ("MRR", report.avg_mrr, limits["mrr"]),
+        ("recall@k", report.avg_recall_at_k, limits["recall_at_k"]),
+        ("pass_rate", report.pass_rate, limits["pass_rate"]),
+    ]
+    for name, actual, expect in checks:
+        if actual + 1e-9 < expect:
+            failures.append(f"{name} = {actual:.3f} < 门槛 {expect:.2f}")
+
+    negative_false_positive = [
+        r for r in report.query_results
+        if r.negative_case and (r.forbidden_topic_hit or r.forbidden_title_hit)
+    ]
+    if negative_false_positive:
+        failures.append(
+            f"negative 误召回 {len(negative_false_positive)} 条: "
+            + "; ".join(r.query[:24] for r in negative_false_positive[:3])
+        )
+    if report.error_queries:
+        failures.append(f"检索错误 {len(report.error_queries)} 条（首条: {report.error_queries[0].error}）")
+
+    return len(failures) == 0, failures
+
+
+# ---------------------------------------------------------------------------
 # 报告生成
 # ---------------------------------------------------------------------------
 
@@ -1134,6 +1189,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="仅校验评估集 schema，不执行检索",
     )
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="质量门禁：指标达标 + negative 零误召回，未达标返回退出码 1",
+    )
     return parser.parse_args(argv)
 
 
@@ -1203,6 +1263,15 @@ async def _main(argv: list[str] | None = None) -> int:
     # 如果有 validation_errors 也报告到 stderr
     if validation_errors:
         print(f"\n⚠ 评估集 schema 有 {len(validation_errors)} 条问题，详见上方输出。", file=sys.stderr)
+
+    # 质量门禁（--gate）
+    if args.gate:
+        passed, failures = check_quality_gate(report)
+        print("\n" + ("✅ 质量门禁通过" if passed else "❌ 质量门禁未通过"))
+        for failure in failures:
+            print(f"  - {failure}")
+        if not passed:
+            return 1
 
     return 0
 

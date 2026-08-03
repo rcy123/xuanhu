@@ -21,6 +21,8 @@ INTAKE_SUBGRAPH_VERSION = "intake-subgraph.v1"
 IntakeExecutor = Callable[[XuanhuGraphState], Awaitable[dict[str, Any]]]
 
 NODE_INTAKE_PERSIST_MESSAGE = "intake.persist_message"
+NODE_INTAKE_CLARIFY_PRECHECK = "intake.clarify_precheck"
+NODE_INTAKE_CLARIFY_REPLY = "intake.clarify_reply"
 NODE_INTAKE_TRIAGE_PRECHECK = "intake.triage_precheck"
 NODE_INTAKE_BUILD_CONTEXT = "intake.build_intake_context"
 NODE_INTAKE_EXTRACT = "intake.extract_intake"
@@ -58,6 +60,18 @@ async def _persist_message_node(state: XuanhuGraphState) -> dict[str, Any]:
     from app.services.langgraph_intake import run_intake_persist_message_node
 
     return await run_intake_persist_message_node(state)
+
+
+async def _clarify_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
+    from app.services.langgraph_intake import run_intake_clarify_precheck_node
+
+    return await run_intake_clarify_precheck_node(state)
+
+
+async def _clarify_reply_node(state: XuanhuGraphState) -> dict[str, Any]:
+    from app.services.langgraph_intake import run_intake_clarify_reply_node
+
+    return await run_intake_clarify_reply_node(state)
 
 
 async def _triage_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
@@ -133,6 +147,19 @@ def _route_after_gates(state: XuanhuGraphState) -> str:
     return NODE_INTAKE_ROUTE_MANUAL
 
 
+def _route_after_clarify_precheck(state: XuanhuGraphState) -> str:
+    if state.get("clarify_requested") is True:
+        return NODE_INTAKE_CLARIFY_REPLY
+    return NODE_INTAKE_BUILD_CONTEXT
+
+
+def _route_after_extract(state: XuanhuGraphState) -> str:
+    # L3-6：抽取放弃提取（abstained）时转向澄清 Agent，避免对非回答输入静默重问。
+    if state.get("intake_decision") == "abstained":
+        return NODE_INTAKE_CLARIFY_REPLY
+    return NODE_INTAKE_VERIFY
+
+
 def make_intake_subgraph_node(executor: IntakeExecutor) -> IntakeExecutor:
     async def _node(state: XuanhuGraphState) -> dict[str, Any]:
         return await executor(state)
@@ -156,6 +183,8 @@ def build_intake_subgraph(
 
     persist_node: Any = _persist_message_node
     graph.add_node(NODE_INTAKE_PERSIST_MESSAGE, persist_node)
+    graph.add_node(NODE_INTAKE_CLARIFY_PRECHECK, _clarify_precheck_node)
+    graph.add_node(NODE_INTAKE_CLARIFY_REPLY, _clarify_reply_node)
     graph.add_node(NODE_INTAKE_TRIAGE_PRECHECK, _triage_precheck_node)
     graph.add_node(NODE_INTAKE_BUILD_CONTEXT, _build_context_node)
     graph.add_node(NODE_INTAKE_EXTRACT, _extract_node)
@@ -168,10 +197,27 @@ def build_intake_subgraph(
     graph.add_node(NODE_INTAKE_ROUTE_MANUAL, _manual_route_node)
 
     graph.add_edge(START, NODE_INTAKE_PERSIST_MESSAGE)
+    # L3-6 澄清：triage_precheck（红旗检测）永远先于澄清短路执行，避免反问消息漏掉红旗标记；
+    # clarify_precheck 只做强信号判定，命中才短路到澄清回复，否则走正常抽取流程。
     graph.add_edge(NODE_INTAKE_PERSIST_MESSAGE, NODE_INTAKE_TRIAGE_PRECHECK)
-    graph.add_edge(NODE_INTAKE_TRIAGE_PRECHECK, NODE_INTAKE_BUILD_CONTEXT)
+    graph.add_edge(NODE_INTAKE_TRIAGE_PRECHECK, NODE_INTAKE_CLARIFY_PRECHECK)
+    graph.add_conditional_edges(
+        NODE_INTAKE_CLARIFY_PRECHECK,
+        _route_after_clarify_precheck,
+        {
+            NODE_INTAKE_CLARIFY_REPLY: NODE_INTAKE_CLARIFY_REPLY,
+            NODE_INTAKE_BUILD_CONTEXT: NODE_INTAKE_BUILD_CONTEXT,
+        },
+    )
     graph.add_edge(NODE_INTAKE_BUILD_CONTEXT, NODE_INTAKE_EXTRACT)
-    graph.add_edge(NODE_INTAKE_EXTRACT, NODE_INTAKE_VERIFY)
+    graph.add_conditional_edges(
+        NODE_INTAKE_EXTRACT,
+        _route_after_extract,
+        {
+            NODE_INTAKE_CLARIFY_REPLY: NODE_INTAKE_CLARIFY_REPLY,
+            NODE_INTAKE_VERIFY: NODE_INTAKE_VERIFY,
+        },
+    )
     graph.add_edge(NODE_INTAKE_VERIFY, NODE_INTAKE_REDUCE)
     graph.add_edge(NODE_INTAKE_REDUCE, NODE_INTAKE_GATES_AND_ROUTE)
     graph.add_conditional_edges(
@@ -188,6 +234,7 @@ def build_intake_subgraph(
     graph.add_edge(NODE_INTAKE_ROUTE_INCOMPLETE, END)
     graph.add_edge(NODE_INTAKE_ROUTE_CONFLICT, END)
     graph.add_edge(NODE_INTAKE_ROUTE_MANUAL, END)
+    graph.add_edge(NODE_INTAKE_CLARIFY_REPLY, END)
     return graph.compile()
 
 

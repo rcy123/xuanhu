@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -42,10 +43,12 @@ from app.schemas.question import (
 # 真实会话复盘（a7c32b0b）：十问激活集扩全后，6 轮对话 + 最多 24 条事实 +
 # 主诉原文在 1000 token 预算下会顶满甚至超限，导致 CONTEXT_BUILD_FAILED 静默断链。
 # 放宽到 6000（与 intake_extraction 同级），并保留 CONTEXT_BUILD_FAILED 的模板兜底。
-QUESTION_CONTEXT_TOKEN_LIMIT = 6_000
+# 2.7 再加到 7000：few-shot 示例使 developer 模板变长，且 schema 新增 summary_allowed，
+# 需继续容纳 maximal inputs（24 事实 + 8 轮长对话 + 2000 字主诉 + 32 激活维度）。
+QUESTION_CONTEXT_TOKEN_LIMIT = 7_000
 QUESTION_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()  # 网关超时 + 余量（runtime 前置守卫要求严格大于网关超时）
 QUESTION_MODEL_MAX_TOKENS = 800
-QUESTION_MODEL_TEMPERATURE = 0.1
+QUESTION_MODEL_TEMPERATURE = 0.4
 # v3: CONTEXT_BUILD_FAILED 纳入软失败回模板白名单，问诊节点不再因上下文构建失败静默断链。
 QUESTION_COMPOSER_POLICY_VERSION = "question-composer-policy.v3"
 QUESTION_COMPOSER_VERIFIER_CHAIN = ("question_schema", "single_question", "no_authority_fields")
@@ -124,31 +127,31 @@ _QUESTION_TEMPLATES_AUTHORITY: Mapping[tuple[InquiryDimension, GapSelectionKind]
         (
             _required_template(
                 InquiryDimension.ALLERGY_STATUS,
-                "为补充用药安全信息，请核实患者是否有已知过敏？",
+                "患者是否有药物或食物过敏史？",
             ),
             _required_template(
                 InquiryDimension.PREGNANCY_STATUS,
-                "为补充用药安全信息，请核实患者目前是否处于妊娠状态？",
+                "患者目前是否处于妊娠状态？",
             ),
             _required_template(
                 InquiryDimension.LACTATION_STATUS,
-                "为补充用药安全信息，请核实患者目前是否处于哺乳期？",
+                "患者目前是否处于哺乳期？",
             ),
             _required_template(
                 InquiryDimension.MEDICATION_STATUS,
-                "为补充用药安全信息，请核实患者目前是否正在服用药物？",
+                "患者目前是否正在服用任何药物？",
             ),
             _required_template(
                 InquiryDimension.MAJOR_CONDITION_STATUS,
-                "为补充用药安全信息，请核实患者是否有需要说明的重要疾病史？",
+                "患者是否有高血压、糖尿病或心脏病等重要疾病史？",
             ),
             _required_template(InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, "请补充患者此次最主要的不适是什么？"),
-            _required_template(InquiryDimension.BASIC_COURSE, "请补充患者主要不适已持续多久？"),
+            _required_template(InquiryDimension.BASIC_COURSE, "患者此次主要不适已持续多久？"),
             _required_template(
                 InquiryDimension.PRESENT_ILLNESS_CHANGE,
-                "请补充患者此次具体有哪些不适，症状近期如何变化？",
+                "患者此次具体有哪些不适，症状近期如何变化？",
             ),
-            _required_template(InquiryDimension.TEN_COLD_HEAT, "请补充患者近期怕冷、发热的情况？"),
+            _required_template(InquiryDimension.TEN_COLD_HEAT, "患者近期怕冷或发热的情况如何？"),
             _required_template(InquiryDimension.TEN_SWEAT, "患者近期出汗情况怎样？"),
             _required_template(InquiryDimension.TEN_HEAD_BODY, "患者近期头身感受怎样？"),
             _required_template(InquiryDimension.TEN_STOOL_URINE, "患者近期二便情况怎样？"),
@@ -326,6 +329,8 @@ def build_question_context(
             "chief_complaint",
             "activated_dimensions",
             "missing_slot",
+            "summary_allowed",
+            "retry_hint",
         },
         token_limit=QUESTION_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
@@ -350,6 +355,46 @@ def build_question_context(
         ),
     )
     return packet, template.prompt_version
+
+
+def _filter_clinical_context_for_dimension(
+    clinical_context: tuple[QuestionComposerClinicalFact, ...],
+    dimension: InquiryDimension,
+) -> tuple[QuestionComposerClinicalFact, ...]:
+    """2.7 自然度：裁剪临床上下文到本轮维度相关事实。
+
+    只保留①维度自身已采集事实、②主诉/现病史背景（供首问小结措辞）；
+    丢弃其他维度（如问睡眠时给饮食事实）的素材，杜绝小结段复读无关事实。
+    """
+    prefix = f"{dimension.value}."
+    return tuple(
+        fact
+        for fact in clinical_context
+        if fact.fact_key == dimension.value
+        or fact.fact_key.startswith(prefix)
+        or fact.fact_key.startswith("chief_complaint.")
+        or fact.fact_key.startswith("present_illness.")
+    )
+
+
+def _summary_allowed_for_dimension(
+    clinical_context: tuple[QuestionComposerClinicalFact, ...],
+    dimension: InquiryDimension,
+    recent_turns: tuple[QuestionComposerTurn, ...],
+) -> bool:
+    """2.7 小结段许可（确定性判定）。
+
+    首问（recent_turns 无 doctor 提问）允许用主诉/现病史背景做小结；
+    连续追问时仅当本维度已有部分事实（需确认/细化）才允许小结，
+    否则直接提问 —— 消除「已记录水肿半月、畏寒肢冷…」式复读。
+    """
+    if not any(turn.role == "doctor" for turn in recent_turns):
+        return True
+    prefix = f"{dimension.value}."
+    return any(
+        fact.fact_key == dimension.value or fact.fact_key.startswith(prefix)
+        for fact in clinical_context
+    )
 
 
 async def compose_question(
@@ -384,6 +429,27 @@ async def compose_question(
             return _failed(exc.code)
         if supplied_selection != authoritative_selection:
             return _failed(QuestionComposerFailureCode.SELECTION_AUTHORITY_MISMATCH)
+
+    # 2.7 自然度：临床上下文按本轮维度裁剪（只留维度自身事实 + 主诉/现病史背景），
+    # 避免模型复读其他维度已采集事实；小结段许可由系统确定性判定。
+    # NO_SELECTION 时 selected_dimension 为 None，无需裁剪，直接走既有空问分支。
+    filtered_context = (
+        _filter_clinical_context_for_dimension(
+            clinical_context,
+            authoritative_selection.selected_dimension,
+        )
+        if authoritative_selection.selected_dimension is not None
+        else clinical_context
+    )
+    summary_allowed = (
+        _summary_allowed_for_dimension(
+            filtered_context,
+            authoritative_selection.selected_dimension,
+            recent_turns,
+        )
+        if authoritative_selection.selected_dimension is not None
+        else True
+    )
     return await _compose_question_with_template_registry(
         selection=authoritative_selection,
         runtime=runtime,
@@ -391,11 +457,12 @@ async def compose_question(
         agent_spec=agent_spec,
         prompt_loader=prompt_loader,
         template_registry=_QUESTION_TEMPLATES_AUTHORITY,
-        clinical_context=clinical_context,
+        clinical_context=filtered_context,
         recent_turns=recent_turns,
         chief_complaint=chief_complaint,
         activated_dimensions=activated_dimensions,
         missing_slot=missing_slot,
+        summary_allowed=summary_allowed,
     )
 
 
@@ -412,6 +479,7 @@ async def _compose_question_with_template_registry(
     chief_complaint: str | None = None,
     activated_dimensions: tuple[str, ...] = (),
     missing_slot: str | None = None,
+    summary_allowed: bool = True,
 ) -> QuestionCompositionOutcome:
     """Compose with the model when runtime provenance is available.
 
@@ -457,6 +525,7 @@ async def _compose_question_with_template_registry(
         chief_complaint=chief_complaint,
         activated_dimensions=activated_dimensions,
         missing_slot=missing_slot,
+        summary_allowed=summary_allowed,
     )
     if model_outcome.status is QuestionCompositionStatus.SUCCEEDED:
         return model_outcome
@@ -607,10 +676,10 @@ def _question_repeats_recent(
     normalized = _normalize_question_text(question)
     if not normalized:
         return True
-    for turn in recent_turns:
-        if turn.role == "doctor" and _normalize_question_text(turn.content) == normalized:
-            return True
-    return False
+    return any(
+        turn.role == "doctor" and _normalize_question_text(turn.content) == normalized
+        for turn in recent_turns
+    )
 
 
 def slot_followup_text(
@@ -676,33 +745,22 @@ def _template_result(
     )
 
 
-async def _model_result(
+async def _run_composer_once(
     *,
     selection: GapSelectionResult,
     runtime: AgentRuntime,
     run_spec: RunSpec | None,
     agent_spec: AgentSpec,
     prompt_loader: PromptLoader | None,
-    clinical_context: tuple[QuestionComposerClinicalFact, ...],
-    recent_turns: tuple[QuestionComposerTurn, ...] = (),
-    chief_complaint: str | None = None,
-    activated_dimensions: tuple[str, ...] = (),
-    missing_slot: str | None = None,
+    input_payload: QuestionComposerModelInput,
 ) -> QuestionCompositionOutcome:
-    assert selection.selected_dimension is not None
-    input_payload = QuestionComposerModelInput(
-        selected_dimension=selection.selected_dimension,
-        selection_kind=selection.selection_kind,
-        safety_instruction=QUESTION_SAFETY_INSTRUCTION,
-        clinical_context=clinical_context,
-        recent_turns=recent_turns,
-        chief_complaint=chief_complaint,
-        activated_dimensions=activated_dimensions,
-        missing_slot=missing_slot,
-    )
+    """Execute the composer model once with a canonicalized payload.
+
+    Shared by the primary attempt and the SINGLE_QUESTION_INVALID retry.
+    """
     try:
-        input_payload = _canonicalize_model_input(input_payload)
-        packet, prompt_version = build_question_context(input_payload, prompt_loader=prompt_loader)
+        canonical_input = _canonicalize_model_input(input_payload)
+        packet, prompt_version = build_question_context(canonical_input, prompt_loader=prompt_loader)
     except ValidationError:
         return _failed(QuestionComposerFailureCode.INPUT_SCHEMA_INVALID)
     except PromptManifestError:
@@ -717,7 +775,7 @@ async def _model_result(
         artifact = await runtime.run(
             agent_spec,
             run_spec,
-            input_payload,
+            canonical_input,
             [message.model_dump(mode="json") for message in packet.messages],
         )
         model_output = _canonicalize_model_output(artifact.output)
@@ -750,10 +808,12 @@ async def _model_result(
     # （否则放行的错维问题会诱导患者重复作答 → 抽取 CORRECT 链 → 断链），
     # 且不得原话重复已问过的问题。两者失败一律 SINGLE_QUESTION_INVALID 回模板，
     # 与既有软失败白名单（degraded + last_failure_code）复用同一回落通道。
+    # 2.8：SINGLE_QUESTION_INVALID 时 _model_result 会带 retry_hint 重试一次，
+    # 重试仍失败才回落模板。
     question_text = model_output.question.strip()
     if not _question_targets_dimension(question_text, selection.selected_dimension):
         return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
-    if _question_repeats_recent(question_text, recent_turns):
+    if _question_repeats_recent(question_text, input_payload.recent_turns):
         return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
     return QuestionCompositionOutcome(
         status=QuestionCompositionStatus.SUCCEEDED,
@@ -765,6 +825,86 @@ async def _model_result(
             source=QuestionSource.MODEL,
             prompt_version=prompt_version,
         ),
+    )
+
+
+async def _model_result(
+    *,
+    selection: GapSelectionResult,
+    runtime: AgentRuntime,
+    run_spec: RunSpec | None,
+    agent_spec: AgentSpec,
+    prompt_loader: PromptLoader | None,
+    clinical_context: tuple[QuestionComposerClinicalFact, ...],
+    recent_turns: tuple[QuestionComposerTurn, ...] = (),
+    chief_complaint: str | None = None,
+    activated_dimensions: tuple[str, ...] = (),
+    missing_slot: str | None = None,
+    summary_allowed: bool = True,
+) -> QuestionCompositionOutcome:
+    assert selection.selected_dimension is not None
+    input_payload = QuestionComposerModelInput(
+        selected_dimension=selection.selected_dimension,
+        selection_kind=selection.selection_kind,
+        safety_instruction=QUESTION_SAFETY_INSTRUCTION,
+        clinical_context=clinical_context,
+        recent_turns=recent_turns,
+        chief_complaint=chief_complaint,
+        activated_dimensions=activated_dimensions,
+        missing_slot=missing_slot,
+        summary_allowed=summary_allowed,
+    )
+    outcome = await _run_composer_once(
+        selection=selection,
+        runtime=runtime,
+        run_spec=run_spec,
+        agent_spec=agent_spec,
+        prompt_loader=prompt_loader,
+        input_payload=input_payload,
+    )
+    # 2.8 重试一次：模型问句被确定性校验拒绝（维度不符/与最近问句重复）时，
+    # 携带失败原因提示重试，避免高频回落模板造成"复读机"体验（REAL-SESSION
+    # 2ad4da6d：同维度二次问时模型逐字复读上一轮问句 → SINGLE_QUESTION_INVALID
+    # → 模板句兜底，且模型句与模板句高度雷同）。
+    if (
+        outcome.status is not QuestionCompositionStatus.SUCCEEDED
+        and outcome.failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+        and run_spec is not None
+    ):
+        try:
+            hint = _retry_hint_for(selection)
+            retry_payload = input_payload.model_copy(update={"retry_hint": hint})
+            retry_spec = run_spec.model_copy(
+                update={
+                    "run_id": uuid.uuid4(),
+                    "idempotency_key": f"{run_spec.idempotency_key}:retry",
+                }
+            )
+            retried = await _run_composer_once(
+                selection=selection,
+                runtime=runtime,
+                run_spec=retry_spec,
+                agent_spec=agent_spec,
+                prompt_loader=prompt_loader,
+                input_payload=retry_payload,
+            )
+            if retried.status is QuestionCompositionStatus.SUCCEEDED:
+                return retried
+        except Exception:
+            # 重试路径任何异常（网关不可用、测试 fake 无更多响应等）都回落
+            # 原 SINGLE_QUESTION_INVALID → 模板兜底；绝不因重试崩坏既有回落链。
+            pass
+    return outcome
+
+
+def _retry_hint_for(selection: GapSelectionResult) -> str:
+    """2.8：生成重试提示，措辞强调换角度与换措辞。"""
+    dimension = selection.selected_dimension
+    return (
+        f"你上一轮生成的问句与最近已问过的问题重复或没有落在系统指定的维度"
+        f"（{dimension.value if dimension else 'unknown'}）上，已被拒绝。"
+        "请换一个完全不同的角度和措辞重新生成追问（可问具体子项、换句式、换切入点），"
+        "但必须仍然围绕该维度。"
     )
 
 

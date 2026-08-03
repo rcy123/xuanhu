@@ -123,6 +123,10 @@ class XuanhuGraphState(TypedDict, total=False):
     pending_interrupt: PendingInterrupt | None
     budget: Budget
     last_error: LastError | None
+    # L3-6 澄清：persist 后 clarify_precheck 的检测结果（决定是否短路到澄清回复）
+    clarify_requested: bool
+    # L3-6 澄清：extract 节点的抽取决策（abstained 时转向澄清回复）
+    intake_decision: str
 
 
 # ---------------------------------------------------------------------------

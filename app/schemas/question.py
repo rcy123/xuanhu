@@ -172,6 +172,12 @@ class QuestionComposerModelInput(_QuestionModel):
     # 十问核心基座(8) + 分类专属维度 + 安全项 + 主诉/患者维度后,激活集可超过 16。
     activated_dimensions: tuple[str, ...] = Field(default=(), max_length=32)
     missing_slot: str | None = Field(default=None, min_length=1, max_length=240)
+    # 小结段许可：由系统确定性判定（首问或本维度已有部分事实时才允许「小结确认 + 追问」
+    # 两段式），false 时模型必须直接提问，避免连续追问反复复读已采集事实。
+    summary_allowed: bool = True
+    # 2.8 重试提示：上一轮模型问句被确定性校验拒绝（维度不符/与最近问句重复）时，
+    # 系统带此提示重试一次；模型必须据此换一种角度/措辞，不得复用原句。
+    retry_hint: str | None = Field(default=None, min_length=1, max_length=300)
 
     @model_validator(mode="after")
     def model_input_requires_selected_kind(self) -> QuestionComposerModelInput:

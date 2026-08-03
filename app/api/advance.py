@@ -551,13 +551,17 @@ async def _run_langgraph_advance(
             gate_id: uuid.UUID | None = None
             gate_state_version: int | None = None
             if locked.current_stage == "inquiry":
+                # 2.8 版本错位修复（REAL-SESSION b801423b / 7f0b21ae）：
+                # 恢复/回退路径（recover、reasoning needs_more_info 回退）会递增
+                # state_version 但不重新生成 completeness gate，精确匹配
+                # input_state_version == state_version 会误报"信息不充分"。
+                # 这些路径不改变已采集事实，取最新一条 gate 判定是安全的。
                 result = await db.execute(
                     select(GateResult)
                     .where(
                         GateResult.session_id == locked.id,
                         GateResult.gate_name == COMPLETENESS_GATE_NAME,
                         GateResult.policy_version == COMPLETENESS_POLICY_VERSION,
-                        GateResult.input_state_version == locked.state_version,
                     )
                     .order_by(GateResult.created_at.desc(), GateResult.id.desc())
                     .limit(1)
@@ -568,7 +572,7 @@ async def _run_langgraph_advance(
                     raise InsufficientInquiryError(
                         detail=(
                             f"session_id={locked.id} current_stage={locked.current_stage} "
-                            "LangGraph advance requires persisted completeness disposition=ready for current state_version"
+                            "LangGraph advance requires a persisted completeness disposition=ready gate"
                         ),
                     )
                 pending_safety_assertion_id = await db.scalar(

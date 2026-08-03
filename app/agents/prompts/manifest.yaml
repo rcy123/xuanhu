@@ -1,15 +1,44 @@
+# 悬壶 Agent 提示词注册表（manifest）
+# 键 = Agent 名称（代码中引用），值 = 对应的 Jinja2 提示词模板文件。
+# 注意：本文件由 PromptLoader 手写逐行解析（不支持行内注释），注释必须独立成行。
+# 同角色存在 v1/v2 双版本时，仅 v2 生效（v1 保留供旧代码/测试引用）。
+
+# --- 基础设施 ---
+# 仅用于 BaseAgent 基础设施测试的占位 Agent
 test_agent: test_agent_v1.jinja2
+
+# --- 问诊阶段（inquiry / intake，langgraph 主路径）---
+# 信息抽取：从患者消息提取候选结构化观察（症状/病史/安全项/红旗/歧义）
 intake_extraction: intake_extraction_v2.jinja2
+# 追问生成：将选定问诊维度转为自然、承接前文的下一句提问
 question_composer: question_composer_v2.jinja2
-syndrome_draft: syndrome_draft_v1.jinja2
-formula_draft: formula_draft_v1.jinja2
-syndrome_draft_rag: syndrome_draft_rag_v1.jinja2
-formula_draft_rag: formula_draft_rag_v1.jinja2
-inquiry: inquiry_v1.jinja2
-sufficiency: sufficiency_v1.jinja2
-syndrome: syndrome_v1.jinja2
-prescription: prescription_v1.jinja2
-modification: modification_v1.jinja2
-safety: safety_v1.jinja2
-record: record_v1.jinja2
+# 主诉分类：把主诉归入 6 大类（呼吸/消化/疼痛等），决定问诊侧重点
 complaint_classifier: complaint_classifier_v1.jinja2
+# 澄清对话：回应医师对追问的疑问（术语解释/无关输入/流程疑问），引导回到问诊
+clarification: clarification_v1.jinja2
+
+# --- 辨证-开方（reasoning 阶段）---
+# 辨证草稿（无 RAG）：仅基于活跃观察记录生成 SyndromeDraft
+syndrome_draft: syndrome_draft_v1.jinja2
+# 辨证草稿（RAG 版）：基于观察 + 检索证据生成 SyndromeDraft，证据与事实矛盾时以事实为准
+syndrome_draft_rag: syndrome_draft_rag_v1.jinja2
+# 方剂草稿（无 RAG）：基于观察 + 权威辨证草稿生成 FormulaDraft（基础方/加减/候选方）
+formula_draft: formula_draft_v1.jinja2
+# 方剂草稿（RAG 版）：同上，但可参考检索到的方剂/中药证据
+formula_draft_rag: formula_draft_rag_v1.jinja2
+
+# --- legacy 路径（supervisor 流程，新 session 已不路由；仅历史兼容）---
+# 问诊采集（legacy）：四诊信息采集 + 补问生成，输出 InquiryAgentOutput
+inquiry: inquiry_v1.jinja2
+# 完备性评估（legacy）：判断信息是否足以进入辨证，输出 SufficiencyReport
+sufficiency: sufficiency_v1.jinja2
+# 辨证（legacy）：基于四诊 + RAG 证据辨证立法，输出 SyndromeResult
+syndrome: syndrome_v1.jinja2
+# 选基础方（legacy）：基于证型/治法选经典基础方，输出 FormulaResult
+prescription: prescription_v1.jinja2
+# 加减化裁（legacy）：在基础方上按患者情况个性化加减，输出 modified_formula
+modification: modification_v1.jinja2
+# 安全审核解释（legacy）：为确定性安全规则引擎的结论编写中医师可读的解释文本
+safety: safety_v1.jinja2
+# 病历生成（legacy）：基于全量会话数据撰写初版中医病历
+record: record_v1.jinja2

@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
+from app.models.domain import Observation
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -56,6 +57,9 @@ async def _cleanup_test_data() -> None:
         test_ids = [row[0] for row in result.all()]
         if not test_ids:
             return
+        await session.execute(
+            delete(Observation).where(Observation.session_id.in_(test_ids))
+        )
         await session.execute(
             delete(ConsultMessage).where(ConsultMessage.session_id.in_(test_ids))
         )
@@ -191,11 +195,10 @@ async def test_advance_sufficiency_to_syndrome_success(
         await session.commit()
 
     body = await _post_advance(
-        client, s["session_id"], {"force": False}, expect_status=200
+        client, s["session_id"], {"force": False}, expect_status=409
     )
-    assert body["code"] == "SUCCESS", f"预期 SUCCESS，实际 {body.get('code')}"
-    data = body["data"]
-    assert data["current_stage"] in ("syndrome", "review", "blocked")
+    # langgraph 收敛后不存在 sufficiency 阶段：advance 仅支持 inquiry/syndrome/safety/record
+    assert body["code"] == "INVALID_STAGE_TRANSITION", f"预期拒绝，实际 {body.get('code')}"
 
 
 # ---------------------------------------------------------------------------

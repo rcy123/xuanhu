@@ -31,8 +31,8 @@ from app.agents.question_composer import (
     QUESTION_TEMPLATES,
     FrozenQuestionTemplateRegistry,
     QuestionTemplate,
-    build_question_context,
     build_question_composer_agent_spec,
+    build_question_context,
     compose_question,
     slot_followup_text,
     validate_single_question_text,
@@ -709,7 +709,8 @@ async def test_invalid_model_wording_falls_back_to_validated_template() -> None:
     assert outcome.status is QuestionCompositionStatus.SUCCEEDED
     assert outcome.result is not None
     assert outcome.result.source is QuestionSource.TEMPLATE
-    assert gateway.actual_request_count == 1
+    # 2.8：SINGLE_QUESTION_INVALID 后带 retry_hint 重试一次（第二次同样无效才回落模板）
+    assert gateway.actual_request_count == 2
     # 模型软失败回模板：携带退化信号 + last_failure_code（越界文案 → SINGLE_QUESTION_INVALID）
     assert outcome.degraded is True
     assert outcome.last_failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
@@ -905,7 +906,7 @@ async def test_context_build_failed_falls_back_to_template_with_degraded_signal(
 
 
 def test_question_context_budget_covers_maximal_schema_inputs() -> None:
-    """6000 token 预算必须容纳 schema 允许的最大输入（24 事实 + 8 轮长对话 + 主诉 + 32 激活维度）。"""
+    """7000 token 预算必须容纳 schema 允许的最大输入（24 事实 + 8 轮长对话 + 主诉 + 32 激活维度）。"""
     facts = tuple(
         QuestionComposerClinicalFact(
             fact_key=(
@@ -939,6 +940,58 @@ def test_question_context_budget_covers_maximal_schema_inputs() -> None:
     packet, _ = build_question_context(payload)
     used = sum(ContextBuilder.estimate_tokens(message.content) for message in packet.messages)
     assert used <= question_composer.QUESTION_CONTEXT_TOKEN_LIMIT
+
+
+def test_clinical_context_filter_keeps_only_dimension_and_background_facts() -> None:
+    """2.7：裁剪只保留本轮维度事实 + 主诉/现病史背景，丢弃无关维度素材。"""
+    ctx = (
+        QuestionComposerClinicalFact(fact_key="chief_complaint.symptom", value="双下肢水肿半月"),
+        QuestionComposerClinicalFact(fact_key="present_illness.change", value="逐渐加重"),
+        QuestionComposerClinicalFact(fact_key="present_illness.sweat", value="夜尿频多"),
+        QuestionComposerClinicalFact(fact_key="ten_questions.diet", value="食欲正常"),
+        QuestionComposerClinicalFact(fact_key="ten_questions.sleep", value="睡眠尚可"),
+    )
+    filtered = question_composer._filter_clinical_context_for_dimension(
+        ctx,
+        InquiryDimension.TEN_SLEEP,
+    )
+    keys = [fact.fact_key for fact in filtered]
+    assert keys == [
+        "chief_complaint.symptom",
+        "present_illness.change",
+        "present_illness.sweat",
+        "ten_questions.sleep",
+    ]
+    assert "ten_questions.diet" not in keys
+
+
+def test_summary_allowed_is_deterministic() -> None:
+    """2.7：首问或本维度已有部分事实才允许小结段，连续追问其他维度直接提问。"""
+    doctor_turn = (QuestionComposerTurn(role="doctor", content="患者近期睡眠如何？"),)
+    dimension = InquiryDimension.TEN_SLEEP
+
+    # 首问（无 doctor 轮）→ 允许小结（可用主诉/现病史背景）
+    assert question_composer._summary_allowed_for_dimension((), dimension, ()) is True
+
+    # 连续追问 + 本维度无事实 → 禁止小结，直接问
+    assert (
+        question_composer._summary_allowed_for_dimension(
+            (QuestionComposerClinicalFact(fact_key="ten_questions.diet", value="食欲正常"),),
+            dimension,
+            doctor_turn,
+        )
+        is False
+    )
+
+    # 连续追问 + 本维度已有部分事实 → 允许小结确认
+    assert (
+        question_composer._summary_allowed_for_dimension(
+            (QuestionComposerClinicalFact(fact_key="ten_questions.sleep", value="睡眠尚可"),),
+            dimension,
+            doctor_turn,
+        )
+        is True
+    )
 
 
 def test_question_context_rejects_identity_dimensions() -> None:
@@ -1276,3 +1329,38 @@ def test_slot_followup_text_targets_the_missing_sub_slot() -> None:
         QuestionComposerTurn(role="patient", content="睡得不太好"),
     )
     assert slot_followup_text(InquiryDimension.TEN_COLD_HEAT, unrelated) is None
+
+
+@pytest.mark.asyncio
+async def test_repeat_question_is_retried_with_hint_and_recovers() -> None:
+    """2.8：模型复读上一轮问句 → SINGLE_QUESTION_INVALID → 带 retry_hint 重试一次 → 换问法成功。"""
+    covered = tuple(item for item in complete_general_facts() if item.fact_key != "ten_questions.chest_abdomen")
+    completeness = evaluate_completeness_policy(policy_input(*covered))
+    selection = select_gap(completeness)
+    assert selection.selected_dimension is InquiryDimension.TEN_CHEST_ABDOMEN
+
+    repeated = "患者近期胸腹部感受怎样？"
+    gateway = FakeGateway(
+        [
+            {"schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION, "question": repeated},
+            {
+                "schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION,
+                "question": "患者近期有没有胸闷、心慌或胃脘胀满的情况？",
+            },
+        ]
+    )
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        recent_turns=(QuestionComposerTurn(role="doctor", content=repeated),),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.MODEL
+    assert outcome.result.question == "患者近期有没有胸闷、心慌或胃脘胀满的情况？"
+    assert gateway.actual_request_count == 2
+    # 第二次请求携带 retry_hint，且 hint 文本出现在 developer/user 层
+    encoded = json.dumps(gateway.calls[1]["messages"], ensure_ascii=False)
+    assert "已被拒绝" in encoded

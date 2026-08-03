@@ -414,7 +414,12 @@ def _safety_blocked_modify(sid: str, state_version: int) -> int:
 
 
 def _intake_loop(sid: str, answers: IntakeAnswers, state_version: int, max_rounds: int = 30) -> int:
-    """驱动问诊直到 completion_notice，返回最新 state_version。"""
+    """驱动问诊直到 completion_notice，返回最新 state_version。
+
+    防死循环：同一问题连续 3 轮无新进展时退出（agent 卡住/消息未更新）。
+    """
+    last_question = ""
+    stall_count = 0
     for _round in range(max_rounds):
         msgs = get_messages(sid)
         qmsg = latest_agent_message(msgs)
@@ -424,7 +429,16 @@ def _intake_loop(sid: str, answers: IntakeAnswers, state_version: int, max_round
         if sd.get("kind") == "completion_notice":
             print(f"  [intake {_round}] COMPLETION_NOTICE")
             break
-        ans = answers.answer_for(qmsg["content"])
+        question = qmsg["content"]
+        if question == last_question:
+            stall_count += 1
+            if stall_count >= 3:
+                print(f"  [intake {_round}] 问诊无进展（同一问题重复 {stall_count} 轮），退出")
+                break
+        else:
+            last_question = question
+            stall_count = 0
+        ans = answers.answer_for(question)
         for _attempt in range(3):
             st, body = post_message(sid, ans, state_version)
             if st == 200:
