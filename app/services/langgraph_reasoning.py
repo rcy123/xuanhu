@@ -8,15 +8,18 @@ as versioned artifact payloads and Graph State only receives references.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_logger = logging.getLogger("xuanhu.services.langgraph_reasoning")
 
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, NODE_REASONING_SUBGRAPH_V1
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
@@ -26,7 +29,14 @@ from app.agent_runtime.formula_consistency import (
     FormulaConsistencyReport,
     verify_trusted_formula_execution,
 )
-from app.agent_runtime.formula_verifier import FORMULA_AGENT_VERSION, FORMULA_PROMPT_VERSION, FormulaVerificationReport
+from app.agent_runtime.formula_verifier import (
+    FORMULA_AGENT_NAME,
+    FORMULA_AGENT_VERSION,
+    FORMULA_POLICY_PROMPT_PAIRS,
+    FORMULA_PROMPT_VERSION,
+    FORMULA_RAG_PROMPT_VERSION,
+    FormulaVerificationReport,
+)
 from app.agent_runtime.reasoning_subgraph import (
     ROUTE_FORMULA_COMPLETED,
     ROUTE_MANUAL_REQUIRED,
@@ -36,6 +46,8 @@ from app.agent_runtime.reasoning_subgraph import (
 from app.agent_runtime.reducer import DomainDelta, DomainState
 from app.core.config import agent_model_timeout_seconds
 from app.agent_runtime.repository import (
+    AgentEvidenceSpec,
+    AgentRunSpec,
     ArtifactPayloadRecord,
     ArtifactPayloadSpec,
     ConsultMessageSpec,
@@ -58,7 +70,12 @@ from app.agent_runtime.specs import (
     run_artifact_subject_digest,
 )
 from app.agent_runtime.state import ArtifactRef, XuanhuGraphState
-from app.agent_runtime.syndrome_verifier import SYNDROME_AGENT_VERSION, SYNDROME_PROMPT_VERSION
+from app.agent_runtime.syndrome_verifier import (
+    SYNDROME_AGENT_NAME,
+    SYNDROME_AGENT_VERSION,
+    SYNDROME_PROMPT_VERSION,
+    SYNDROME_RAG_PROMPT_VERSION,
+)
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
 from app.agents.formula_draft import (
     FormulaExecutionResult,
@@ -80,8 +97,11 @@ from app.db.session import get_session_factory
 from app.models.consult import ConsultSession
 from app.models.domain import GraphRun, IntakeCommandClaim
 from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus, ObservationStatus
+from app.rag.reasoning_retrieval import stage_rag_enabled
+from app.rag.schemas import Evidence
 from app.schemas.formula import (
     FORMULA_POLICY_VERSION,
+    FORMULA_RAG_POLICY_VERSION,
     FORMULA_READY_STAGE,
     FormulaDraft,
     FormulaDraftDecision,
@@ -90,6 +110,7 @@ from app.schemas.formula import (
 from app.schemas.question import GapSelectionKind
 from app.schemas.syndrome import (
     SYNDROME_POLICY_VERSION,
+    SYNDROME_RAG_POLICY_VERSION,
     SYNDROME_READY_STAGE,
     SyndromeDraft,
     SyndromeDraftDecision,
@@ -144,6 +165,114 @@ def _commit_run_id(claim: IntakeCommandClaim, step: str) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:reasoning:{claim.run_id}:{step}")
 
 
+def _agent_run_spec(
+    *,
+    run_spec: RunSpec,
+    agent_name: str,
+    input_payload: BaseModel,
+    output: BaseModel,
+    artifact: RunArtifact,
+) -> AgentRunSpec:
+    """构造 agent_runs 投影（轻量摘要；完整内容在 artifact payload 中）。"""
+    return AgentRunSpec(
+        run_id=run_spec.run_id,
+        session_id=run_spec.session_id,
+        agent_name=agent_name,
+        stage=run_spec.stage,
+        input_snapshot={
+            "state_version": getattr(input_payload, "state_version", None),
+            "policy_version": run_spec.policy_version,
+            "observation_count": len(getattr(input_payload, "context_observations", ())),
+        },
+        output_snapshot={
+            "decision": str(getattr(output, "decision", "")),
+            "evidence_mode": getattr(output, "evidence_mode", None),
+            "confidence": getattr(output, "confidence", None),
+            "claim_evidence_links": len(getattr(output, "claim_evidence_links", ())),
+        },
+        prompt_version=run_spec.prompt_version,
+        model=artifact.model_actual or "",
+        retry_count=0,
+        status="success",
+        error_code=None,
+        latency_ms=artifact.latency_ms,
+        trace_id=run_spec.trace_id,
+    )
+
+
+def _agent_evidence_specs(
+    *,
+    run_id: uuid.UUID,
+    session_id: uuid.UUID,
+    retrieved_evidence: tuple[Evidence, ...],
+) -> tuple[AgentEvidenceSpec, ...]:
+    """构造 agent_evidences 投影（确定性行 ID，幂等重放不产生重复行）。"""
+    specs: list[AgentEvidenceSpec] = []
+    for evidence in retrieved_evidence:
+        try:
+            source_id = uuid.UUID(str(evidence.source_id))
+        except (ValueError, TypeError):
+            source_id = uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:evidence-source:{evidence.source_id}")
+        chunk_id = None
+        if evidence.chunk_id:
+            try:
+                chunk_id = uuid.UUID(str(evidence.chunk_id))
+            except (ValueError, TypeError):
+                chunk_id = None
+        specs.append(
+            AgentEvidenceSpec(
+                evidence_row_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"xuanhu:evidence:{run_id}:{evidence.evidence_id}",
+                ),
+                agent_run_id=run_id,
+                session_id=session_id,
+                evidence_id=evidence.evidence_id,
+                source_type=evidence.source_type,
+                source_id=source_id,
+                chunk_id=chunk_id,
+                title=evidence.title,
+                content_snippet=evidence.content_snippet,
+                score=evidence.score,
+                rank=evidence.rank,
+            )
+        )
+    return tuple(specs)
+
+
+def _reasoning_policy(stage: str) -> tuple[str, str]:
+    """编排层按配置选 (policy_version, prompt_version)（D1：策略级决策）。
+
+    RAG 开关为 true 时返回 *.rag.v1 配对，否则维持 *.no-rag.v1 配对。
+    agent 内按 input_payload.policy_version 分支检索；verifier 按
+    run_spec.policy_version 分派校验——双端一致由本函数唯一决定。
+    """
+    if stage_rag_enabled(stage):
+        if stage == "syndrome":
+            return SYNDROME_RAG_POLICY_VERSION, SYNDROME_RAG_PROMPT_VERSION
+        return FORMULA_RAG_POLICY_VERSION, FORMULA_RAG_PROMPT_VERSION
+    if stage == "syndrome":
+        return SYNDROME_POLICY_VERSION, SYNDROME_PROMPT_VERSION
+    return FORMULA_POLICY_VERSION, FORMULA_PROMPT_VERSION
+
+
+def _rag_retriever() -> Any | None:
+    """编排层构造推理检索器（延迟 import，避免启动耦合）。
+
+    总开关关闭时返回 None；构造失败返回 None（agent 内走空证据 RAG 模式，
+    不阻断推理——D3 降级）。RAGRetriever 构造不建立连接（延迟连接）。
+    """
+    if not get_settings().rag_enabled:
+        return None
+    try:
+        from app.rag.retriever import RAGRetriever
+
+        return RAGRetriever()
+    except Exception as exc:  # noqa: BLE001 - 检索器不可用必须降级而非阻断
+        _logger.warning("RAG retriever 构造失败，推理将走空证据降级: %s: %s", type(exc).__name__, str(exc))
+        return None
+
+
 # 模型质量类随机失败：同输入重放一次大概率成功（与 intake 抽取同款策略）。
 # 真实会话（229a048c 等）：formula/syndrome 草稿偶发 confidence 超 no-RAG 上限、
 # schema 越界、截断、网关超时——旧实现一律 manual_required → blocked，瞬时失败
@@ -154,11 +283,17 @@ _REASONING_RETRYABLE_MODEL_CODES = frozenset(
         "SYNDROME_OUTPUT_TYPE_INVALID",
         "SYNDROME_DECISION_CONTENT_INVALID",
         "SYNDROME_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT",
+        "SYNDROME_CONFIDENCE_EXCEEDS_RAG_LIMIT",
+        "SYNDROME_EVIDENCE_LINK_FABRICATED",
+        "SYNDROME_EVIDENCE_MODE_POLICY_MISMATCH",
         "SYNDROME_FACT_LINK_INVALID",
         "FORMULA_SCHEMA_INVALID",
         "FORMULA_OUTPUT_TYPE_INVALID",
         "FORMULA_DECISION_CONTENT_INVALID",
         "FORMULA_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT",
+        "FORMULA_CONFIDENCE_EXCEEDS_RAG_LIMIT",
+        "FORMULA_EVIDENCE_LINK_FABRICATED",
+        "FORMULA_EVIDENCE_MODE_POLICY_MISMATCH",
         "FORMULA_FACT_LINK_INVALID",
         "FORMULA_SYNDROME_FACT_LINK_INVALID",
         "STRUCTURED_OUTPUT_INVALID",
@@ -279,14 +414,15 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             return _syndrome_graph_update(claim, recovered, await repository.get_state(claim.session_id))
 
         input_payload = _build_syndrome_input(authority)
+        syndrome_policy, syndrome_prompt = _reasoning_policy("syndrome")
         run_spec = RunSpec(
             run_id=_commit_run_id(claim, "syndrome"),
             session_id=claim.session_id,
             state_version=input_payload.state_version,
             stage=SYNDROME_READY_STAGE,
             agent_spec_version=SYNDROME_AGENT_VERSION,
-            prompt_version=SYNDROME_PROMPT_VERSION,
-            policy_version=SYNDROME_POLICY_VERSION,
+            prompt_version=syndrome_prompt,
+            policy_version=syndrome_policy,
             # 节点级 RunSpec deadline 需 > SYNDROME AgentSpec ModelPolicy.timeout
             # （= 网关超时 + 余量），避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
             deadline_at=_deadline(agent_model_timeout_seconds() + 15),
@@ -300,6 +436,7 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             run_spec=run_spec,
             input_payload=input_payload,
             agent_spec=build_syndrome_agent_spec(),
+            retriever=_rag_retriever(),
         )
         if result.status is not SyndromeExecutionStatus.SUCCEEDED or result.output is None or result.verification is None:
             code = str(result.failure_code or "SYNDROME_FAILED")
@@ -475,14 +612,15 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         if syndrome_result is None or syndrome_result.output is None or authority is None:
             return _sanitized_graph_error(state, "FORMULA_CONTEXT_MISSING", "formula context authority is unavailable")
         input_payload = _build_formula_input(authority, syndrome_result.output)
+        formula_policy, formula_prompt = _reasoning_policy("formula")
         run_spec = RunSpec(
             run_id=_commit_run_id(claim, "formula"),
             session_id=claim.session_id,
             state_version=input_payload.state_version,
             stage=FORMULA_READY_STAGE,
             agent_spec_version=FORMULA_AGENT_VERSION,
-            prompt_version=FORMULA_PROMPT_VERSION,
-            policy_version=FORMULA_POLICY_VERSION,
+            prompt_version=formula_prompt,
+            policy_version=formula_policy,
             # 节点级 RunSpec deadline 需 > FORMULA AgentSpec ModelPolicy.timeout
             # （= 网关超时 + 余量），避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
             deadline_at=_deadline(agent_model_timeout_seconds() + 15),
@@ -497,6 +635,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             input_payload=input_payload,
             syndrome_result=syndrome_result,
             agent_spec=build_formula_agent_spec(),
+            retriever=_rag_retriever(),
         )
         if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
             code = str(result.failure_code or "FORMULA_FAILED")
@@ -809,11 +948,12 @@ async def _current_authority(
 
 
 def _build_syndrome_input(authority: ReasoningAuthoritySnapshot) -> SyndromeDraftInput:
+    policy, _prompt = _reasoning_policy("syndrome")
     return SyndromeDraftInput(
         session_id=authority.session_id,
         state_version=authority.current_state_version,
         current_stage=SYNDROME_READY_STAGE,
-        policy_version=SYNDROME_POLICY_VERSION,
+        policy_version=policy,
         domain_state=authority.domain_state,
         triage_gate=authority.triage_gate,
         completeness_gate=authority.completeness_gate,
@@ -822,11 +962,12 @@ def _build_syndrome_input(authority: ReasoningAuthoritySnapshot) -> SyndromeDraf
 
 
 def _build_formula_input(authority: ReasoningAuthoritySnapshot, syndrome: SyndromeDraft) -> FormulaDraftInput:
+    policy, _prompt = _reasoning_policy("formula")
     return FormulaDraftInput(
         session_id=authority.session_id,
         state_version=authority.current_state_version,
         current_stage=FORMULA_READY_STAGE,
-        policy_version=FORMULA_POLICY_VERSION,
+        policy_version=policy,
         domain_state=authority.domain_state,
         triage_gate=authority.triage_gate,
         completeness_gate=authority.completeness_gate,
@@ -864,6 +1005,10 @@ async def _commit_syndrome_artifact(
         "run_artifact": _run_artifact_payload(trusted.artifact),
         "verification": result.verification.model_dump(mode="json"),
     }
+    # D2：完整证据随 payload 落库（v1 记录无此键；恢复路径按记录自身有无该键重建）。
+    payload["retrieved_evidence"] = [
+        evidence.model_dump(mode="json") for evidence in trusted.retrieved_evidence
+    ]
     return await _commit_artifact_payload(
         repository,
         claim,
@@ -876,10 +1021,24 @@ async def _commit_syndrome_artifact(
         idempotency_key=f"{claim.idempotency_key}:syndrome",
         gate_name="syndrome_verifier",
         gate_decision="passed" if result.verification.passed else "failed",
-        gate_policy="syndrome-draft-policy.no-rag.v1",
+        gate_policy=trusted.run_spec.policy_version,
         session_updates=None,
         outbox_event_type=REASONING_ARTIFACT_COMMITTED,
         outbox_payload_extra={"artifact_type": SYNDROME_ARTIFACT_TYPE, "decision": trusted.output.decision.value},
+        agent_runs=(
+            _agent_run_spec(
+                run_spec=trusted.run_spec,
+                agent_name=SYNDROME_AGENT_NAME,
+                input_payload=trusted.input_payload,
+                output=trusted.output,
+                artifact=trusted.artifact,
+            ),
+        ),
+        agent_evidences=_agent_evidence_specs(
+            run_id=trusted.run_spec.run_id,
+            session_id=trusted.input_payload.session_id,
+            retrieved_evidence=trusted.retrieved_evidence,
+        ),
     )
 
 
@@ -904,6 +1063,10 @@ async def _commit_formula_artifact(
         "verification": result.verification.model_dump(mode="json"),
         "consistency": consistency.model_dump(mode="json"),
     }
+    # D2：完整证据随 payload 落库（v1 记录无此键；恢复路径按记录自身有无该键重建）。
+    payload["retrieved_evidence"] = [
+        evidence.model_dump(mode="json") for evidence in trusted.retrieved_evidence
+    ]
     session_updates = None
     outbox_event_type = REASONING_ARTIFACT_COMMITTED
     if trusted.output.decision is FormulaDraftDecision.COMPLETED and consistency.passed:
@@ -937,6 +1100,20 @@ async def _commit_formula_artifact(
         session_updates=session_updates,
         outbox_event_type=outbox_event_type,
         outbox_payload_extra={"artifact_type": FORMULA_ARTIFACT_TYPE, "decision": trusted.output.decision.value},
+        agent_runs=(
+            _agent_run_spec(
+                run_spec=trusted.run_spec,
+                agent_name=FORMULA_AGENT_NAME,
+                input_payload=trusted.input_payload,
+                output=trusted.output,
+                artifact=trusted.artifact,
+            ),
+        ),
+        agent_evidences=_agent_evidence_specs(
+            run_id=trusted.run_spec.run_id,
+            session_id=trusted.input_payload.session_id,
+            retrieved_evidence=trusted.retrieved_evidence,
+        ),
     )
 
 
@@ -957,6 +1134,8 @@ async def _commit_artifact_payload(
     session_updates: dict[str, object] | None,
     outbox_event_type: str,
     outbox_payload_extra: dict[str, object],
+    agent_runs: Sequence[AgentRunSpec] = (),
+    agent_evidences: Sequence[AgentEvidenceSpec] = (),
 ) -> dict[str, Any]:
     state = await repository.get_state(claim.session_id)
     if state.state_version != expected_state_version:
@@ -1014,6 +1193,8 @@ async def _commit_artifact_payload(
                 content_digest=digest,
             ),
         ),
+        agent_runs=agent_runs,
+        agent_evidences=agent_evidences,
         session_updates=session_updates,
         outbox_event_type=outbox_event_type,
         outbox_payload={
@@ -1312,6 +1493,10 @@ def _formula_route_from_record(record: ArtifactPayloadRecord | None) -> str:
         "verification": verification.model_dump(mode="json"),
         "consistency": consistency.model_dump(mode="json"),
     }
+    # D2：v1 记录无 retrieved_evidence 键；有键时重建必须原样保留（route 判定
+    # 用，证据内容已由 content_digest 防篡改）。
+    if "retrieved_evidence" in record.payload:
+        canonical_payload["retrieved_evidence"] = record.payload["retrieved_evidence"]
     if (
         record.artifact_type != FORMULA_ARTIFACT_TYPE
         or record.status != "current"
@@ -1324,7 +1509,7 @@ def _formula_route_from_record(record: ArtifactPayloadRecord | None) -> str:
         or artifact.run_id != run_spec.run_id
         or artifact.trace_id != run_spec.trace_id
         or artifact.agent_spec_version != FORMULA_AGENT_VERSION
-        or artifact.prompt_version != FORMULA_PROMPT_VERSION
+        or (run_spec.policy_version, artifact.prompt_version) not in FORMULA_POLICY_PROMPT_PAIRS
         or artifact.output != output
         or not verification.passed
         or verification.subject_digest != run_artifact_subject_digest(artifact)

@@ -50,6 +50,10 @@ from app.schemas.formula import (
     FORMULA_INPUT_SCHEMA_VERSION,
     FORMULA_NO_RAG_CONFIDENCE_MAX,
     FORMULA_POLICY_VERSION,
+    FORMULA_RAG_CONFIDENCE_MAX,
+    FORMULA_RAG_EVIDENCE_MODE,
+    FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
+    FORMULA_RAG_POLICY_VERSION,
     FORMULA_READY_STAGE,
     FormulaComposition,
     FormulaDraft,
@@ -60,6 +64,7 @@ from app.schemas.formula import (
 from app.schemas.syndrome import (
     SYNDROME_INPUT_SCHEMA_VERSION,
     SYNDROME_POLICY_VERSION,
+    SYNDROME_RAG_POLICY_VERSION,
     SYNDROME_READY_STAGE,
     SyndromeDraft,
     SyndromeDraftDecision,
@@ -70,6 +75,17 @@ from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 FORMULA_AGENT_NAME = "formula_draft"
 FORMULA_AGENT_VERSION = "formula-draft-agent.v1"
 FORMULA_PROMPT_VERSION = "formula_draft_v1.jinja2"
+# RAG 模式的 manifest agent key。spec.name/version 保持 FORMULA_AGENT_NAME/
+# _VERSION 不变（_valid_agent_spec 只认固定 name/version），RAG 仅切换 prompt。
+FORMULA_RAG_AGENT_NAME = "formula_draft_rag"
+FORMULA_RAG_PROMPT_VERSION = "formula_draft_rag_v1.jinja2"
+# 合法 policy_version / prompt_version 配对集合（D1：策略级决策，verifier 只认配对）。
+FORMULA_POLICY_PROMPT_PAIRS = frozenset(
+    {
+        (FORMULA_POLICY_VERSION, FORMULA_PROMPT_VERSION),
+        (FORMULA_RAG_POLICY_VERSION, FORMULA_RAG_PROMPT_VERSION),
+    }
+)
 FORMULA_VERIFIER_CHAIN = (
     "schema",
     "run_provenance",
@@ -102,6 +118,9 @@ class FormulaVerificationFailureCode(StrEnum):
     MODIFICATION_BASIS_MISSING = "FORMULA_MODIFICATION_BASIS_MISSING"
     CONFIDENCE_EXCEEDS_NO_RAG_LIMIT = "FORMULA_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT"
     NO_RAG_CONTRACT_VIOLATED = "FORMULA_NO_RAG_CONTRACT_VIOLATED"
+    CONFIDENCE_EXCEEDS_RAG_LIMIT = "FORMULA_CONFIDENCE_EXCEEDS_RAG_LIMIT"
+    EVIDENCE_LINK_FABRICATED = "FORMULA_EVIDENCE_LINK_FABRICATED"
+    EVIDENCE_MODE_POLICY_MISMATCH = "FORMULA_EVIDENCE_MODE_POLICY_MISMATCH"
     AUTHORITY_FIELD_FORBIDDEN = "FORMULA_AUTHORITY_FIELD_FORBIDDEN"
 
 
@@ -199,12 +218,11 @@ def validate_formula_preflight(
         return FormulaVerificationFailureCode.AGENT_SPEC_INVALID
     if (
         run_spec.agent_spec_version != agent_spec.version
-        or run_spec.prompt_version != FORMULA_PROMPT_VERSION
-        or run_spec.policy_version != FORMULA_POLICY_VERSION
+        or (run_spec.policy_version, run_spec.prompt_version) not in FORMULA_POLICY_PROMPT_PAIRS
         or run_spec.total_attempt_budget != 1
         or run_spec.session_id != input_payload.session_id
         or run_spec.state_version != input_payload.state_version
-        or input_payload.policy_version != FORMULA_POLICY_VERSION
+        or input_payload.policy_version != run_spec.policy_version
     ):
         return FormulaVerificationFailureCode.RUN_PROVENANCE_MISMATCH
     stage_failure = _verify_stage_and_gates(run_spec, input_payload, gate_authority)
@@ -276,7 +294,7 @@ def verify_formula_artifact(
     checks.append(_check("fact_links", _verify_fact_links(output, input_payload)))
     checks.append(_check("decision_consistency", _verify_decision(output)))
     checks.append(_check("modification_basis", _verify_modification_basis(output)))
-    checks.append(_check("no_rag_contract", _verify_no_rag(output)))
+    checks.append(_check("no_rag_contract", _verify_evidence_contract(output, artifact.evidence_ids, run_spec.policy_version)))
     checks.append(_check("authority_boundary", _verify_authority(output)))
     return _report(checks, artifact)
 
@@ -477,14 +495,20 @@ def _build_syndrome_input_from_formula(formula_input: FormulaDraftInput) -> Synd
     The formula input's domain_state, gates, and context_observations have
     already been replaced by authoritative Repository values.  We project
     them into the L4-1 SyndromeDraftInput shape using the syndrome stage
-    and policy version.
+    and policy version.  RAG 模式贯通：formula 是 rag policy 时，重建的
+    syndrome input 也用 rag policy（L4-1 verifier 按 syndrome_run_spec 分派）。
     """
+    policy_version = (
+        SYNDROME_RAG_POLICY_VERSION
+        if formula_input.policy_version == FORMULA_RAG_POLICY_VERSION
+        else SYNDROME_POLICY_VERSION
+    )
     return SyndromeDraftInput(
         schema_version=SYNDROME_INPUT_SCHEMA_VERSION,
         session_id=formula_input.session_id,
         state_version=formula_input.state_version,
         current_stage=SYNDROME_READY_STAGE,
-        policy_version=SYNDROME_POLICY_VERSION,
+        policy_version=policy_version,
         domain_state=formula_input.domain_state,
         triage_gate=formula_input.triage_gate,
         completeness_gate=formula_input.completeness_gate,
@@ -631,7 +655,47 @@ def _verify_modification_basis(output: FormulaDraft) -> FormulaVerificationFailu
     return None
 
 
-def _verify_no_rag(output: FormulaDraft) -> FormulaVerificationFailureCode | None:
+def _verify_evidence_contract(
+    output: FormulaDraft,
+    evidence_ids: tuple[str, ...],
+    policy_version: str,
+) -> FormulaVerificationFailureCode | None:
+    """按 policy_version 分派的证据契约校验（D1/D2）。
+
+    - no-rag 契约：evidence_ids 必须为空、evidence_mode=model_knowledge_only、
+      links 空、confidence ≤ FORMULA_NO_RAG_CONFIDENCE_MAX。
+    - rag 契约：evidence_mode=rag_retrieved、每条 link 的 evidence_id 必须命中
+      本次检索证据集合（防幻觉引用）、confidence 按证据空否分别封顶。
+    """
+    if policy_version == FORMULA_RAG_POLICY_VERSION:
+        if output.evidence_mode != FORMULA_RAG_EVIDENCE_MODE:
+            return FormulaVerificationFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+        return _verify_rag_contract(output, evidence_ids)
+    if output.evidence_mode != FORMULA_EVIDENCE_MODE:
+        return FormulaVerificationFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+    return _verify_no_rag(output, evidence_ids)
+
+
+def _verify_rag_contract(output: FormulaDraft, evidence_ids: tuple[str, ...]) -> FormulaVerificationFailureCode | None:
+    allowed = frozenset(evidence_ids)
+    if any(link.evidence_id not in allowed for link in output.claim_evidence_links):
+        # 引用不存在的证据 ID = 模型编造引用，整份输出拒绝。
+        return FormulaVerificationFailureCode.EVIDENCE_LINK_FABRICATED
+    if not allowed:
+        # 空证据降级模式：不允许过度自信（RAG 无证据时模型只基于内知识）。
+        if output.confidence > FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX:
+            return FormulaVerificationFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    elif output.confidence > FORMULA_RAG_CONFIDENCE_MAX:
+        return FormulaVerificationFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    if output.review_required is not True:
+        return FormulaVerificationFailureCode.NO_RAG_CONTRACT_VIOLATED
+    return None
+
+
+def _verify_no_rag(output: FormulaDraft, evidence_ids: tuple[str, ...]) -> FormulaVerificationFailureCode | None:
+    if evidence_ids:
+        # no-rag 模式下 artifact 不得携带任何检索证据 ID（防证据泄漏冒充）。
+        return FormulaVerificationFailureCode.NO_RAG_CONTRACT_VIOLATED
     if output.confidence > FORMULA_NO_RAG_CONFIDENCE_MAX:
         return FormulaVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
     if (

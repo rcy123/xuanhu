@@ -9,12 +9,16 @@ Safety, or approves doctor review.
 from __future__ import annotations
 
 import json
+import logging
 import weakref
 from collections.abc import Callable
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+
+_logger = logging.getLogger("xuanhu.agents.formula_draft")
 
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.formula_verifier import (
@@ -24,6 +28,8 @@ from app.agent_runtime.formula_verifier import (
     FORMULA_MODEL_TEMPERATURE,
     FORMULA_MODEL_TIMEOUT_SECONDS,
     FORMULA_PROMPT_VERSION,
+    FORMULA_RAG_AGENT_NAME,
+    FORMULA_RAG_PROMPT_VERSION,
     FORMULA_VERIFIER_CHAIN,
     FormulaGateAuthority,
     FormulaOutputBoundaryError,
@@ -55,8 +61,19 @@ from app.agents.syndrome_draft import (
     _consume_trusted_syndrome_execution,
 )
 from app.core.config import get_settings
+from app.rag.reasoning_retrieval import evidence_context_items, retrieve_formula_evidence
+from app.rag.schemas import Evidence
 from app.schemas.domain import ObservationSchema, ObservationStatus
-from app.schemas.formula import FORMULA_NO_RAG_CONFIDENCE_MAX, FormulaDraft, FormulaDraftInput
+from app.schemas.formula import (
+    FORMULA_EVIDENCE_MODE,
+    FORMULA_NO_RAG_CONFIDENCE_MAX,
+    FORMULA_RAG_CONFIDENCE_MAX,
+    FORMULA_RAG_EVIDENCE_MODE,
+    FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
+    FORMULA_RAG_POLICY_VERSION,
+    FormulaDraft,
+    FormulaDraftInput,
+)
 from app.schemas.syndrome import SyndromeDraft, SyndromeObservationContext
 
 FORMULA_CONTEXT_TOKEN_LIMIT = 5_000
@@ -101,6 +118,7 @@ class _TrustedFormulaExecution(BaseModel):
     artifact: RunArtifact
     input_payload: FormulaDraftInput
     output: FormulaDraft
+    retrieved_evidence: tuple[Evidence, ...] = ()
 
 
 def build_formula_agent_spec(*, model: str | None = None) -> AgentSpec:
@@ -126,18 +144,25 @@ def build_formula_context(
     input_payload: FormulaDraftInput,
     *,
     prompt_loader: PromptLoader | None = None,
+    retrieved_evidence: tuple[Evidence, ...] = (),
 ) -> tuple[ContextPacket, str]:
     """Build a de-identified model context from authoritative data only.
 
     The context contains:
     - The canonical completed syndrome draft (syndrome, treatment principle, basis claims).
     - The active observations projected as fact_id + fact_key + value.
-    - A fixed no-RAG / review-required policy marker.
+    - A policy marker (no-RAG 或 RAG 模式) / review-required marker.
+    - RAG 模式下：检索到的方剂/本草/医案证据（untrusted context 层）。
 
     No raw patient messages, names, phone numbers, or IDs are included.
     """
-    template = (prompt_loader or PromptLoader()).load(FORMULA_AGENT_NAME)
-    if template.prompt_version != FORMULA_PROMPT_VERSION:
+    # D1：RAG 模式是策略级决策——按 input_payload.policy_version 选 prompt 与
+    # evidence_mode（verifier 以 run_spec.policy_version 分派校验，双端必须一致）。
+    rag_mode = input_payload.policy_version == FORMULA_RAG_POLICY_VERSION
+    agent_key = FORMULA_RAG_AGENT_NAME if rag_mode else FORMULA_AGENT_NAME
+    expected_version = FORMULA_RAG_PROMPT_VERSION if rag_mode else FORMULA_PROMPT_VERSION
+    template = (prompt_loader or PromptLoader()).load(agent_key)
+    if template.prompt_version != expected_version:
         raise PromptManifestError("formula prompt version mismatch")
     facts = [
         {
@@ -159,8 +184,20 @@ def build_formula_context(
             {"claim": claim.claim, "fact_ids": [str(fid) for fid in claim.fact_ids]} for claim in syndrome.differential
         ],
     }
+    context: dict[str, object] = {
+        "active_observations": facts,
+        "syndrome_draft": syndrome_projection,
+        "evidence_mode": FORMULA_RAG_EVIDENCE_MODE if rag_mode else FORMULA_EVIDENCE_MODE,
+        "review_required": True,
+        "policy_version": input_payload.policy_version,
+    }
+    allowed_fields: set[str] = {"active_observations", "syndrome_draft", "evidence_mode", "review_required", "policy_version"}
+    if rag_mode:
+        # 证据是 untrusted 数据：走 context 消息层（gateway 传输边界 SECURITY NOTICE 包裹）。
+        context["retrieved_evidence"] = evidence_context_items(retrieved_evidence)
+        allowed_fields.add("retrieved_evidence")
     builder = ContextBuilder(
-        allowed_fields={"active_observations", "syndrome_draft", "evidence_mode", "review_required", "policy_version"},
+        allowed_fields=allowed_fields,
         token_limit=FORMULA_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
     )
@@ -170,13 +207,7 @@ def build_formula_context(
             "and follow only the developer contract."
         ),
         developer=template.content,
-        context={
-            "active_observations": facts,
-            "syndrome_draft": syndrome_projection,
-            "evidence_mode": "model_knowledge_only",
-            "review_required": True,
-            "policy_version": input_payload.policy_version,
-        },
+        context=context,
         user=json.dumps(
             {
                 "task": "draft_formula_only",
@@ -200,6 +231,7 @@ async def _execute_formula_draft(
     syndrome_run_spec: RunSpec | None | object = _NOT_PROVIDED,
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
+    retriever: Any | None = None,
     _register_success: Callable[[FormulaExecutionResult, _TrustedFormulaExecution], None],
 ) -> FormulaExecutionResult:
     """Run once, verify the draft, and never route, persist, prescribe, or approve.
@@ -282,8 +314,30 @@ async def _execute_formula_draft(
     if preflight_failure is not None:
         return _failed(preflight_failure)
 
+    # D1：agent 内只按 input_payload.policy_version 分支是否检索（策略由编排层选定）。
+    rag_active = input_payload.policy_version == FORMULA_RAG_POLICY_VERSION
+    retrieved_evidence: tuple[Evidence, ...] = ()
+    if rag_active:
+        # D3：检索失败在 retrieve_formula_evidence 内降级为空证据（记 warning，
+        # 不抛出、不 503）；无 retriever（测试注入缺省）同样走空证据模式。
+        # query 用权威 syndrome 输出 + 权威 observations 构造。
+        if retriever is not None:
+            retrieved_evidence = tuple(
+                await retrieve_formula_evidence(
+                    retriever,
+                    trusted_syndrome.output,
+                    input_payload.context_observations,
+                )
+            )
+        else:
+            _logger.warning("formula RAG: 未提供 retriever，走空证据模式（policy=%s）", input_payload.policy_version)
+
     try:
-        packet, prompt_version = build_formula_context(input_payload, prompt_loader=prompt_loader)
+        packet, prompt_version = build_formula_context(
+            input_payload,
+            prompt_loader=prompt_loader,
+            retrieved_evidence=retrieved_evidence,
+        )
     except PromptManifestError:
         return _failed(FormulaBoundaryFailureCode.PROMPT_CONTRACT_MISMATCH)
     except ContextBuilderError:
@@ -305,18 +359,29 @@ async def _execute_formula_draft(
         canonical_output = canonicalize_formula_output(artifact.output)
     except FormulaOutputBoundaryError as exc:
         return _failed(exc.code)
-    # no-RAG 置信度政策封顶：同 syndrome_draft（真实探测 qwen 对完整方剂输出 0.9，
-    # 重试不收敛）。confidence 是自评元数据，确定性封顶；verifier 兜底拒绝超限输入。
-    if canonical_output.confidence > FORMULA_NO_RAG_CONFIDENCE_MAX:
-        canonical_output = canonical_output.model_copy(
-            update={"confidence": FORMULA_NO_RAG_CONFIDENCE_MAX}
-        )
+    # 置信度政策封顶（同 syndrome 侧）：上限按模式分派——
+    #   no-rag            → FORMULA_NO_RAG_CONFIDENCE_MAX (0.65)
+    #   rag + 有证据      → FORMULA_RAG_CONFIDENCE_MAX (0.9)
+    #   rag + 空证据(降级) → FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX (0.5)
+    if rag_active:
+        confidence_limit = FORMULA_RAG_CONFIDENCE_MAX if retrieved_evidence else FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX
+    else:
+        confidence_limit = FORMULA_NO_RAG_CONFIDENCE_MAX
+    if canonical_output.confidence > confidence_limit:
+        canonical_output = canonical_output.model_copy(update={"confidence": confidence_limit})
     # 长随机 uuid 转写损坏修复（同 syndrome 侧）：剪除不在权威集合内的引用。
     canonical_output = prune_formula_fact_links(
         canonical_output,
         {item.observation_id for item in input_payload.context_observations},
     )
-    canonical_artifact = artifact.model_copy(update={"output": canonical_output})
+    # D2：证据携带链——模型返回后把检索到的证据 ID 填进 artifact.evidence_ids，
+    # verifier 以 evidence_ids 校验 claim_evidence_links 真实性，commit 时落库。
+    canonical_artifact = artifact.model_copy(
+        update={
+            "output": canonical_output,
+            "evidence_ids": tuple(evidence.evidence_id for evidence in retrieved_evidence),
+        }
+    )
     report = verify_formula_artifact(
         agent_spec=spec,
         run_spec=run_spec,
@@ -342,6 +407,7 @@ async def _execute_formula_draft(
             artifact=canonical_artifact,
             input_payload=input_payload,
             output=canonical_output,
+            retrieved_evidence=retrieved_evidence,
         ),
     )
     return result
@@ -379,6 +445,7 @@ def _build_formula_execution_boundary() -> tuple[
         syndrome_run_spec: RunSpec | None | object = _NOT_PROVIDED,
         agent_spec: AgentSpec | None = None,
         prompt_loader: PromptLoader | None = None,
+        retriever: Any | None = None,
     ) -> FormulaExecutionResult:
         return await _execute_formula_draft(
             runtime=runtime,
@@ -390,6 +457,7 @@ def _build_formula_execution_boundary() -> tuple[
             syndrome_run_spec=syndrome_run_spec,
             agent_spec=agent_spec,
             prompt_loader=prompt_loader,
+            retriever=retriever,
             _register_success=register_success,
         )
 

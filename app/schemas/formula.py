@@ -23,9 +23,17 @@ from app.schemas.syndrome import SyndromeDraft, SyndromeObservationContext
 FORMULA_DRAFT_SCHEMA_VERSION: Literal["formula-draft.v1"] = "formula-draft.v1"
 FORMULA_INPUT_SCHEMA_VERSION: Literal["formula-draft-input.v1"] = "formula-draft-input.v1"
 FORMULA_EVIDENCE_MODE: Literal["model_knowledge_only"] = "model_knowledge_only"
+FORMULA_RAG_EVIDENCE_MODE: Literal["rag_retrieved"] = "rag_retrieved"
+FORMULA_EVIDENCE_MODE_T = Literal["model_knowledge_only", "rag_retrieved"]
 FORMULA_POLICY_VERSION: Literal["formula-draft-policy.no-rag.v1"] = "formula-draft-policy.no-rag.v1"
+FORMULA_RAG_POLICY_VERSION: Literal["formula-draft-policy.rag.v1"] = "formula-draft-policy.rag.v1"
+FORMULA_POLICY_VERSION_T = Literal["formula-draft-policy.no-rag.v1", "formula-draft-policy.rag.v1"]
 FORMULA_READY_STAGE: Literal["READY_FOR_FORMULA"] = "READY_FOR_FORMULA"
 FORMULA_NO_RAG_CONFIDENCE_MAX: float = 0.65
+# RAG 模式置信度上限：有检索证据时允许的最高自评置信度。
+FORMULA_RAG_CONFIDENCE_MAX: float = 0.9
+# RAG 模式但检索结果为空（降级）时的置信度上限——缺证提示下不允许过度自信。
+FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX: float = 0.5
 
 
 class FormulaDraftDecision(StrEnum):
@@ -99,10 +107,11 @@ class FormulaModification(BaseModel):
 
 
 class FormulaClaimEvidenceLink(BaseModel):
-    """Reserved evidence-link shape.
+    """Evidence-link shape.
 
-    L4-2 is no-RAG, so the FormulaVerifier requires this collection to be
-    empty.  The type exists only to keep the contract explicit.
+    no-RAG 契约要求集合为空；RAG 契约（formula-draft-policy.rag.v1）允许
+    非空，且每条 ``evidence_id`` 必须命中本次检索证据集合（verifier 校验，
+    防幻觉引用）。
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -127,7 +136,7 @@ class FormulaDraft(BaseModel):
     candidate_formula: FormulaComposition | None = None
     rationale: str | None = Field(default=None, min_length=1, max_length=1000)
     confidence: float = Field(ge=0, le=1)
-    evidence_mode: Literal["model_knowledge_only"] = FORMULA_EVIDENCE_MODE
+    evidence_mode: FORMULA_EVIDENCE_MODE_T = FORMULA_EVIDENCE_MODE
     claim_evidence_links: tuple[FormulaClaimEvidenceLink, ...] = Field(default=(), max_length=16)
     missing_inputs: tuple[str, ...] = Field(default=(), max_length=16)
     review_required: bool = True
@@ -157,7 +166,7 @@ class FormulaDraftInput(BaseModel):
     session_id: UUID
     state_version: int = Field(ge=1)
     current_stage: Literal["READY_FOR_FORMULA"] = FORMULA_READY_STAGE
-    policy_version: Literal["formula-draft-policy.no-rag.v1"] = FORMULA_POLICY_VERSION
+    policy_version: FORMULA_POLICY_VERSION_T = FORMULA_POLICY_VERSION
     domain_state: DomainState
     triage_gate: GateResultSchema
     completeness_gate: GateResultSchema

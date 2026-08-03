@@ -22,6 +22,10 @@ from app.schemas.syndrome import (
     SYNDROME_INPUT_SCHEMA_VERSION,
     SYNDROME_NO_RAG_CONFIDENCE_MAX,
     SYNDROME_POLICY_VERSION,
+    SYNDROME_RAG_CONFIDENCE_MAX,
+    SYNDROME_RAG_EVIDENCE_MODE,
+    SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
+    SYNDROME_RAG_POLICY_VERSION,
     SYNDROME_READY_STAGE,
     SyndromeDraft,
     SyndromeDraftDecision,
@@ -33,6 +37,17 @@ from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 SYNDROME_AGENT_NAME = "syndrome_draft"
 SYNDROME_AGENT_VERSION = "syndrome-draft-agent.v1"
 SYNDROME_PROMPT_VERSION = "syndrome_draft_v1.jinja2"
+# RAG 模式的 manifest agent key。spec.name/version 保持 SYNDROME_AGENT_NAME/
+# _VERSION 不变（_valid_agent_spec 只认固定 name/version），RAG 仅切换 prompt。
+SYNDROME_RAG_AGENT_NAME = "syndrome_draft_rag"
+SYNDROME_RAG_PROMPT_VERSION = "syndrome_draft_rag_v1.jinja2"
+# 合法 policy_version / prompt_version 配对集合（D1：策略级决策，verifier 只认配对）。
+SYNDROME_POLICY_PROMPT_PAIRS = frozenset(
+    {
+        (SYNDROME_POLICY_VERSION, SYNDROME_PROMPT_VERSION),
+        (SYNDROME_RAG_POLICY_VERSION, SYNDROME_RAG_PROMPT_VERSION),
+    }
+)
 # Syndrome 综合 AgentSpec 单次模型调用超时上限（s）。必须 > MODEL_GATEWAY_TIMEOUT_SECONDS
 # （runtime 前置守卫强制），统一按网关超时 + 余量推导。
 SYNDROME_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()
@@ -62,6 +77,9 @@ class SyndromeVerificationFailureCode(StrEnum):
     DECISION_CONTENT_INVALID = "SYNDROME_DECISION_CONTENT_INVALID"
     CONFIDENCE_EXCEEDS_NO_RAG_LIMIT = "SYNDROME_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT"
     NO_RAG_CONTRACT_VIOLATED = "SYNDROME_NO_RAG_CONTRACT_VIOLATED"
+    CONFIDENCE_EXCEEDS_RAG_LIMIT = "SYNDROME_CONFIDENCE_EXCEEDS_RAG_LIMIT"
+    EVIDENCE_LINK_FABRICATED = "SYNDROME_EVIDENCE_LINK_FABRICATED"
+    EVIDENCE_MODE_POLICY_MISMATCH = "SYNDROME_EVIDENCE_MODE_POLICY_MISMATCH"
     AUTHORITY_FIELD_FORBIDDEN = "SYNDROME_AUTHORITY_FIELD_FORBIDDEN"
 
 
@@ -144,12 +162,11 @@ def validate_syndrome_preflight(
         return SyndromeVerificationFailureCode.AGENT_SPEC_INVALID
     if (
         run_spec.agent_spec_version != agent_spec.version
-        or run_spec.prompt_version != SYNDROME_PROMPT_VERSION
-        or run_spec.policy_version != SYNDROME_POLICY_VERSION
+        or (run_spec.policy_version, run_spec.prompt_version) not in SYNDROME_POLICY_PROMPT_PAIRS
         or run_spec.total_attempt_budget != 1
         or run_spec.session_id != input_payload.session_id
         or run_spec.state_version != input_payload.state_version
-        or input_payload.policy_version != SYNDROME_POLICY_VERSION
+        or input_payload.policy_version != run_spec.policy_version
     ):
         return SyndromeVerificationFailureCode.RUN_PROVENANCE_MISMATCH
     stage_failure = _verify_stage_and_gates(run_spec, input_payload, gate_authority)
@@ -183,7 +200,7 @@ def verify_syndrome_artifact(
     checks.append(_check("preconditions", validate_syndrome_preflight(agent_spec, run_spec, input_payload, gate_authority)))
     checks.append(_check("fact_links", _verify_fact_links(output, input_payload)))
     checks.append(_check("decision_consistency", _verify_decision(output, input_payload)))
-    checks.append(_check("no_rag_contract", _verify_no_rag(output)))
+    checks.append(_check("no_rag_contract", _verify_evidence_contract(output, artifact.evidence_ids, run_spec.policy_version)))
     checks.append(_check("authority_boundary", _verify_authority(output)))
     return _report(checks, artifact)
 
@@ -433,7 +450,47 @@ def _verify_decision(output: SyndromeDraft, input_payload: SyndromeDraftInput) -
     return None
 
 
-def _verify_no_rag(output: SyndromeDraft) -> SyndromeVerificationFailureCode | None:
+def _verify_evidence_contract(
+    output: SyndromeDraft,
+    evidence_ids: tuple[str, ...],
+    policy_version: str,
+) -> SyndromeVerificationFailureCode | None:
+    """按 policy_version 分派的证据契约校验（D1/D2）。
+
+    - no-rag 契约：evidence_ids 必须为空、evidence_mode=model_knowledge_only、
+      links 空、confidence ≤ SYNDROME_NO_RAG_CONFIDENCE_MAX。
+    - rag 契约：evidence_mode=rag_retrieved、每条 link 的 evidence_id 必须命中
+      本次检索证据集合（防幻觉引用）、confidence 按证据空否分别封顶。
+    """
+    if policy_version == SYNDROME_RAG_POLICY_VERSION:
+        if output.evidence_mode != SYNDROME_RAG_EVIDENCE_MODE:
+            return SyndromeVerificationFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+        return _verify_rag_contract(output, evidence_ids)
+    if output.evidence_mode != SYNDROME_EVIDENCE_MODE:
+        return SyndromeVerificationFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+    return _verify_no_rag(output, evidence_ids)
+
+
+def _verify_rag_contract(output: SyndromeDraft, evidence_ids: tuple[str, ...]) -> SyndromeVerificationFailureCode | None:
+    allowed = frozenset(evidence_ids)
+    if any(link.evidence_id not in allowed for link in output.claim_evidence_links):
+        # 引用不存在的证据 ID = 模型编造引用，整份输出拒绝。
+        return SyndromeVerificationFailureCode.EVIDENCE_LINK_FABRICATED
+    if not allowed:
+        # 空证据降级模式：不允许过度自信（RAG 无证据时模型只基于内知识）。
+        if output.confidence > SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX:
+            return SyndromeVerificationFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    elif output.confidence > SYNDROME_RAG_CONFIDENCE_MAX:
+        return SyndromeVerificationFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    if output.review_required is not True:
+        return SyndromeVerificationFailureCode.NO_RAG_CONTRACT_VIOLATED
+    return None
+
+
+def _verify_no_rag(output: SyndromeDraft, evidence_ids: tuple[str, ...]) -> SyndromeVerificationFailureCode | None:
+    if evidence_ids:
+        # no-rag 模式下 artifact 不得携带任何检索证据 ID（防证据泄漏冒充）。
+        return SyndromeVerificationFailureCode.NO_RAG_CONTRACT_VIOLATED
     if output.confidence > SYNDROME_NO_RAG_CONFIDENCE_MAX:
         return SyndromeVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
     if (

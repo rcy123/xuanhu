@@ -3,6 +3,8 @@ intake_extraction: intake_extraction_v2.jinja2
 question_composer: question_composer_v2.jinja2
 syndrome_draft: syndrome_draft_v1.jinja2
 formula_draft: formula_draft_v1.jinja2
+syndrome_draft_rag: syndrome_draft_rag_v1.jinja2
+formula_draft_rag: formula_draft_rag_v1.jinja2
 inquiry: inquiry_v1.jinja2
 sufficiency: sufficiency_v1.jinja2
 syndrome: syndrome_v1.jinja2

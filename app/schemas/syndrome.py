@@ -20,9 +20,17 @@ from app.schemas.domain import GateResultSchema, ObservationStatus
 SYNDROME_DRAFT_SCHEMA_VERSION: Literal["syndrome-draft.v1"] = "syndrome-draft.v1"
 SYNDROME_INPUT_SCHEMA_VERSION: Literal["syndrome-draft-input.v1"] = "syndrome-draft-input.v1"
 SYNDROME_EVIDENCE_MODE: Literal["model_knowledge_only"] = "model_knowledge_only"
+SYNDROME_RAG_EVIDENCE_MODE: Literal["rag_retrieved"] = "rag_retrieved"
+SYNDROME_EVIDENCE_MODE_T = Literal["model_knowledge_only", "rag_retrieved"]
 SYNDROME_POLICY_VERSION: Literal["syndrome-draft-policy.no-rag.v1"] = "syndrome-draft-policy.no-rag.v1"
+SYNDROME_RAG_POLICY_VERSION: Literal["syndrome-draft-policy.rag.v1"] = "syndrome-draft-policy.rag.v1"
+SYNDROME_POLICY_VERSION_T = Literal["syndrome-draft-policy.no-rag.v1", "syndrome-draft-policy.rag.v1"]
 SYNDROME_READY_STAGE: Literal["READY_FOR_REASONING"] = "READY_FOR_REASONING"
 SYNDROME_NO_RAG_CONFIDENCE_MAX: float = 0.65
+# RAG 模式置信度上限：有检索证据时允许的最高自评置信度。
+SYNDROME_RAG_CONFIDENCE_MAX: float = 0.9
+# RAG 模式但检索结果为空（降级）时的置信度上限——缺证提示下不允许过度自信。
+SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX: float = 0.5
 
 
 class SyndromeDraftDecision(StrEnum):
@@ -45,10 +53,11 @@ class SyndromeFactClaim(BaseModel):
 
 
 class SyndromeClaimEvidenceLink(BaseModel):
-    """Reserved evidence-link shape.
+    """Evidence-link shape.
 
-    L4-1 is no-RAG, so ``SyndromeVerifier`` requires the containing collection
-    to be empty.  The type exists only to keep the contract explicit.
+    no-RAG 契约要求集合为空；RAG 契约（syndrome-draft-policy.rag.v1）允许
+    非空，且每条 ``evidence_id`` 必须命中本次检索证据集合（verifier 校验，
+    防幻觉引用）。
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -71,7 +80,7 @@ class SyndromeDraft(BaseModel):
     differential: tuple[SyndromeFactClaim, ...] = Field(default=(), max_length=16)
     treatment_principle: str | None = Field(default=None, min_length=1, max_length=300)
     confidence: float = Field(ge=0, le=1)
-    evidence_mode: Literal["model_knowledge_only"] = SYNDROME_EVIDENCE_MODE
+    evidence_mode: SYNDROME_EVIDENCE_MODE_T = SYNDROME_EVIDENCE_MODE
     claim_evidence_links: tuple[SyndromeClaimEvidenceLink, ...] = Field(default=(), max_length=16)
     missing_inputs: tuple[InquiryDimension, ...] = Field(default=(), max_length=16)
     review_required: bool = True
@@ -108,7 +117,7 @@ class SyndromeDraftInput(BaseModel):
     session_id: UUID
     state_version: int = Field(ge=1)
     current_stage: Literal["READY_FOR_REASONING"] = SYNDROME_READY_STAGE
-    policy_version: Literal["syndrome-draft-policy.no-rag.v1"] = SYNDROME_POLICY_VERSION
+    policy_version: SYNDROME_POLICY_VERSION_T = SYNDROME_POLICY_VERSION
     domain_state: DomainState
     triage_gate: GateResultSchema
     completeness_gate: GateResultSchema

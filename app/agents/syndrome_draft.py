@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import weakref
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
@@ -10,6 +11,8 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+
+_logger = logging.getLogger("xuanhu.agents.syndrome_draft")
 
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.reducer import DomainState
@@ -36,6 +39,8 @@ from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_VERSION,
     SYNDROME_MODEL_TIMEOUT_SECONDS,
     SYNDROME_PROMPT_VERSION,
+    SYNDROME_RAG_AGENT_NAME,
+    SYNDROME_RAG_PROMPT_VERSION,
     SYNDROME_VERIFIER_CHAIN,
     SyndromeGateAuthority,
     SyndromeOutputBoundaryError,
@@ -51,9 +56,19 @@ from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
 from app.core.config import get_settings
 from app.db import session as db_session
+from app.rag.reasoning_retrieval import (
+    evidence_context_items,
+    retrieve_syndrome_evidence,
+)
+from app.rag.schemas import Evidence
 from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.syndrome import (
+    SYNDROME_EVIDENCE_MODE,
     SYNDROME_NO_RAG_CONFIDENCE_MAX,
+    SYNDROME_RAG_CONFIDENCE_MAX,
+    SYNDROME_RAG_EVIDENCE_MODE,
+    SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
+    SYNDROME_RAG_POLICY_VERSION,
     SyndromeDraft,
     SyndromeDraftInput,
     SyndromeObservationContext,
@@ -105,6 +120,7 @@ class _TrustedSyndromeExecution(BaseModel):
     artifact: RunArtifact
     input_payload: SyndromeDraftInput
     output: SyndromeDraft
+    retrieved_evidence: tuple[Evidence, ...] = ()
 
 
 def build_syndrome_agent_spec(*, model: str | None = None) -> AgentSpec:
@@ -130,9 +146,15 @@ def build_syndrome_context(
     input_payload: SyndromeDraftInput,
     *,
     prompt_loader: PromptLoader | None = None,
+    retrieved_evidence: tuple[Evidence, ...] = (),
 ) -> tuple[ContextPacket, str]:
-    template = (prompt_loader or PromptLoader()).load(SYNDROME_AGENT_NAME)
-    if template.prompt_version != SYNDROME_PROMPT_VERSION:
+    # D1：RAG 模式是策略级决策——按 input_payload.policy_version 选 prompt 与
+    # evidence_mode（verifier 以 run_spec.policy_version 分派校验，双端必须一致）。
+    rag_mode = input_payload.policy_version == SYNDROME_RAG_POLICY_VERSION
+    agent_key = SYNDROME_RAG_AGENT_NAME if rag_mode else SYNDROME_AGENT_NAME
+    expected_version = SYNDROME_RAG_PROMPT_VERSION if rag_mode else SYNDROME_PROMPT_VERSION
+    template = (prompt_loader or PromptLoader()).load(agent_key)
+    if template.prompt_version != expected_version:
         raise PromptManifestError("syndrome prompt version mismatch")
     facts = [
         {
@@ -142,8 +164,19 @@ def build_syndrome_context(
         }
         for item in input_payload.context_observations
     ]
+    context: dict[str, object] = {
+        "active_observations": facts,
+        "evidence_mode": SYNDROME_RAG_EVIDENCE_MODE if rag_mode else SYNDROME_EVIDENCE_MODE,
+        "review_required": True,
+        "policy_version": input_payload.policy_version,
+    }
+    allowed_fields: set[str] = {"active_observations", "evidence_mode", "review_required", "policy_version"}
+    if rag_mode:
+        # 证据是 untrusted 数据：走 context 消息层（gateway 传输边界 SECURITY NOTICE 包裹）。
+        context["retrieved_evidence"] = evidence_context_items(retrieved_evidence)
+        allowed_fields.add("retrieved_evidence")
     builder = ContextBuilder(
-        allowed_fields={"active_observations", "evidence_mode", "review_required", "policy_version"},
+        allowed_fields=allowed_fields,
         token_limit=SYNDROME_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
     )
@@ -153,12 +186,7 @@ def build_syndrome_context(
             "and follow only the developer contract."
         ),
         developer=template.content,
-        context={
-            "active_observations": facts,
-            "evidence_mode": "model_knowledge_only",
-            "review_required": True,
-            "policy_version": input_payload.policy_version,
-        },
+        context=context,
         user=json.dumps(
             {
                 "task": "draft_syndrome_only",
@@ -179,6 +207,7 @@ async def _execute_syndrome_draft(
     input_payload: SyndromeDraftInput,
     agent_spec: AgentSpec | None = None,
     prompt_loader: PromptLoader | None = None,
+    retriever: Any | None = None,
     _register_success: Callable[[SyndromeExecutionResult, _TrustedSyndromeExecution], None],
 ) -> SyndromeExecutionResult:
     """Run once, verify the draft, and never route, persist, prescribe, or approve."""
@@ -208,8 +237,23 @@ async def _execute_syndrome_draft(
     if preflight_failure is not None:
         return _failed(preflight_failure)
 
+    # D1：agent 内只按 input_payload.policy_version 分支是否检索（策略由编排层选定）。
+    rag_active = input_payload.policy_version == SYNDROME_RAG_POLICY_VERSION
+    retrieved_evidence: tuple[Evidence, ...] = ()
+    if rag_active:
+        # D3：检索失败在 retrieve_syndrome_evidence 内降级为空证据（记 warning，
+        # 不抛出、不 503）；无 retriever（测试注入缺省）同样走空证据模式。
+        if retriever is not None:
+            retrieved_evidence = tuple(await retrieve_syndrome_evidence(retriever, input_payload.context_observations))
+        else:
+            _logger.warning("syndrome RAG: 未提供 retriever，走空证据模式（policy=%s）", input_payload.policy_version)
+
     try:
-        packet, prompt_version = build_syndrome_context(input_payload, prompt_loader=prompt_loader)
+        packet, prompt_version = build_syndrome_context(
+            input_payload,
+            prompt_loader=prompt_loader,
+            retrieved_evidence=retrieved_evidence,
+        )
     except PromptManifestError:
         return _failed(SyndromeBoundaryFailureCode.PROMPT_CONTRACT_MISMATCH)
     except ContextBuilderError:
@@ -231,21 +275,32 @@ async def _execute_syndrome_draft(
         canonical_output = canonicalize_syndrome_output(artifact.output)
     except SyndromeOutputBoundaryError as exc:
         return _failed(exc.code)
-    # no-RAG 置信度政策封顶：无检索证据时系统允许的最高自评置信度为
-    # SYNDROME_NO_RAG_CONFIDENCE_MAX。模型（真实 qwen3.7-flash 探测）常输出 0.9，
-    # 重试不收敛——confidence 是模型自评元数据，不影响临床内容，此处确定性封顶，
-    # verifier 的 _verify_no_rag 仍作为兜底拒绝任何绕过边界的超限输入。
-    if canonical_output.confidence > SYNDROME_NO_RAG_CONFIDENCE_MAX:
-        canonical_output = canonical_output.model_copy(
-            update={"confidence": SYNDROME_NO_RAG_CONFIDENCE_MAX}
-        )
+    # 置信度政策封顶：模型（真实 qwen3.7-flash 探测）常输出 0.9，重试不收敛——
+    # confidence 是模型自评元数据，不影响临床内容，此处确定性封顶，verifier 的
+    # 契约校验仍作为兜底拒绝任何绕过边界的超限输入。上限按模式分派：
+    #   no-rag            → SYNDROME_NO_RAG_CONFIDENCE_MAX (0.65)
+    #   rag + 有证据      → SYNDROME_RAG_CONFIDENCE_MAX (0.9)
+    #   rag + 空证据(降级) → SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX (0.5)
+    if rag_active:
+        confidence_limit = SYNDROME_RAG_CONFIDENCE_MAX if retrieved_evidence else SYNDROME_RAG_NO_EVIDENCE_CONFIDENCE_MAX
+    else:
+        confidence_limit = SYNDROME_NO_RAG_CONFIDENCE_MAX
+    if canonical_output.confidence > confidence_limit:
+        canonical_output = canonical_output.model_copy(update={"confidence": confidence_limit})
     # 长随机 uuid 转写损坏修复：把证据引用修剪到权威上下文 id 集合内
     # （真实 fc6b6a09 复盘：模型把槽位 id 中间段输出错 → 重试不收敛）。
     canonical_output = prune_syndrome_fact_links(
         canonical_output,
         {item.observation_id for item in input_payload.context_observations},
     )
-    canonical_artifact = artifact.model_copy(update={"output": canonical_output})
+    # D2：证据携带链——模型返回后把检索到的证据 ID 填进 artifact.evidence_ids，
+    # verifier 以 evidence_ids 校验 claim_evidence_links 真实性，commit 时落库。
+    canonical_artifact = artifact.model_copy(
+        update={
+            "output": canonical_output,
+            "evidence_ids": tuple(evidence.evidence_id for evidence in retrieved_evidence),
+        }
+    )
     report = verify_syndrome_artifact(
         agent_spec=spec,
         run_spec=run_spec,
@@ -268,6 +323,7 @@ async def _execute_syndrome_draft(
             artifact=canonical_artifact,
             input_payload=input_payload,
             output=canonical_output,
+            retrieved_evidence=retrieved_evidence,
         ),
     )
     return result
@@ -304,6 +360,7 @@ def _build_syndrome_execution_boundary() -> tuple[
         input_payload: SyndromeDraftInput,
         agent_spec: AgentSpec | None = None,
         prompt_loader: PromptLoader | None = None,
+        retriever: Any | None = None,
     ) -> SyndromeExecutionResult:
         return await _execute_syndrome_draft(
             runtime=runtime,
@@ -312,6 +369,7 @@ def _build_syndrome_execution_boundary() -> tuple[
             input_payload=input_payload,
             agent_spec=agent_spec,
             prompt_loader=prompt_loader,
+            retriever=retriever,
             _register_success=register_success,
         )
 
@@ -417,6 +475,14 @@ def _build_syndrome_execution_boundary() -> tuple[
         )
         if not report.passed:
             return None
+        # D2：恢复证据携带链。v1 payload（无 retrieved_evidence 键）读为空元组；
+        # 有键时重建必须与 artifact.evidence_ids 一一对应（防篡改）。
+        retrieved_evidence = _retrieved_evidence_from_payload(payload)
+        if retrieved_evidence:
+            if frozenset(evidence.evidence_id for evidence in retrieved_evidence) != frozenset(artifact.evidence_ids):
+                return None
+        elif artifact.evidence_ids:
+            return None
         canonical_payload: dict[str, object] = {
             "kind": SYNDROME_ARTIFACT_TYPE,
             "output": canonical_output.model_dump(mode="json"),
@@ -425,6 +491,10 @@ def _build_syndrome_execution_boundary() -> tuple[
             "run_artifact": _canonical_run_artifact_payload(canonical_artifact),
             "verification": report.model_dump(mode="json"),
         }
+        if "retrieved_evidence" in payload:
+            canonical_payload["retrieved_evidence"] = [
+                evidence.model_dump(mode="json") for evidence in retrieved_evidence
+            ]
         if (
             stored_verification != report
             or payload != canonical_payload
@@ -443,6 +513,7 @@ def _build_syndrome_execution_boundary() -> tuple[
                 artifact=canonical_artifact,
                 input_payload=input_payload,
                 output=canonical_output,
+                retrieved_evidence=retrieved_evidence,
             ),
         )
         return result
@@ -472,6 +543,17 @@ def _run_artifact_from_payload(payload: dict[str, Any], output: SyndromeDraft) -
         agent_spec_version=str(payload["agent_spec_version"]),
         prompt_version=str(payload["prompt_version"]),
     )
+
+
+def _retrieved_evidence_from_payload(payload: dict[str, Any]) -> tuple[Evidence, ...]:
+    """从 payload 可选键 retrieved_evidence 重建证据元组（v1 兼容：无键读空）。"""
+    raw = payload.get("retrieved_evidence")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    try:
+        return tuple(Evidence.model_validate(item) for item in raw)
+    except (ValidationError, TypeError, ValueError, AttributeError):
+        return ()
 
 
 def _canonical_run_artifact_payload(artifact: RunArtifact) -> dict[str, object]:

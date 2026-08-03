@@ -158,6 +158,27 @@ class Settings(BaseSettings):
     rag_top_k_fulltext: int = Field(default=12, ge=1, description="全文检索 top-k")
     rag_top_n_final: int = Field(default=8, ge=1, description="合并去重后最终返回条数")
 
+    # ---- RAG 推理链路接入开关 ----
+    # 正式接入 RAG：编排层按 policy_version 选 *.rag.v1（见 reasoning_retrieval.stage_rag_enabled）。
+    # rag_enabled 为总开关；关闭时辨证/开方维持 no-rag 契约（evidence_mode=model_knowledge_only、
+    # confidence 封顶 0.65），与既有行为完全一致。
+    rag_enabled: bool = Field(
+        default=True,
+        validation_alias="XUANHU_RAG_ENABLED",
+        description="推理链路 RAG 总开关；关闭时走 no-rag 契约",
+    )
+    rag_syndrome_enabled: bool = Field(
+        default=True,
+        description="辨证阶段 RAG 开关（需 rag_enabled=true 才生效）",
+    )
+    rag_formula_enabled: bool = Field(
+        default=True,
+        description="开方阶段 RAG 开关（需 rag_enabled=true 才生效）",
+    )
+    rag_syndrome_top_k: int = Field(default=8, ge=1, le=20, description="辨证检索最终返回条数")
+    rag_formula_top_k: int = Field(default=8, ge=1, le=20, description="开方检索最终返回条数")
+    rag_query_max_chars: int = Field(default=600, ge=50, description="推理检索 query 最大长度")
+
     # ---- Agent ----
     agent_runtime_version: Literal["legacy", "langgraph"] = Field(
         default="legacy",

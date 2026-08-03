@@ -24,6 +24,7 @@ from app.agent_runtime.reducer import (
     reduce_domain_state,
 )
 from app.agent_runtime.verifiers import VerificationContext
+from app.models.agent import AgentEvidence, AgentRun
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
@@ -454,6 +455,52 @@ class AuditEventSpec(BaseModel):
     trace_id: str | None = Field(default=None, max_length=64)
 
 
+class AgentRunSpec(BaseModel):
+    """Atomic compatibility projection for one agent run row.
+
+    ``run_id`` 即 AgentRun.id（与 RunSpec.run_id 一致）——天然幂等：
+    同一 run 重放时按 id 命中已存在行，值一致即静默通过。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: UUID
+    session_id: UUID
+    agent_name: str = Field(min_length=1, max_length=32)
+    stage: str = Field(min_length=1, max_length=32)
+    input_snapshot: dict[str, object] | None = None
+    output_snapshot: dict[str, object] | None = None
+    prompt_version: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=128)
+    retry_count: int = Field(default=0, ge=0)
+    status: str = Field(pattern=r"^(success|failed|blocked)$")
+    error_code: str | None = Field(default=None, max_length=64)
+    latency_ms: int | None = Field(default=None, ge=0)
+    trace_id: str | None = Field(default=None, max_length=64)
+
+
+class AgentEvidenceSpec(BaseModel):
+    """Atomic compatibility projection for one agent_evidences row.
+
+    ``evidence_row_id`` 为确定性行 ID（uuid5(run_id, evidence_id)），
+    保证幂等重放不产生重复行。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_row_id: UUID
+    agent_run_id: UUID
+    session_id: UUID
+    evidence_id: str = Field(min_length=1, max_length=128)
+    source_type: str = Field(pattern=r"^(formula|herb|acupoint|theory|case)$")
+    source_id: UUID
+    chunk_id: UUID | None = None
+    title: str | None = Field(default=None, max_length=255)
+    content_snippet: str | None = None
+    score: float | None = Field(default=None, ge=0, le=1)
+    rank: int | None = Field(default=None, ge=1)
+
+
 class OutboxMessage(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -518,6 +565,8 @@ class DomainRepository(Protocol):
         safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
         doctor_reviews: Sequence[DoctorReviewSpec] = (),
         medical_records: Sequence[MedicalRecordSpec] = (),
+        agent_runs: Sequence[AgentRunSpec] = (),
+        agent_evidences: Sequence[AgentEvidenceSpec] = (),
         audit_events: Sequence[AuditEventSpec] = (),
         session_updates: dict[str, object] | None = None,
         outbox_event_type: str = DOMAIN_STATE_COMMITTED,
@@ -721,6 +770,8 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         safety_rule_runs: Sequence[SafetyRuleRunSpec] = (),
         doctor_reviews: Sequence[DoctorReviewSpec] = (),
         medical_records: Sequence[MedicalRecordSpec] = (),
+        agent_runs: Sequence[AgentRunSpec] = (),
+        agent_evidences: Sequence[AgentEvidenceSpec] = (),
         audit_events: Sequence[AuditEventSpec] = (),
         session_updates: dict[str, object] | None = None,
         outbox_event_type: str = DOMAIN_STATE_COMMITTED,
@@ -787,6 +838,8 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                     safety_rule_runs=safety_rule_runs,
                     doctor_reviews=doctor_reviews,
                     medical_records=medical_records,
+                    agent_runs=agent_runs,
+                    agent_evidences=agent_evidences,
                     audit_events=audit_events,
                 )
                 locked.state_version = next_state.state_version
@@ -1455,6 +1508,8 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         safety_rule_runs: Sequence[SafetyRuleRunSpec],
         doctor_reviews: Sequence[DoctorReviewSpec],
         medical_records: Sequence[MedicalRecordSpec],
+        agent_runs: Sequence[AgentRunSpec],
+        agent_evidences: Sequence[AgentEvidenceSpec],
         audit_events: Sequence[AuditEventSpec],
     ) -> None:
         """Persist compatibility projections inside the Domain transaction."""
@@ -1579,6 +1634,68 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             if any(
                 getattr(existing_record, name) != value
                 for name, value in record_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        run_ids = {item.run_id for item in agent_runs}
+        if len(run_ids) != len(agent_runs):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        if any(run_item.session_id != delta.session_id for run_item in agent_runs):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+        for run_item in agent_runs:
+            existing_run = await session.get(AgentRun, run_item.run_id)
+            run_values: dict[str, object] = {
+                "session_id": run_item.session_id,
+                "agent_name": run_item.agent_name,
+                "stage": run_item.stage,
+                "input_snapshot": run_item.input_snapshot,
+                "output_snapshot": run_item.output_snapshot,
+                "prompt_version": run_item.prompt_version,
+                "model": run_item.model,
+                "retry_count": run_item.retry_count,
+                "status": run_item.status,
+                "error_code": run_item.error_code,
+                "latency_ms": run_item.latency_ms,
+                "trace_id": run_item.trace_id,
+            }
+            if existing_run is None:
+                session.add(AgentRun(id=run_item.run_id, **run_values))
+                continue
+            if any(
+                getattr(existing_run, name) != value
+                for name, value in run_values.items()
+            ):
+                raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+
+        evidence_row_ids = {item.evidence_row_id for item in agent_evidences}
+        if len(evidence_row_ids) != len(agent_evidences):
+            raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        if any(
+            evidence_item.session_id != delta.session_id
+            or evidence_item.agent_run_id not in run_ids
+            for evidence_item in agent_evidences
+        ):
+            raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+        for evidence_item in agent_evidences:
+            existing_evidence = await session.get(AgentEvidence, evidence_item.evidence_row_id)
+            evidence_values: dict[str, object] = {
+                "agent_run_id": evidence_item.agent_run_id,
+                "session_id": evidence_item.session_id,
+                "evidence_id": evidence_item.evidence_id,
+                "source_type": evidence_item.source_type,
+                "source_id": evidence_item.source_id,
+                "chunk_id": evidence_item.chunk_id,
+                "title": evidence_item.title,
+                "content_snippet": evidence_item.content_snippet,
+                "score": evidence_item.score,
+                "rank": evidence_item.rank,
+            }
+            if existing_evidence is None:
+                session.add(AgentEvidence(id=evidence_item.evidence_row_id, **evidence_values))
+                continue
+            if any(
+                getattr(existing_evidence, name) != value
+                for name, value in evidence_values.items()
             ):
                 raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
 

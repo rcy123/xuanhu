@@ -26,6 +26,10 @@ from app.schemas.formula import (
     FORMULA_DRAFT_SCHEMA_VERSION,
     FORMULA_EVIDENCE_MODE,
     FORMULA_NO_RAG_CONFIDENCE_MAX,
+    FORMULA_RAG_CONFIDENCE_MAX,
+    FORMULA_RAG_EVIDENCE_MODE,
+    FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
+    FORMULA_RAG_POLICY_VERSION,
     FormulaComposition,
     FormulaDraft,
     FormulaDraftDecision,
@@ -109,6 +113,9 @@ class FormulaConsistencyFailureCode(StrEnum):
     SCHEMA_INVALID = "FORMULA_CONSISTENCY_SCHEMA_INVALID"
     SOURCE_NOT_TRUSTED = "FORMULA_CONSISTENCY_SOURCE_NOT_TRUSTED"
     NO_RAG_CONTRACT_VIOLATED = "FORMULA_CONSISTENCY_NO_RAG_CONTRACT_VIOLATED"
+    CONFIDENCE_EXCEEDS_RAG_LIMIT = "FORMULA_CONSISTENCY_CONFIDENCE_EXCEEDS_RAG_LIMIT"
+    EVIDENCE_LINK_FABRICATED = "FORMULA_CONSISTENCY_EVIDENCE_LINK_FABRICATED"
+    EVIDENCE_MODE_POLICY_MISMATCH = "FORMULA_CONSISTENCY_EVIDENCE_MODE_POLICY_MISMATCH"
     HERB_NAME_INVALID = "FORMULA_CONSISTENCY_HERB_NAME_INVALID"
     DUPLICATE_HERB = "FORMULA_CONSISTENCY_DUPLICATE_HERB"
     DOSE_MISSING = "FORMULA_CONSISTENCY_DOSE_MISSING"
@@ -254,6 +261,8 @@ def verify_trusted_formula_execution(result: FormulaExecutionResult) -> FormulaC
         trusted_syndrome_fact_ids=syndrome,
         trusted_source=True,
         require_trusted_source=True,
+        policy_version=trusted.run_spec.policy_version,
+        evidence_ids=frozenset(evidence.evidence_id for evidence in trusted.retrieved_evidence),
     )
 
 
@@ -285,6 +294,8 @@ def _verify(
     trusted_syndrome_fact_ids: frozenset[UUID],
     trusted_source: bool,
     require_trusted_source: bool,
+    policy_version: str | None = None,
+    evidence_ids: frozenset[str] = frozenset(),
 ) -> FormulaConsistencyReport:
     checks: list[FormulaConsistencyCheck] = []
     canonical_base: CanonicalFormula | None = None
@@ -304,7 +315,11 @@ def _verify(
         )
     )
 
-    no_rag_code = _verify_no_rag(output) if output is not None else FormulaConsistencyFailureCode.SCHEMA_INVALID
+    no_rag_code = (
+        _verify_evidence_contract(output, policy_version=policy_version, evidence_ids=evidence_ids)
+        if output is not None
+        else FormulaConsistencyFailureCode.SCHEMA_INVALID
+    )
     checks.append(_check("no_rag_contract", no_rag_code))
 
     normalization_code: FormulaConsistencyFailureCode | None = None
@@ -521,8 +536,47 @@ def _decimal_text(value: Decimal) -> str:
     return "0" if text in {"-0", ""} else text
 
 
-def _verify_no_rag(output: FormulaDraft | None) -> FormulaConsistencyFailureCode | None:
-    if output is None:
+def _verify_evidence_contract(
+    output: FormulaDraft | None,
+    *,
+    policy_version: str | None,
+    evidence_ids: frozenset[str],
+) -> FormulaConsistencyFailureCode | None:
+    """按 policy_version 分派的证据契约校验（与 L4-2 verifier 同口径）。
+
+    policy_version 为 None（未声明来源的 draft 审计）时按 no-rag 契约兜底。
+    """
+    if policy_version == FORMULA_RAG_POLICY_VERSION:
+        if output.evidence_mode != FORMULA_RAG_EVIDENCE_MODE:
+            return FormulaConsistencyFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+        return _verify_rag_contract(output, evidence_ids)
+    if output.evidence_mode != FORMULA_EVIDENCE_MODE:
+        return FormulaConsistencyFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
+    return _verify_no_rag(output, evidence_ids)
+
+
+def _verify_rag_contract(
+    output: FormulaDraft,
+    evidence_ids: frozenset[str],
+) -> FormulaConsistencyFailureCode | None:
+    if any(link.evidence_id not in evidence_ids for link in output.claim_evidence_links):
+        return FormulaConsistencyFailureCode.EVIDENCE_LINK_FABRICATED
+    if not evidence_ids:
+        if output.confidence > FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX:
+            return FormulaConsistencyFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    elif output.confidence > FORMULA_RAG_CONFIDENCE_MAX:
+        return FormulaConsistencyFailureCode.CONFIDENCE_EXCEEDS_RAG_LIMIT
+    if output.review_required is not True:
+        return FormulaConsistencyFailureCode.NO_RAG_CONTRACT_VIOLATED
+    return None
+
+
+def _verify_no_rag(
+    output: FormulaDraft,
+    evidence_ids: frozenset[str],
+) -> FormulaConsistencyFailureCode | None:
+    if evidence_ids:
+        # no-rag 模式下不得携带任何检索证据 ID（防证据泄漏冒充）。
         return FormulaConsistencyFailureCode.NO_RAG_CONTRACT_VIOLATED
     if (
         output.evidence_mode != FORMULA_EVIDENCE_MODE
