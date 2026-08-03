@@ -44,7 +44,7 @@ from app.agent_runtime.reasoning_subgraph import (
     ROUTE_SYNDROME_COMPLETED,
 )
 from app.agent_runtime.reducer import DomainDelta, DomainState
-from app.core.config import agent_model_timeout_seconds
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.agent_runtime.repository import (
     AgentEvidenceSpec,
     AgentRunSpec,

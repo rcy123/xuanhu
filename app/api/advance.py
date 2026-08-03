@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import uuid
 from typing import Any, cast
@@ -25,6 +26,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy import null as sql_null
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_logger = logging.getLogger("xuanhu.api.advance")
 
 from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import XuanhuCommand
@@ -732,6 +735,13 @@ async def _run_langgraph_advance(
             session_id=sid,
             command_key=command_key,
             error_code="REASONING_GRAPH_FAILED",
+        )
+        # 诊断审计：保留异常类型（GraphRunner 已脱敏，仅留 exception_type 可定位逃逸节点）。
+        _logger.warning(
+            "advance reasoning graph failed: session_id=%s error=%s detail=%s",
+            session_id,
+            type(exc).__name__,
+            str(exc),
         )
         raise ModelGatewayUnavailableError(
             f"session_id={session_id} advance reasoning graph failed",
