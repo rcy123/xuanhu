@@ -957,27 +957,29 @@ def validate_eval_queries(queries: list[dict[str, Any]]) -> list[str]:
         errors.append("评估集为空")
         return errors
 
-    # 数量校验
+    # 数量校验（医案生成集可到 40+ 条，放宽到 60）
     if len(queries) < 10:
         errors.append(f"评估集 query 数量不足：{len(queries)} < 10")
-    if len(queries) > 20:
-        errors.append(f"评估集 query 数量超出：{len(queries)} > 20")
+    if len(queries) > 60:
+        errors.append(f"评估集 query 数量超出：{len(queries)} > 60")
 
     # 逐条校验
     for idx, q in enumerate(queries, start=1):
         errors.extend(validate_eval_query(q, idx))
 
-    # 类别覆盖检查
+    # 类别覆盖检查（医案生成集按 disease_category 分类，跳过固定类别要求）
     categories: set[str] = set()
     for q in queries:
         cat = q.get("category", "")
         if cat:
             categories.add(cat)
 
-    required_categories = {"主诉到证型", "证型到方剂", "药物禁忌", "穴位检索", "理论检索", "医案检索", "无结果场景"}
-    missing_categories = required_categories - categories
-    if missing_categories:
-        errors.append(f"缺少覆盖类别: {missing_categories}")
+    is_generated_set = any(q.get("provenance_session_id") for q in queries)
+    if not is_generated_set:
+        required_categories = {"主诉到证型", "证型到方剂", "药物禁忌", "穴位检索", "理论检索", "医案检索", "无结果场景"}
+        missing_categories = required_categories - categories
+        if missing_categories:
+            errors.append(f"缺少覆盖类别: {missing_categories}")
 
     return errors
 

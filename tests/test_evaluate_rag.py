@@ -277,10 +277,25 @@ class TestValidateEvalQueries:
     def test_too_many_queries(self) -> None:
         queries = [
             {"query": f"q{i}", "expected_topics": [], "expected_source_types": []}
-            for i in range(25)
+            for i in range(65)
         ]
         errors = validate_eval_queries(queries)
         assert any("超出" in e for e in errors)
+
+    def test_generated_set_with_many_queries_passes(self) -> None:
+        """医案生成集（>20 条、含 provenance_session_id）数量与类别校验通过。"""
+        queries = [
+            {
+                "query": f"q{i}",
+                "expected_topics": ["证型"],
+                "expected_source_types": ["case", "theory", "formula"],
+                "category": "咳嗽",
+                "provenance_session_id": f"session-{i}",
+            }
+            for i in range(30)
+        ]
+        errors = validate_eval_queries(queries)
+        assert errors == []
 
     def test_empty_queries(self) -> None:
         errors = validate_eval_queries([])
