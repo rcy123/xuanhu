@@ -35,7 +35,7 @@ from app.core.config import get_settings
 from app.core.exceptions import SafetyReviewBlockedError
 from app.db.session import get_session_factory
 from app.models.consult import ConsultSession
-from app.models.domain import GraphRun, SafetyProfile
+from app.models.domain import GateResult, GraphRun, SafetyProfile
 from app.models.knowledge import DosageUnit, Herb
 from app.models.review import DoctorReview
 from app.models.safety import SafetyRuleRun
@@ -129,6 +129,11 @@ async def _seed_blocked_safety() -> _SeededBlocked:
 
     async with postgres_checkpointer(get_settings().database_url):
         pass
+    # intake→syndrome 的 advance 出处（completeness gate），reject 后 syndrome
+    # 阶段重新 advance 时 reasoning 预检依赖它，必须原样保留。
+    completeness_gate_id = uuid.uuid4()
+    triage_gate_id = uuid.uuid4()
+    completeness_run_id = uuid.uuid4()
     async with factory() as db, db.begin():
         db.add(
             ConsultSession(
@@ -140,10 +145,53 @@ async def _seed_blocked_safety() -> _SeededBlocked:
                 agent_runtime="langgraph",
                 pending_review=False,
                 rollback_counts={},
-                state_snapshot={"agent_runtime": "langgraph"},
+                state_snapshot={
+                    "agent_runtime": "langgraph",
+                    "advance": {
+                        "source_gate_id": str(completeness_gate_id),
+                        "source_gate_state_version": 1,
+                        "trace_id": f"blocked-seed-{suffix}",
+                    },
+                },
                 state_version=3,
                 recovery_status="manual_required",
                 blocked_reason="safety_rule_blocked",
+            )
+        )
+        db.add(
+            GraphRun(
+                id=completeness_run_id,
+                session_id=session_id,
+                graph_version=DEFAULT_GRAPH_VERSION,
+                command_id=f"intake:{session_id}",
+                input_state_version=1,
+                status="completed",
+            )
+        )
+        # graph_run 必须先落库，gate_results 外键才有目标（与 repository 一致）。
+        await db.flush()
+        db.add(
+            GateResult(
+                id=completeness_gate_id,
+                session_id=session_id,
+                graph_run_id=completeness_run_id,
+                gate_name="completeness",
+                policy_version="completeness-policy.v1",
+                input_state_version=1,
+                decision="passed",
+                details={"disposition": "ready"},
+            )
+        )
+        db.add(
+            GateResult(
+                id=triage_gate_id,
+                session_id=session_id,
+                graph_run_id=completeness_run_id,
+                gate_name="triage",
+                policy_version="triage-red-flag.v1",
+                input_state_version=1,
+                decision="passed",
+                details={"disposition": "continue", "candidate_count": 0},
             )
         )
         db.add(
@@ -276,6 +324,12 @@ async def _seed_blocked_safety() -> _SeededBlocked:
             pending_review=False,
             state_version=state.state_version + 1,
             route="ready_for_safety",
+            # 模拟 reasoning 修复：保留 intake→syndrome 的 advance 出处。
+            preserve_advance={
+                "source_gate_id": str(completeness_gate_id),
+                "source_gate_state_version": 1,
+                "trace_id": f"blocked-seed-{suffix}",
+            },
         ),
         outbox_event_type="integration.formula_ready.v1",
         outbox_payload={"session_id": str(session_id)},
@@ -398,6 +452,11 @@ async def _seed_blocked_safety() -> _SeededBlocked:
             state_version=state.state_version + 1,
             route="safety_blocked",
             blocked_reason="safety_rule_blocked",
+            preserve_advance={
+                "source_gate_id": str(completeness_gate_id),
+                "source_gate_state_version": 1,
+                "trace_id": f"blocked-seed-{suffix}",
+            },
         ),
         outbox_event_type="safety.blocked.v1",
         outbox_payload={"session_id": str(session_id), "passed": False, "issue_count": 1},
@@ -484,6 +543,47 @@ async def test_blocked_safety_modify_compliant_override_resolves_to_record() -> 
         assert "doctor_override" in sources
         overrides = [run for run in safety_runs if run.formula_source == "doctor_override"]
         assert overrides and overrides[0].passed is True
+
+
+@pytest.mark.asyncio
+async def test_reject_preserves_advance_provenance_and_authority() -> None:
+    """reject 回 syndrome 后重新 advance 不再 REASONING_PRECHECK_FAILED。
+
+    回归问题 19：reasoning/safety/review 各阶段重建 snapshot 时若丢掉
+    intake→syndrome 的 advance 出处，reasoning 预检找不到 completeness
+    来源门 → 被否决的方子无法重新开方（503）。
+    """
+    seed = await _seed_blocked_safety()
+    factory = get_session_factory()
+
+    async with factory() as db:
+        response = await LangGraphReviewService(db).review(
+            str(seed.session_id),
+            ReviewRequest(action="reject", feedback="方剂与辨证不符，请重新辨证开方"),
+            doctor_id="blocked-doctor",
+            trace_id="blocked-reject",
+            x_state_version=seed.state_version,
+            idempotency_key=f"blocked-reject:{uuid.uuid4()}",
+            shared_runtime=None,
+            allow_request_local_runtime=True,
+        )
+    assert response.current_stage == "syndrome"
+
+    # snapshot 必须保留 advance 出处
+    async with factory() as db:
+        session = await db.get(ConsultSession, seed.session_id)
+        assert session is not None
+        snapshot = session.state_snapshot or {}
+        assert isinstance(snapshot.get("advance"), dict)
+        assert snapshot["advance"].get("source_gate_state_version") == 1
+
+    # syndrome 阶段重新 advance 的 reasoning 预检 authority 必须可解析
+    repository = PostgresDomainRepository(factory)
+    authority = await repository.get_reasoning_authority(seed.session_id, response.state_version)
+    assert authority is not None
+    assert authority.source_gate_state_version == 1
+    assert authority.completeness_gate.decision == "passed"
+    assert authority.triage_gate.decision == "passed"
 
 
 @pytest.mark.asyncio

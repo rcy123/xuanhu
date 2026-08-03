@@ -138,6 +138,7 @@ class _SessionMeta:
     agent_runtime: str
     patient_info: dict[str, Any]
     blocked_reason: str | None = None
+    state_snapshot: dict[str, Any] | None = None
 
 
 def _stable_id(session_id: uuid.UUID, kind: str) -> uuid.UUID:
@@ -189,6 +190,7 @@ async def _session_meta(session_id: uuid.UUID) -> _SessionMeta:
             agent_runtime=row.agent_runtime,
             patient_info=dict(row.patient_info or {}),
             blocked_reason=row.blocked_reason,
+            state_snapshot=dict(row.state_snapshot or {}),
         )
 
 
@@ -475,6 +477,18 @@ def _verification_context(
     )
 
 
+def _preserved_advance(meta: _SessionMeta) -> dict[str, Any] | None:
+    """提取旧 snapshot 中的 advance 出处（intake→syndrome 的 completeness gate）。
+
+    该出处是 syndrome 阶段重新 advance 时 reasoning 预检的依据；review 模块
+    的任何阶段转换（safety→review/blocked、review→record/syndrome/inquiry）
+    都不改变 intake 来源门，必须原样保留，否则被否决/拦截的方子无法重新开方。
+    """
+    snapshot = meta.state_snapshot or {}
+    advance = snapshot.get("advance")
+    return advance if isinstance(advance, dict) else None
+
+
 def _session_updates(
     *,
     current_stage: str,
@@ -483,7 +497,23 @@ def _session_updates(
     state_version: int,
     route: str,
     blocked_reason: str | None = None,
+    preserve_advance: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "agent_runtime": "langgraph",
+        "current_stage": current_stage,
+        "state_version": state_version,
+        "pending_review": pending_review,
+        "langgraph_review": {
+            "version": REVIEW_POLICY_VERSION,
+            "route": route,
+        },
+    }
+    # reject 回到 syndrome 时保留 intake→syndrome 的 advance 出处（completeness
+    # gate），否则 syndrome 阶段重新 advance 时 reasoning 预检找不到来源门 →
+    # REASONING_PRECHECK_FAILED（被否决的方子无法重新开方）。
+    if preserve_advance is not None:
+        snapshot["advance"] = preserve_advance
     return {
         "current_stage": current_stage,
         "status": status,
@@ -491,16 +521,7 @@ def _session_updates(
         "recovery_status": "manual_required" if status == "blocked" else "normal",
         "blocked_reason": blocked_reason,
         "blocked_at": datetime.now(UTC).replace(tzinfo=None) if status == "blocked" else None,
-        "state_snapshot": {
-            "agent_runtime": "langgraph",
-            "current_stage": current_stage,
-            "state_version": state_version,
-            "pending_review": pending_review,
-            "langgraph_review": {
-                "version": REVIEW_POLICY_VERSION,
-                "route": route,
-            },
-        },
+        "state_snapshot": snapshot,
     }
 
 
@@ -935,6 +956,7 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
             state_version=domain_state.state_version + 1,
             route="review_required" if result.passed else "safety_blocked",
             blocked_reason=None if result.passed else "safety_rule_blocked",
+            preserve_advance=_preserved_advance(meta),
         ),
         outbox_event_type="review.required.v1" if result.passed else "safety.blocked.v1",
         outbox_payload={
@@ -1193,6 +1215,9 @@ async def apply_review_resume(
         invalidate_artifact_ids=invalidation_ids,
     )
     target_stage = "record" if action in {"confirm", "modify"} else "syndrome" if action == "reject" else "inquiry"
+    # 保留 intake→syndrome 的 advance 出处：reject 回 syndrome 后重新 advance
+    # 时 reasoning 预检复用 completeness gate，否则 REASONING_PRECHECK_FAILED。
+    preserve_advance = _preserved_advance(meta)
     trace_id = _node_trace_id(state)
     commit = await repository.commit(
         delta,
@@ -1243,6 +1268,7 @@ async def apply_review_resume(
             pending_review=False,
             state_version=domain_state.state_version + 1,
             route=f"review_{action}",
+            preserve_advance=preserve_advance,
         ),
         outbox_event_type="doctor.review_applied.v1",
         outbox_payload={
@@ -1664,7 +1690,9 @@ class LangGraphReviewService:
                 )
             )
 
-        if not safety_result.passed:
+        # 仅 modify 的二次审核结果可触发该分支；blocked 会话的原始 safety 为
+        # failed，reject / request_more_info 若误入此处会提交空 delta。
+        if request.action == "modify" and not safety_result.passed:
             delta = DomainDelta(
                 delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:review-recheck:{run_id}"),
                 run_id=run_id,
@@ -1692,6 +1720,7 @@ class LangGraphReviewService:
                     pending_review=True,
                     state_version=domain_state.state_version + 1,
                     route="modify_safety_blocked",
+                    preserve_advance=_preserved_advance(meta),
                 ),
                 outbox_event_type="review.safety_recheck_blocked.v1",
                 outbox_payload={
@@ -1812,6 +1841,7 @@ class LangGraphReviewService:
                 pending_review=True,
                 state_version=domain_state.state_version + 1,
                 route="review_submission_staged",
+                preserve_advance=_preserved_advance(meta),
             ),
             outbox_event_type="doctor.review_submitted.v1",
             outbox_payload={

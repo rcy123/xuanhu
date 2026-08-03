@@ -989,9 +989,29 @@ def _session_updates(
     target: str,
     state_version: int,
     proof: RecoveryCheckpointProof,
+    preserve_advance: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     terminated = action == "terminate"
     current_stage = "blocked" if terminated else target
+    snapshot: dict[str, object] = {
+        "agent_runtime": "langgraph",
+        "current_stage": current_stage,
+        "state_version": state_version,
+        "pending_review": False,
+        "recovery_status": "normal",
+        "langgraph_recovery": {
+            "version": RECOVERY_POLICY_VERSION,
+            "action": action,
+            "source_stage": source,
+            "target_stage": current_stage,
+            "checkpoint_domain_state_version": proof.domain_state_version,
+            "checkpoint_had_interrupt": proof.has_pending_interrupt,
+        },
+    }
+    # 保留 intake→syndrome 的 advance 出处：safety 目标恢复后仍需经过
+    # review/reject 回到 syndrome 重新开方的链路。
+    if preserve_advance is not None:
+        snapshot["advance"] = preserve_advance
     return {
         "current_stage": current_stage,
         "status": "terminated" if terminated else "active",
@@ -999,21 +1019,7 @@ def _session_updates(
         "recovery_status": "normal",
         "blocked_reason": "terminated_by_doctor" if terminated else None,
         "blocked_at": datetime.now(UTC).replace(tzinfo=None) if terminated else None,
-        "state_snapshot": {
-            "agent_runtime": "langgraph",
-            "current_stage": current_stage,
-            "state_version": state_version,
-            "pending_review": False,
-            "recovery_status": "normal",
-            "langgraph_recovery": {
-                "version": RECOVERY_POLICY_VERSION,
-                "action": action,
-                "source_stage": source,
-                "target_stage": current_stage,
-                "checkpoint_domain_state_version": proof.domain_state_version,
-                "checkpoint_had_interrupt": proof.has_pending_interrupt,
-            },
-        },
+        "state_snapshot": snapshot,
     }
 
 
@@ -1346,6 +1352,8 @@ async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
     trace_id = trace_id_raw if isinstance(trace_id_raw, str) else _node_trace_id(state)
     output_version = domain_state.state_version + 1
     event_type = "session.terminated" if action == "terminate" else "session.recovered"
+    old_advance = (session.state_snapshot or {}).get("advance")
+    preserve_advance = old_advance if isinstance(old_advance, dict) else None
     commit = await repository.commit(
         delta,
         _verification_context(
@@ -1387,6 +1395,7 @@ async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
             target=target,
             state_version=output_version,
             proof=proof,
+            preserve_advance=preserve_advance,
         ),
         outbox_event_type="session.terminated.v1" if action == "terminate" else "session.recovered.v1",
         outbox_payload={

@@ -34,6 +34,7 @@ from app.agent_runtime.reasoning_subgraph import (
     ROUTE_SYNDROME_COMPLETED,
 )
 from app.agent_runtime.reducer import DomainDelta, DomainState
+from app.core.config import agent_model_timeout_seconds
 from app.agent_runtime.repository import (
     ArtifactPayloadRecord,
     ArtifactPayloadSpec,
@@ -76,6 +77,7 @@ from app.agents.syndrome_draft import (
     recover_trusted_syndrome_from_repository,
 )
 from app.db.session import get_session_factory
+from app.models.consult import ConsultSession
 from app.models.domain import GraphRun, IntakeCommandClaim
 from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus, ObservationStatus
 from app.schemas.formula import (
@@ -140,6 +142,54 @@ def _commit_run_id(claim: IntakeCommandClaim, step: str) -> uuid.UUID:
     if step == "syndrome":
         return claim.run_id
     return uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:reasoning:{claim.run_id}:{step}")
+
+
+# 模型质量类随机失败：同输入重放一次大概率成功（与 intake 抽取同款策略）。
+# 真实会话（229a048c 等）：formula/syndrome 草稿偶发 confidence 超 no-RAG 上限、
+# schema 越界、截断、网关超时——旧实现一律 manual_required → blocked，瞬时失败
+# 把整个辨证开方永久卡死（只能 recover 重跑）。此处对可重试码自动重试一次。
+_REASONING_RETRYABLE_MODEL_CODES = frozenset(
+    {
+        "SYNDROME_SCHEMA_INVALID",
+        "SYNDROME_OUTPUT_TYPE_INVALID",
+        "SYNDROME_DECISION_CONTENT_INVALID",
+        "SYNDROME_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT",
+        "SYNDROME_FACT_LINK_INVALID",
+        "FORMULA_SCHEMA_INVALID",
+        "FORMULA_OUTPUT_TYPE_INVALID",
+        "FORMULA_DECISION_CONTENT_INVALID",
+        "FORMULA_CONFIDENCE_EXCEEDS_NO_RAG_LIMIT",
+        "FORMULA_FACT_LINK_INVALID",
+        "FORMULA_SYNDROME_FACT_LINK_INVALID",
+        "STRUCTURED_OUTPUT_INVALID",
+        "MODEL_OUTPUT_TRUNCATED",
+        "MODEL_GATEWAY_TIMEOUT",
+        "MODEL_GATEWAY_UNAVAILABLE",
+    }
+)
+
+
+def _reasoning_failure_is_retryable(code: str | None) -> bool:
+    return (code or "") in _REASONING_RETRYABLE_MODEL_CODES
+
+
+def _reasoning_retry_spec(original: RunSpec, *, suffix: str, attempt: int = 1) -> RunSpec:
+    """Fresh RunSpec for a retry (new run_id / idempotency key).
+
+    ``attempt`` 从 1 开始（第 1 次重试）。deadline 随尝试递增，
+    避免模型随机慢响应再次撞节点超时。
+    """
+    return original.model_copy(
+        update={
+            "run_id": uuid.uuid4(),
+            "idempotency_key": f"{original.idempotency_key}:retry:{suffix}:{attempt}",
+            "deadline_at": _deadline(agent_model_timeout_seconds() * (attempt + 1) + 30),
+        }
+    )
+
+
+# 模型质量/网关类失败的最大重试次数（同输入重放，随机失败大概率自愈）。
+_REASONING_MAX_RETRIES = 2
 
 
 async def run_reasoning_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
@@ -237,9 +287,9 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             agent_spec_version=SYNDROME_AGENT_VERSION,
             prompt_version=SYNDROME_PROMPT_VERSION,
             policy_version=SYNDROME_POLICY_VERSION,
-            # 节点级 RunSpec deadline 需 > SYNDROME AgentSpec ModelPolicy.timeout(75s)
-            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
-            deadline_at=_deadline(90),
+            # 节点级 RunSpec deadline 需 > SYNDROME AgentSpec ModelPolicy.timeout
+            # （= 网关超时 + 余量），避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:syndrome",
             trace_id=_node_trace_id(state),
@@ -252,12 +302,43 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             agent_spec=build_syndrome_agent_spec(),
         )
         if result.status is not SyndromeExecutionStatus.SUCCEEDED or result.output is None or result.verification is None:
+            code = str(result.failure_code or "SYNDROME_FAILED")
+            retried = 0
+            if _reasoning_failure_is_retryable(code):
+                while retried < _REASONING_MAX_RETRIES:
+                    retried += 1
+                    retried_result = await _execute_syndrome(
+                        runtime=AgentRuntime(),
+                        repository=repository,
+                        run_spec=_reasoning_retry_spec(run_spec, suffix="syndrome", attempt=retried),
+                        input_payload=input_payload,
+                        agent_spec=build_syndrome_agent_spec(),
+                    )
+                    if (
+                        retried_result.status is SyndromeExecutionStatus.SUCCEEDED
+                        and retried_result.output is not None
+                        and retried_result.verification is not None
+                    ):
+                        result = retried_result
+                        code = None
+                        break
             await _save_intermediate(
                 claim.id,
-                {"syndrome": {"failure_code": str(result.failure_code or "SYNDROME_FAILED")}},
+                {
+                    "syndrome": {
+                        "failure_code": code or "SYNDROME_FAILED",
+                        "retry_count": retried,
+                        "retried": code is None,
+                    }
+                },
                 step="draft_syndrome",
             )
-            return {"route": NODE_REASONING_SUBGRAPH_V1, "reasoning_route": ROUTE_MANUAL_REQUIRED, "last_error": None}
+            if code is not None:
+                return {
+                    "route": NODE_REASONING_SUBGRAPH_V1,
+                    "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                    "last_error": None,
+                }
         commit = await _commit_syndrome_artifact(repository, claim, result, trace_id=_node_trace_id(state))
         if commit is None:
             await _save_intermediate(
@@ -402,9 +483,9 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             agent_spec_version=FORMULA_AGENT_VERSION,
             prompt_version=FORMULA_PROMPT_VERSION,
             policy_version=FORMULA_POLICY_VERSION,
-            # 节点级 RunSpec deadline 需 > FORMULA AgentSpec ModelPolicy.timeout(75s)
-            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)，避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
-            deadline_at=_deadline(90),
+            # 节点级 RunSpec deadline 需 > FORMULA AgentSpec ModelPolicy.timeout
+            # （= 网关超时 + 余量），避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
             total_attempt_budget=1,
             idempotency_key=f"{claim.idempotency_key}:formula",
             trace_id=_node_trace_id(state),
@@ -419,9 +500,36 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         )
         if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
             code = str(result.failure_code or "FORMULA_FAILED")
-            await _save_intermediate(claim.id, {"formula": {"failure_code": code}}, step="draft_formula")
-            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-            return {"route": NODE_REASONING_SUBGRAPH_V1, "reasoning_route": ROUTE_MANUAL_REQUIRED, "last_error": None}
+            retried = 0
+            if _reasoning_failure_is_retryable(code):
+                while retried < _REASONING_MAX_RETRIES:
+                    retried += 1
+                    retried_result = await _execute_formula(
+                        runtime=AgentRuntime(),
+                        repository=repository,
+                        run_spec=_reasoning_retry_spec(run_spec, suffix="formula", attempt=retried),
+                        input_payload=input_payload,
+                        syndrome_result=syndrome_result,
+                        agent_spec=build_formula_agent_spec(),
+                    )
+                    if retried_result.status is FormulaExecutionStatus.SUCCEEDED and retried_result.output is not None:
+                        result = retried_result
+                        code = None
+                        break
+            await _save_intermediate(
+                claim.id,
+                {
+                    "formula": {
+                        "failure_code": code or "FORMULA_FAILED",
+                        "retry_count": retried,
+                        "retried": code is None,
+                    }
+                },
+                step="draft_formula",
+            )
+            if code is not None:
+                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+                return {"route": NODE_REASONING_SUBGRAPH_V1, "reasoning_route": ROUTE_MANUAL_REQUIRED, "last_error": None}
 
         consistency = verify_trusted_formula_execution(result)
         if result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
@@ -728,24 +836,13 @@ def _build_formula_input(authority: ReasoningAuthoritySnapshot, syndrome: Syndro
 
 
 def _context_from_domain_state(domain_state: DomainState) -> tuple[SyndromeObservationContext, ...]:
-    superseded = frozenset(
-        item.supersedes_observation_id
-        for item in domain_state.observations
-        if item.status.value != "active" and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        SyndromeObservationContext(
-            observation_id=item.observation_id,
-            session_id=item.session_id,
-            state_version=domain_state.state_version,
-            fact_key=item.fact_key,
-            value=item.value,
-            normalized_value=item.normalized_value,
-            status=ObservationStatus.ACTIVE,
-        )
-        for item in domain_state.observations
-        if item.status.value == "active" and item.observation_id not in superseded
-    )
+    # 3a 统一口径：与 syndrome_draft/formula_draft 的 _authoritative_input 完全一致
+    # （槽位路径投影合成 id，否则裸键）。调用方先 build 的 input 在 preflight 时也会
+    # 被权威重建，但「首次 preflight 用调用方输入」这一步也必须在同一口径下成立，
+    # 否则 FORMULA_SYNDROME_FACT_LINK_INVALID（合成 syndrome fact_ids ⊄ 裸键集）。
+    from app.agents.syndrome_draft import _context_from_domain_state as _authoritative_context
+
+    return _authoritative_context(domain_state)
 
 
 async def _commit_syndrome_artifact(
@@ -810,6 +907,9 @@ async def _commit_formula_artifact(
     session_updates = None
     outbox_event_type = REASONING_ARTIFACT_COMMITTED
     if trusted.output.decision is FormulaDraftDecision.COMPLETED and consistency.passed:
+        # 保留 intake→syndrome 的 advance 出处（后续 reject 回 syndrome 重新
+        # 开方时 reasoning 预检依赖 completeness gate 来源门）。
+        preserve_advance = await _load_session_advance(claim.session_id)
         session_updates = _session_updates(
             current_stage="safety",
             status="active",
@@ -818,6 +918,7 @@ async def _commit_formula_artifact(
             trace_id=trace_id,
             output_state_version=trusted.input_payload.state_version + 1,
             route="ready_for_safety",
+            preserve_advance=preserve_advance,
         )
         outbox_event_type = REASONING_COMMAND_COMPLETED
     return await _commit_artifact_payload(
@@ -1331,6 +1432,22 @@ def _question_for_dimension(raw_dimension: object) -> str:
     return template.question if template is not None else "请补充一个关键问诊信息？"
 
 
+async def _load_session_advance(session_id: uuid.UUID) -> dict[str, Any] | None:
+    """读取会话当前 state_snapshot 中的 advance 出处（intake completeness gate）。
+
+    reasoning 子图（syndrome→safety）重建 snapshot 时必须原样保留该出处，
+    否则医生 reject 回 syndrome 后重新 advance 时 reasoning 预检找不到来源门
+    → REASONING_PRECHECK_FAILED，被否决的方子无法重新开方。
+    """
+    factory = get_session_factory()
+    async with factory() as db:
+        row = await db.get(ConsultSession, session_id)
+        if row is None or not isinstance(row.state_snapshot, dict):
+            return None
+        advance = row.state_snapshot.get("advance")
+        return advance if isinstance(advance, dict) else None
+
+
 def _session_updates(
     *,
     current_stage: str,
@@ -1340,8 +1457,9 @@ def _session_updates(
     trace_id: str,
     output_state_version: int,
     route: str,
+    preserve_advance: dict[str, Any] | None = None,
 ) -> dict[str, object]:
-    snapshot = {
+    snapshot: dict[str, object] = {
         "agent_runtime": "langgraph",
         "current_stage": current_stage,
         "state_version": output_state_version,
@@ -1356,6 +1474,8 @@ def _session_updates(
             "trace_id": trace_id,
         },
     }
+    if preserve_advance is not None:
+        snapshot["advance"] = preserve_advance
     return {
         "current_stage": current_stage,
         "status": status,
