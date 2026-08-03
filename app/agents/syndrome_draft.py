@@ -43,6 +43,7 @@ from app.agent_runtime.syndrome_verifier import (
     SyndromeVerificationReport,
     canonicalize_syndrome_input,
     canonicalize_syndrome_output,
+    prune_syndrome_fact_links,
     validate_syndrome_preflight,
     verify_syndrome_artifact,
 )
@@ -51,7 +52,12 @@ from app.agents.prompt_loader import PromptLoader
 from app.core.config import get_settings
 from app.db import session as db_session
 from app.schemas.domain import ObservationSchema, ObservationStatus
-from app.schemas.syndrome import SyndromeDraft, SyndromeDraftInput, SyndromeObservationContext
+from app.schemas.syndrome import (
+    SYNDROME_NO_RAG_CONFIDENCE_MAX,
+    SyndromeDraft,
+    SyndromeDraftInput,
+    SyndromeObservationContext,
+)
 
 SYNDROME_CONTEXT_TOKEN_LIMIT = 4_000
 SYNDROME_MODEL_MAX_TOKENS = 1_500
@@ -225,6 +231,20 @@ async def _execute_syndrome_draft(
         canonical_output = canonicalize_syndrome_output(artifact.output)
     except SyndromeOutputBoundaryError as exc:
         return _failed(exc.code)
+    # no-RAG 置信度政策封顶：无检索证据时系统允许的最高自评置信度为
+    # SYNDROME_NO_RAG_CONFIDENCE_MAX。模型（真实 qwen3.7-flash 探测）常输出 0.9，
+    # 重试不收敛——confidence 是模型自评元数据，不影响临床内容，此处确定性封顶，
+    # verifier 的 _verify_no_rag 仍作为兜底拒绝任何绕过边界的超限输入。
+    if canonical_output.confidence > SYNDROME_NO_RAG_CONFIDENCE_MAX:
+        canonical_output = canonical_output.model_copy(
+            update={"confidence": SYNDROME_NO_RAG_CONFIDENCE_MAX}
+        )
+    # 长随机 uuid 转写损坏修复：把证据引用修剪到权威上下文 id 集合内
+    # （真实 fc6b6a09 复盘：模型把槽位 id 中间段输出错 → 重试不收敛）。
+    canonical_output = prune_syndrome_fact_links(
+        canonical_output,
+        {item.observation_id for item in input_payload.context_observations},
+    )
     canonical_artifact = artifact.model_copy(update={"output": canonical_output})
     report = verify_syndrome_artifact(
         agent_spec=spec,

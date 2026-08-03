@@ -92,6 +92,41 @@ def test_no_modifications_equivalent_base_and_candidate_passes_deterministically
     assert draft == _draft(base, base.model_copy(deep=True))
 
 
+def test_candidate_with_model_renaming_and_rationale_passes_when_composition_matches() -> None:
+    """2026-08 真实会话（f26da40f）：模型对候选方自然改写方名/理法/依据，
+    composition 与 base+modifications 确定性重建一致即可通过——name/rationale/basis
+    是模型临床自由文本，不可从 base 确定性推导，不应参与候选一致性比较。"""
+    base = _formula(
+        HerbItem(herb="川芎", dose=10, unit="g"),
+        HerbItem(herb="荆芥", dose=9, unit="g"),
+    )
+    mod = FormulaModification(
+        action=ModificationAction.ADD,
+        herb="白芷",
+        dose=6,
+        unit="g",
+        reason="加强止痛",
+        basis=_claim(),
+    )
+    candidate = FormulaComposition(
+        name="川芎茶调散加白芷",
+        composition=(*base.composition, HerbItem(herb="白芷", dose=6, unit="g")),
+        rationale="在基础方疏风止痛之上加白芷增强止痛之力",
+        basis=(_claim(), _claim()),
+    )
+    report = _verify(_draft(base, candidate, (mod,)))
+
+    assert report.passed, report.failure_code
+    assert _code(report, "candidate_match") is None
+
+    # composition 不一致（多一味未经修改的药材）仍必须被拒。
+    extra = candidate.model_copy(
+        update={"composition": (*candidate.composition, HerbItem(herb="细辛", dose=3, unit="g"))}
+    )
+    extra_report = _verify(_draft(base, extra, (mod,)))
+    assert _code(extra_report, "candidate_match") is FormulaConsistencyFailureCode.CANDIDATE_MISMATCH
+
+
 def test_add_appends_to_tail() -> None:
     base = _formula(HerbItem(herb="川芎", dose=10, unit="g"))
     mod = FormulaModification(
@@ -342,9 +377,17 @@ def test_unauthorized_candidate_changes_fail(candidate_items: tuple[HerbItem, ..
 
 
 def test_candidate_name_rationale_and_basis_are_exactly_preserved() -> None:
+    # 2026-08 政策调整：候选方 name/rationale/basis 是模型临床自由文本，确定性
+    # 重建只覆盖 composition——改名/改写理法不再视为不一致（真实模型必然如此）。
     base = _formula(HerbItem(herb="川芎", dose=10, unit="g"))
     changed = base.model_copy(update={"name": "加味基础方"})
-    assert _code(_verify(_draft(base, changed)), "candidate_match") is FormulaConsistencyFailureCode.CANDIDATE_MISMATCH
+    assert _code(_verify(_draft(base, changed)), "candidate_match") is None
+    # 换药才是不一致（composition 改变但无对应 modification）。
+    swapped = base.model_copy(update={"composition": (HerbItem(herb="白芷", dose=10, unit="g"),)})
+    assert (
+        _code(_verify(_draft(base, swapped)), "candidate_match")
+        is FormulaConsistencyFailureCode.CANDIDATE_MISMATCH
+    )
 
 
 @pytest.mark.parametrize(

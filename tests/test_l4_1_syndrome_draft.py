@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from uuid import UUID
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from app.agent_runtime.syndrome_verifier import (
     SYNDROME_PROMPT_VERSION,
     SyndromeGateAuthority,
     SyndromeVerificationFailureCode,
+    prune_syndrome_fact_links,
     validate_syndrome_preflight,
     verify_syndrome_artifact,
 )
@@ -533,6 +535,127 @@ async def test_context_observation_same_id_tampering_is_zero_call(update: dict[s
 
 
 @pytest.mark.asyncio
+async def test_slot_projected_context_is_accepted_by_verifier() -> None:
+    """3a 回归（4416ad28）：槽位投影上下文（合成 observation_id）必须通过权威校验。
+
+    intake_slot_path_enabled 时 syndrome_draft._authoritative_input 用
+    derive_slot_context_rows 重写 context（每维度一行、合成 uuid5 id），旧 verifier
+    只认裸键集 → 每次草稿 CONTEXT_NOT_ACTIVE → advance 后 manual_required 死路。
+    现在 verifier 接受「从 domain_state 确定性可导出」的任一投影。
+    """
+    payload = _input()
+    run = _run(session_id=payload.session_id, state_version=payload.state_version)
+    spec = build_syndrome_agent_spec(model="fake-model")
+
+    from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+    from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+
+    rows = derive_slot_context_rows(
+        payload.domain_state.observations,
+        dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+        state_version=payload.state_version,
+        session_id=payload.session_id,
+    )
+    assert rows, "slot projection must produce rows for the ready observations"
+    projected_context = tuple(
+        SyndromeObservationContext(
+            observation_id=UUID(item["observation_id"]),
+            session_id=payload.session_id,
+            state_version=item["state_version"],
+            fact_key=item["fact_key"],
+            value=item["value"],
+            normalized_value=None,
+            status=ObservationStatus.ACTIVE,
+        )
+        for item in rows
+    )
+    # 投影上下文不应与裸键集同 id 集合（这是旧实现误拒的场景）。
+    assert {item.observation_id for item in projected_context} != {
+        item.observation_id for item in payload.context_observations
+    }
+    projected_payload = payload.model_copy(update={"context_observations": projected_context})
+
+    # 投影上下文 + 引用投影 id 的完整草稿 → 校验通过。
+    ok_report = verify_syndrome_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(_completed(projected_payload), run),
+        input_payload=projected_payload,
+        gate_authority=_gate_authority(projected_payload),
+    )
+    assert ok_report.passed, ok_report.failure_code
+
+    # 伪造投影（同一合成 id 但换值）仍必须被拒 —— 校验不是放行一切。
+    tampered = projected_context[0].model_copy(update={"value": {"forged": True}})
+    tampered_payload = payload.model_copy(
+        update={"context_observations": (tampered, *projected_context[1:])}
+    )
+    tampered_report = verify_syndrome_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(_completed(tampered_payload), run),
+        input_payload=tampered_payload,
+        gate_authority=_gate_authority(tampered_payload),
+    )
+    assert tampered_report.failure_code is SyndromeVerificationFailureCode.CONTEXT_NOT_ACTIVE
+
+    # 投影值含身份数据（如电话号码）仍必须被隐私闸门拦截。
+    leaked = projected_context[0].model_copy(update={"value": {"slot": "联系", "phone": "13800138000"}})
+    leaked_payload = payload.model_copy(
+        update={"context_observations": (leaked, *projected_context[1:])}
+    )
+    leaked_report = verify_syndrome_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(_completed(leaked_payload), run),
+        input_payload=leaked_payload,
+        gate_authority=_gate_authority(leaked_payload),
+    )
+    assert leaked_report.failure_code is SyndromeVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+
+
+def test_prune_syndrome_fact_links_drops_unknown_ids_and_keeps_supported_claims() -> None:
+    """2026-08 真实会话（fc6b6a09）：长随机 uuid 转写损坏（槽位 id 中间段错乱）
+    → 边界确定性剪除无效引用；引用被剪光的 claim 整条丢弃。"""
+    payload = _input()
+    allowed = {item.observation_id for item in payload.context_observations}
+    first = payload.context_observations[0].observation_id
+    forged = uuid.uuid4()
+
+    draft = SyndromeDraft(
+        decision=SyndromeDraftDecision.COMPLETED,
+        syndrome="风寒头痛证",
+        syndrome_basis=(
+            SyndromeFactClaim(claim="有效引用", fact_ids=(first,)),
+            SyndromeFactClaim(claim="含伪造引用", fact_ids=(first, forged)),
+            SyndromeFactClaim(claim="全部伪造", fact_ids=(forged,)),
+        ),
+        differential=(SyndromeFactClaim(claim="鉴别", fact_ids=(first,)),),
+        treatment_principle="疏风散寒止痛",
+        confidence=0.6,
+        evidence_mode=SYNDROME_EVIDENCE_MODE,
+        claim_evidence_links=(),
+        review_required=True,
+    )
+    pruned = prune_syndrome_fact_links(draft, allowed)
+
+    assert [c.fact_ids for c in pruned.syndrome_basis] == [(first,), (first,)]
+    assert [c.claim for c in pruned.syndrome_basis] == ["有效引用", "含伪造引用"]
+    assert pruned.differential == draft.differential
+    # 无有效引用的 claim 被丢弃后，草稿仍可通过完整校验（引用合法）。
+    run = _run(session_id=payload.session_id, state_version=payload.state_version)
+    spec = build_syndrome_agent_spec(model="fake-model")
+    report = verify_syndrome_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(pruned, run),
+        input_payload=payload,
+        gate_authority=_gate_authority(payload),
+    )
+    assert report.passed, report.failure_code
+
+
+@pytest.mark.asyncio
 async def test_needs_more_info_and_abstained_legal_paths_pass() -> None:
     payload = _input()
     needs = SyndromeDraft(
@@ -733,8 +856,13 @@ async def test_needs_more_info_with_completed_content_and_pseudo_completed_are_r
 @pytest.mark.asyncio
 async def test_no_rag_confidence_evidence_and_review_required_are_rechecked() -> None:
     payload = _input()
+    # 2026-08 政策调整：模型自评 confidence 超出 no-RAG 上限时，执行边界确定性封顶
+    # （真实 qwen 对完整方剂常输出 0.9，重试不收敛），而不是拒绝整份草稿。
+    # verifier 直测仍拒绝超限输入（见下方 verify_syndrome_artifact 断言）。
     high_confidence, _ = await _execute(payload, _completed(payload, confidence=SYNDROME_NO_RAG_CONFIDENCE_MAX + 0.01))
-    assert high_confidence.failure_code is SyndromeVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
+    assert high_confidence.status is SyndromeExecutionStatus.SUCCEEDED
+    assert high_confidence.output is not None
+    assert high_confidence.output.confidence == SYNDROME_NO_RAG_CONFIDENCE_MAX
 
     no_review = _completed(payload).model_copy(update={"review_required": False})
     no_review_result, _ = await _execute(payload, no_review)
@@ -750,6 +878,19 @@ async def test_no_rag_confidence_evidence_and_review_required_are_rechecked() ->
     citation = _completed(payload).model_copy(update={"citation": "fake source"})
     citation_result, _ = await _execute(payload, citation)
     assert citation_result.failure_code is SyndromeVerificationFailureCode.AUTHORITY_FIELD_FORBIDDEN
+
+    # verifier 兜底契约不削弱：直接喂超限输出仍被拒。
+    run = _run(session_id=payload.session_id, state_version=payload.state_version)
+    spec = build_syndrome_agent_spec(model="fake-model")
+    over_limit = _completed(payload, confidence=SYNDROME_NO_RAG_CONFIDENCE_MAX + 0.01)
+    direct_report = verify_syndrome_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(over_limit, run),
+        input_payload=payload,
+        gate_authority=_gate_authority(payload),
+    )
+    assert direct_report.failure_code is SyndromeVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
 
 
 @pytest.mark.asyncio

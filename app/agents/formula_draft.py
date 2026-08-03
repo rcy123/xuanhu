@@ -31,6 +31,7 @@ from app.agent_runtime.formula_verifier import (
     FormulaVerificationReport,
     canonicalize_formula_input,
     canonicalize_formula_output,
+    prune_formula_fact_links,
     valid_formula_agent_spec,
     validate_formula_preflight,
     verify_formula_artifact,
@@ -55,7 +56,7 @@ from app.agents.syndrome_draft import (
 )
 from app.core.config import get_settings
 from app.schemas.domain import ObservationSchema, ObservationStatus
-from app.schemas.formula import FormulaDraft, FormulaDraftInput
+from app.schemas.formula import FORMULA_NO_RAG_CONFIDENCE_MAX, FormulaDraft, FormulaDraftInput
 from app.schemas.syndrome import SyndromeDraft, SyndromeObservationContext
 
 FORMULA_CONTEXT_TOKEN_LIMIT = 5_000
@@ -304,6 +305,17 @@ async def _execute_formula_draft(
         canonical_output = canonicalize_formula_output(artifact.output)
     except FormulaOutputBoundaryError as exc:
         return _failed(exc.code)
+    # no-RAG 置信度政策封顶：同 syndrome_draft（真实探测 qwen 对完整方剂输出 0.9，
+    # 重试不收敛）。confidence 是自评元数据，确定性封顶；verifier 兜底拒绝超限输入。
+    if canonical_output.confidence > FORMULA_NO_RAG_CONFIDENCE_MAX:
+        canonical_output = canonical_output.model_copy(
+            update={"confidence": FORMULA_NO_RAG_CONFIDENCE_MAX}
+        )
+    # 长随机 uuid 转写损坏修复（同 syndrome 侧）：剪除不在权威集合内的引用。
+    canonical_output = prune_formula_fact_links(
+        canonical_output,
+        {item.observation_id for item in input_payload.context_observations},
+    )
     canonical_artifact = artifact.model_copy(update={"output": canonical_output})
     report = verify_formula_artifact(
         agent_spec=spec,

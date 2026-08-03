@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import Any
@@ -11,7 +12,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
+from app.core.config import agent_model_timeout_seconds
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
+from app.agent_runtime.reducer import DomainState
 from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
 from app.schemas.syndrome import (
     SYNDROME_DRAFT_SCHEMA_VERSION,
@@ -23,15 +26,16 @@ from app.schemas.syndrome import (
     SyndromeDraft,
     SyndromeDraftDecision,
     SyndromeDraftInput,
+    SyndromeFactClaim,
 )
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION
 
 SYNDROME_AGENT_NAME = "syndrome_draft"
 SYNDROME_AGENT_VERSION = "syndrome-draft-agent.v1"
 SYNDROME_PROMPT_VERSION = "syndrome_draft_v1.jinja2"
-# Syndrom 综合 AgentSpec 单次模型调用超时上限（s）。必须 >= MODEL_GATEWAY_TIMEOUT_SECONDS，
-# 否则外层会先于网关内层判超时并错误归因为 MODEL_GATEWAY_TIMEOUT。
-SYNDROME_MODEL_TIMEOUT_SECONDS = 75
+# Syndrome 综合 AgentSpec 单次模型调用超时上限（s）。必须 > MODEL_GATEWAY_TIMEOUT_SECONDS
+# （runtime 前置守卫强制），统一按网关超时 + 余量推导。
+SYNDROME_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()
 SYNDROME_VERIFIER_CHAIN = (
     "schema",
     "run_provenance",
@@ -249,27 +253,150 @@ def _verify_stage_and_gates(
 
 
 def _verify_context(input_payload: SyndromeDraftInput) -> SyndromeVerificationFailureCode | None:
-    active = tuple(_active_observations(input_payload.domain_state.observations))
-    active_by_id = {item.observation_id: item for item in active}
-    context_by_id = {item.observation_id: item for item in input_payload.context_observations}
-    if set(active_by_id) != set(context_by_id):
-        return SyndromeVerificationFailureCode.CONTEXT_NOT_ACTIVE
-    for item in input_payload.context_observations:
-        source = active_by_id.get(item.observation_id)
-        if (
-            source is None
-            or source.session_id != input_payload.session_id
-            or source.status is not ObservationStatus.ACTIVE
-            or item.status != ObservationStatus.ACTIVE
-            or item.state_version != input_payload.state_version
-            or item.fact_key != source.fact_key
-            or item.value != source.value
-            or item.normalized_value != source.normalized_value
-        ):
-            return SyndromeVerificationFailureCode.CONTEXT_NOT_ACTIVE
+    # 隐私闸门优先：泄漏身份数据的上下文无论是否匹配权威都要拦下（更严重）。
     if _contains_identity_key_or_value(input_payload.context_observations):
         return SyndromeVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+    if not _context_matches_authority(
+        input_payload.context_observations,
+        input_payload.domain_state,
+        session_id=input_payload.session_id,
+        state_version=input_payload.state_version,
+    ):
+        return SyndromeVerificationFailureCode.CONTEXT_NOT_ACTIVE
     return None
+
+
+def prune_syndrome_fact_links(
+    output: SyndromeDraft,
+    allowed_ids: set[uuid.UUID],
+) -> SyndromeDraft:
+    """Deterministically drop fact_ids that are not in the authoritative context.
+
+    真实会话（fc6b6a09 等）复盘：qwen 对长随机 uuid 偶发转写损坏（把
+    head_body 槽位 id ``f07f339a-2195-…`` 输出成 ``f07f339a-212c-…``），
+    重试不收敛 → 每次辨证都 FACT_LINK_INVALID → manual_required 死路。
+    此处把证据引用修剪到权威上下文集合内：引用被剪光的 claim 整条丢弃，
+    保留的 claim 至少携带一条有效引用。verifier 的 FACT_LINK_INVALID 兜底
+    契约不削弱（剪枝后仍无有效引用的输出照样被拒）。
+    """
+
+    def _prune(claims: tuple[SyndromeFactClaim, ...]) -> tuple[SyndromeFactClaim, ...]:
+        kept: list[SyndromeFactClaim] = []
+        for claim in claims:
+            valid = tuple(fact_id for fact_id in claim.fact_ids if fact_id in allowed_ids)
+            if not valid:
+                continue
+            kept.append(claim.model_copy(update={"fact_ids": valid}))
+        return tuple(kept)
+
+    new_basis = _prune(output.syndrome_basis)
+    new_differential = _prune(output.differential)
+    if new_basis == output.syndrome_basis and new_differential == output.differential:
+        return output
+    return output.model_copy(update={"syndrome_basis": new_basis, "differential": new_differential})
+
+
+def _context_signature(item: Any) -> tuple[Any, ...]:
+    """JSON-safe comparable signature of one context row.
+
+    Accepts either a context model (SyndromeObservationContext / similar) or a
+    plain dict produced by ``derive_slot_context_rows``; both shapes appear on
+    the two sides of the slot-projection comparison.
+    """
+
+    if isinstance(item, dict):
+        observation_id = item.get("observation_id")
+        session_id = item.get("session_id")
+        state_version = item.get("state_version")
+        fact_key = item.get("fact_key")
+        value = item.get("value")
+        status = item.get("status")
+    else:
+        observation_id = item.observation_id
+        session_id = item.session_id
+        state_version = item.state_version
+        fact_key = item.fact_key
+        value = item.value
+        status = item.status
+    return (
+        str(observation_id),
+        str(session_id),
+        state_version,
+        str(fact_key),
+        _stable_json(value),
+        str(getattr(status, "value", status)),
+    )
+
+
+def _stable_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=str,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return "<unserializable>"
+
+
+def _context_matches_authority(
+    context_observations: tuple[Any, ...],
+    domain_state: DomainState,
+    *,
+    session_id: uuid.UUID,
+    state_version: int,
+) -> bool:
+    """True when the supplied context is a faithful projection of the domain state.
+
+    Two authoritative derivations are accepted:
+    1. plain: the exact active observations (real observation ids);
+    2. slot projection (3a / 问题 22): one deterministic row per dimension with a
+       stable synthetic uuid5 id — the intake slot path rewrites the context so
+       downstream agents never see drifting raw fact keys.
+    Both are pure functions of ``domain_state``, so accepting either keeps the
+    verifier's security property: the model can never fabricate context facts.
+
+    真实会话（4416ad28）：intake_slot_path_enabled 时 syndrome_draft 的
+    ``_authoritative_input`` 用槽位投影重写 context（合成 observation_id），
+    而旧 verifier 只认裸键集 → 每次草稿都 CONTEXT_NOT_ACTIVE → advance 后
+    manual_required 死路。此处按投影确定性重算并接受。
+    """
+
+    active = tuple(_active_observations(domain_state.observations))
+    active_by_id = {item.observation_id: item for item in active}
+    context_by_id = {item.observation_id: item for item in context_observations}
+    if set(active_by_id) == set(context_by_id):
+        for item in context_observations:
+            source = active_by_id.get(item.observation_id)
+            if (
+                source is None
+                or source.session_id != session_id
+                or source.status is not ObservationStatus.ACTIVE
+                or item.status != ObservationStatus.ACTIVE
+                or item.state_version != state_version
+                or item.fact_key != source.fact_key
+                or item.value != source.value
+                or item.normalized_value != source.normalized_value
+            ):
+                return False
+        return True
+    try:
+        from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+        from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+    except ImportError:
+        return False
+    rows = derive_slot_context_rows(
+        domain_state.observations,
+        dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+        state_version=state_version,
+        session_id=session_id,
+    )
+    expected = {_context_signature(row) for row in rows}
+    actual = {_context_signature(item) for item in context_observations}
+    return bool(expected) and actual == expected
 
 
 def _verify_fact_links(output: SyndromeDraft, input_payload: SyndromeDraftInput) -> SyndromeVerificationFailureCode | None:
@@ -440,11 +567,20 @@ def _valid_clinical_text(value: str | None) -> bool:
     return bool(normalized) and normalized not in _PSEUDO_COMPLETED
 
 
+# 3a 槽位投影的结构键（derive_dimension_slots 产出）：这些键名由程序定义
+# （slot_name = 已验证的 canonical fact_key），不是患者身份数据，不应被
+# _is_identity_key 误判（"slot_name" 含 "name" 后缀）。其 value 仍照常递归检查。
+_SLOT_PROJECTION_SCHEMA_KEYS = frozenset({"slot_name", "dimension", "completeness", "missing_slots"})
+
+
 def _contains_identity_key_or_value(value: Any) -> bool:
     if isinstance(value, BaseModel):
         return _contains_identity_key_or_value(value.model_dump(mode="python"))
     if isinstance(value, dict):
-        if any(_is_identity_key(str(key)) for key in value):
+        if any(
+            _is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS
+            for key in value
+        ):
             return True
         return any(_contains_identity_key_or_value(item) for item in value.values())
     if isinstance(value, (list, tuple)):

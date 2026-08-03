@@ -35,10 +35,13 @@ from app.agent_runtime.syndrome_verifier import (
     SYNDROME_VERIFIER_CHAIN,
     SyndromeGateAuthority,
     SyndromeVerificationReport,
+    _SLOT_PROJECTION_SCHEMA_KEYS,
+    _context_matches_authority,
 )
 from app.agent_runtime.syndrome_verifier import (
     verify_syndrome_artifact as _verify_syndrome_artifact_l4,
 )
+from app.core.config import agent_model_timeout_seconds
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
 from app.schemas.formula import (
@@ -283,8 +286,12 @@ def verify_formula_artifact(
 # ---------------------------------------------------------------------------
 
 FORMULA_MODEL_TEMPERATURE = 0.1
-FORMULA_MODEL_MAX_TOKENS = 2_000
-FORMULA_MODEL_TIMEOUT_SECONDS = 75  # >= MODEL_GATEWAY_TIMEOUT_SECONDS（60s），避免外层先判超时
+# 2026-08 真实会话（714b8cf7）：formula 输出含 base_formula + candidate_formula +
+# modifications + rationale + 各 basis claim（槽位投影上下文使输出更长），
+# 2000 token 常被截断（MODEL_OUTPUT_TRUNCATED → manual_required 死路）。
+# 提到 4096 给完整处方留足预算；json_object 网关模式另有 max(2048, …) 下限。
+FORMULA_MODEL_MAX_TOKENS = 4_096
+FORMULA_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()  # 网关超时 + 余量（runtime 前置守卫要求严格大于网关超时）
 
 
 def _valid_agent_spec(spec: AgentSpec) -> bool:
@@ -396,12 +403,16 @@ def _verify_upstream_syndrome(
         return FormulaVerificationFailureCode.SYNDROME_DRAFT_INVALID
 
     active_ids = _active_observation_ids(input_payload.domain_state.observations)
+    # 3a 槽位路径：syndrome 草稿的 fact_ids 引用的是「从 domain_state 确定性导出的
+    # 槽位投影 context」（合成 observation_id），不是裸键 id。允许集合 = 真实 active
+    # id ∪ 本输入携带的投影 context id（两者都是权威 domain_state 的纯函数）。
+    context_ids = {item.observation_id for item in input_payload.context_observations}
     syndrome_ids = {
         fact_id
         for claim in (*artifact_draft.syndrome_basis, *artifact_draft.differential)
         for fact_id in claim.fact_ids
     }
-    if not syndrome_ids or not syndrome_ids.issubset(active_ids):
+    if not syndrome_ids or not syndrome_ids.issubset(active_ids | context_ids):
         return FormulaVerificationFailureCode.SYNDROME_FACT_LINK_INVALID
 
     # Build the syndrome agent spec using the same fixed parameters as L4-1.
@@ -489,39 +500,30 @@ def _syndrome_digest(draft: SyndromeDraft) -> str:
 
 
 def _verify_context(input_payload: FormulaDraftInput) -> FormulaVerificationFailureCode | None:
-    active = tuple(_active_observations(input_payload.domain_state.observations))
-    active_by_id = {item.observation_id: item for item in active}
-    context_by_id = {item.observation_id: item for item in input_payload.context_observations}
-    if set(active_by_id) != set(context_by_id):
-        return FormulaVerificationFailureCode.CONTEXT_NOT_ACTIVE
-    for item in input_payload.context_observations:
-        source = active_by_id.get(item.observation_id)
-        if (
-            source is None
-            or source.session_id != input_payload.session_id
-            or source.status is not ObservationStatus.ACTIVE
-            or item.status != ObservationStatus.ACTIVE
-            or item.state_version != input_payload.state_version
-            or item.fact_key != source.fact_key
-            or item.value != source.value
-            or item.normalized_value != source.normalized_value
-        ):
-            return FormulaVerificationFailureCode.CONTEXT_NOT_ACTIVE
+    # 隐私闸门优先：泄漏身份数据的上下文无论是否匹配权威都要拦下（更严重）。
     if _contains_identity_key_or_value(input_payload.context_observations):
         return FormulaVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+    if not _context_matches_authority(
+        input_payload.context_observations,
+        input_payload.domain_state,
+        session_id=input_payload.session_id,
+        state_version=input_payload.state_version,
+    ):
+        return FormulaVerificationFailureCode.CONTEXT_NOT_ACTIVE
     return None
 
 
 def _verify_fact_links(output: FormulaDraft, input_payload: FormulaDraftInput) -> FormulaVerificationFailureCode | None:
-    """Output fact IDs must come from current active facts or upstream syndrome basis."""
+    """Output fact IDs must come from current active facts, the upstream syndrome
+    basis, or the slot-projected context (3a: synthetic deterministic ids)."""
     active_ids = _active_observation_ids(input_payload.domain_state.observations)
+    context_ids = {item.observation_id for item in input_payload.context_observations}
     syndrome_ids: set[UUID] = set()
     for syndrome_claim in input_payload.syndrome_draft.syndrome_basis:
         syndrome_ids.update(syndrome_claim.fact_ids)
     for syndrome_claim in input_payload.syndrome_draft.differential:
         syndrome_ids.update(syndrome_claim.fact_ids)
-    allowed = active_ids | syndrome_ids
-
+    allowed = active_ids | syndrome_ids | context_ids
     compositions: list[FormulaComposition] = []
     if output.base_formula is not None:
         compositions.append(output.base_formula)
@@ -535,6 +537,59 @@ def _verify_fact_links(output: FormulaDraft, input_payload: FormulaDraftInput) -
         if not mod.basis.fact_ids or any(fact_id not in allowed for fact_id in mod.basis.fact_ids):
             return FormulaVerificationFailureCode.FACT_LINK_INVALID
     return None
+
+
+def prune_formula_fact_links(
+    output: FormulaDraft,
+    allowed_ids: set[UUID],
+) -> FormulaDraft:
+    """Deterministically drop formula fact_ids outside the authoritative set.
+
+    与 syndrome 侧同因（长随机 uuid 转写损坏）——把 base/candidate/modification
+    的 basis 引用修剪到权威集合内；引用被剪光的 claim 整条丢弃。
+    """
+
+    def _prune_claims(claims: tuple[FormulaFactClaim, ...]) -> tuple[FormulaFactClaim, ...]:
+        kept: list[FormulaFactClaim] = []
+        for claim in claims:
+            valid = tuple(fact_id for fact_id in claim.fact_ids if fact_id in allowed_ids)
+            if not valid:
+                continue
+            kept.append(claim.model_copy(update={"fact_ids": valid}))
+        return tuple(kept)
+
+    base = output.base_formula
+    candidate = output.candidate_formula
+    changed = False
+    if base is not None:
+        new_basis = _prune_claims(base.basis)
+        if new_basis != base.basis:
+            base = base.model_copy(update={"basis": new_basis})
+            changed = True
+    if candidate is not None:
+        new_basis = _prune_claims(candidate.basis)
+        if new_basis != candidate.basis:
+            candidate = candidate.model_copy(update={"basis": new_basis})
+            changed = True
+    modifications = output.modifications
+    new_mods: list[FormulaModification] = []
+    for mod in modifications:
+        valid = tuple(fact_id for fact_id in mod.basis.fact_ids if fact_id in allowed_ids)
+        if not valid:
+            changed = True
+            continue
+        if len(valid) != len(mod.basis.fact_ids):
+            changed = True
+        new_mods.append(mod.model_copy(update={"basis": mod.basis.model_copy(update={"fact_ids": valid})}))
+    if not changed:
+        return output
+    return output.model_copy(
+        update={
+            "base_formula": base,
+            "candidate_formula": candidate,
+            "modifications": tuple(new_mods),
+        }
+    )
 
 
 def _verify_decision(output: FormulaDraft) -> FormulaVerificationFailureCode | None:
@@ -722,7 +777,10 @@ def _contains_identity_key_or_value(value: Any) -> bool:
     if isinstance(value, BaseModel):
         return _contains_identity_key_or_value(value.model_dump(mode="python"))
     if isinstance(value, dict):
-        if any(_is_identity_key(str(key)) for key in value):
+        if any(
+            _is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS
+            for key in value
+        ):
             return True
         return any(_contains_identity_key_or_value(item) for item in value.values())
     if isinstance(value, (list, tuple)):

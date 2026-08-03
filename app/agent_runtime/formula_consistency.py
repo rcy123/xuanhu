@@ -343,7 +343,11 @@ def _verify(
     checks.append(_check("candidate_rebuild", rebuild_code))
     match_code = (
         None
-        if canonical_candidate is not None and recomputed is not None and canonical_candidate == recomputed
+        if (
+            canonical_candidate is not None
+            and recomputed is not None
+            and canonical_candidate.composition == recomputed.composition
+        )
         else FormulaConsistencyFailureCode.CANDIDATE_MISMATCH
     )
     checks.append(_check("candidate_match", match_code))

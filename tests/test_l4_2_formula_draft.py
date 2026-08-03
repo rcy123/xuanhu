@@ -1308,12 +1308,17 @@ async def test_context_privacy_rejects_pii_before_gateway() -> None:
 
 
 @pytest.mark.asyncio
-async def test_confidence_exceeds_no_rag_limit_is_rejected() -> None:
+async def test_confidence_exceeds_no_rag_limit_is_capped_at_boundary() -> None:
     payload = _input()
+    # 2026-08 政策调整：自评 confidence 超出 no-RAG 上限时执行边界确定性封顶
+    # （真实 qwen 输出 0.9 不收敛）。verifier 的 no-RAG 拒绝契约由
+    # test_l4_1_syndrome_draft.py 的直测覆盖（同一闸门逻辑）。
     high_confidence, _ = await _execute(
         payload, _completed_formula(payload, confidence=FORMULA_NO_RAG_CONFIDENCE_MAX + 0.01)
     )
-    assert high_confidence.failure_code is FormulaVerificationFailureCode.CONFIDENCE_EXCEEDS_NO_RAG_LIMIT
+    assert high_confidence.status is FormulaExecutionStatus.SUCCEEDED
+    assert high_confidence.output is not None
+    assert high_confidence.output.confidence == FORMULA_NO_RAG_CONFIDENCE_MAX
 
 
 @pytest.mark.asyncio
