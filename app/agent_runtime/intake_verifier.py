@@ -341,6 +341,17 @@ def _verify_observations(
             target = history.get(item.target_observation_id)
             if target is None or target.fact_key != item.fact_key:
                 return IntakeVerificationFailureCode.CORRECTION_TARGET_INVALID
+            # 3c 同值 CORRECT = 无变更重提取：目标事实与纠正值完全相同(键、值、归一值
+            # 全等)时，纠正不改变任何临床语义。真实会话（40140cf4）composer 错维重复
+            # 提问时，抽取逐轮对同一 active 事实发相同值 CORRECT，链越长越可能把已
+            # 超前的中间观测当 target → CORRECTION_TARGET_INVALID 断链。此处提前把
+            # 冗余 CORRECT 归入 HISTORICAL_FACT_REEXTRACTED（可重试 + 静默降级集），
+            # 重放大概率 ABSTAIN/no-op，重试仍失败则静默丢弃，不再堆积纠正链。
+            if (
+                item.operation is ObservationOperation.CORRECT
+                and key == _fact_value_key(target.fact_key, target.value, target.normalized_value)
+            ):
+                return IntakeVerificationFailureCode.HISTORICAL_FACT_REEXTRACTED
     return None
 
 

@@ -23,7 +23,7 @@ from app.agent_runtime.completeness_policy import (
     evaluate_completeness_policy,
 )
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
-from app.core.config import get_settings
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.agent_runtime.triage_policy import to_gate_result_schema
 from app.agents.question_composer import compose_question
 from app.models.audit import AuditEvent
@@ -168,7 +168,7 @@ async def create_initial_intake_question(
         agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
         prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
         policy_version=QUESTION_COMPOSER_POLICY_VERSION,
-        deadline_at=datetime.now(UTC) + timedelta(seconds=90),
+        deadline_at=datetime.now(UTC) + timedelta(seconds=agent_model_timeout_seconds() + 15),
         total_attempt_budget=1,
         idempotency_key=f"bootstrap:{session.id}:question",
         trace_id=trace_id,

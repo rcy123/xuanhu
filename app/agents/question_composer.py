@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -16,7 +17,7 @@ from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunSpec, RuntimeErrorCode
 from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
-from app.core.config import get_settings
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.schemas.completeness import InquiryDimension
 from app.schemas.question import (
     QUESTION_COMPOSER_AGENT_NAME,
@@ -42,7 +43,7 @@ from app.schemas.question import (
 # 主诉原文在 1000 token 预算下会顶满甚至超限，导致 CONTEXT_BUILD_FAILED 静默断链。
 # 放宽到 6000（与 intake_extraction 同级），并保留 CONTEXT_BUILD_FAILED 的模板兜底。
 QUESTION_CONTEXT_TOKEN_LIMIT = 6_000
-QUESTION_MODEL_TIMEOUT_SECONDS = 75  # >= MODEL_GATEWAY_TIMEOUT_SECONDS（60s），避免外层先判超时
+QUESTION_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()  # 网关超时 + 余量（runtime 前置守卫要求严格大于网关超时）
 QUESTION_MODEL_MAX_TOKENS = 800
 QUESTION_MODEL_TEMPERATURE = 0.1
 # v3: CONTEXT_BUILD_FAILED 纳入软失败回模板白名单，问诊节点不再因上下文构建失败静默断链。
@@ -523,6 +524,95 @@ _SLOT_FOLLOWUP_RULES: tuple[tuple[InquiryDimension, tuple[str, ...], tuple[str, 
 )
 
 
+# 3c 维度一致性守卫：模型题文必须真正在问 selected_dimension，否则降级模板。
+# 真实会话复现（40140cf4）：composer 选中 ten_questions.chest_abdomen 却连续输出
+# 「是否有头痛或全身肌肉酸痛等不适？」（head_body 文案），患者重复作答后抽取反复
+# CORRECT 同值事实 → INTAKE_CORRECTION_TARGET_INVALID 断链。此处以程序权威的
+# 维度关键词表做确定性校验：题文不含本维度任何规范关键词 → SINGLE_QUESTION_INVALID
+# 走模板兜底（模板本身按维度注册，天然一致）。
+# 注意关键词应选取该维度「专属且高频」的措辞，宁宽勿严——误拒只会回落模板（安全），
+# 漏放才会把错维问题放行（危险）。遵循代码库铁律：模块级不可变（tuple 对，非 dict）。
+_QUESTION_DIMENSION_KEYWORDS: tuple[tuple[InquiryDimension, tuple[str, ...]], ...] = (
+    (InquiryDimension.CHIEF_COMPLAINT_SYMPTOM, ("不适", "症状", "不舒服", "难受", "主要")),
+    (InquiryDimension.CHIEF_COMPLAINT_CATEGORY, ("主诉", "类别")),
+    (InquiryDimension.BASIC_COURSE, ("多久", "多长", "持续", "病程", "什么时候", "多长时间")),
+    (InquiryDimension.PRESENT_ILLNESS_CHANGE, ("变化", "加重", "减轻", "缓解", "诱因", "起因", "治疗", "好转", "加剧")),
+    (InquiryDimension.TEN_COLD_HEAT, ("怕冷", "寒热", "发热", "发烧", "体温", "发冷", "畏寒", "冷", "热")),
+    (InquiryDimension.TEN_SWEAT, ("出汗", "汗")),
+    (InquiryDimension.TEN_HEAD_BODY, ("头痛", "头晕", "头", "身", "肢体", "关节", "酸痛", "乏力", "肩", "背", "腰", "四肢")),
+    (InquiryDimension.TEN_STOOL_URINE, ("大便", "小便", "二便", "排便", "排尿", "便秘", "腹泻", "拉稀", "尿")),
+    (InquiryDimension.TEN_DIET, ("食欲", "饮食", "胃口", "吃饭", "进食", "饭量", "食量")),
+    (InquiryDimension.TEN_CHEST_ABDOMEN, ("胸", "腹", "胃脘", "心悸", "心慌", "恶心", "呕吐", "痞满", "胁", "反酸")),
+    (InquiryDimension.TEN_THIRST, ("口渴", "口干", "喝水", "饮水", "渴")),
+    (InquiryDimension.TEN_SLEEP, ("睡眠", "睡觉", "失眠", "入睡", "睡")),
+    (InquiryDimension.TEN_MENSES_LEUKORRHEA, ("月经", "经带", "白带", "经期")),
+    (InquiryDimension.TEN_PAIN, ("疼痛", "痛", "疼")),
+    (InquiryDimension.TEN_RESPIRATORY, ("呼吸", "咳嗽", "咳", "痰", "喘", "气短", "鼻塞", "流涕", "喷嚏", "嗓子", "咽喉")),
+    (InquiryDimension.ALLERGY_STATUS, ("过敏", "药敏")),
+    (InquiryDimension.MEDICATION_STATUS, ("药物", "用药", "服药", "吃药", "服用", "药")),
+    (InquiryDimension.MAJOR_CONDITION_STATUS, ("疾病", "病史", "既往", "慢性", "疾病史")),
+    (InquiryDimension.PREGNANCY_STATUS, ("妊娠", "怀孕", "孕")),
+    (InquiryDimension.LACTATION_STATUS, ("哺乳", "母乳")),
+    (InquiryDimension.PAST_HISTORY, ("既往", "病史")),
+    (InquiryDimension.FOUR_DIAGNOSIS, ("舌", "脉", "四诊", "舌苔", "苔")),
+    (InquiryDimension.PATIENT_SEX, ("性别", "男", "女")),
+    (InquiryDimension.PATIENT_AGE, ("年龄", "几岁", "岁数", "多大")),
+    (InquiryDimension.MENOPAUSE_STATUS, ("绝经", "月经")),
+    (InquiryDimension.PREGNANCY_APPLICABILITY_FLAG, ("妊娠", "孕")),
+    (InquiryDimension.LACTATION_APPLICABILITY_FLAG, ("哺乳",)),
+)
+
+_QUESTION_DIMENSION_KEYWORD_LOOKUP: Mapping[InquiryDimension, tuple[str, ...]] = MappingProxyType(
+    dict(_QUESTION_DIMENSION_KEYWORDS)
+)
+
+
+def _question_targets_dimension(question: str, dimension: InquiryDimension) -> bool:
+    """Return True when the question text references the selected dimension.
+
+    Only the interrogative clause matters.  The v2 contract is a two-part
+    「小结确认 + 追问」 sentence, so the summary clause (before the first 。)
+    may legitimately echo the target dimension's keywords while the actual
+    question drifts to another dimension (real 40140cf4 / b91e94fe: summary
+    mentions 咳嗽 while the question asks about 过敏).  Checking the last
+    clause alone keeps the summary from masking a wrong-dimension question.
+    """
+
+    text = question.strip()
+    if "。" in text:
+        text = text.rsplit("。", 1)[-1].strip()
+    keywords = _QUESTION_DIMENSION_KEYWORD_LOOKUP.get(dimension)
+    if not keywords:
+        # 无关键词表的维度不做拦截（保守：只放行，不误拒）。
+        return True
+    return any(keyword in text for keyword in keywords)
+
+
+def _normalize_question_text(text: str) -> str:
+    """Normalize for repeat detection: strip whitespace and punctuation."""
+    return re.sub(r"[\s。.!！？?，,、]+", "", text)
+
+
+def _question_repeats_recent(
+    question: str,
+    recent_turns: tuple[QuestionComposerTurn, ...],
+) -> bool:
+    """Reject an exact repeat of a previously asked doctor question.
+
+    Trigger: composer model repeatedly emitted the identical sentence while the
+    dimension selector cycled; the patient re-answered the same content and the
+    extraction piled up redundant CORRECTs until the chain broke.
+    """
+
+    normalized = _normalize_question_text(question)
+    if not normalized:
+        return True
+    for turn in recent_turns:
+        if turn.role == "doctor" and _normalize_question_text(turn.content) == normalized:
+            return True
+    return False
+
+
 def slot_followup_text(
     dimension: InquiryDimension,
     recent_turns: tuple[QuestionComposerTurn, ...],
@@ -656,13 +746,22 @@ async def _model_result(
     failure = validate_single_question_text(model_output.question)
     if failure is not None:
         return _failed(failure)
+    # 3c 维度一致性 + 不重复：模型题文必须命中 selected_dimension 的规范关键词
+    # （否则放行的错维问题会诱导患者重复作答 → 抽取 CORRECT 链 → 断链），
+    # 且不得原话重复已问过的问题。两者失败一律 SINGLE_QUESTION_INVALID 回模板，
+    # 与既有软失败白名单（degraded + last_failure_code）复用同一回落通道。
+    question_text = model_output.question.strip()
+    if not _question_targets_dimension(question_text, selection.selected_dimension):
+        return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
+    if _question_repeats_recent(question_text, recent_turns):
+        return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
     return QuestionCompositionOutcome(
         status=QuestionCompositionStatus.SUCCEEDED,
         result=QuestionComposerResult(
             input_state_version=selection.input_state_version,
             selected_dimension=selection.selected_dimension,
             selection_kind=selection.selection_kind,
-            question=model_output.question.strip(),
+            question=question_text,
             source=QuestionSource.MODEL,
             prompt_version=prompt_version,
         ),

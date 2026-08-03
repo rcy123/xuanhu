@@ -605,6 +605,53 @@ def test_forged_source_and_invalid_correction_target_are_rejected() -> None:
     assert target_report.failure_code is IntakeVerificationFailureCode.CORRECTION_TARGET_INVALID
 
 
+def test_same_value_correct_is_rejected_as_unchanged_reextraction() -> None:
+    """3c 回归：同键同值 CORRECT = 无变更重提取（真实 40140cf4 的冗余纠正链）。
+
+    错维重复提问下，模型逐轮对同一 active 事实发相同值 CORRECT，链越长越容易把
+    已超前的中间观测当 target → CORRECTION_TARGET_INVALID 断链。此处提前归入
+    HISTORICAL_FACT_REEXTRACTED（可重试 + 静默降级），不再堆积纠正链。
+    """
+    prior = ActiveObservationContext(
+        observation_id=uuid4(),
+        fact_key="ten_questions.head_body",
+        value="头有点晕，身上酸痛乏力",
+        normalized_value="头有点晕，身上酸痛乏力",
+    )
+    payload = make_input("头有点晕，身上酸痛乏力", history=(prior,))
+    source = payload.current_messages[0].message_id
+    run = make_run()
+    spec = build_intake_agent_spec(model="fake-model")
+    redundant_correct = ObservationDelta(
+        fact_key=prior.fact_key,
+        value=prior.value,
+        normalized_value=prior.normalized_value,
+        source_message_id=source,
+        confidence=0.95,
+        operation=ObservationOperation.CORRECT,
+        target_observation_id=prior.observation_id,
+    )
+    report = verify_intake_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=artifact(extracted(source, redundant_correct), run, spec=spec),
+        input_payload=payload,
+    )
+    assert report.failure_code is IntakeVerificationFailureCode.HISTORICAL_FACT_REEXTRACTED
+
+    # 值不同（真正纠正）仍放行。
+    real_correct = redundant_correct.model_copy(
+        update={"value": "头晕消失，只剩乏力", "normalized_value": "头晕消失，只剩乏力"}
+    )
+    ok_report = verify_intake_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=artifact(extracted(source, real_correct), run, spec=spec),
+        input_payload=payload,
+    )
+    assert ok_report.failure_code is None
+
+
 def test_safety_unknown_and_explicitly_none_are_distinct() -> None:
     source = uuid4()
     unknown = SafetyListDelta()

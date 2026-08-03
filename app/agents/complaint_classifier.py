@@ -33,7 +33,7 @@ from app.agent_runtime.specs import (
 )
 from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
-from app.core.config import get_settings
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.schemas.completeness import ComplaintCategory
 from app.schemas.intake import (
     COMPLAINT_CLASSIFICATION_OUTPUT_SCHEMA_VERSION,
@@ -98,8 +98,8 @@ def build_complaint_classifier_agent_spec(*, model: str | None = None) -> AgentS
             model=model or get_settings().chat_model,
             temperature=0.1,
             max_tokens=512,
-            # >= MODEL_GATEWAY_TIMEOUT_SECONDS(60s) 以避免外层先判超时却归因为网关超时。
-            timeout_seconds=75,
+            # > MODEL_GATEWAY_TIMEOUT_SECONDS（runtime 前置守卫强制），统一按网关超时 + 余量推导。
+            timeout_seconds=agent_model_timeout_seconds(),
             max_attempts=1,
         ),
         tool_permissions=COMPLAINT_CLASSIFIER_TOOL_PERMISSIONS,

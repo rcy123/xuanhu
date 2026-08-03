@@ -717,6 +717,88 @@ async def test_invalid_model_wording_falls_back_to_validated_template() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_question_missing_selected_dimension_keywords_falls_back_to_template() -> None:
+    """3c 回归：选中 chest_abdomen 却输出 head_body 题文（真实 40140cf4）→ 回模板。"""
+    covered = tuple(item for item in complete_general_facts() if item.fact_key != "ten_questions.chest_abdomen")
+    completeness = evaluate_completeness_policy(policy_input(*covered))
+    selection = select_gap(completeness)
+    assert selection.selected_dimension is InquiryDimension.TEN_CHEST_ABDOMEN
+    gateway = fallback_gateway("已记录患者感冒一周、咳嗽加重伴痰。请问患者目前是否有头痛或全身肌肉酸痛等不适？")
+
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.result.question == "患者近期胸腹部感受怎样？"
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+
+
+@pytest.mark.asyncio
+async def test_summary_masking_other_dimension_keyword_does_not_bypass_guard() -> None:
+    """3c 回归（b91e94fe）：小结段含目标维关键词、问句却指向他维时仍须拦截。
+
+    选中 respiratory 却输出「已记录咳嗽加重…请问患者是否有药物或食物过敏史？」——
+    小结段"咳嗽"是 respiratory 关键词，若整句检查会被放行；守卫只检查"。"后的
+    问句部分（"是否有药物或食物过敏史"），无 respiratory 关键词 → 回模板。
+    """
+    covered = tuple(
+        item
+        for item in complete_general_facts()
+        if item.fact_key != "chief_complaint.category"
+    ) + (fact("chief_complaint.category", "respiratory"),)
+    completeness = evaluate_completeness_policy(policy_input(*covered))
+    selection = select_gap(completeness)
+    assert selection.selected_dimension is InquiryDimension.TEN_RESPIRATORY
+    gateway = fallback_gateway("已记录咳嗽加重伴发热、食欲不佳。请问患者是否有药物或食物过敏史？")
+
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.result.question == "患者近期呼吸情况怎样？"
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+
+
+@pytest.mark.asyncio
+async def test_model_question_verbatim_repeat_falls_back_to_template() -> None:
+    """3c 回归：模型原话重复已问过的问题 → 回模板，不诱导患者重复作答。"""
+    covered = tuple(item for item in complete_general_facts() if item.fact_key != "ten_questions.chest_abdomen")
+    completeness = evaluate_completeness_policy(policy_input(*covered))
+    selection = select_gap(completeness)
+    assert selection.selected_dimension is InquiryDimension.TEN_CHEST_ABDOMEN
+    question_text = "已记录患者感冒一周、咳嗽加重伴痰。请问患者目前是否有胸闷或胸痛等胸部不适？"
+    gateway = fallback_gateway(question_text)
+
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        recent_turns=(
+            QuestionComposerTurn(role="doctor", content=question_text),
+            QuestionComposerTurn(role="patient", content="胸口有点闷"),
+        ),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.source is QuestionSource.TEMPLATE
+    assert outcome.degraded is True
+    assert outcome.last_failure_code is QuestionComposerFailureCode.SINGLE_QUESTION_INVALID
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_code, expected_failure_code",
     [

@@ -1,4 +1,4 @@
-"""LangGraph-backed intake message flow for L3-5.
+﻿"""LangGraph-backed intake message flow for L3-5.
 
 This service owns request/API orchestration only.  Clinical facts are committed
 through the L2 verifier/reducer/repository path, and model calls happen outside
@@ -76,7 +76,7 @@ from app.agents.question_composer import (
     compose_question,
     slot_followup_text,
 )
-from app.core.config import get_settings
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.core.exceptions import (
     AgentTriggerFailedError,
     IdempotencyConflictError,
@@ -113,6 +113,7 @@ from app.schemas.domain import (
     GateResultSchema,
     ObservationSchema,
     ObservationStatus,
+    SafetyProfileSchema,
 )
 from app.schemas.intake import (
     ActiveObservationContext,
@@ -174,6 +175,10 @@ RETRYABLE_INTAKE_FAILURE_CODES = frozenset(
         "INTAKE_DECISION_CONTENT_MISMATCH",
         # 模型偶发把身份类键(如 patient.name)当观察提取——重试大概率正常。
         "INTAKE_IDENTITY_FACT_FORBIDDEN",
+        "INTAKE_HISTORICAL_FACT_REEXTRACTED",
+        # 模型幻觉 CORRECT/RETRACT 目标 id(真实 7816d394)或引用已超前中间观测——
+        # 同属输出质量随机失败，重试大概率自愈；持续失败由静默降级兜底。
+        "INTAKE_CORRECTION_TARGET_INVALID",
         # 0d-2：composer 模型失败（自由措辞生成失败）同属随机失败，
         # 可重试重放；模板兜底仍由 compose_question 内部先承担（degraded 留痕）。
         "QUESTION_MODEL_OUTPUT_INVALID",
@@ -209,6 +214,10 @@ _INTAKE_SILENT_DEGRADE_CODES = frozenset(
         # 模型幻觉身份/权威字段(如 patient.name)输出会被丢弃,不必 503 整轮。
         "INTAKE_IDENTITY_FACT_FORBIDDEN",
         "INTAKE_AUTHORITY_FIELD_FORBIDDEN",
+        "INTAKE_HISTORICAL_FACT_REEXTRACTED",
+        # 幻觉 CORRECT 目标:整轮退回 ABSTAINED(不落事实),completeness 驱动下一问,
+        # 避免安全项采集被模型随机性卡死(真实 7816d394 503 复盘)。
+        "INTAKE_CORRECTION_TARGET_INVALID",
     }
 )
 # 模型质量类失败：同输入重放一次大概率成功(输出随机)，两次仍失败再降级。
@@ -223,6 +232,8 @@ _INTAKE_RETRYABLE_MODEL_CODES = frozenset(
         "INTAKE_SAFETY_SEMANTICS_INVALID",
         "INTAKE_IDENTITY_FACT_FORBIDDEN",
         "INTAKE_AUTHORITY_FIELD_FORBIDDEN",
+        "INTAKE_HISTORICAL_FACT_REEXTRACTED",
+        "INTAKE_CORRECTION_TARGET_INVALID",
     }
 )
 INTAKE_ROUTE_READY = "ready"
@@ -985,9 +996,9 @@ class LangGraphIntakeMessageRunner:
             agent_spec_version=QUESTION_COMPOSER_AGENT_VERSION,
             prompt_version=QUESTION_COMPOSER_PROMPT_VERSION,
             policy_version=QUESTION_COMPOSER_POLICY_VERSION,
-            # intake 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
-            # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；保留余量给 recorder/console。
-            deadline_at=_deadline(90),
+            # intake 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout
+            # （= 网关超时 + 余量）；保留余量给 recorder/console。
+            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
             total_attempt_budget=1,
             idempotency_key=f"{command_key}:question",
             trace_id=trace_id,
@@ -1757,10 +1768,10 @@ async def _classify_and_merge_category(
         agent_spec_version=COMPLAINT_CLASSIFIER_AGENT_VERSION,
         prompt_version=COMPLAINT_CLASSIFIER_PROMPT_VERSION,
         policy_version=COMPLAINT_CLASSIFY_POLICY_VERSION,
-        # 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout(75s)
-        # 且 > MODEL_GATEWAY_TIMEOUT_SECONDS(60s)；与 question_composer 惯例对齐（90s），
-        # 保留余量给 recorder/console，避免网关配置变化时 deadline 先触发误归因降级。
-        deadline_at=_deadline(90),
+        # 节点级 RunSpec deadline 需 > 对应 AgentSpec ModelPolicy.timeout
+        # （= 网关超时 + 余量）；与 question_composer 惯例对齐，保留余量给 recorder/console，
+        # 避免网关配置变化时 deadline 先触发误归因降级。
+        deadline_at=_deadline(agent_model_timeout_seconds() + 15),
         total_attempt_budget=1,
         idempotency_key=f"{claim.idempotency_key}:classify",
         trace_id=trace_id,
@@ -1997,11 +2008,18 @@ async def _pending_safety_dimensions(
         "medications": InquiryDimension.MEDICATION_STATUS,
         "major_conditions": InquiryDimension.MAJOR_CONDITION_STATUS,
     }
+    # Deterministic reply-bound explicit negatives are projected into the
+    # safety profile by the intake reducer, so they are no longer pending.
+    # Only model-extracted candidates and uncollected fields remain pending.
     pending_fields = set(
         await db.scalars(
             select(SafetyFactAssertion.field_name).where(
                 SafetyFactAssertion.session_id == session_id,
                 SafetyFactAssertion.status == "proposed",
+                ~(
+                    (SafetyFactAssertion.source_kind == "deterministic_reply_binding")
+                    & (SafetyFactAssertion.value["collection_status"].astext == "explicitly_none")
+                ),
             )
         )
     )
@@ -2012,7 +2030,10 @@ async def _pending_safety_dimensions(
         ("medications", current_delta.medications),
         ("major_conditions", current_delta.major_conditions),
     ):
-        if item.status is not CollectionStatus.UNKNOWN:
+        if (
+            item.status is not CollectionStatus.UNKNOWN
+            and item.status is not CollectionStatus.EXPLICITLY_NONE
+        ):
             pending_fields.add(field_name)
     return tuple(
         sorted(
@@ -2133,7 +2154,11 @@ async def _execute_intake_extraction_with_retry(
 
     first = await execute_intake_extraction(
         runtime=AgentRuntime(),
-        run_spec=_run_spec(run_id, deadline_seconds=90, retry=False),
+        run_spec=_run_spec(
+            run_id,
+            deadline_seconds=agent_model_timeout_seconds() + 15,
+            retry=False,
+        ),
         input_payload=intake_input,
     )
     if first.status is IntakeExecutionStatus.SUCCEEDED:
@@ -2143,7 +2168,11 @@ async def _execute_intake_extraction_with_retry(
     retry_run_id = uuid.uuid4()
     retried = await execute_intake_extraction(
         runtime=AgentRuntime(),
-        run_spec=_run_spec(retry_run_id, deadline_seconds=150, retry=True),
+        run_spec=_run_spec(
+            retry_run_id,
+            deadline_seconds=agent_model_timeout_seconds() + 75,
+            retry=True,
+        ),
         input_payload=intake_input,
     )
     if retried.status is IntakeExecutionStatus.SUCCEEDED:
@@ -2956,11 +2985,22 @@ def _intake_output_to_delta(
         )
         for index, item in enumerate(legal_observations)
     )
-    # High-risk model output is candidate-only.  It is persisted separately as
-    # SafetyFactAssertion(proposed) and can reach SafetyProfile only through an
-    # explicit, evidence-verified confirmation transition.
+    # Safety projection policy:
+    # - Deterministic explicit negatives (reply-bound "没有"/"无" to a safety
+    #   question) are authoritative collection outcomes: project them into the
+    #   safety profile immediately so completeness can mark the dimension
+    #   covered and advance can proceed. The corresponding assertion is still
+    #   persisted as proposed for provenance/audit, but advance skips it.
+    # - Model-extracted candidates (collected with values, or red flags)
+    #   remain proposed-only and can reach SafetyProfile only through an
+    #   explicit, evidence-verified doctor confirmation transition.
+    projected_profile = _project_explicit_none_safety(
+        state.safety_profile,
+        safety_delta,
+        session_id=session_id,
+    )
     del safety_delta
-    if not observation_schemas:
+    if not observation_schemas and projected_profile is None:
         artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-empty:{run_id}")
         artifact_revisions: tuple[ArtifactRevisionSchema, ...] = (
             ArtifactRevisionSchema(
@@ -2983,9 +3023,71 @@ def _intake_output_to_delta(
         expected_state_version=expected_state_version,
         source_message_ids=(source_message_id,),
         observations=observation_schemas,
-        safety_profile=None,
+        safety_profile=projected_profile,
         artifact_revisions=artifact_revisions,
     )
+
+
+def _project_explicit_none_safety(
+    current: SafetyProfileSchema | None,
+    delta: PatientSafetyDelta,
+    *,
+    session_id: uuid.UUID,
+) -> SafetyProfileSchema | None:
+    """Project deterministic explicit negatives into the safety profile.
+
+    Only ``EXPLICITLY_NONE`` collection outcomes from the intake safety delta
+    are projected here.  Collected candidates and red flags stay proposal-only
+    (doctor confirmation required).
+    """
+
+    if not delta.has_candidate():
+        return current
+    profile_values = (
+        current.model_dump(mode="json", exclude={"session_id"})
+        if current is not None
+        else {
+            "allergy_collection_status": CollectionStatus.UNKNOWN,
+            "allergens": None,
+            "pregnancy_collection_status": CollectionStatus.UNKNOWN,
+            "pregnancy_value": None,
+            "lactation_collection_status": CollectionStatus.UNKNOWN,
+            "lactation_value": None,
+            "medications_collection_status": CollectionStatus.UNKNOWN,
+            "medications": None,
+            "major_conditions_collection_status": CollectionStatus.UNKNOWN,
+            "major_conditions": None,
+            "contraindications_collection_status": CollectionStatus.UNKNOWN,
+            "contraindications": None,
+        }
+    )
+    updates: list[tuple[str, str | None]] = []
+    if delta.allergy.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("allergy_collection_status", "allergens"))
+    if delta.medications.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("medications_collection_status", "medications"))
+    if delta.major_conditions.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("major_conditions_collection_status", "major_conditions"))
+    if delta.pregnancy.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("pregnancy_collection_status", "pregnancy_value"))
+    if delta.lactation.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("lactation_collection_status", "lactation_value"))
+    if delta.contraindications.status is CollectionStatus.EXPLICITLY_NONE:
+        updates.append(("contraindications_collection_status", "contraindications"))
+    if not updates:
+        return None
+    for status_column, value_column in updates:
+        profile_values[status_column] = CollectionStatus.EXPLICITLY_NONE.value
+        profile_values[value_column] = None
+    projected = SafetyProfileSchema.model_validate(
+        {"session_id": session_id, **profile_values}
+    )
+    # Only return a profile when something actually changed; otherwise the
+    # reducer sees safety_profile as a no-op and may mix it with an empty
+    # artifact revision (MIXED_FACT_AND_ARTIFACT_CHANGE).
+    if current is not None and current.model_dump(mode="json") == projected.model_dump(mode="json"):
+        return None
+    return projected
 
 
 def _observation_status(operation: ObservationOperation) -> ObservationStatus:

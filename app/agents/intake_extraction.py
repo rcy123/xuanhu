@@ -36,7 +36,7 @@ from app.agent_runtime.specs import (
 )
 from app.agents.errors import PromptManifestError
 from app.agents.prompt_loader import PromptLoader
-from app.core.config import get_settings
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.schemas.intake import IntakeExtractionInput, IntakeExtractionOutput
 
 INTAKE_CONTEXT_TOKEN_LIMIT = 6_000
@@ -84,9 +84,9 @@ def build_intake_agent_spec(*, model: str | None = None) -> AgentSpec:
             model=model or get_settings().chat_model,
             temperature=0.1,
             max_tokens=4_096,
-            # 必须 >= MODEL_GATEWAY_TIMEOUT_SECONDS（内层单请求超时），否则外层先判超时却归因为
-            # MODEL_GATEWAY_TIMEOUT。配合节点级 RunSpec deadline(90s) 给 recorder 留余量。
-            timeout_seconds=75,
+            # 必须 > MODEL_GATEWAY_TIMEOUT_SECONDS（内层单请求超时），否则 runtime 前置守卫
+            # 直接判 MODEL_GATEWAY_TIMEOUT（请求根本不发出）。统一按网关超时 + 余量推导。
+            timeout_seconds=agent_model_timeout_seconds(),
             max_attempts=1,
         ),
         tool_permissions=frozenset({Capability.READ_STATE}),

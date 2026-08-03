@@ -576,6 +576,13 @@ async def _run_langgraph_advance(
                         # Red flags are owned by the triage/recovery boundary,
                         # not the generic safety-fact confirmation workflow.
                         SafetyFactAssertion.field_name != "red_flag",
+                        # Deterministic reply-bound explicit negatives are
+                        # already projected into the safety profile by the
+                        # intake reducer; they need no doctor resolution.
+                        ~(
+                            (SafetyFactAssertion.source_kind == "deterministic_reply_binding")
+                            & (SafetyFactAssertion.value["collection_status"].astext == "explicitly_none")
+                        ),
                     )
                     .limit(1)
                 )
