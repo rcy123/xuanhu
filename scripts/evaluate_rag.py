@@ -25,12 +25,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------------------
 # 项目根路径
@@ -103,6 +107,12 @@ class QueryEvalResult:
     # 综合判定（negative_case：禁止项均未命中 = pass）
     passed: bool = False
 
+    # 标准 IR 指标（P2-5 增强：仅对非 negative_case 且有 expected_topics 计算）
+    recall_at_k: float = 0.0  # 命中 expected_topics 比例
+    precision_at_k: float = 0.0  # top-k 中相关证据比例
+    mrr: float = 0.0  # 各 topic 首次命中 rank 倒数均值
+    ndcg_at_k: float = 0.0  # 按相关证据排序的 DCG/IDCG
+
 
 @dataclass
 class EvalReport:
@@ -122,6 +132,13 @@ class EvalReport:
     source_type_hit_rate: float = 0.0
     pass_count: int = 0
     pass_rate: float = 0.0
+
+    # 标准 IR 指标（仅对非 negative_case 且有 expected_topics 的 query 平均）
+    avg_recall_at_k: float = 0.0
+    avg_precision_at_k: float = 0.0
+    avg_mrr: float = 0.0
+    avg_ndcg_at_k: float = 0.0
+    ir_query_count: int = 0
 
     # 低召回列表
     low_recall_queries: list[QueryEvalResult] = field(default_factory=list)
@@ -176,6 +193,61 @@ def judge_topic_hit(
             if m not in all_matched:
                 all_matched.append(m)
     return len(all_matched) > 0, all_matched
+
+
+def judge_topic_ranks(
+    evidences: list[Any],
+    expected_topics: list[str],
+) -> dict[str, int]:
+    """返回每个 expected_topic 首次命中的 1-based rank（未命中不包含）。
+
+    用于 recall@k / MRR / NDCG@k 计算。
+    """
+    ranks: dict[str, int] = {}
+    for idx, ev in enumerate(evidences, start=1):
+        text = f"{getattr(ev, 'title', '')} {getattr(ev, 'content_snippet', '')}"
+        _hit, matched = _check_keyword_match(text, expected_topics)
+        for m in matched:
+            if m not in ranks:
+                ranks[m] = idx
+    return ranks
+
+
+def compute_ir_metrics(
+    evidences: list[Any],
+    expected_topics: list[str],
+    *,
+    top_k: int,
+) -> tuple[float, float, float, float]:
+    """计算单 query 的标准 IR 指标 (recall@k, precision@k, MRR, NDCG@k)。
+
+    - recall@k：命中 topic 数 / 期望 topic 数
+    - precision@k：top-k 中相关（命中任一期望 topic）证据数 / min(k, 返回数)
+    - MRR：各 topic 首次命中 rank 倒数均值（k 内未命中记 0）
+    - NDCG@k：相关证据按 rank 折损的 DCG / 理想排序 IDCG
+    """
+    if not expected_topics:
+        return 0.0, 0.0, 0.0, 0.0
+    ranked = evidences[:top_k]
+    ranks = judge_topic_ranks(ranked, expected_topics)
+    recall = len(ranks) / len(expected_topics)
+
+    def _is_relevant(ev: Any) -> bool:
+        text = f"{getattr(ev, 'title', '')} {getattr(ev, 'content_snippet', '')}"
+        return _check_keyword_match(text, expected_topics)[0]
+
+    denominator = max(1, min(top_k, len(evidences)))
+    precision = sum(1 for ev in ranked if _is_relevant(ev)) / denominator
+    mrr = sum(1.0 / rank for rank in ranks.values()) / len(expected_topics) if ranks else 0.0
+
+    dcg = 0.0
+    for idx, ev in enumerate(ranked, start=1):
+        if _is_relevant(ev):
+            dcg += 1.0 / math.log2(idx + 1)
+    total_relevant = sum(1 for ev in ranked if _is_relevant(ev))
+    idcg = sum(1.0 / math.log2(idx + 1) for idx in range(1, total_relevant + 1))
+    ndcg = dcg / idcg if idcg > 0 else 0.0
+    return recall, precision, mrr, ndcg
 
 
 def judge_source_type_hit(
@@ -433,6 +505,14 @@ async def run_evaluation(
             evidences[:top_k],
             forbidden_titles,
         )
+        # 标准 IR 指标（非 negative_case 且有 expected_topics）
+        if not negative_case and expected_topics:
+            (
+                result.recall_at_k,
+                result.precision_at_k,
+                result.mrr,
+                result.ndcg_at_k,
+            ) = compute_ir_metrics(evidences, expected_topics, top_k=top_k)
 
         # 综合 pass/fail 判定
         if negative_case:
@@ -492,6 +572,15 @@ def _compute_aggregate_metrics(report: EvalReport) -> None:
     report.pass_count = sum(1 for r in report.query_results if r.passed)
     report.pass_rate = report.pass_count / total if total > 0 else 0.0
 
+    # 标准 IR 指标（非 negative_case 且有 expected_topics 的 query 平均）
+    ir_results = [r for r in normal_results if r.expected_topics]
+    report.ir_query_count = len(ir_results)
+    if ir_results:
+        report.avg_recall_at_k = sum(r.recall_at_k for r in ir_results) / len(ir_results)
+        report.avg_precision_at_k = sum(r.precision_at_k for r in ir_results) / len(ir_results)
+        report.avg_mrr = sum(r.mrr for r in ir_results) / len(ir_results)
+        report.avg_ndcg_at_k = sum(r.ndcg_at_k for r in ir_results) / len(ir_results)
+
     # 低召回 query（非 negative_case 但有结果但未 pass）
     report.low_recall_queries = [r for r in normal_results if r.has_results and not r.passed]
 
@@ -547,6 +636,17 @@ def generate_markdown_report(report: EvalReport) -> str:
     lines.append(f"| topic 命中率（有 topic 期望的 query） | {report.topic_hit_rate:.1%} |")
     lines.append(f"| source_type 命中率（有 source 期望的 query） | {report.source_type_hit_rate:.1%} |")
     lines.append(f"| 综合 pass 率 | {report.pass_rate:.1%} |")
+    if report.ir_query_count:
+        lines.append("")
+        lines.append("### 标准 IR 指标（非 negative_case，有 expected_topics）")
+        lines.append("")
+        lines.append("| 指标 | 值 |")
+        lines.append("|------|----|")
+        lines.append(f"| IR 计算 query 数 | {report.ir_query_count} |")
+        lines.append(f"| recall@{report.top_k} | {report.avg_recall_at_k:.3f} |")
+        lines.append(f"| precision@{report.top_k} | {report.avg_precision_at_k:.3f} |")
+        lines.append(f"| MRR | {report.avg_mrr:.3f} |")
+        lines.append(f"| NDCG@{report.top_k} | {report.avg_ndcg_at_k:.3f} |")
     lines.append(f"| 低召回 query 数 | {len(report.low_recall_queries)} |")
     lines.append(f"| 报错 query 数 | {len(report.error_queries)} |")
     lines.append("")
@@ -723,6 +823,10 @@ def generate_json_report(report: EvalReport) -> dict[str, Any]:
                 "forbidden_topics_matched": r.forbidden_topics_matched,
                 "forbidden_titles_matched": r.forbidden_titles_matched,
                 "passed": r.passed,
+                "recall_at_k": r.recall_at_k,
+                "precision_at_k": r.precision_at_k,
+                "mrr": r.mrr,
+                "ndcg_at_k": r.ndcg_at_k,
                 "error": r.error,
             }
         )
@@ -736,6 +840,11 @@ def generate_json_report(report: EvalReport) -> dict[str, Any]:
             "topic_hit_rate": report.topic_hit_rate,
             "source_type_hit_rate": report.source_type_hit_rate,
             "pass_rate": report.pass_rate,
+            "recall_at_k": report.avg_recall_at_k,
+            "precision_at_k": report.avg_precision_at_k,
+            "mrr": report.avg_mrr,
+            "ndcg_at_k": report.avg_ndcg_at_k,
+            "ir_query_count": report.ir_query_count,
             "low_recall_count": len(report.low_recall_queries),
             "error_count": len(report.error_queries),
         },
