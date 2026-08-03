@@ -20,7 +20,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from app.core.config import get_settings
 from app.rag.schemas import Evidence
@@ -83,14 +84,14 @@ def stage_rag_enabled(stage: str) -> bool:
     """编排层判断 stage 是否启用 RAG（总开关 + 阶段开关）。
 
     Args:
-        stage: "syndrome" | "formula"
+        stage: "syndrome" | "formula" | "base_formula" | "modification"
     """
     settings = get_settings()
     if not settings.rag_enabled:
         return False
     if stage == "syndrome":
         return settings.rag_syndrome_enabled
-    if stage == "formula":
+    if stage in ("formula", "base_formula", "modification"):
         return settings.rag_formula_enabled
     return False
 

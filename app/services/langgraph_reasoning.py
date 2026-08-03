@@ -45,7 +45,6 @@ from app.agent_runtime.reasoning_subgraph import (
     ROUTE_SYNDROME_COMPLETED,
 )
 from app.agent_runtime.reducer import DomainDelta, DomainState, _current_observations
-from app.core.config import agent_model_timeout_seconds, get_settings
 from app.agent_runtime.repository import (
     AgentEvidenceSpec,
     AgentRunSpec,
@@ -79,11 +78,18 @@ from app.agent_runtime.syndrome_verifier import (
 )
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
 from app.agents.formula_draft import (
+    BASE_FORMULA_AGENT_VERSION,
+    BASE_FORMULA_RAG_POLICY_VERSION,
+    MODIFICATION_DRAFT_AGENT_VERSION,
+    MODIFICATION_DRAFT_RAG_POLICY_VERSION,
     FormulaExecutionResult,
     FormulaExecutionStatus,
     _consume_trusted_formula_execution,
-    build_formula_agent_spec,
+    build_base_formula_agent_spec,
+    build_modification_draft_agent_spec,
+    execute_base_formula_draft,
     execute_formula_draft,
+    execute_modification_draft,
 )
 from app.agents.question_composer import QUESTION_TEMPLATES, validate_single_question_text
 from app.agents.syndrome_draft import (
@@ -94,19 +100,28 @@ from app.agents.syndrome_draft import (
     execute_syndrome_draft,
     recover_trusted_syndrome_from_repository,
 )
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.db.session import get_session_factory
 from app.models.consult import ConsultSession
 from app.models.domain import GraphRun, IntakeCommandClaim
-from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus, ObservationStatus
 from app.rag.reasoning_retrieval import stage_rag_enabled
 from app.rag.schemas import Evidence
+from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus
 from app.schemas.formula import (
+    BASE_FORMULA_POLICY_VERSION,
+    BASE_FORMULA_PROMPT_VERSION,
+    BASE_FORMULA_RAG_PROMPT_VERSION,
     FORMULA_POLICY_VERSION,
     FORMULA_RAG_POLICY_VERSION,
     FORMULA_READY_STAGE,
+    MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION,
+    MODIFICATION_DRAFT_POLICY_VERSION,
+    MODIFICATION_DRAFT_PROMPT_VERSION,
+    MODIFICATION_DRAFT_RAG_PROMPT_VERSION,
     FormulaDraft,
     FormulaDraftDecision,
     FormulaDraftInput,
+    ModificationDraftInput,
 )
 from app.schemas.question import GapSelectionKind
 from app.schemas.syndrome import (
@@ -247,13 +262,22 @@ def _reasoning_policy(stage: str) -> tuple[str, str]:
     RAG 开关为 true 时返回 *.rag.v1 配对，否则维持 *.no-rag.v1 配对。
     agent 内按 input_payload.policy_version 分支检索；verifier 按
     run_spec.policy_version 分派校验——双端一致由本函数唯一决定。
+    2.8 两阶段开方：base_formula / modification 各自独立的 policy/prompt。
     """
     if stage_rag_enabled(stage):
         if stage == "syndrome":
             return SYNDROME_RAG_POLICY_VERSION, SYNDROME_RAG_PROMPT_VERSION
+        if stage == "base_formula":
+            return BASE_FORMULA_RAG_POLICY_VERSION, BASE_FORMULA_RAG_PROMPT_VERSION
+        if stage == "modification":
+            return MODIFICATION_DRAFT_RAG_POLICY_VERSION, MODIFICATION_DRAFT_RAG_PROMPT_VERSION
         return FORMULA_RAG_POLICY_VERSION, FORMULA_RAG_PROMPT_VERSION
     if stage == "syndrome":
         return SYNDROME_POLICY_VERSION, SYNDROME_PROMPT_VERSION
+    if stage == "base_formula":
+        return BASE_FORMULA_POLICY_VERSION, BASE_FORMULA_PROMPT_VERSION
+    if stage == "modification":
+        return MODIFICATION_DRAFT_POLICY_VERSION, MODIFICATION_DRAFT_PROMPT_VERSION
     return FORMULA_POLICY_VERSION, FORMULA_PROMPT_VERSION
 
 
@@ -586,6 +610,89 @@ async def run_reasoning_build_formula_context_node(state: XuanhuGraphState) -> d
         await db.close()
 
 
+async def _run_formula_stage_with_retry(
+    claim: IntakeCommandClaim,
+    repository: PostgresDomainRepository,
+    syndrome_result: SyndromeExecutionResult,
+    executor: Callable[..., Awaitable[FormulaExecutionResult]],
+    run_spec: RunSpec,
+    *,
+    input_payload: FormulaDraftInput | ModificationDraftInput,
+    agent_spec: AgentSpec,
+    step_label: str,
+) -> tuple[FormulaExecutionResult, FormulaConsistencyReport] | None:
+    """2.8 执行一个开方阶段（base_formula / modification）+ 统一重试循环。
+
+    执行失败（模型质量/网关）与一致性校验失败（加减引用基础方不存在的药等）
+    都是模型随机质量问题，同输入重放大概率自愈；共用 _REASONING_MAX_RETRIES
+    预算，重试耗尽返回 None（intermediate 已留痕，调用方转 manual_required）。
+    """
+    result = await executor(
+        runtime=AgentRuntime(),
+        repository=repository,
+        run_spec=run_spec,
+        input_payload=input_payload,
+        syndrome_result=syndrome_result,
+        agent_spec=agent_spec,
+        retriever=_rag_retriever(),
+    )
+    consistency = verify_trusted_formula_execution(result)
+    retried = 0
+    while True:
+        retry_code: str | None = None
+        if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
+            retry_code = str(result.failure_code or "FORMULA_FAILED")
+        elif result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
+            retry_code = str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED")
+        if retry_code is None:
+            break
+        if not _reasoning_failure_is_retryable(retry_code) or retried >= _REASONING_MAX_RETRIES:
+            await _save_intermediate(
+                claim.id,
+                {
+                    "formula": {
+                        "stage": step_label,
+                        "failure_code": retry_code,
+                        "retry_count": retried,
+                        "retried": False,
+                    },
+                    "formula_consistency": (
+                        {
+                            "passed": False,
+                            "failure_code": retry_code,
+                        }
+                        if result.status is FormulaExecutionStatus.SUCCEEDED
+                        and result.output is not None
+                        else None
+                    ),
+                },
+                step="draft_formula",
+            )
+            return None
+        retried += 1
+        retried_result = await executor(
+            runtime=AgentRuntime(),
+            repository=repository,
+            run_spec=_reasoning_retry_spec(run_spec, suffix=step_label, attempt=retried),
+            input_payload=input_payload,
+            syndrome_result=syndrome_result,
+            agent_spec=agent_spec,
+        )
+        if retried_result.status is not FormulaExecutionStatus.SUCCEEDED or retried_result.output is None:
+            result = retried_result
+            consistency = FormulaConsistencyReport(passed=False, failure_code=None)
+            continue
+        result = retried_result
+        consistency = verify_trusted_formula_execution(result)
+    if retried:
+        await _save_intermediate(
+            claim.id,
+            {"formula": {"stage": step_label, "retry_count": retried, "retried": True}},
+            step="draft_formula",
+        )
+    return result, consistency
+
+
 async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str, Any]:
     loaded = await _load_reasoning_claim(state)
     if isinstance(loaded, dict):
@@ -616,101 +723,114 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         if syndrome_result is None or syndrome_result.output is None or authority is None:
             return _sanitized_graph_error(state, "FORMULA_CONTEXT_MISSING", "formula context authority is unavailable")
         input_payload = _build_formula_input(authority, syndrome_result.output)
-        formula_policy, formula_prompt = _reasoning_policy("formula")
-        run_spec = RunSpec(
-            run_id=_commit_run_id(claim, "formula"),
+        # ---- 2.8 阶段 1：基础方草稿（仅选方，不做加减）----
+        base_policy, base_prompt = _reasoning_policy("base_formula")
+        # preflight 强制 input.policy_version == run_spec.policy_version：
+        # 基础方阶段使用 base 专属 policy/prompt 配对。
+        input_payload = input_payload.model_copy(update={"policy_version": base_policy})
+        base_policy, base_prompt = _reasoning_policy("base_formula")
+        base_run_spec = RunSpec(
+            run_id=_commit_run_id(claim, "base_formula"),
             session_id=claim.session_id,
             state_version=input_payload.state_version,
             stage=FORMULA_READY_STAGE,
-            agent_spec_version=FORMULA_AGENT_VERSION,
-            prompt_version=formula_prompt,
-            policy_version=formula_policy,
-            # 节点级 RunSpec deadline 需 > FORMULA AgentSpec ModelPolicy.timeout
-            # （= 网关超时 + 余量），避免外层先判超时错误归因为 MODEL_GATEWAY_TIMEOUT。
+            agent_spec_version=BASE_FORMULA_AGENT_VERSION,
+            prompt_version=base_prompt,
+            policy_version=base_policy,
             deadline_at=_deadline(agent_model_timeout_seconds() + 15),
             total_attempt_budget=1,
-            idempotency_key=f"{claim.idempotency_key}:formula",
+            idempotency_key=f"{claim.idempotency_key}:base_formula",
             trace_id=_node_trace_id(state),
         )
-        result = await _execute_formula(
-            runtime=AgentRuntime(),
-            repository=repository,
-            run_spec=run_spec,
+        base_stage = await _run_formula_stage_with_retry(
+            claim,
+            repository,
+            syndrome_result,
+            execute_base_formula_draft,
+            base_run_spec,
             input_payload=input_payload,
-            syndrome_result=syndrome_result,
-            agent_spec=build_formula_agent_spec(),
-            retriever=_rag_retriever(),
+            agent_spec=build_base_formula_agent_spec(),
+            step_label="base_formula",
         )
-        # 2.8 统一重试循环：执行失败（模型质量/网关）与一致性校验失败（加减引用
-        # 基础方不存在的药等，REAL-SESSION b801423b）都是模型随机质量问题，
-        # 同输入重放大概率自愈；两者共用 _REASONING_MAX_RETRIES 预算，
-        # 重试耗尽才 manual_required → 人工介入。
-        consistency = verify_trusted_formula_execution(result)
-        retried = 0
-        while True:
-            retry_code: str | None = None
-            if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
-                retry_code = str(result.failure_code or "FORMULA_FAILED")
-            elif result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
-                retry_code = str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED")
-            if retry_code is None:
-                break
-            if not _reasoning_failure_is_retryable(retry_code) or retried >= _REASONING_MAX_RETRIES:
+        if base_stage is None:
+            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+            return {
+                "route": NODE_REASONING_SUBGRAPH_V1,
+                "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                "last_error": None,
+            }
+        base_result, _ = base_stage
+        base_formula = base_result.output.base_formula
+        base_missing = _formula_missing_dimension(base_result.output)
+        if base_result.output.decision is not FormulaDraftDecision.COMPLETED or base_formula is None:
+            # 基础方阶段 needs_more_info/abstained：走与单步一致的缺失分支
+            if base_result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and base_missing is None:
                 await _save_intermediate(
                     claim.id,
                     {
                         "formula": {
-                            "failure_code": retry_code,
-                            "retry_count": retried,
-                            "retried": False,
-                        },
-                        "formula_consistency": (
-                            {
-                                "passed": False,
-                                "failure_code": retry_code,
-                            }
-                            if result.status is FormulaExecutionStatus.SUCCEEDED
-                            and result.output is not None
-                            else None
-                        ),
+                            "stage": "base_formula",
+                            "decision": base_result.output.decision.value,
+                            "failure_code": "FORMULA_MISSING_INPUT_UNMAPPED",
+                        }
                     },
                     step="draft_formula",
                 )
-                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-                return {
-                    "route": NODE_REASONING_SUBGRAPH_V1,
-                    "reasoning_route": ROUTE_MANUAL_REQUIRED,
-                    "last_error": None,
-                }
-            retried += 1
-            retried_result = await _execute_formula(
-                runtime=AgentRuntime(),
-                repository=repository,
-                run_spec=_reasoning_retry_spec(run_spec, suffix="formula", attempt=retried),
-                input_payload=input_payload,
-                syndrome_result=syndrome_result,
-                agent_spec=build_formula_agent_spec(),
-            )
-            if retried_result.status is not FormulaExecutionStatus.SUCCEEDED or retried_result.output is None:
-                result = retried_result
-                consistency = FormulaConsistencyReport(
-                    passed=False,
-                    failure_code=None,
-                )
-                continue
-            result = retried_result
-            consistency = verify_trusted_formula_execution(result)
-        if retried:
-            await _save_intermediate(
-                claim.id,
-                {
-                    "formula": {
-                        "retry_count": retried,
-                        "retried": True,
-                    }
-                },
-                step="draft_formula",
-            )
+            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+            return {
+                "route": NODE_REASONING_SUBGRAPH_V1,
+                "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                "last_error": None,
+            }
+
+        # ---- 2.8 阶段 2：加减草稿（输入含权威基础方全文）----
+        mod_policy, mod_prompt = _reasoning_policy("modification")
+        mod_input = ModificationDraftInput(
+            schema_version=MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION,
+            session_id=input_payload.session_id,
+            state_version=input_payload.state_version,
+            current_stage=input_payload.current_stage,
+            policy_version=mod_policy,
+            domain_state=input_payload.domain_state,
+            triage_gate=input_payload.triage_gate,
+            completeness_gate=input_payload.completeness_gate,
+            context_observations=input_payload.context_observations,
+            syndrome_draft=input_payload.syndrome_draft,
+            base_formula=base_formula,
+            base_formula_rationale=base_result.output.rationale,
+            base_confidence=base_result.output.confidence,
+        )
+        mod_run_spec = RunSpec(
+            run_id=_commit_run_id(claim, "modification"),
+            session_id=claim.session_id,
+            state_version=input_payload.state_version,
+            stage=FORMULA_READY_STAGE,
+            agent_spec_version=MODIFICATION_DRAFT_AGENT_VERSION,
+            prompt_version=mod_prompt,
+            policy_version=mod_policy,
+            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
+            total_attempt_budget=1,
+            idempotency_key=f"{claim.idempotency_key}:modification",
+            trace_id=_node_trace_id(state),
+        )
+        mod_stage = await _run_formula_stage_with_retry(
+            claim,
+            repository,
+            syndrome_result,
+            execute_modification_draft,
+            mod_run_spec,
+            input_payload=mod_input,
+            agent_spec=build_modification_draft_agent_spec(),
+            step_label="modification",
+        )
+        if mod_stage is None:
+            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+            return {
+                "route": NODE_REASONING_SUBGRAPH_V1,
+                "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                "last_error": None,
+            }
+        result, consistency = mod_stage
         formula_missing_dimension = _formula_missing_dimension(result.output)
         if result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and formula_missing_dimension is None:
             await _save_intermediate(

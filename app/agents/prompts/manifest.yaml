@@ -26,6 +26,12 @@ syndrome_draft_rag: syndrome_draft_rag_v1.jinja2
 formula_draft: formula_draft_v1.jinja2
 # 方剂草稿（RAG 版）：同上，但可参考检索到的方剂/中药证据
 formula_draft_rag: formula_draft_rag_v1.jinja2
+# 两阶段开方（2.8）：阶段 1 基础方草稿（无 RAG / RAG 版）
+base_formula_draft: base_formula_draft_v1.jinja2
+base_formula_draft_rag: base_formula_draft_rag_v1.jinja2
+# 两阶段开方（2.8）：阶段 2 加减草稿（输入含权威基础方全文，无 RAG / RAG 版）
+modification_draft: modification_draft_v1.jinja2
+modification_draft_rag: modification_draft_rag_v1.jinja2
 
 # --- legacy 路径（supervisor 流程，新 session 已不路由；仅历史兼容）---
 # 问诊采集（legacy）：四诊信息采集 + 补问生成，输出 InquiryAgentOutput

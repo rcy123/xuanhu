@@ -23,6 +23,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.schemas.formula import (
+    BASE_FORMULA_RAG_POLICY_VERSION,
     FORMULA_DRAFT_SCHEMA_VERSION,
     FORMULA_EVIDENCE_MODE,
     FORMULA_NO_RAG_CONFIDENCE_MAX,
@@ -30,6 +31,7 @@ from app.schemas.formula import (
     FORMULA_RAG_EVIDENCE_MODE,
     FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
     FORMULA_RAG_POLICY_VERSION,
+    MODIFICATION_DRAFT_RAG_POLICY_VERSION,
     FormulaComposition,
     FormulaDraft,
     FormulaDraftDecision,
@@ -211,6 +213,34 @@ class _ConsistencyFailure(ValueError):
     def __init__(self, code: FormulaConsistencyFailureCode) -> None:
         super().__init__(code.value)
         self.code = code
+
+
+def apply_modifications_to_base(
+    base: FormulaComposition,
+    modifications: tuple[FormulaModification, ...],
+) -> FormulaComposition:
+    """2.8 阶段 2 合成：把加减应用到权威基础方，产出候选方（CanonicalFormula 形态）。
+
+    REMOVE / DOSE_ADJUST 的 target 以 ``base`` composition 为唯一真源检查 ——
+    结构性杜绝 MODIFICATION_TARGET_MISSING 类自相矛盾输出。
+
+    Raises:
+        _ConsistencyFailure: 任一 modification 越界（target 不存在/剂量非法等）。
+    """
+    canonical_base = _canonicalize_draft(
+        FormulaDraft(
+            schema_version=FORMULA_DRAFT_SCHEMA_VERSION,
+            decision=FormulaDraftDecision.COMPLETED,
+            base_formula=base,
+            modifications=(),
+            candidate_formula=base,
+            rationale="base",
+            confidence=0.5,
+        )
+    ).base_formula
+    if canonical_base is None:
+        raise _ConsistencyFailure(FormulaConsistencyFailureCode.SCHEMA_INVALID)
+    return _apply_modifications(canonical_base, modifications)
 
 
 def verify_formula_consistency(
@@ -546,7 +576,11 @@ def _verify_evidence_contract(
 
     policy_version 为 None（未声明来源的 draft 审计）时按 no-rag 契约兜底。
     """
-    if policy_version == FORMULA_RAG_POLICY_VERSION:
+    if policy_version in {
+        FORMULA_RAG_POLICY_VERSION,
+        BASE_FORMULA_RAG_POLICY_VERSION,
+        MODIFICATION_DRAFT_RAG_POLICY_VERSION,
+    }:
         if output.evidence_mode != FORMULA_RAG_EVIDENCE_MODE:
             return FormulaConsistencyFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
         return _verify_rag_contract(output, evidence_ids)

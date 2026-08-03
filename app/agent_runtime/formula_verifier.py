@@ -30,12 +30,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
 from app.agent_runtime.syndrome_verifier import (
+    _SLOT_PROJECTION_SCHEMA_KEYS,
     SYNDROME_AGENT_NAME,
     SYNDROME_AGENT_VERSION,
     SYNDROME_VERIFIER_CHAIN,
     SyndromeGateAuthority,
     SyndromeVerificationReport,
-    _SLOT_PROJECTION_SCHEMA_KEYS,
     _context_matches_authority,
 )
 from app.agent_runtime.syndrome_verifier import (
@@ -45,6 +45,12 @@ from app.core.config import agent_model_timeout_seconds
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
 from app.schemas.formula import (
+    BASE_FORMULA_AGENT_NAME,
+    BASE_FORMULA_AGENT_VERSION,
+    BASE_FORMULA_POLICY_VERSION,
+    BASE_FORMULA_PROMPT_VERSION,
+    BASE_FORMULA_RAG_POLICY_VERSION,
+    BASE_FORMULA_RAG_PROMPT_VERSION,
     FORMULA_DRAFT_SCHEMA_VERSION,
     FORMULA_EVIDENCE_MODE,
     FORMULA_INPUT_SCHEMA_VERSION,
@@ -55,11 +61,21 @@ from app.schemas.formula import (
     FORMULA_RAG_NO_EVIDENCE_CONFIDENCE_MAX,
     FORMULA_RAG_POLICY_VERSION,
     FORMULA_READY_STAGE,
+    MODIFICATION_DRAFT_AGENT_NAME,
+    MODIFICATION_DRAFT_AGENT_VERSION,
+    MODIFICATION_DRAFT_POLICY_VERSION,
+    MODIFICATION_DRAFT_PROMPT_VERSION,
+    MODIFICATION_DRAFT_RAG_POLICY_VERSION,
+    MODIFICATION_DRAFT_RAG_PROMPT_VERSION,
+    BaseFormulaDraft,
     FormulaComposition,
     FormulaDraft,
     FormulaDraftDecision,
     FormulaDraftInput,
+    FormulaFactClaim,
     FormulaModification,
+    ModificationDraft,
+    ModificationDraftInput,
 )
 from app.schemas.syndrome import (
     SYNDROME_INPUT_SCHEMA_VERSION,
@@ -80,10 +96,15 @@ FORMULA_PROMPT_VERSION = "formula_draft_v1.jinja2"
 FORMULA_RAG_AGENT_NAME = "formula_draft_rag"
 FORMULA_RAG_PROMPT_VERSION = "formula_draft_rag_v1.jinja2"
 # 合法 policy_version / prompt_version 配对集合（D1：策略级决策，verifier 只认配对）。
+# 2.8 两阶段开方：base_formula / modification 各自的 no-rag / rag 配对。
 FORMULA_POLICY_PROMPT_PAIRS = frozenset(
     {
         (FORMULA_POLICY_VERSION, FORMULA_PROMPT_VERSION),
         (FORMULA_RAG_POLICY_VERSION, FORMULA_RAG_PROMPT_VERSION),
+        (BASE_FORMULA_POLICY_VERSION, BASE_FORMULA_PROMPT_VERSION),
+        (BASE_FORMULA_RAG_POLICY_VERSION, BASE_FORMULA_RAG_PROMPT_VERSION),
+        (MODIFICATION_DRAFT_POLICY_VERSION, MODIFICATION_DRAFT_PROMPT_VERSION),
+        (MODIFICATION_DRAFT_RAG_POLICY_VERSION, MODIFICATION_DRAFT_RAG_PROMPT_VERSION),
     }
 )
 FORMULA_VERIFIER_CHAIN = (
@@ -314,11 +335,22 @@ FORMULA_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()  # 网关超时 + 
 
 def _valid_agent_spec(spec: AgentSpec) -> bool:
     policy = spec.model_policy
+    # 2.8 两阶段开方：base_formula / modification_draft 与单步 formula 共用
+    # 同一策略链（温度/预算/权限/verifier 链），仅 name/version/schema 不同。
+    name_ok = spec.name in {FORMULA_AGENT_NAME, BASE_FORMULA_AGENT_NAME, MODIFICATION_DRAFT_AGENT_NAME}
+    version_ok = spec.version in {
+        FORMULA_AGENT_VERSION,
+        BASE_FORMULA_AGENT_VERSION,
+        MODIFICATION_DRAFT_AGENT_VERSION,
+    }
+    schema_ok = (
+        spec.input_schema in {FormulaDraftInput, ModificationDraftInput}
+        and spec.output_schema in {FormulaDraft, BaseFormulaDraft, ModificationDraft}
+    )
     return (
-        spec.name == FORMULA_AGENT_NAME
-        and spec.version == FORMULA_AGENT_VERSION
-        and spec.input_schema is FormulaDraftInput
-        and spec.output_schema is FormulaDraft
+        name_ok
+        and version_ok
+        and schema_ok
         and policy.temperature == FORMULA_MODEL_TEMPERATURE
         and policy.max_tokens <= FORMULA_MODEL_MAX_TOKENS
         and policy.timeout_seconds <= FORMULA_MODEL_TIMEOUT_SECONDS
@@ -667,7 +699,11 @@ def _verify_evidence_contract(
     - rag 契约：evidence_mode=rag_retrieved、每条 link 的 evidence_id 必须命中
       本次检索证据集合（防幻觉引用）、confidence 按证据空否分别封顶。
     """
-    if policy_version == FORMULA_RAG_POLICY_VERSION:
+    if policy_version in {
+        FORMULA_RAG_POLICY_VERSION,
+        BASE_FORMULA_RAG_POLICY_VERSION,
+        MODIFICATION_DRAFT_RAG_POLICY_VERSION,
+    }:
         if output.evidence_mode != FORMULA_RAG_EVIDENCE_MODE:
             return FormulaVerificationFailureCode.EVIDENCE_MODE_POLICY_MISMATCH
         return _verify_rag_contract(output, evidence_ids)
