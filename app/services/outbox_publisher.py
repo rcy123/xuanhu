@@ -125,8 +125,11 @@ def map_outbox_event(message: OutboxMessage) -> tuple[MappedSessionEvent, ...]:
                 )
             )
         completeness_disposition = _string(payload, "completeness_disposition")
+        triage_decision = _string(payload, "triage_decision")
+        # triage_decision 缺失（如澄清回复等无 triage 重算的命令）不视为阻断；
+        # 仅当显式非 "passed" 时才广播 safety.blocked。
         if (
-            _string(payload, "triage_decision") != "passed"
+            (triage_decision is not None and triage_decision != "passed")
             or completeness_disposition == "triage_blocked"
         ):
             events.extend(

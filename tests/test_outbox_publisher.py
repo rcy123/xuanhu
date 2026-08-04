@@ -167,6 +167,12 @@ def test_versioned_mapper_projects_only_safe_fields() -> None:
             ["agent.finished", "session.blocked"],
         ),
         (
+            # 澄清回复等无 triage 重算的命令：triage_decision 缺失不视为阻断。
+            "intake.command_completed.v1",
+            {"patient_message_id": str(uuid4())},
+            ["agent.finished"],
+        ),
+        (
             "safety_confirmation.recomputed.v1",
             {
                 "stage": "inquiry",

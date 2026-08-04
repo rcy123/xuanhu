@@ -252,7 +252,9 @@ function SafetyReviewCard({
   const passed = safetyReview?.passed as boolean | undefined
   const issues = (blockedIssues ?? (safetyReview?.issues as SafetyIssue[] | undefined)) ?? []
   const hasIssues = issues.length > 0
-  const isBlocked = !passed || hasIssues
+  // 只有显式 passed=false 或存在 issues 才判为未通过；safetyReview 缺失时
+  // （如 safety.blocked 事件携带空 issues 的误报）不展示失败状态。
+  const isBlocked = hasIssues || passed === false
 
   if (!safetyReview && !blockedIssues) return null
 
@@ -331,7 +333,7 @@ function SafetyReviewCard({
           <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
             <WarningOutlined style={{ color: 'var(--xh-error)' }} />
             <Text type="danger" style={{ fontSize: 12 }}>
-              {rollbackTarget
+              {rollbackTarget && rollbackTarget !== 'none'
                 ? `系统将自动回退调整（目标：${rollbackTarget === 'prescription' ? '开方阶段' : '加减方阶段'}）`
                 : '已阻断，系统将回退调整'}
             </Text>
