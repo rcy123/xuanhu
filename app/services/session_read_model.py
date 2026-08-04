@@ -39,7 +39,10 @@ _FORMULA_PAYLOAD_SCHEMA_VERSION = "formula-artifact-payload.v1"
 _TRIAGE_POLICY_VERSION = "triage-red-flag.v1"
 _COMPLETENESS_POLICY_VERSION = "completeness-policy.v1"
 _SYNDROME_GATE_NAME = "syndrome_verifier"
-_SYNDROME_GATE_POLICY = "syndrome-draft-policy.no-rag.v1"
+# RAG 启用时 verifier gate 使用 rag.v1 policy（与 syndrome_draft 的 policy 一致），
+# 未启用时是 no-rag.v1 —— read model 必须两者都接受，否则 RAG 会话的
+# syndrome/formula artifact 无法通过信任校验 → 前端方子为空。
+_SYNDROME_GATE_POLICIES = ("syndrome-draft-policy.no-rag.v1", "syndrome-draft-policy.rag.v1")
 _FORMULA_GATE_NAME = "formula_consistency"
 _FORMULA_GATE_POLICY = "formula-consistency-policy.v1"
 _CANONICAL_GATE_NAME = "canonical_verifier_chain"
@@ -189,7 +192,7 @@ def _artifact_gate(
     rows: tuple[GateAuthorityRow, ...],
     *,
     gate_name: str,
-    gate_policy: str,
+    gate_policies: tuple[str, ...],
 ) -> GateResult | None:
     matching = [
         row.gate
@@ -198,7 +201,7 @@ def _artifact_gate(
         and row.gate.graph_run_id == artifact.produced_by_run_id
         and row.gate.input_state_version == artifact.input_state_version
         and row.gate.gate_name == gate_name
-        and row.gate.policy_version == gate_policy
+        and row.gate.policy_version in gate_policies
         and row.gate.decision == "passed"
         and isinstance(row.gate.details, dict)
         and row.gate.details.get("artifact_digest") == payload.content_digest
@@ -258,12 +261,12 @@ def _trusted_artifact(
     if artifact.artifact_type == _SYNDROME_ARTIFACT_TYPE:
         expected_schema = _SYNDROME_PAYLOAD_SCHEMA_VERSION
         gate_name = _SYNDROME_GATE_NAME
-        gate_policy = _SYNDROME_GATE_POLICY
+        gate_policies = _SYNDROME_GATE_POLICIES
         output_type: type[SyndromeDraft] | type[FormulaDraft] = SyndromeDraft
     else:
         expected_schema = _FORMULA_PAYLOAD_SCHEMA_VERSION
         gate_name = _FORMULA_GATE_NAME
-        gate_policy = _FORMULA_GATE_POLICY
+        gate_policies = (_FORMULA_GATE_POLICY,)
         output_type = FormulaDraft
     if payload.payload_schema_version != expected_schema or raw_payload.get("kind") != artifact.artifact_type:
         return None
@@ -283,7 +286,7 @@ def _trusted_artifact(
         if not isinstance(consistency, dict) or consistency.get("passed") is not True:
             return None
 
-    gate = _artifact_gate(artifact, payload, gates, gate_name=gate_name, gate_policy=gate_policy)
+    gate = _artifact_gate(artifact, payload, gates, gate_name=gate_name, gate_policies=gate_policies)
     if gate is None:
         return None
     try:
