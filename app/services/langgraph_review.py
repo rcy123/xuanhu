@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.checkpoint import postgres_checkpointer
-from app.agent_runtime.commands import NODE_REVIEW_PLACEHOLDER, XuanhuCommand
+from app.agent_runtime.commands import NODE_BLOCKED_TERMINAL, NODE_REVIEW_PLACEHOLDER, XuanhuCommand
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.formula_consistency import FORMULA_CONSISTENCY_POLICY_VERSION
 from app.agent_runtime.graph import build_main_graph
@@ -997,8 +997,10 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         state_version=domain_state.state_version + 1,
     )
     if not result.passed:
+        # safety 硬门禁不通过：路由到 blocked 终态（与 session stage=blocked 一致），
+        # 否则 checkpoint 记成 review_placeholder → recover 时状态错乱 → 死循环。
         return {
-            "route": NODE_REVIEW_PLACEHOLDER,
+            "route": NODE_BLOCKED_TERMINAL,
             "domain_state_version": domain_state.state_version + 1,
             "artifact_refs": response["artifact_refs"],
             "gate_results": response["gate_results"],
