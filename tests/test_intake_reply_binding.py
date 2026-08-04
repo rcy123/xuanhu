@@ -86,6 +86,34 @@ def test_safety_negative_still_uses_explicit_none_path() -> None:
     assert out.patient_safety_delta is not None
 
 
+def test_bound_four_diagnosis_fallback_records_tongue_and_pulse() -> None:
+    content = "舌质淡红，舌苔薄白且润泽；脉浮。"
+
+    out = langgraph_intake._gateway_bound_reply_fallback_output(
+        _input(content, "four_diagnosis"),
+        "INTAKE_IDENTITY_FACT_FORBIDDEN",
+    )
+
+    assert out is not None
+    assert out.decision.value == "extracted"
+    assert [(item.fact_key, item.value) for item in out.observations] == [
+        ("four_diagnosis.inspection", content),
+        ("four_diagnosis.palpation", content),
+    ]
+
+
+def test_bound_four_diagnosis_fallback_never_infers_an_unmentioned_component() -> None:
+    content = "舌质淡红，舌苔薄白。"
+
+    out = langgraph_intake._gateway_bound_reply_fallback_output(
+        _input(content, "four_diagnosis"),
+        "INTAKE_IDENTITY_FACT_FORBIDDEN",
+    )
+
+    assert out is not None
+    assert [item.fact_key for item in out.observations] == ["four_diagnosis.inspection"]
+
+
 # ---------------------------------------------------------------------------
 # 2.8 冲突过滤：模型重复提取同键不同值 → 丢弃留痕，不整轮失败
 # ---------------------------------------------------------------------------

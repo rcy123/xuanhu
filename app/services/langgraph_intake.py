@@ -3260,11 +3260,17 @@ def _bound_social_reply_output(
 def _bound_required_reply_fallback_output(
     input_payload: IntakeExtractionInput,
 ) -> IntakeExtractionOutput | None:
-    """Turn a gateway outage into a focused follow-up, never an inferred fact.
+    """Keep a bound required reply usable when the primary extraction degrades.
 
-    The doctor's source message remains durable, but without a verified model
-    extraction the clinical dimension stays incomplete.  Safety and conflict
-    replies deliberately remain outside this availability fallback.
+    Most required dimensions can be preserved as a single coarse observation.
+    Four-diagnosis is different: its legal, completeness-recognised fact keys
+    are ``four_diagnosis.inspection`` and ``four_diagnosis.palpation`` rather
+    than the coarse ``four_diagnosis`` dimension.  A valid tongue-and-pulse
+    reply must therefore be split by the explicit terms it contains; otherwise
+    a transient extraction failure causes an unnecessary repeat question.
+
+    Safety and conflict replies deliberately remain outside this availability
+    fallback.
     """
 
     context = input_payload.reply_context
@@ -3274,6 +3280,8 @@ def _bound_required_reply_fallback_output(
         selected_dimension = InquiryDimension(context.selected_dimension)
     except ValueError:
         return None
+    if selected_dimension is InquiryDimension.FOUR_DIAGNOSIS:
+        return _bound_four_diagnosis_reply_fallback_output(input_payload)
     if selected_dimension not in _BOUND_REQUIRED_OBSERVATION_DIMENSIONS:
         return None
     message = input_payload.current_messages[0]
@@ -3290,6 +3298,50 @@ def _bound_required_reply_fallback_output(
                 confidence=_DETERMINISTIC_REPLY_BINDING_CONFIDENCE,
                 operation=ObservationOperation.ADD,
             ),
+        ),
+    )
+
+
+def _bound_four_diagnosis_reply_fallback_output(
+    input_payload: IntakeExtractionInput,
+) -> IntakeExtractionOutput | None:
+    """Bind explicit tongue and pulse details to their canonical fact keys.
+
+    This is intentionally a narrow fallback: it only applies to a reply bound
+    to the required four-diagnosis question, and only emits a fact when the
+    reply explicitly mentions ``舌`` or ``脉``.  Values keep the original
+    answer as their source text so no clinical detail is invented or discarded.
+    """
+
+    context = input_payload.reply_context
+    if context is None or context.selection_kind != "required" or len(input_payload.current_messages) != 1:
+        return None
+    if context.selected_dimension != InquiryDimension.FOUR_DIAGNOSIS.value:
+        return None
+    message = input_payload.current_messages[0]
+    content = message.content.strip()
+    if not content or _is_social_acknowledgement(content):
+        return None
+
+    observation_keys: list[str] = []
+    if "舌" in content:
+        observation_keys.append("four_diagnosis.inspection")
+    if "脉" in content or "脈" in content:
+        observation_keys.append("four_diagnosis.palpation")
+    if not observation_keys:
+        return None
+
+    return IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        observations=tuple(
+            ObservationDelta(
+                fact_key=fact_key,
+                value=content[:240],
+                source_message_id=message.message_id,
+                confidence=_DETERMINISTIC_REPLY_BINDING_CONFIDENCE,
+                operation=ObservationOperation.ADD,
+            )
+            for fact_key in observation_keys
         ),
     )
 
