@@ -134,6 +134,54 @@ describe('SessionList', () => {
     expect(screen.getByText('暂无会话')).toBeInTheDocument()
   })
 
+  it('collapsed 模式：会话缩成小块（姓名首字）', () => {
+    wrap(
+      <SessionList
+        sessions={[makeSession('s1', { patient_info: { name: '王芳', gender: 'female', age: 28 } })]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        collapsed
+        onSelect={() => {}}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    // 首字小块存在
+    expect(screen.getByText('王')).toBeInTheDocument()
+    // 完整摘要不再显示
+    expect(screen.queryByText('王芳 · 女 · 28岁')).toBeNull()
+    // 新建按钮收起为图标（无文字）
+    expect(screen.queryByText('新建问诊')).toBeNull()
+  })
+
+  it('collapsed 模式：点击小块触发 onSelect，删除仍有效', () => {
+    const onSelect = vi.fn()
+    const { unmount } = wrap(
+      <SessionList
+        sessions={[makeSession('s1'), makeSession('s2')]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        collapsed
+        onSelect={onSelect}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    act(() => {
+      fireEvent.click(screen.getByTestId('session-list').querySelector('[data-session-id="s1"]') as HTMLElement)
+    })
+    expect(onSelect).toHaveBeenCalledWith('s1')
+    act(() => {
+      fireEvent.click(screen.getByTestId('remove-s2'))
+    })
+    const list = screen.getByTestId('session-list')
+    expect(list.querySelector('[data-session-id="s2"]')).toBeNull()
+    expect(list.querySelector('[data-session-id="s1"]')).not.toBeNull()
+    unmount()
+  })
+
   it('可按患者与主诉快速筛选会话', () => {
     wrap(
       <SessionList

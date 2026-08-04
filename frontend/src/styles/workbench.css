@@ -180,6 +180,97 @@
   font-size: 18px;
 }
 
+.xh-session-sider-heading .xh-session-collapse.ant-btn {
+  color: var(--xh-text-secondary);
+}
+
+/* 折叠态：侧栏变窄，会话缩成小块（患者姓名首字） */
+.xh-session-sider .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.xh-session-list.is-collapsed {
+  align-items: center;
+}
+
+.xh-session-list.is-collapsed .xh-session-list-scroll {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.xh-session-list.is-collapsed .xh-create-session.ant-btn {
+  width: 44px;
+  height: 44px;
+  min-width: 0;
+  padding: 0;
+  border-radius: 12px;
+}
+
+.xh-session-chip {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--xh-border);
+  border-radius: 12px;
+  background: var(--xh-bg-card, #fff);
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.xh-session-chip:hover {
+  transform: translateY(-1px);
+  border-color: var(--xh-primary, #1677ff);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+}
+
+.xh-session-chip[data-selected="true"] {
+  border-color: var(--xh-primary, #1677ff);
+  background: rgba(22, 119, 255, 0.08);
+  box-shadow: 0 4px 12px rgb(22 119 255 / 16%);
+}
+
+.xh-session-chip-initial {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--xh-text, #333);
+}
+
+.xh-session-chip[data-selected="true"] .xh-session-chip-initial {
+  color: var(--xh-primary, #1677ff);
+}
+
+/* 小块右上角删除：hover 时显示 */
+.xh-session-chip-remove.ant-btn {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 18px;
+  height: 18px;
+  min-width: 0;
+  padding: 0;
+  font-size: 10px;
+  border-radius: 50%;
+  background: #fff;
+  color: #ff4d4f;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 18%);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease;
+}
+
+.xh-session-chip:hover .xh-session-chip-remove.ant-btn,
+.xh-session-chip-remove.ant-btn:focus-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
 .xh-section-kicker {
   color: var(--xh-text-secondary) !important;
   font-size: 9px !important;
