@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 
+from pydantic import ValidationError
+
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import AgentSpec, FailurePolicy, ModelPolicy, RunSpec
@@ -110,18 +112,20 @@ async def execute_record_narrative(
         packet, prompt_version = build_record_narrative_context(input_payload)
         if prompt_version != run_spec.prompt_version:
             return RecordNarrativeResult(output=None, failure_code="RECORD_NARRATIVE_PROMPT_MISMATCH")
-        result = await runtime.run(
+        artifact = await runtime.run(
             spec,
             run_spec,
             input_payload,
             [message.model_dump(mode="json") for message in packet.messages],
         )
-        if result.status.value != "succeeded" or result.output is None:
-            return RecordNarrativeResult(
-                output=None,
-                failure_code=str(result.failure_code or "RECORD_NARRATIVE_FAILED"),
-            )
-        return RecordNarrativeResult(output=result.output, failure_code=None)
-    except (RuntimeErrorBase, PromptManifestError, ContextBuilderError, ValueError, TypeError) as exc:
-        logger.warning("record narrative execution failed: %s", type(exc).__name__)
+    except RuntimeErrorBase as exc:
+        return RecordNarrativeResult(output=None, failure_code=str(exc.code))
+    except (PromptManifestError, ContextBuilderError, ValueError, TypeError) as exc:
+        logger.warning("record narrative context/build failed: %s", type(exc).__name__)
         return RecordNarrativeResult(output=None, failure_code="RECORD_NARRATIVE_FAILED")
+    try:
+        output = RecordNarrativeOutput.model_validate(artifact.output)
+    except (ValidationError, TypeError, ValueError):
+        logger.warning("record narrative output invalid")
+        return RecordNarrativeResult(output=None, failure_code="RECORD_NARRATIVE_OUTPUT_INVALID")
+    return RecordNarrativeResult(output=output, failure_code=None)
