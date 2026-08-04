@@ -247,6 +247,10 @@ class _RecoveryCheckpointState(_CheckpointControlModel):
     pending_interrupt: _CheckpointInterruptRef | None
     budget: _CheckpointBudget
     last_error: _CheckpointLastError | None
+    # 澄清通道（intake 子图）与 extract 决策：旧 checkpoint 不含这两个字段，
+    # 必须为可选并带默认值，保证 backward-compatible。
+    clarify_requested: bool = False
+    intake_decision: str = ""
 
     @field_validator("session_id", "run_id", mode="before")
     @classmethod
