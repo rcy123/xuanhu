@@ -181,6 +181,8 @@ class FormulaDraftInput(BaseModel):
     syndrome_draft: SyndromeDraft
     # 医师否决反馈（reject 后重新开方时注入）：None=首次开方
     review_feedback: str | None = Field(default=None, max_length=2_000)
+    # 知识库修正提示（开方预检发现未收录药时注入重试输入）：None=无
+    knowledge_correction: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def input_consistency(self) -> FormulaDraftInput:
@@ -317,4 +319,6 @@ class ModificationDraftInput(BaseModel):
     base_formula_rationale: str | None = Field(default=None, max_length=1000)
     # 医师否决反馈（reject 后重新开方时注入）：None=首次开方
     review_feedback: str | None = Field(default=None, max_length=2_000)
+    # 知识库修正提示（开方预检发现未收录药时注入重试输入）：None=无
+    knowledge_correction: str | None = Field(default=None, max_length=500)
     base_confidence: float = Field(ge=0, le=1)

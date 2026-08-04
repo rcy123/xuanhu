@@ -329,6 +329,8 @@ _REASONING_RETRYABLE_MODEL_CODES = frozenset(
         # 2.8 一致性校验失败（模型输出与基础方矛盾，如加减引用不存在的药）：
         # 属模型随机质量问题，同输入重放大概率自愈；仍失败才 manual_required。
         *(code.value for code in FormulaConsistencyFailureCode),
+        # 3.0 开方预检：方子含知识库未收录药（safety 必拦）→ 带修正提示重试。
+        "FORMULA_HERB_NOT_IN_KNOWLEDGE_BASE",
     }
 )
 
@@ -363,6 +365,62 @@ def _reasoning_retry_backoff_seconds(attempt: int) -> float:
 
     base = get_settings().reasoning_retry_backoff_base_seconds
     return base * attempt
+
+
+async def _load_herb_normalizer() -> Any:
+    """加载知识库药名标准化器（herbs 表 -> 别名映射）。"""
+    from app.models.knowledge import Herb
+    from app.safety.engine import _HerbAliasAdapter
+    from app.safety.normalizer import HerbNormalizer
+
+    factory = get_session_factory()
+    async with factory() as db:
+        rows = await db.execute(select(Herb).order_by(Herb.name))
+        herbs = list(rows.scalars())
+    return HerbNormalizer(_HerbAliasAdapter(herb) for herb in herbs)
+
+
+async def _unknown_herbs_in_candidate(output: object) -> tuple[str, ...]:
+    """检查方子 candidate 组成中知识库未收录的药名（开方预检）。
+
+    返回未收录药名列表；空元组表示全部收录。safety 硬门禁对未收录药
+    必拦（high），此处提前拦截并让模型带修正提示重试，避免走到
+    safety 阶段才被拦死。
+    """
+    from app.schemas.formula import FormulaDraftDecision
+
+    if output is None or getattr(output, "decision", None) is not FormulaDraftDecision.COMPLETED:
+        return ()
+    candidate = getattr(output, "candidate_formula", None)
+    if candidate is None:
+        return ()
+    try:
+        normalizer = await _load_herb_normalizer()
+    except Exception:
+        # 知识库不可用（未迁移/加载失败）：跳过预检，safety 硬门禁仍有兜底。
+        return ()
+    if not normalizer._standard_names:
+        # 知识库为空（如测试环境）：跳过预检，避免误伤全部药名。
+        return ()
+    unknown: list[str] = []
+    for item in candidate.composition:
+        herb = getattr(item, "herb", None)
+        if not isinstance(herb, str) or not herb:
+            continue
+        if normalizer.normalize(herb) not in normalizer._standard_names:
+            if herb not in unknown:
+                unknown.append(herb)
+    return tuple(unknown)
+
+
+def _herb_correction_hint(unknown: tuple[str, ...]) -> str:
+    """构造未收录药名的修正提示（注入重试输入，模型据此改用规范药名）。"""
+    names = "、".join(unknown)
+    return (
+        f"以下药名不在系统中药知识库中：{names}。"
+        "请将其替换为知识库收录的规范药名或别名（如「紫苏子」应写「苏子」、"
+        "「生石膏」应写「石膏」），不得保留未收录药名。"
+    )
 
 
 # 模型质量/网关类失败的最大重试次数（同输入重放，随机失败大概率自愈）。
@@ -657,12 +715,19 @@ async def _run_formula_stage_with_retry(
     )
     consistency = verify_trusted_formula_execution(result)
     retried = 0
+    correction_hint: str | None = None
     while True:
         retry_code: str | None = None
         if result.status is not FormulaExecutionStatus.SUCCEEDED or result.output is None:
             retry_code = str(result.failure_code or "FORMULA_FAILED")
         elif result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
             retry_code = str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED")
+        if retry_code is None and result.output is not None:
+            # 3.0 开方预检：方子含知识库未收录药 → safety 必拦，提前重试。
+            unknown = await _unknown_herbs_in_candidate(result.output)
+            if unknown:
+                correction_hint = _herb_correction_hint(unknown)
+                retry_code = "FORMULA_HERB_NOT_IN_KNOWLEDGE_BASE"
         if retry_code is None:
             break
         if not _reasoning_failure_is_retryable(retry_code) or retried >= _REASONING_MAX_RETRIES:
@@ -674,6 +739,7 @@ async def _run_formula_stage_with_retry(
                         "failure_code": retry_code,
                         "retry_count": retried,
                         "retried": False,
+                        "knowledge_correction": correction_hint,
                     },
                     "formula_consistency": (
                         {
@@ -691,11 +757,16 @@ async def _run_formula_stage_with_retry(
         retried += 1
         # 第三方网关频率风控（403）：重试前退避，跨过风控窗口。
         await asyncio.sleep(_reasoning_retry_backoff_seconds(retried))
+        retry_input = (
+            input_payload.model_copy(update={"knowledge_correction": correction_hint})
+            if correction_hint is not None
+            else input_payload
+        )
         retried_result = await executor(
             runtime=AgentRuntime(),
             repository=repository,
             run_spec=_reasoning_retry_spec(run_spec, suffix=step_label, attempt=retried),
-            input_payload=input_payload,
+            input_payload=retry_input,
             syndrome_result=syndrome_result,
             agent_spec=agent_spec,
         )
