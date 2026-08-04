@@ -9,6 +9,7 @@ API Key 不得进入日志、异常详情、health 响应或测试快照。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -239,13 +240,24 @@ class ModelGatewayClient:
                     f"模型网关返回非 2xx 状态码: {status_code}",
                     retryable=True,
                 )
-                # 4xx 错误通常不可重试（除 429 外）
+                # 4xx 错误通常不可重试（除 429 外）；403 在第三方中转场景常见为
+                # 临时风控/限流，允许单次重试（仅第一次失败时，总尝试 ≤ 2），
+                # 其余 4xx 直接失败。
                 if 400 <= status_code < 500 and status_code != 429:
-                    last_exception = ModelGatewayUnavailableError(
-                        f"模型网关返回客户端错误: {status_code}",
-                        retryable=False,
-                    )
-                    break
+                    if status_code == 403 and attempt == 0:
+                        logger.warning(
+                            "模型网关 403（疑似临时风控），单次重试: path=%s, attempt=%d/%d",
+                            path,
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        await asyncio.sleep(1.0)
+                    else:
+                        last_exception = ModelGatewayUnavailableError(
+                            f"模型网关返回客户端错误: {status_code}",
+                            retryable=False,
+                        )
+                        break
 
             except httpx.TimeoutException:
                 logger.warning(

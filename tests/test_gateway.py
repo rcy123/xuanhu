@@ -165,6 +165,61 @@ async def test_chat_non_2xx_error(mock_settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_403_retries_once_then_succeeds(mock_settings: Settings) -> None:
+    """403（疑似临时风控）允许单次重试：第一次 403，第二次 200 应成功。"""
+    client = ModelGatewayClient(mock_settings)
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions")
+        route.mock(
+            side_effect=[
+                Response(403, json={"error": "forbidden"}),
+                Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "{\"reply\": \"ok\"}",
+                                    "reasoning_content": None,
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"total_tokens": 5},
+                    },
+                ),
+            ]
+        )
+
+        response = await client.chat(
+            messages=[{"role": "user", "content": "Hello"}],
+            trace_id="test-trace-403-retry",
+        )
+        assert response is not None
+        assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_403_persistent_fails_with_limited_attempts(mock_settings: Settings) -> None:
+    """403 持续失败：总尝试数不超过 2 次（单次重试上限），不空转。"""
+    client = ModelGatewayClient(mock_settings)
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions")
+        route.mock(return_value=Response(403, json={"error": "forbidden"}))
+
+        with pytest.raises(ModelGatewayUnavailableError) as exc_info:
+            await client.chat(
+                messages=[{"role": "user", "content": "Hello"}],
+                trace_id="test-trace-403-persist",
+            )
+
+        assert exc_info.value.retryable is False
+        assert route.call_count <= 2
+
+
+@pytest.mark.asyncio
 async def test_chat_response_structure_error(mock_settings: Settings) -> None:
     """chat 响应结构异常归一化测试 — 网关返回 200 但缺少 choices 字段。"""
     client = ModelGatewayClient(mock_settings)
