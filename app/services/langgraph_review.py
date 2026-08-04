@@ -356,6 +356,10 @@ def _patient_info_from_domain(
         if profile.pregnancy_value is PregnancyValue.POSSIBLE
         else PregnancyStatus.NO
         if profile.pregnancy_value is PregnancyValue.NOT_PREGNANT
+        # 患者已明确确认「无」（explicitly_none）：value 为 None，但状态本身就是
+        # 否定确认，不得降级为 UNKNOWN —— 否则已确认的妊娠否定会被安全引擎
+        # 误报「妊娠状态未确认」（真实会话 794ad8e4 复盘）。
+        or profile.pregnancy_collection_status is CollectionStatus.EXPLICITLY_NONE
         else PregnancyStatus.UNKNOWN
     )
     lactation = (
@@ -363,6 +367,8 @@ def _patient_info_from_domain(
         if profile.lactation_value is LactationValue.LACTATING
         else LactationValue.NOT_LACTATING
         if profile.lactation_value is LactationValue.NOT_LACTATING
+        # 同 pregnancy：explicitly_none 视为否定确认。
+        or profile.lactation_collection_status is CollectionStatus.EXPLICITLY_NONE
         else None
     )
     return PatientInfo(
