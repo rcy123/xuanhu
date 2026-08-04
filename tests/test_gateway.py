@@ -220,6 +220,27 @@ async def test_chat_403_persistent_fails_with_limited_attempts(mock_settings: Se
 
 
 @pytest.mark.asyncio
+async def test_chat_403_respects_max_requests_1_no_transport_retry(mock_settings: Settings) -> None:
+    """runtime 路径（max_requests=1）：403 不做传输层重试，由节点级预算兜底。"""
+    client = ModelGatewayClient(mock_settings)
+
+    with respx.mock:
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions")
+        route.mock(return_value=Response(403, json={"error": "forbidden"}))
+
+        with pytest.raises(ModelGatewayUnavailableError) as exc_info:
+            await client.chat_structured(
+                messages=[{"role": "user", "content": "Hello"}],
+                output_schema=SampleOutput,
+                trace_id="test-trace-403-budget1",
+                max_requests=1,
+            )
+
+        assert exc_info.value.retryable is False
+        assert route.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_chat_response_structure_error(mock_settings: Settings) -> None:
     """chat 响应结构异常归一化测试 — 网关返回 200 但缺少 choices 字段。"""
     client = ModelGatewayClient(mock_settings)

@@ -241,10 +241,11 @@ class ModelGatewayClient:
                     retryable=True,
                 )
                 # 4xx 错误通常不可重试（除 429 外）；403 在第三方中转场景常见为
-                # 临时风控/限流，允许单次重试（仅第一次失败时，总尝试 ≤ 2），
-                # 其余 4xx 直接失败。
+                # 临时风控/限流，仅在第一次失败且还有重试预算时重试一次
+                # （总尝试 ≤ 2），其余 4xx 直接失败。runtime 路径传 max_requests=1
+                # 时预算为 1，此处自然不重试，由 runtime 的节点级预算兜底。
                 if 400 <= status_code < 500 and status_code != 429:
-                    if status_code == 403 and attempt == 0:
+                    if status_code == 403 and attempt == 0 and attempt + 1 < max_attempts:
                         logger.warning(
                             "模型网关 403（疑似临时风控），单次重试: path=%s, attempt=%d/%d",
                             path,

@@ -7,6 +7,7 @@ as versioned artifact payloads and Graph State only receives references.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -351,6 +352,19 @@ def _reasoning_retry_spec(original: RunSpec, *, suffix: str, attempt: int = 1) -
     )
 
 
+def _reasoning_retry_backoff_seconds(attempt: int) -> float:
+    """第 ``attempt`` 次重试前的等待秒数（指数退避）。
+
+    第三方中转网关（如 dmxapi）对短时高频调用有频率风控（403，窗口约 30-60s），
+    重试必须退避以跨过风控窗口，否则 3 连发必然全挂。基数可经
+    REASONING_RETRY_BACKOFF_BASE_SECONDS 配置（0=关闭，测试用）。
+    """
+    from app.core.config import get_settings
+
+    base = get_settings().reasoning_retry_backoff_base_seconds
+    return base * attempt
+
+
 # 模型质量/网关类失败的最大重试次数（同输入重放，随机失败大概率自愈）。
 _REASONING_MAX_RETRIES = 2
 
@@ -472,6 +486,8 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             if _reasoning_failure_is_retryable(code):
                 while retried < _REASONING_MAX_RETRIES:
                     retried += 1
+                    # 第三方网关频率风控（403）：重试前退避，跨过风控窗口。
+                    await asyncio.sleep(_reasoning_retry_backoff_seconds(retried))
                     retried_result = await _execute_syndrome(
                         runtime=AgentRuntime(),
                         repository=repository,
@@ -670,6 +686,8 @@ async def _run_formula_stage_with_retry(
             )
             return None
         retried += 1
+        # 第三方网关频率风控（403）：重试前退避，跨过风控窗口。
+        await asyncio.sleep(_reasoning_retry_backoff_seconds(retried))
         retried_result = await executor(
             runtime=AgentRuntime(),
             repository=repository,

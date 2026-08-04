@@ -121,6 +121,15 @@ class Settings(BaseSettings):
     model_gateway_route_profile: str = Field(
         default="default", description="网关路由 profile"
     )
+    reasoning_retry_backoff_base_seconds: float = Field(
+        default=10.0,
+        ge=0,
+        description=(
+            "reasoning 节点级重试的指数退避基数（秒）：第 n 次重试前等待 "
+            "base*n 秒。第三方中转网关对短时高频调用有风控（403），退避可跨过"
+            "风控窗口；设 0 关闭（测试用）。"
+        ),
+    )
     model_gateway_structured_mode: Literal["auto", "tools", "json_object"] = Field(
         default="auto",
         description=(
