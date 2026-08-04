@@ -110,16 +110,17 @@ export function ReviewActionsBar({
             >
               否决，重新开方
             </Button>
-            {!blocked ? (
-              <Button
-                icon={<EditOutlined />}
-                onClick={onModify}
-                loading={submitting}
-                data-testid="review-modify-btn"
-              >
-                修改处方
-              </Button>
-            ) : null}
+            {/* 修改处方是阻断态的合法出路：提交后重新执行 Safety 硬门禁，
+                通过后才能确认（确认按钮仍隐藏）。否则医生被困在
+                recover→advance 循环里无法改方子。 */}
+            <Button
+              icon={<EditOutlined />}
+              onClick={onModify}
+              loading={submitting}
+              data-testid="review-modify-btn"
+            >
+              修改处方
+            </Button>
             {!blocked ? (
               <Button
                 type="primary"

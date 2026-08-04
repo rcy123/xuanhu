@@ -114,7 +114,7 @@ describe('ReviewActionsBar', () => {
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
   })
 
-  it('阻断态不显示确认/修改按钮', () => {
+  it('阻断态隐藏确认按钮但保留修改处方（修改后重新执行 Safety 硬门禁）', () => {
     const detail = makeDetail({
       safety_review: { passed: false, issues: [{ severity: 'blocker', message: '十八反' }] },
     })
@@ -131,7 +131,7 @@ describe('ReviewActionsBar', () => {
       />,
     )
     expect(screen.queryByTestId('review-confirm-btn')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('review-modify-btn')).not.toBeInTheDocument()
+    expect(screen.getByTestId('review-modify-btn')).toBeInTheDocument()
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
   })
 

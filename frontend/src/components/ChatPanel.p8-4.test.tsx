@@ -200,7 +200,8 @@ describe('ChatPanel P8-4 集成', () => {
     )
 
     expect(screen.queryByTestId('review-confirm-btn')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('review-modify-btn')).not.toBeInTheDocument()
+    // 修改处方保留：提交后重新执行 Safety 硬门禁
+    expect(screen.getByTestId('review-modify-btn')).toBeInTheDocument()
     // 否决按钮仍可显示
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
   })
