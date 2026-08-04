@@ -60,9 +60,20 @@ from app.services.langgraph_review import (
 )
 
 MEDICAL_RECORD_ARTIFACT_TYPE = "medical_record"
-MEDICAL_RECORD_SCHEMA_VERSION = "medical-record.product.v1"
+# v1：处方确认单（legacy）；v2：完整临床病历（主诉/现病史/辨证过程/诊断/处方/注意事项 + 叙述）。
+MEDICAL_RECORD_SCHEMA_VERSION_V1 = "medical-record.product.v1"
+MEDICAL_RECORD_SCHEMA_VERSION = "medical-record.product.v2"
 RECORD_POLICY_VERSION = "record-consistency.product.v1"
-RECORD_DISCLAIMER = "本记录由确定性规则根据已确认处方生成，须由具备资质的医师结合原始病历复核。"
+RECORD_DISCLAIMER = "本记录由确定性规则根据已确认处方生成，叙述部分由 AI 辅助撰写，须由具备资质的医师复核确认。"
+
+# 叙述模型不可用时的降级话术（保持流程不中断）。
+_RECORD_NARRATIVE_FALLBACK_DIET = (
+    "饮食宜清淡易消化，注意营养均衡、规律进餐，忌生冷油腻辛辣刺激之品，"
+    "具体忌口请遵医嘱。"
+)
+_RECORD_NARRATIVE_FALLBACK_PROGNOSIS = (
+    "遵医嘱按时服药并注意调摄，症状多可逐渐缓解；若症状加重或持续不缓解，请及时复诊。"
+)
 
 
 def _stable_record_artifact_id(session_id: uuid.UUID) -> uuid.UUID:
@@ -251,20 +262,33 @@ def _render_record_text(
     formula: FormulaAuthority,
     action: str,
     safety_rule_version: str,
+    clinical: dict[str, str],
+    narrative: dict[str, str] | None = None,
 ) -> str:
-    composition = "、".join(
-        f"{item.herb}{'' if item.dose is None else item.dose}{item.unit}"
-        for item in formula.formula.composition
-    )
-    return "\n".join(
+    """渲染完整病历文本（主诉/现病史/辨证过程/诊断/处方/注意事项 + 叙述）。"""
+    narrative = narrative or {}
+    lines = [
+        f"主诉：{clinical.get('chief_complaint') or '未记录'}",
+        f"现病史：{clinical.get('present_illness') or '未记录'}",
+        f"辨证过程：{clinical.get('syndrome_process') or '未记录'}",
+        f"中医诊断：{clinical.get('diagnosis') or '未记录'}",
+        f"治则治法：{clinical.get('treatment_principle') or '未记录'}",
+        f"处方：{formula.formula.name or '未命名处方'}",
+        f"组成：{clinical.get('formula_composition') or ''}",
+        f"注意事项：{clinical.get('precautions') or '无'}",
+    ]
+    if narrative.get("diet_advice"):
+        lines.append(f"饮食建议：{narrative['diet_advice']}")
+    if narrative.get("prognosis"):
+        lines.append(f"预后情况：{narrative['prognosis']}")
+    lines.extend(
         (
-            f"处方：{formula.formula.name or '未命名处方'}",
-            f"组成：{composition}",
             f"安全审核：通过（{safety_rule_version}）",
             f"医师复核：{action}",
             f"免责声明：{RECORD_DISCLAIMER}",
         )
     )
+    return "\n".join(lines)
 
 
 def _doctor_review_output(review: DoctorReview) -> dict[str, object]:
@@ -293,6 +317,9 @@ def _record_json(
     safety_record: ArtifactPayloadRecord,
     safety_result: SafetyRuleResult,
     safety_run_id: uuid.UUID,
+    clinical: dict[str, str],
+    narrative: dict[str, str] | None = None,
+    narrative_source: str = "template",
 ) -> dict[str, object]:
     result_dump = safety_result.model_dump(mode="json")
     return {
@@ -318,6 +345,10 @@ def _record_json(
             },
         },
         "disclaimer": RECORD_DISCLAIMER,
+        # v2 完整病历：确定性临床结构 + 叙述（模型或降级模板）。
+        "clinical": clinical,
+        "narrative": narrative or {},
+        "narrative_source": narrative_source,
     }
 
 
@@ -476,7 +507,8 @@ async def resolve_committed_record_advance(
         )
         if (
             payload_row is None
-            or payload_row.payload_schema_version != MEDICAL_RECORD_SCHEMA_VERSION
+            or payload_row.payload_schema_version
+            not in {MEDICAL_RECORD_SCHEMA_VERSION, MEDICAL_RECORD_SCHEMA_VERSION_V1}
             or artifact_payload_digest(
                 payload_row.payload_schema_version,
                 cast(dict[str, object], payload_row.payload),
@@ -502,19 +534,49 @@ async def resolve_committed_record_advance(
             or medical_record.record_text != payload_row.payload["record_text"]
             or medical_record.record_json != record_json
             or medical_record.disclaimer != RECORD_DISCLAIMER
-            or set(record_json)
-            != {
-                "schema_version",
-                "record_id",
-                "session_id",
-                "record_version",
-                "formula",
-                "safety_review",
-                "doctor_review",
-                "authority_refs",
-                "disclaimer",
-            }
-            or record_json.get("schema_version") != MEDICAL_RECORD_SCHEMA_VERSION
+            or (
+                record_json.get("schema_version") == MEDICAL_RECORD_SCHEMA_VERSION
+                and set(record_json)
+                != {
+                    "schema_version",
+                    "record_id",
+                    "session_id",
+                    "record_version",
+                    "formula",
+                    "safety_review",
+                    "doctor_review",
+                    "authority_refs",
+                    "disclaimer",
+                    "clinical",
+                    "narrative",
+                    "narrative_source",
+                }
+            )
+            or (
+                record_json.get("schema_version") == MEDICAL_RECORD_SCHEMA_VERSION_V1
+                and set(record_json)
+                != {
+                    "schema_version",
+                    "record_id",
+                    "session_id",
+                    "record_version",
+                    "formula",
+                    "safety_review",
+                    "doctor_review",
+                    "authority_refs",
+                    "disclaimer",
+                }
+            )
+            or record_json.get("schema_version")
+            not in {MEDICAL_RECORD_SCHEMA_VERSION, MEDICAL_RECORD_SCHEMA_VERSION_V1}
+            or (
+                record_json.get("schema_version") == MEDICAL_RECORD_SCHEMA_VERSION
+                and (
+                    not isinstance(record_json.get("clinical"), dict)
+                    or not isinstance(record_json.get("narrative"), dict)
+                    or record_json.get("narrative_source") not in {"model", "template"}
+                )
+            )
             or record_json.get("record_id") != str(expected_record_id)
             or record_json.get("session_id") != str(session_id)
             or record_json.get("record_version") != artifact_row.revision
@@ -590,6 +652,151 @@ async def resolve_committed_record_advance(
         )
 
 
+def _clinical_record_fields(
+    *,
+    observations: tuple[Any, ...],
+    syndrome: dict[str, Any] | None,
+    formula: FormulaAuthority,
+    safety_result: SafetyRuleResult,
+    safety_profile: Any,
+) -> dict[str, str]:
+    """确定性拼接完整病历的临床结构字段（不经过模型）。"""
+    facts: dict[str, str] = {}
+    for item in observations:
+        key = getattr(item, "fact_key", None)
+        if not isinstance(key, str):
+            continue
+        value = getattr(item, "normalized_value", None) or getattr(item, "value", None)
+        if value is not None:
+            facts.setdefault(key, str(value))
+
+    chief_complaint = " ".join(
+        str(v) for v in (facts.get("chief_complaint.symptom"), facts.get("chief_complaint.course")) if v
+    )
+    present_items = [
+        facts.get("present_illness.change"),
+        *(facts.get(key) for key in sorted(facts) if key.startswith("ten_questions.")),
+        facts.get("past_history"),
+    ]
+    present_illness = "；".join(str(v) for v in present_items if v)
+
+    syndrome_process = ""
+    diagnosis = ""
+    treatment_principle = ""
+    if syndrome is not None:
+        diagnosis = str(syndrome.get("syndrome") or "")
+        treatment_principle = str(syndrome.get("treatment_principle") or "")
+        basis = syndrome.get("syndrome_basis") or ()
+        if isinstance(basis, (list, tuple)):
+            claims = [str(item.get("claim") or "") for item in basis if isinstance(item, dict)]
+            syndrome_process = "；".join(c for c in claims if c)
+        if not syndrome_process:
+            syndrome_process = diagnosis
+
+    composition = "、".join(
+        f"{item.herb}{'' if item.dose is None else item.dose}{item.unit}"
+        for item in formula.formula.composition
+    )
+    precautions = "；".join(
+        str(issue.suggestion) for issue in safety_result.issues if getattr(issue, "suggestion", None)
+    )
+    pregnancy = getattr(safety_profile, "pregnancy_collection_status", None)
+    if pregnancy is not None and str(pregnancy) != "unknown":
+        precautions = (precautions + "；" if precautions else "") + f"妊娠状态：{pregnancy}"
+    return {
+        "chief_complaint": chief_complaint,
+        "present_illness": present_illness,
+        "syndrome_process": syndrome_process,
+        "diagnosis": diagnosis,
+        "treatment_principle": treatment_principle,
+        "formula_name": formula.formula.name or "未命名处方",
+        "formula_composition": composition,
+        "precautions": precautions,
+    }
+
+
+async def _load_syndrome_record(
+    repository: PostgresDomainRepository,
+    session_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """读取可信的 syndrome_draft 输出（供病历确定性拼接）。"""
+    record = await repository.get_artifact_payload(
+        session_id,
+        artifact_type="syndrome_draft",
+        artifact_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:syndrome_draft:{session_id}"),
+        status="current",
+    )
+    if record is None or not isinstance(record.payload, dict):
+        return None
+    try:
+        await _require_completed_producer(record)
+    except Exception:
+        return None
+    output = record.payload.get("output")
+    return output if isinstance(output, dict) else None
+
+
+async def _draft_record_narrative(
+    *,
+    session_id: uuid.UUID,
+    state_version: int,
+    clinical: dict[str, str],
+    run_id: uuid.UUID,
+) -> tuple[dict[str, str], str]:
+    """生成叙述性段落（饮食建议/预后）；失败降级为固定话术，绝不中断病历流程。"""
+    from app.agents.record_narrative import (
+        build_record_narrative_agent_spec,
+        execute_record_narrative,
+    )
+    from app.agent_runtime.specs import RunSpec
+    from app.core.config import get_settings
+    from app.schemas.record_narrative import (
+        RECORD_NARRATIVE_POLICY_VERSION,
+        RECORD_NARRATIVE_PROMPT_VERSION,
+        RecordNarrativeInput,
+    )
+    from app.services.langgraph_reasoning import _deadline
+
+    narrative_input = RecordNarrativeInput(
+        session_id=str(session_id),
+        state_version=state_version,
+        policy_version=RECORD_NARRATIVE_POLICY_VERSION,
+        **clinical,
+    )
+    run_spec = RunSpec(
+        run_id=run_id,
+        session_id=session_id,
+        state_version=state_version,
+        stage="record_narrative",
+        agent_spec_version=build_record_narrative_agent_spec().version,
+        prompt_version=RECORD_NARRATIVE_PROMPT_VERSION,
+        policy_version=RECORD_NARRATIVE_POLICY_VERSION,
+        deadline_at=_deadline(get_settings().model_gateway_timeout_seconds + 15),
+        total_attempt_budget=1,
+        idempotency_key=f"{run_id}:record_narrative",
+        trace_id=str(run_id),
+    )
+    result = await execute_record_narrative(
+        run_spec=run_spec,
+        input_payload=narrative_input,
+    )
+    if result.output is None:
+        return (
+            {
+                "diet_advice": _RECORD_NARRATIVE_FALLBACK_DIET,
+                "prognosis": _RECORD_NARRATIVE_FALLBACK_PROGNOSIS,
+            },
+            "template",
+        )
+    return (
+        {
+            "diet_advice": result.output.diet_advice,
+            "prognosis": result.output.prognosis,
+        },
+        "model",
+    )
+
+
 async def execute_record_command(state: XuanhuGraphState) -> dict[str, Any]:
     """Assemble and atomically persist one deterministic product record."""
 
@@ -633,6 +840,20 @@ async def execute_record_command(state: XuanhuGraphState) -> dict[str, Any]:
         latest=latest,
     )
     record_id = _projection_record_id(artifact.artifact_id, artifact.revision)
+    syndrome = await _load_syndrome_record(repository, session_id)
+    clinical = _clinical_record_fields(
+        observations=domain_state.observations,
+        syndrome=syndrome,
+        formula=formula,
+        safety_result=safety_result,
+        safety_profile=domain_state.safety_profile,
+    )
+    narrative, narrative_source = await _draft_record_narrative(
+        session_id=session_id,
+        state_version=domain_state.state_version,
+        clinical=clinical,
+        run_id=run_id,
+    )
     record_json = _record_json(
         session_id=session_id,
         record_id=record_id,
@@ -643,11 +864,16 @@ async def execute_record_command(state: XuanhuGraphState) -> dict[str, Any]:
         safety_record=safety_record,
         safety_result=safety_result,
         safety_run_id=safety_run_id,
+        clinical=clinical,
+        narrative=narrative,
+        narrative_source=narrative_source,
     )
     record_text = _render_record_text(
         formula=formula,
         action=review.action,
         safety_rule_version=safety_result.rule_version,
+        clinical=clinical,
+        narrative=narrative,
     )
     payload: dict[str, object] = {
         "kind": MEDICAL_RECORD_ARTIFACT_TYPE,

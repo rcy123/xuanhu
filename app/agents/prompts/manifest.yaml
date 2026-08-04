@@ -48,3 +48,5 @@ modification: modification_v1.jinja2
 safety: safety_v1.jinja2
 # 病历生成（legacy）：基于全量会话数据撰写初版中医病历
 record: record_v1.jinja2
+# 病历叙述（record）：基于权威临床结构补充饮食建议与预后情况
+record_narrative: record_narrative_v1.jinja2
