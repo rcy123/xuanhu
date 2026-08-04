@@ -162,6 +162,7 @@ _QUESTION_TEMPLATES_AUTHORITY: Mapping[tuple[InquiryDimension, GapSelectionKind]
             _required_template(InquiryDimension.TEN_MENSES_LEUKORRHEA, "患者近期经带情况怎样？"),
             _required_template(InquiryDimension.TEN_PAIN, "患者疼痛情况怎样？"),
             _required_template(InquiryDimension.TEN_RESPIRATORY, "患者近期呼吸情况怎样？"),
+            _required_template(InquiryDimension.FOUR_DIAGNOSIS, "请提供患者舌脉情况：舌象（舌色、舌形、舌苔）与脉象？"),
             _conflict_template(InquiryDimension.CHIEF_COMPLAINT_CATEGORY, "请核实患者主诉类别以哪项记录为准？"),
             _conflict_template(InquiryDimension.ALLERGY_STATUS, "请核实患者过敏状态以哪项记录为准？"),
             _conflict_template(InquiryDimension.PREGNANCY_STATUS, "请核实患者妊娠状态以哪项记录为准？"),

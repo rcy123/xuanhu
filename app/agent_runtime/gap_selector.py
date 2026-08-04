@@ -200,6 +200,7 @@ _GAP_PRIORITY_RULES_AUTHORITY: Mapping[InquiryDimension, GapPriorityRule] = Froz
         GapPriorityRule(
             rule_id="gap.priority.four_diagnosis.v1",
             dimension=InquiryDimension.FOUR_DIAGNOSIS,
+            required_priority=350,
             conflict_priority=710,
         ),
         GapPriorityRule(

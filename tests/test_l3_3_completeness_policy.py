@@ -161,6 +161,7 @@ def complete_general_facts() -> tuple[CompletenessObservationFact, ...]:
         fact("ten_questions.thirst", "none"),
         fact("ten_questions.sleep", "normal"),
         fact("patient.sex", "male"),
+        fact("four_diagnosis.inspection", "tongue_pale_red_thin_white_coating"),
     )
 
 
@@ -302,10 +303,21 @@ def test_required_dimensions_complete_is_ready_and_passed() -> None:
 
 
 def test_optional_dimensions_missing_do_not_block_ready() -> None:
-    result = evaluate_completeness_policy(policy_input(*complete_general_facts()))
+    result = evaluate_completeness_policy(
+        policy_input(*complete_general_facts(), fact("four_diagnosis.inspection", "tongue_pale_red_thin_white_coating"))
+    )
 
     assert result.disposition is CompletenessDisposition.READY
-    assert result.missing_optional == (InquiryDimension.FOUR_DIAGNOSIS, InquiryDimension.PAST_HISTORY)
+    assert result.missing_optional == (InquiryDimension.PAST_HISTORY,)
+
+
+def test_tongue_pulse_missing_blocks_ready() -> None:
+    """舌脉（四诊）为辨证必需维度：缺失时不得判 ready（防止输入框提前禁用）。"""
+    facts = tuple(item for item in complete_general_facts() if item.fact_key != "four_diagnosis.inspection")
+    result = evaluate_completeness_policy(policy_input(*facts))
+
+    assert result.disposition is CompletenessDisposition.INCOMPLETE
+    assert InquiryDimension.FOUR_DIAGNOSIS in result.missing_required
 
 
 def test_single_snapshot_with_multiple_structured_facts_covers_multiple_dimensions() -> None:
@@ -489,6 +501,7 @@ def test_complaint_category_selects_dynamic_ten_question_thresholds() -> None:
         fact("ten_questions.sleep", "normal"),
         fact("ten_questions.respiratory", "cough"),
         fact("patient.sex", "male"),
+        fact("four_diagnosis.inspection", "tongue_pale_red_thin_white_coating"),
     )
 
     result = evaluate_completeness_policy(policy_input(*facts, safety_profile=safety()))

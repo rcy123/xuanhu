@@ -177,6 +177,7 @@ def complete_general_facts() -> tuple[CompletenessObservationFact, ...]:
         fact("ten_questions.thirst", "none"),
         fact("ten_questions.sleep", "normal"),
         fact("patient.sex", "male"),
+        fact("four_diagnosis.inspection", "tongue_pale_red_thin_white_coating"),
     )
 
 

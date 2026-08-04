@@ -220,7 +220,7 @@ COMPLETENESS_DIMENSION_RULES: Mapping[InquiryDimension, CompletenessDimensionRul
                 rule_id="completeness.four_diagnosis.v1",
                 dimension=InquiryDimension.FOUR_DIAGNOSIS,
                 fact_keys=("four_diagnosis.inspection", "four_diagnosis.palpation"),
-                optional_report=True,
+                required_by_default=True,
             ),
             CompletenessDimensionRule(
                 rule_id="completeness.patient.sex.v1",
