@@ -171,6 +171,10 @@ def build_syndrome_context(
         "policy_version": input_payload.policy_version,
     }
     allowed_fields: set[str] = {"active_observations", "evidence_mode", "review_required", "policy_version"}
+    if input_payload.review_feedback:
+        # 医师否决反馈：注入模型，重新辨证时针对性调整。
+        context["review_feedback"] = input_payload.review_feedback
+        allowed_fields.add("review_feedback")
     if rag_mode:
         # 证据是 untrusted 数据：走 context 消息层（gateway 传输边界 SECURITY NOTICE 包裹）。
         context["retrieved_evidence"] = evidence_context_items(retrieved_evidence)

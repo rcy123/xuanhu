@@ -498,6 +498,7 @@ def _session_updates(
     route: str,
     blocked_reason: str | None = None,
     preserve_advance: dict[str, Any] | None = None,
+    review_feedback: str | None = None,
 ) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "agent_runtime": "langgraph",
@@ -514,6 +515,9 @@ def _session_updates(
     # REASONING_PRECHECK_FAILED（被否决的方子无法重新开方）。
     if preserve_advance is not None:
         snapshot["advance"] = preserve_advance
+    # 医师否决反馈：reject 时写入 state_snapshot，重新辨证/开方时注入模型输入。
+    if review_feedback:
+        snapshot["review_feedback"] = review_feedback
     return {
         "current_stage": current_stage,
         "status": status,
@@ -1202,7 +1206,7 @@ async def apply_review_resume(
                 FORMULA_ARTIFACT_TYPE,
                 REVIEWED_FORMULA_ARTIFACT_TYPE,
                 SAFETY_ARTIFACT_TYPE,
-                "syndrome_draft" if action == "request_more_info" else "__none__",
+                "syndrome_draft" if action in {"request_more_info", "reject"} else "__none__",
             }
         )
     invalidation_ids = tuple(dict.fromkeys(invalidations))
@@ -1269,6 +1273,8 @@ async def apply_review_resume(
             state_version=domain_state.state_version + 1,
             route=f"review_{action}",
             preserve_advance=preserve_advance,
+            # 否决反馈持久化：reject 后重新辨证/开方时注入模型输入。
+            review_feedback=payload.get("feedback") if action == "reject" else None,
         ),
         outbox_event_type="doctor.review_applied.v1",
         outbox_payload={

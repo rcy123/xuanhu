@@ -179,6 +179,8 @@ class FormulaDraftInput(BaseModel):
     completeness_gate: GateResultSchema
     context_observations: tuple[SyndromeObservationContext, ...] = Field(default=(), max_length=512)
     syndrome_draft: SyndromeDraft
+    # 医师否决反馈（reject 后重新开方时注入）：None=首次开方
+    review_feedback: str | None = Field(default=None, max_length=2_000)
 
     @model_validator(mode="after")
     def input_consistency(self) -> FormulaDraftInput:
@@ -313,4 +315,6 @@ class ModificationDraftInput(BaseModel):
     syndrome_draft: SyndromeDraft
     base_formula: FormulaComposition
     base_formula_rationale: str | None = Field(default=None, max_length=1000)
+    # 医师否决反馈（reject 后重新开方时注入）：None=首次开方
+    review_feedback: str | None = Field(default=None, max_length=2_000)
     base_confidence: float = Field(ge=0, le=1)

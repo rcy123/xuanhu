@@ -316,6 +316,10 @@ def build_formula_context(
         "policy_version": input_payload.policy_version,
     }
     allowed_fields: set[str] = {"active_observations", "syndrome_draft", "evidence_mode", "review_required", "policy_version"}
+    if input_payload.review_feedback:
+        # 医师否决反馈：注入模型，重新开方时针对性调整。
+        context["review_feedback"] = input_payload.review_feedback
+        allowed_fields.add("review_feedback")
     if base_formula is not None:
         # 2.8 阶段 2：权威基础方全文（composition 每味药 + 剂量）是加减的唯一真源。
         # 注意：方剂名 name 会命中 PII 键名扫描，改为 formula_name 规避。

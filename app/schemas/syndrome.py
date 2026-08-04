@@ -122,6 +122,8 @@ class SyndromeDraftInput(BaseModel):
     triage_gate: GateResultSchema
     completeness_gate: GateResultSchema
     context_observations: tuple[SyndromeObservationContext, ...] = Field(default=(), max_length=512)
+    # 医师否决反馈（reject 后重新辨证时注入）：None=首次开方
+    review_feedback: str | None = Field(default=None, max_length=2_000)
 
     @model_validator(mode="after")
     def input_consistency(self) -> SyndromeDraftInput:

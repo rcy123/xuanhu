@@ -416,7 +416,8 @@ async def run_reasoning_build_syndrome_context_node(state: XuanhuGraphState) -> 
         authority = await _current_authority(repository, claim.session_id)
         if authority is None:
             return _sanitized_graph_error(state, "REASONING_AUTHORITY_MISSING", "reasoning authority is unavailable")
-        input_payload = _build_syndrome_input(authority)
+        feedback = await _load_review_feedback(claim.session_id)
+        input_payload = _build_syndrome_input(authority, feedback)
         await _save_intermediate(
             claim.id,
             {
@@ -455,7 +456,8 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             await _save_intermediate_step(claim.id, "draft_syndrome")
             return _syndrome_graph_update(claim, recovered, await repository.get_state(claim.session_id))
 
-        input_payload = _build_syndrome_input(authority)
+        feedback = await _load_review_feedback(claim.session_id)
+        input_payload = _build_syndrome_input(authority, feedback)
         syndrome_policy, syndrome_prompt = _reasoning_policy("syndrome")
         run_spec = RunSpec(
             run_id=_commit_run_id(claim, "syndrome"),
@@ -605,7 +607,8 @@ async def run_reasoning_build_formula_context_node(state: XuanhuGraphState) -> d
         )
         if syndrome_result is None or syndrome_result.output is None or authority is None:
             return _sanitized_graph_error(state, "FORMULA_CONTEXT_MISSING", "formula context authority is unavailable")
-        input_payload = _build_formula_input(authority, syndrome_result.output)
+        feedback = await _load_review_feedback(claim.session_id)
+        input_payload = _build_formula_input(authority, syndrome_result.output, feedback)
         await _save_intermediate(
             claim.id,
             {
@@ -740,7 +743,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         )
         if syndrome_result is None or syndrome_result.output is None or authority is None:
             return _sanitized_graph_error(state, "FORMULA_CONTEXT_MISSING", "formula context authority is unavailable")
-        input_payload = _build_formula_input(authority, syndrome_result.output)
+        feedback = await _load_review_feedback(claim.session_id)
+        input_payload = _build_formula_input(authority, syndrome_result.output, feedback)
         # ---- 2.8 阶段 1：基础方草稿（仅选方，不做加减）----
         base_policy, base_prompt = _reasoning_policy("base_formula")
         # preflight 强制 input.policy_version == run_spec.policy_version：
@@ -817,6 +821,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             base_formula=base_formula,
             base_formula_rationale=base_result.output.rationale,
             base_confidence=base_result.output.confidence,
+            review_feedback=input_payload.review_feedback,
         )
         mod_run_spec = RunSpec(
             run_id=_commit_run_id(claim, "modification"),
@@ -1112,7 +1117,9 @@ async def _current_authority(
     return await repository.get_reasoning_authority(session_id, state.state_version)
 
 
-def _build_syndrome_input(authority: ReasoningAuthoritySnapshot) -> SyndromeDraftInput:
+def _build_syndrome_input(
+    authority: ReasoningAuthoritySnapshot, review_feedback: str | None = None
+) -> SyndromeDraftInput:
     policy, _prompt = _reasoning_policy("syndrome")
     return SyndromeDraftInput(
         session_id=authority.session_id,
@@ -1123,10 +1130,13 @@ def _build_syndrome_input(authority: ReasoningAuthoritySnapshot) -> SyndromeDraf
         triage_gate=authority.triage_gate,
         completeness_gate=authority.completeness_gate,
         context_observations=_context_from_domain_state(authority.domain_state),
+        review_feedback=review_feedback,
     )
 
 
-def _build_formula_input(authority: ReasoningAuthoritySnapshot, syndrome: SyndromeDraft) -> FormulaDraftInput:
+def _build_formula_input(
+    authority: ReasoningAuthoritySnapshot, syndrome: SyndromeDraft, review_feedback: str | None = None
+) -> FormulaDraftInput:
     policy, _prompt = _reasoning_policy("formula")
     return FormulaDraftInput(
         session_id=authority.session_id,
@@ -1138,6 +1148,7 @@ def _build_formula_input(authority: ReasoningAuthoritySnapshot, syndrome: Syndro
         completeness_gate=authority.completeness_gate,
         context_observations=_context_from_domain_state(authority.domain_state),
         syndrome_draft=syndrome,
+        review_feedback=review_feedback,
     )
 
 
@@ -1814,6 +1825,20 @@ def _question_for_dimension(raw_dimension: object) -> str:
         return "请提供患者舌脉情况：舌象（舌色、舌形、舌苔）与脉象？"
     template = QUESTION_TEMPLATES.get((dimension, GapSelectionKind.REQUIRED))
     return template.question if template is not None else "请补充一个关键问诊信息？"
+
+
+async def _load_review_feedback(session_id: uuid.UUID) -> str | None:
+    """读取医师否决反馈（reject 时写入 state_snapshot.review_feedback）。
+
+    重新辨证/开方时注入模型输入；无反馈（首次开方）返回 None。
+    """
+    factory = get_session_factory()
+    async with factory() as db:
+        row = await db.get(ConsultSession, session_id)
+        if row is None or not isinstance(row.state_snapshot, dict):
+            return None
+        feedback = row.state_snapshot.get("review_feedback")
+        return feedback if isinstance(feedback, str) and feedback else None
 
 
 async def _load_session_advance(session_id: uuid.UUID) -> dict[str, Any] | None:
