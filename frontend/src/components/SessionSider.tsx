@@ -3,13 +3,12 @@
  *
  * 组合 useSessions + SessionList + CreateSessionModal。
  * 创建会话成功后通过 onCreated(id) 通知父层（用于路由跳转）。
- * 支持折叠：收起后每个历史会话缩成小块（患者姓名首字）。
+ * 支持折叠：收起后保留患者头像入口与关键操作。
  */
 
 import { useState } from 'react'
 import { Button, Layout, Tooltip, Typography } from 'antd'
 import {
-  HistoryOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
 } from '@ant-design/icons'
@@ -26,11 +25,19 @@ interface SessionSiderProps {
   selectedId: string | null
   onSelect: (id: string) => void
   onCreated: (id: string) => void
+  collapsed: boolean
+  onCollapsedChange: (collapsed: boolean) => void
 }
 
-export function SessionSider({ sessionsHook, selectedId, onSelect, onCreated }: SessionSiderProps) {
+export function SessionSider({
+  sessionsHook,
+  selectedId,
+  onSelect,
+  onCreated,
+  collapsed,
+  onCollapsedChange,
+}: SessionSiderProps) {
   const [modalOpen, setModalOpen] = useState(false)
-  const [collapsed, setCollapsed] = useState(false)
 
   const handleCreate = async (body: SessionCreateRequest): Promise<string> => {
     const id = await sessionsHook.createSession(body)
@@ -40,27 +47,27 @@ export function SessionSider({ sessionsHook, selectedId, onSelect, onCreated }: 
 
   return (
     <Sider
-      width={280}
-      collapsedWidth={64}
+      width={296}
+      collapsedWidth={76}
       collapsed={collapsed}
       className="xh-session-sider"
     >
-      <div className="xh-session-sider-heading">
+      <div className={`xh-session-sider-heading${collapsed ? ' is-collapsed' : ''}`}>
         {collapsed ? null : (
           <div>
             <Text className="xh-section-kicker">CONSULTATIONS</Text>
             <Text strong>问诊会话</Text>
           </div>
         )}
-        {collapsed ? <HistoryOutlined aria-hidden="true" /> : null}
         <Tooltip title={collapsed ? '展开会话栏' : '收起会话栏'} placement="right">
           <Button
             type="text"
             size="small"
             className="xh-session-collapse"
             aria-label={collapsed ? '展开会话栏' : '收起会话栏'}
+            aria-expanded={!collapsed}
             data-testid="session-collapse-toggle"
-            onClick={() => setCollapsed((prev) => !prev)}
+            onClick={() => onCollapsedChange(!collapsed)}
           >
             {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
           </Button>

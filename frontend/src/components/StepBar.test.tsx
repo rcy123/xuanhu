@@ -7,11 +7,16 @@ afterEach(() => {
 })
 
 describe('StepBar', () => {
-  it('渲染 7 个步骤节点', () => {
+  it('渲染稳定的 6 个临床步骤节点', () => {
     render(<StepBar currentStage="inquiry" />)
     expect(screen.getByTestId('step-bar')).toBeInTheDocument()
     expect(screen.getByText('问诊')).toBeInTheDocument()
-    expect(screen.getByText('医师确认')).toBeInTheDocument()
+    expect(screen.getByText('辨证')).toBeInTheDocument()
+    expect(screen.getByText('方药')).toBeInTheDocument()
+    expect(screen.getByText('医师复核')).toBeInTheDocument()
+    expect(screen.getByText('病历')).toBeInTheDocument()
+    expect(screen.queryByText('完备性')).toBeNull()
+    expect(screen.queryByText('加减方')).toBeNull()
   })
 
   it('done 阶段全部完成', () => {
@@ -57,49 +62,16 @@ describe('StepBar', () => {
     expect(screen.getByTestId('step-bar')).toBeInTheDocument()
   })
 
-  it('LangGraph 使用合并后的 Formula 节点并展示持久化状态', () => {
-    render(
-      <StepBar
-        currentStage="safety"
-        agentRuntime="langgraph"
-        readModel={{
-          schema_version: 'session-read-model.v1',
-          agent_runtime: 'langgraph',
-          graph: { revision: 4, status: 'completed' },
-          gates: [],
-          artifacts: [
-            {
-              artifact_id: 'formula-1',
-              artifact_type: 'formula_draft',
-              revision: 1,
-              input_state_version: 3,
-              status: 'current',
-              produced_by_run_id: 'run-1',
-              payload_schema_version: 'formula-artifact-payload.v1',
-              content_digest: '0'.repeat(64),
-              decision: 'completed',
-              evidence_mode: 'model_knowledge_only',
-              review_required: true,
-              unresolved: [],
-              verification_gate: {
-                gate_id: 'gate-1',
-                gate_name: 'formula_consistency',
-                policy_version: 'formula-consistency-policy.v1',
-                input_state_version: 3,
-                decision: 'passed',
-              },
-              output: {},
-            },
-          ],
-          review_required: true,
-          unresolved: [],
-        }}
-      />,
-    )
-    expect(screen.getByTestId('step-bar')).toHaveAttribute('data-runtime', 'langgraph')
-    expect(screen.getByText('方药草案')).toBeInTheDocument()
-    expect(screen.queryByText('加减方')).not.toBeInTheDocument()
-    expect(screen.getByText('已持久化')).toBeInTheDocument()
-    expect(screen.getByText('等待硬门禁')).toBeInTheDocument()
+  it('阶段别名映射到统一的临床流程，不展示运行时细节', () => {
+    const { rerender } = render(<StepBar currentStage="sufficiency" />)
+    expect(screen.getByText('问诊')).toBeInTheDocument()
+    expect(screen.queryByText('完备性')).toBeNull()
+
+    rerender(<StepBar currentStage="modification" />)
+    expect(screen.getByText('方药')).toBeInTheDocument()
+    expect(screen.queryByText('加减方')).toBeNull()
+    expect(screen.queryByText('方药草案')).toBeNull()
+    expect(screen.queryByText('已持久化')).toBeNull()
+    expect(screen.queryByText('等待硬门禁')).toBeNull()
   })
 })

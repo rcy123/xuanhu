@@ -74,8 +74,8 @@ export function MessageInput({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? (disabledReason ?? '当前阶段不可输入问诊消息') : '输入症状描述 / 回复问题…（Enter 发送，Shift+Enter 换行）'}
-          autoSize={{ minRows: 2, maxRows: 6 }}
+          placeholder={disabled ? (disabledReason ?? '当前阶段不可输入问诊消息') : '回复问诊问题或补充症状…'}
+          autoSize={{ minRows: 1, maxRows: 4 }}
           maxLength={MAX}
           disabled={submitting || disabled}
           className="xh-composer-input"

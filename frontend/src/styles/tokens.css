@@ -52,6 +52,7 @@
 
   /* 侧边栏宽度 */
   --xh-sider-width: 296px;
+  --xh-sider-collapsed-width: 76px;
   --xh-context-width: 420px;
   --xh-header-height: 68px;
   --xh-disclaimer-height: 30px;

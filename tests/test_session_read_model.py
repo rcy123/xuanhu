@@ -355,6 +355,7 @@ def test_read_model_projects_current_verified_l3_l4_authority_and_legacy_fields(
     assert result.read_model.unresolved == ()
     assert result.sufficiency_report is not None
     assert result.sufficiency_report["sufficient"] is True
+    assert result.sufficiency_report["missing_items"] == []
     assert result.syndrome_result is not None
     assert result.syndrome_result["syndrome"] == "脾虚湿盛证"
     assert result.base_formula is not None and result.base_formula["name"] == "四君子汤"
@@ -559,10 +560,7 @@ async def test_postgres_read_model_survives_fresh_http_get_session() -> None:
             "syndrome_draft",
             "formula_draft",
         ]
-        assert all(
-            artifact["verification_gate"]["decision"] == "passed"
-            for artifact in read_model["artifacts"]
-        )
+        assert all(artifact["verification_gate"]["decision"] == "passed" for artifact in read_model["artifacts"])
         assert data["syndrome_result"]["syndrome"] != "forged-snapshot-syndrome"
         assert data["modified_formula"]["name"] != "forged-snapshot-formula"
     finally:
@@ -573,9 +571,7 @@ async def test_postgres_read_model_survives_fresh_http_get_session() -> None:
                 await connection.execute(
                     delete(ArtifactRevisionPayload).where(ArtifactRevisionPayload.session_id == session.id)
                 )
-                await connection.execute(
-                    delete(ArtifactRevision).where(ArtifactRevision.session_id == session.id)
-                )
+                await connection.execute(delete(ArtifactRevision).where(ArtifactRevision.session_id == session.id))
                 await connection.execute(delete(GateResult).where(GateResult.session_id == session.id))
                 await connection.execute(delete(GraphRun).where(GraphRun.session_id == session.id))
                 await connection.execute(delete(ConsultSession).where(ConsultSession.id == session.id))

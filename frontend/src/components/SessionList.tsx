@@ -3,11 +3,11 @@
  *
  * 新建会话按钮 + 会话列表项（患者摘要 + 时间 + 状态 Tag）。
  * 选中高亮；空态/加载态/错误态（含重试）。
- * collapsed 模式：每个会话缩成小块（患者姓名首字），hover 显示完整信息。
+ * collapsed 模式：每个会话缩成患者头像入口，hover 显示完整信息。
  * 删除按钮仅前端隐藏展示，不删除数据库记录。
  */
 
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type CSSProperties } from 'react'
 import { Button, Empty, Input, Spin, Tag, Tooltip, Typography } from 'antd'
 import { DeleteOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import type { SessionListItem } from '@/types/api'
@@ -28,10 +28,35 @@ interface SessionListProps {
   onCreate: () => void
 }
 
-/** 患者名字首字（无名字时用「患」）。 */
+function patientName(session: SessionListItem): string {
+  return session.patient_info?.name?.trim() || '未命名患者'
+}
+
+function patientDetails(session: SessionListItem): string {
+  const details: string[] = []
+  const { age, gender } = session.patient_info
+  if (gender && gender !== 'unknown') {
+    const genderLabel: Record<string, string> = { male: '男', female: '女' }
+    details.push(genderLabel[gender] ?? gender)
+  }
+  if (age != null) details.push(`${age}岁`)
+  return details.join(' · ')
+}
+
 function patientInitial(session: SessionListItem): string {
   const name = session.patient_info?.name?.trim()
   return name ? name.slice(0, 1) : '患'
+}
+
+function sessionAccentColor(color: string): string {
+  const semanticColors: Record<string, string> = {
+    default: 'var(--xh-border-strong)',
+    error: 'var(--xh-error)',
+    processing: 'var(--xh-secondary)',
+    success: 'var(--xh-success)',
+    warning: 'var(--xh-warning)',
+  }
+  return semanticColors[color] ?? color
 }
 
 function SessionItem({
@@ -48,112 +73,112 @@ function SessionItem({
   onRemove: (id: string) => void
 }) {
   const tag = sessionTag(session)
+  const summary = patientSummary(session) || '未命名患者'
+  const complaint = session.chief_complaint?.trim() || '暂无主诉'
+  const updatedAt = formatTime(session.updated_at)
+  const accentStyle = {
+    '--xh-session-accent': sessionAccentColor(tag.color),
+  } as CSSProperties
 
   if (collapsed) {
-    const summary = patientSummary(session) || '未命名患者'
     return (
-      <Tooltip
-        title={`${summary}${session.chief_complaint ? ` · ${session.chief_complaint}` : ''}`}
-        placement="right"
-        mouseEnterDelay={0.2}
-      >
-        <div
-          className="xh-session-chip"
-          role="button"
-          tabIndex={0}
-          data-session-id={session.session_id}
-          data-selected={selected || undefined}
-          data-status-color={tag.color}
-          aria-label={`会话 ${summary}`}
-          onClick={() => onSelect(session.session_id)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              onSelect(session.session_id)
-            }
+      <div className="xh-session-chip-shell">
+        <Tooltip
+          title={(
+            <div className="xh-session-chip-tooltip">
+              <div className="xh-session-chip-tooltip-heading">
+                <strong>{summary}</strong>
+                <span>{tag.label}</span>
+              </div>
+              <div>主诉：{complaint}</div>
+              {updatedAt ? <small>更新于 {updatedAt}</small> : null}
+            </div>
+          )}
+          placement="right"
+          mouseEnterDelay={0.2}
+        >
+          <button
+            type="button"
+            className="xh-session-chip"
+            data-session-id={session.session_id}
+            data-selected={selected || undefined}
+            aria-current={selected ? 'page' : undefined}
+            aria-label={`会话 ${summary}，${tag.label}，主诉 ${complaint}`}
+            style={accentStyle}
+            onClick={() => onSelect(session.session_id)}
+          >
+            <span className="xh-session-chip-avatar" aria-hidden="true">
+              {patientInitial(session)}
+            </span>
+            <span className="xh-session-chip-status" aria-hidden="true" />
+          </button>
+        </Tooltip>
+        <Button
+          type="text"
+          size="small"
+          className="xh-session-chip-remove"
+          aria-label={`删除会话 ${summary}`}
+          data-testid={`remove-${session.session_id}`}
+          onClick={(event) => {
+            // 仅前端隐藏展示，不删除数据库记录。
+            event.stopPropagation()
+            onRemove(session.session_id)
           }}
         >
-          <span className="xh-session-chip-initial">{patientInitial(session)}</span>
-          <Button
-            type="text"
-            size="small"
-            className="xh-session-chip-remove"
-            aria-label={`删除会话 ${summary}`}
-            data-testid={`remove-${session.session_id}`}
-            onClick={(event) => {
-              // 仅前端隐藏展示，不删除数据库记录。
-              event.stopPropagation()
-              onRemove(session.session_id)
-            }}
-          >
-            <DeleteOutlined />
-          </Button>
-        </div>
-      </Tooltip>
+          <DeleteOutlined />
+        </Button>
+      </div>
     )
   }
 
   return (
     <div
       className="xh-session-item"
-      role="button"
-      tabIndex={0}
-      data-session-id={session.session_id}
       data-selected={selected || undefined}
-      onClick={() => onSelect(session.session_id)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onSelect(session.session_id)
-        }
-      }}
+      style={accentStyle}
     >
-      <div className="xh-session-item-main">
-        <Text
-          strong
-          className="xh-session-patient"
-        >
-          {patientSummary(session) || '未命名患者'}
-        </Text>
-        <Tag color={tag.color} className="xh-session-status">
-          {tag.label}
-        </Tag>
-      </div>
-      <div className="xh-session-complaint">
-        <Text type="secondary">
-          {session.chief_complaint
-            ? session.chief_complaint.length > 18
-              ? `${session.chief_complaint.slice(0, 18)}…`
-              : session.chief_complaint
-            : '—'}
-        </Text>
-      </div>
-      <div className="xh-session-meta">
-          <Text type="secondary">
-            {formatTime(session.updated_at)}
-          </Text>
-          <Tag
-            color={session.agent_runtime === 'langgraph' ? 'geekblue' : 'default'}
-            className="xh-runtime-tag"
-            data-testid={`runtime-${session.session_id}`}
-          >
-            {session.agent_runtime === 'langgraph' ? 'LangGraph v2' : 'Legacy'}
+      <button
+        type="button"
+        className="xh-session-item-select"
+        data-session-id={session.session_id}
+        aria-current={selected ? 'page' : undefined}
+        aria-label={`会话 ${summary}，${tag.label}，主诉 ${complaint}`}
+        onClick={() => onSelect(session.session_id)}
+      >
+        <div className="xh-session-item-main">
+          <span className="xh-session-identity">
+            <strong className="xh-session-patient">{patientName(session)}</strong>
+            {patientDetails(session) ? (
+              <span className="xh-session-demographics">{patientDetails(session)}</span>
+            ) : null}
+          </span>
+          <Tag color={tag.color} className="xh-session-status">
+            {tag.label}
           </Tag>
-          <Button
-            type="text"
-            size="small"
-            className="xh-session-remove"
-            aria-label={`删除会话 ${patientSummary(session) || session.session_id}`}
-            data-testid={`remove-${session.session_id}`}
-            onClick={(event) => {
-              // 仅前端隐藏展示，不删除数据库记录。
-              event.stopPropagation()
-              onRemove(session.session_id)
-            }}
-          >
-            <DeleteOutlined />
-          </Button>
-      </div>
+        </div>
+        <div className="xh-session-complaint" title={complaint}>
+          <Text>{complaint}</Text>
+        </div>
+        <div className="xh-session-meta">
+          <Text type="secondary">
+            {updatedAt}
+          </Text>
+        </div>
+      </button>
+      <Button
+        type="text"
+        size="small"
+        className="xh-session-remove"
+        aria-label={`删除会话 ${summary}`}
+        data-testid={`remove-${session.session_id}`}
+        onClick={(event) => {
+          // 仅前端隐藏展示，不删除数据库记录。
+          event.stopPropagation()
+          onRemove(session.session_id)
+        }}
+      >
+        <DeleteOutlined />
+      </Button>
     </div>
   )
 }

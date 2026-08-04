@@ -7,7 +7,7 @@
 
 import { useEffect, useRef } from 'react'
 import { Empty, Spin, Typography } from 'antd'
-import { RobotOutlined, UserOutlined } from '@ant-design/icons'
+import { MedicineBoxOutlined, UserOutlined } from '@ant-design/icons'
 import type { MessageItem } from '@/types/api'
 import { ErrorBanner } from './ErrorBanner'
 
@@ -22,35 +22,30 @@ interface MessageListProps {
 
 function MessageBubble({ msg }: { msg: MessageItem }) {
   const isAgent = msg.role === 'agent'
+  const author = isAgent ? '悬壶助手' : '医师'
   return (
     <div
       data-message-id={msg.id}
       data-role={msg.role}
+      data-stage={msg.stage ?? undefined}
       className={`xh-message-row ${isAgent ? 'is-agent' : 'is-clinician'}`}
     >
-      <div
-        className="xh-message-bubble"
-      >
-        <div className="xh-message-author">
+      <div className="xh-message-cluster">
+        <span className="xh-message-avatar" aria-hidden="true">
           {isAgent ? (
-            <RobotOutlined style={{ fontSize: 12, color: 'var(--xh-secondary)' }} />
+            <MedicineBoxOutlined />
           ) : (
-            <UserOutlined style={{ fontSize: 12, color: 'var(--xh-primary)' }} />
+            <UserOutlined />
           )}
-          <Text type="secondary">
-            {isAgent ? (msg.agent_name ?? '悬壶') : '医师'}
+        </span>
+        <div className="xh-message-bubble">
+          <div className="xh-message-author">
+            <span>{author}</span>
+          </div>
+          <Text className="xh-message-content">
+            {msg.content}
           </Text>
         </div>
-        <Text className="xh-message-content">
-          {msg.content}
-        </Text>
-        {msg.stage ? (
-          <div style={{ marginTop: 6 }}>
-            <Text type="secondary" style={{ fontSize: 10 }}>
-              {msg.stage}
-            </Text>
-          </div>
-        ) : null}
       </div>
     </div>
   )

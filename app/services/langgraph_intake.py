@@ -1,4 +1,4 @@
-﻿"""LangGraph-backed intake message flow for L3-5.
+"""LangGraph-backed intake message flow for L3-5.
 
 This service owns request/API orchestration only.  Clinical facts are committed
 through the L2 verifier/reducer/repository path, and model calls happen outside
@@ -166,6 +166,7 @@ from app.services.intake_completion_notice import (
 )
 from app.services.safety_confirmation import build_intake_safety_assertion_specs
 from app.services.session_lock import SessionLock
+from app.services.sufficiency_report import missing_item_payloads
 
 logger = logging.getLogger("xuanhu.langgraph_intake")
 
@@ -1163,7 +1164,8 @@ class LangGraphIntakeMessageRunner:
         await self._complete_claim(claim.id, response, None, commit.output_state_version)
         return _graph_update_from_response(response), response
 
-    async def _next_progress(        self,
+    async def _next_progress(
+        self,
         session_id: uuid.UUID,
         *,
         new_fact_count: int,
@@ -2396,10 +2398,7 @@ async def _pending_safety_dimensions(
         ("medications", current_delta.medications),
         ("major_conditions", current_delta.major_conditions),
     ):
-        if (
-            item.status is not CollectionStatus.UNKNOWN
-            and item.status is not CollectionStatus.EXPLICITLY_NONE
-        ):
+        if item.status is not CollectionStatus.UNKNOWN and item.status is not CollectionStatus.EXPLICITLY_NONE:
             pending_fields.add(field_name)
     return tuple(
         sorted(
@@ -2473,11 +2472,7 @@ async def _load_or_retry_intake_output(
     _INTAKE_OUTPUT_CACHE[claim.id] = intake_result.output
     await _save_intermediate(
         claim.id,
-        {
-            "extraction": _extraction_metadata(
-                success_run_id, intake_result.output, claim.input_state_version
-            )
-        },
+        {"extraction": _extraction_metadata(success_run_id, intake_result.output, claim.input_state_version)},
         step="extract_intake",
     )
     return intake_result.output
@@ -2512,9 +2507,7 @@ async def _execute_intake_extraction_with_retry(
             policy_version=INTAKE_POLICY_VERSION,
             deadline_at=_deadline(deadline_seconds),
             total_attempt_budget=1,
-            idempotency_key=(
-                f"{claim.idempotency_key}:intake:retry" if retry else f"{claim.idempotency_key}:intake"
-            ),
+            idempotency_key=(f"{claim.idempotency_key}:intake:retry" if retry else f"{claim.idempotency_key}:intake"),
             trace_id=trace_id,
         )
 
@@ -3377,7 +3370,9 @@ def _drop_value_conflicting_adds(
                             fact_key=item.fact_key,
                             operation=item.operation.value,
                             reason="value_conflicts_active_fact",
-                            target_observation_id=str(item.target_observation_id) if item.target_observation_id else None,
+                            target_observation_id=str(item.target_observation_id)
+                            if item.target_observation_id
+                            else None,
                             value_preview=str(item.value)[:80] if item.value is not None else "",
                         )
                     )
@@ -3541,9 +3536,7 @@ def _project_explicit_none_safety(
     for status_column, value_column in updates:
         profile_values[status_column] = CollectionStatus.EXPLICITLY_NONE.value
         profile_values[value_column] = None
-    projected = SafetyProfileSchema.model_validate(
-        {"session_id": session_id, **profile_values}
-    )
+    projected = SafetyProfileSchema.model_validate({"session_id": session_id, **profile_values})
     # Only return a profile when something actually changed; otherwise the
     # reducer sees safety_profile as a no-op and may mix it with an empty
     # artifact revision (MIXED_FACT_AND_ARTIFACT_CHANGE).
@@ -3749,9 +3742,7 @@ def _session_updates(
             "last_run_id": str(run_id),
             "last_patient_message_id": str(patient_message.id),
             "last_question_message_id": (
-                None
-                if disposition is CompletenessDisposition.READY
-                else agent_item.message_id if agent_item else None
+                None if disposition is CompletenessDisposition.READY else agent_item.message_id if agent_item else None
             ),
             "triage": {
                 "decision": triage_gate.decision.value,
@@ -3949,6 +3940,7 @@ def _sufficiency_report(completeness_gate: GateResultSchema) -> SufficiencyRepor
         sufficient=details.get("disposition") == CompletenessDisposition.READY.value,
         covered=list(details.get("covered_dimensions") or []),
         missing=list(details.get("missing_required") or []),
+        missing_items=missing_item_payloads(details.get("missing_required") or ()),
         suggestions=[],
     )
 

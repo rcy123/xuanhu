@@ -32,11 +32,6 @@ from app.core.exceptions import (
 from app.db.session import get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
-from app.services.intake_completion_notice import (
-    INTAKE_COMPLETE_NOTICE_TEXT,
-    intake_complete_notice_delta,
-    latest_agent_message_is_intake_complete,
-)
 from app.models.domain import (
     GateResult,
     GraphRun,
@@ -73,6 +68,12 @@ from app.schemas.safety_confirmation import (
     SafetyFactField,
 )
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
+from app.services.intake_completion_notice import (
+    INTAKE_COMPLETE_NOTICE_TEXT,
+    intake_complete_notice_delta,
+    latest_agent_message_is_intake_complete,
+)
+from app.services.sufficiency_report import missing_item_payloads
 
 SafetyAction = Literal["confirm", "reject", "retract"]
 SAFETY_RECOMPUTE_EVENT = "safety_confirmation.recomputed.v1"
@@ -993,9 +994,7 @@ class SafetyConfirmationService:
         )
 
         if question_message is not None:
-            selected_dimension = (
-                question_result.selected_dimension.value if question_result is not None else None
-            )
+            selected_dimension = question_result.selected_dimension.value if question_result is not None else None
             self._db.add(
                 AuditEvent(
                     session_id=session.id,
@@ -1369,6 +1368,7 @@ def _apply_recompute_session_state(
                 "sufficient": completeness_disposition is CompletenessDisposition.READY,
                 "covered": list(details.get("covered_dimensions") or ()),
                 "missing": list(details.get("missing_required") or ()),
+                "missing_items": missing_item_payloads(details.get("missing_required") or ()),
                 "suggestions": [],
             },
             "langgraph_intake": intake,

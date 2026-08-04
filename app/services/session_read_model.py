@@ -28,6 +28,7 @@ from app.schemas.session_read_model import (
     SessionUnresolvedReadModelV1,
 )
 from app.schemas.syndrome import SyndromeDraft
+from app.services.sufficiency_report import missing_item_payloads
 
 _SYNDROME_ARTIFACT_TYPE = "syndrome_draft"
 _FORMULA_ARTIFACT_TYPE = "formula_draft"
@@ -357,6 +358,7 @@ def _sufficiency_report(gates: tuple[GateResult, ...]) -> dict[str, Any] | None:
         "sufficient": details.get("disposition") == "ready" and gate.decision == "passed",
         "covered": [item for item in covered if isinstance(item, str)],
         "missing": [item for item in missing if isinstance(item, str)],
+        "missing_items": missing_item_payloads(item for item in missing if isinstance(item, str)),
         "suggestions": [],
         "next_question": None,
         "disposition": details.get("disposition"),
@@ -528,9 +530,7 @@ def _merge_pending_safety_assertions(
     item replaces that duplicate missing marker until the assertion is settled.
     """
 
-    fields = tuple(
-        sorted(set(pending_fields) - _TRIAGE_OWNED_SAFETY_FIELDS)
-    )
+    fields = tuple(sorted(set(pending_fields) - _TRIAGE_OWNED_SAFETY_FIELDS))
     if not fields:
         return projection
     pending_dimensions = {

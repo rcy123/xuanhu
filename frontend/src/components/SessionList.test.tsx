@@ -47,16 +47,20 @@ describe('SessionList', () => {
       />,
     )
     expect(screen.getByText('新建问诊')).toBeInTheDocument()
-    const items = screen.getAllByText('李明 · 男 · 35岁')
-    expect(items.length).toBe(2)
+    expect(screen.getAllByText('李明').length).toBe(2)
+    expect(screen.getAllByText('男 · 35岁').length).toBe(2)
+    expect(screen.getAllByText('头痛').length).toBe(2)
     expect(screen.getAllByText('07-03 10:35').length).toBe(2)
-    expect(screen.getAllByText('Legacy').length).toBe(2)
+    expect(screen.queryByText('Legacy')).toBeNull()
   })
 
-  it('标记 LangGraph v2 会话运行时', () => {
+  it('不在会话列表暴露运行时实现标识', () => {
     wrap(
       <SessionList
-        sessions={[makeSession('s-lg', { agent_runtime: 'langgraph' })]}
+        sessions={[
+          makeSession('s-legacy'),
+          makeSession('s-lg', { agent_runtime: 'langgraph' }),
+        ]}
         loading={false}
         error={null}
         selectedId={null}
@@ -65,7 +69,25 @@ describe('SessionList', () => {
         onCreate={() => {}}
       />,
     )
-    expect(screen.getByTestId('runtime-s-lg')).toHaveTextContent('LangGraph v2')
+    expect(screen.queryByText('LangGraph v2')).toBeNull()
+    expect(screen.queryByText('Legacy')).toBeNull()
+    expect(screen.queryByTestId('runtime-s-lg')).toBeNull()
+  })
+
+  it('主诉保留完整文本，由样式负责两行截断', () => {
+    const complaint = '感冒一周，咳嗽严重，夜间加重并伴有咽干口渴'
+    wrap(
+      <SessionList
+        sessions={[makeSession('s-long', { chief_complaint: complaint })]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        onSelect={() => {}}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    expect(screen.getByText(complaint)).toBeInTheDocument()
   })
 
   it('点击列表项触发 onSelect', () => {

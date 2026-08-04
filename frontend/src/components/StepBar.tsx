@@ -1,36 +1,81 @@
 /**
  * 悬壶 WebUI —— 步骤条（P8-3 增强）
  *
- * 基于 current_stage 计算 current index。
- * 新增 agentRuns prop：按 Agent 节点显示运行状态（running/done/failed）。
- * 不接 SSE、不支持点击跳转（P8-4 再做）。
+ * 使用稳定的临床流程展示 current_stage，避免不同执行运行时改变步骤数量或标题。
+ * agentRuns 仅用于展示当前步骤的运行/失败状态，不暴露内部编排差异。
  */
 
-import { Steps } from 'antd'
-import { LoadingOutlined, CheckCircleFilled, CloseCircleFilled } from '@ant-design/icons'
-import type { AgentRuntime, SessionReadModel, Stage } from '@/types/api'
-import { stageStepIndex, stepNodesForRuntime } from '@/utils/stage'
+import { CheckOutlined, LoadingOutlined, CloseCircleFilled } from '@ant-design/icons'
+import type { Stage } from '@/types/api'
 import { agentNameToStage } from '@/utils/agent'
 import type { AgentRunState } from '@/hooks/useSessionStream'
 
 interface StepBarProps {
   currentStage: Stage | null
-  agentRuntime?: AgentRuntime
-  readModel?: SessionReadModel
   /** per-agent 运行状态（key = agent_name e.g. "syndrome", "safety"）。 */
   agentRuns?: Record<string, AgentRunState>
+}
+
+const CLINICAL_STEP_NODES = [
+  { stage: 'inquiry', label: '问诊' },
+  { stage: 'syndrome', label: '辨证' },
+  { stage: 'formula', label: '方药' },
+  { stage: 'safety', label: '安全审核' },
+  { stage: 'review', label: '医师复核' },
+  { stage: 'record', label: '病历' },
+] as const
+
+type ClinicalStepStage = (typeof CLINICAL_STEP_NODES)[number]['stage']
+
+function normalizeClinicalStage(stage: Stage): ClinicalStepStage | null {
+  switch (stage) {
+    case 'inquiry':
+    case 'sufficiency':
+      return 'inquiry'
+    case 'syndrome':
+      return 'syndrome'
+    case 'formula':
+    case 'prescription':
+    case 'modification':
+      return 'formula'
+    case 'safety':
+      return 'safety'
+    case 'review':
+      return 'review'
+    case 'record':
+    case 'done':
+      return 'record'
+    default:
+      return null
+  }
+}
+
+function clinicalStepIndex(stage: Stage): number | undefined {
+  const normalized = normalizeClinicalStage(stage)
+  if (!normalized) return undefined
+  const index = CLINICAL_STEP_NODES.findIndex((node) => node.stage === normalized)
+  return index >= 0 ? index : undefined
 }
 
 /** 把 agentRuns 转换为 stage → status 的映射。 */
 function resolveAgentStatus(
   agentRuns: Record<string, AgentRunState> | undefined,
-): Record<string, AgentRunState['status']> {
+): Partial<Record<ClinicalStepStage, AgentRunState['status']>> {
   if (!agentRuns) return {}
-  const result: Record<string, AgentRunState['status']> = {}
+  const result: Partial<Record<ClinicalStepStage, AgentRunState['status']>> = {}
+  const priority: Record<AgentRunState['status'], number> = {
+    done: 1,
+    running: 2,
+    failed: 3,
+  }
   for (const [agentName, run] of Object.entries(agentRuns)) {
     const stage = agentNameToStage(agentName)
-    if (stage) {
-      result[stage] = run.status
+    const clinicalStage = stage ? normalizeClinicalStage(stage) : null
+    if (
+      clinicalStage
+      && (!result[clinicalStage] || priority[run.status] >= priority[result[clinicalStage]])
+    ) {
+      result[clinicalStage] = run.status
     }
   }
   return result
@@ -38,65 +83,69 @@ function resolveAgentStatus(
 
 export function StepBar({
   currentStage,
-  agentRuntime = 'legacy',
-  readModel,
   agentRuns,
 }: StepBarProps) {
-  const nodes = stepNodesForRuntime(agentRuntime)
-  const step = currentStage ? stageStepIndex(currentStage, agentRuntime) : undefined
+  const step = currentStage ? clinicalStepIndex(currentStage) : undefined
   let current = step ?? 0
-  let overallStatus: 'process' | 'finish' | 'error' = 'process'
   if (currentStage === 'done') {
-    current = nodes.length
-    overallStatus = 'finish'
+    current = CLINICAL_STEP_NODES.length
   } else if (currentStage === 'blocked') {
     current = step ?? 0
-    overallStatus = 'error'
   }
 
   const agentStatus = resolveAgentStatus(agentRuns)
 
-  const artifactTypes = new Set(readModel?.artifacts.map((item) => item.artifact_type) ?? [])
-  const items = nodes.map((n) => {
+  const items = CLINICAL_STEP_NODES.map((n, idx) => {
     const status = agentStatus[n.stage]
-    let icon: React.ReactNode | undefined
-    if (status === 'running') {
-      icon = <LoadingOutlined style={{ color: 'var(--xh-primary)' }} />
-    } else if (status === 'done') {
-      icon = <CheckCircleFilled style={{ color: 'var(--xh-success)' }} />
-    } else if (status === 'failed') {
-      icon = <CloseCircleFilled style={{ color: 'var(--xh-error)' }} />
-    }
-    // 已完成阶段（index < current）用默认 ✓ 图标
-    // 仅在当前或未来阶段显示 agent 状态图标
-    const idx = nodes.findIndex((x) => x.stage === n.stage)
-    const showAgentIcon = idx >= current && icon !== undefined
-    let description: string | undefined
-    if (agentRuntime === 'langgraph') {
-      if (status === 'running') description = '运行中'
-      else if (status === 'failed') description = '执行失败'
-      else if (
-        (n.stage === 'syndrome' && artifactTypes.has('syndrome_draft'))
-        || (n.stage === 'formula' && artifactTypes.has('formula_draft'))
-      ) description = '已持久化'
-      else if (n.stage === 'review' && readModel?.review_required) description = '等待硬门禁'
-    }
+    const isCurrent = currentStage !== 'done' && idx === current
+    const isComplete = currentStage === 'done' || idx < current
+    const isFailed = status === 'failed' || (currentStage === 'blocked' && idx === current)
+    const isRunning = status === 'running' && isCurrent
+    const state = isFailed
+      ? 'error'
+      : isRunning
+        ? 'running'
+        : isComplete
+          ? 'complete'
+          : isCurrent
+            ? 'current'
+            : 'pending'
+
+    const marker = isFailed
+      ? <CloseCircleFilled />
+      : isRunning
+        ? <LoadingOutlined />
+        : isComplete
+          ? <CheckOutlined />
+          : idx + 1
 
     return {
-      title: n.label,
-      description,
-      icon: showAgentIcon ? icon : undefined,
+      ...n,
+      marker,
+      state,
     }
   })
 
   return (
-    <div
+    <nav
       data-testid="step-bar"
-      data-runtime={agentRuntime}
       className="xh-step-bar"
+      aria-label="诊疗流程"
     >
-      <Steps current={current} status={overallStatus} size="small" items={items} style={{ padding: 0 }} />
-    </div>
+      <ol className="xh-clinical-flow">
+        {items.map((item, idx) => (
+          <li
+            key={item.stage}
+            className={`xh-flow-step is-${item.state}`}
+            aria-current={item.state === 'current' || item.state === 'running' ? 'step' : undefined}
+          >
+            <span className="xh-flow-marker" aria-hidden="true">{item.marker}</span>
+            <span className="xh-flow-label">{item.label}</span>
+            {idx < items.length - 1 ? <span className="xh-flow-separator" aria-hidden="true">›</span> : null}
+          </li>
+        ))}
+      </ol>
+    </nav>
   )
 }
 

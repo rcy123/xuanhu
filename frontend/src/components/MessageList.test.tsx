@@ -37,6 +37,27 @@ describe('MessageList', () => {
     expect(screen.getByText('头痛')).toBeInTheDocument()
   })
 
+  it('使用面向医师的消息身份，不暴露内部 agent 与阶段名称', () => {
+    const agentMessage = {
+      ...makeMsg('m1', 'agent', '请描述不适症状'),
+      agent_name: 'question_composer',
+    }
+    wrap(
+      <MessageList
+        messages={[agentMessage, makeMsg('m2', 'doctor', '怕冷')]}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getAllByText('悬壶助手').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('医师').length).toBeGreaterThan(0)
+    expect(screen.queryByText('question_composer')).not.toBeInTheDocument()
+    expect(screen.queryByText('inquiry')).not.toBeInTheDocument()
+    expect(document.querySelector('.anticon-medicine-box')).toBeInTheDocument()
+  })
+
   it('空消息显示空态引导', () => {
     wrap(
       <MessageList messages={[]} loading={false} error={null} onRetry={() => {}} />,

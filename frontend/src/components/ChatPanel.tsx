@@ -11,16 +11,16 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Spin, Tag, Typography } from 'antd'
+import { Button, Spin, Typography } from 'antd'
 import {
   CloseOutlined,
-  FileSearchOutlined,
   MessageOutlined,
+  ProfileOutlined,
 } from '@ant-design/icons'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import { useSessionStream } from '@/hooks/useSessionStream'
-import type { SessionDetail, Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest } from '@/types/api'
+import type { Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest } from '@/types/api'
 import { StepBar } from './StepBar'
 import { MessageList } from './MessageList'
 import { MessageInput } from './MessageInput'
@@ -35,7 +35,6 @@ import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
 import { ThinkingHint } from './ThinkingHint'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
-import { stageLabel } from '@/utils/stage'
 import { langGraphDisposition } from '@/utils/agent'
 import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
@@ -47,34 +46,6 @@ interface ChatPanelProps {
   sessionId: string | null
   detailHook: UseSessionDetailResult
   messagesHook: UseMessagesResult
-}
-
-function PatientBar({ detail }: { detail: SessionDetail }) {
-  const p = detail.patient_info
-  const parts: string[] = []
-  if (p.gender && p.gender !== 'unknown') {
-    parts.push(p.gender === 'male' ? '男' : '女')
-  }
-  if (p.age != null) parts.push(`${p.age}岁`)
-  return (
-    <div className="xh-patient-bar">
-      <div className="xh-patient-avatar" aria-hidden="true">
-        {p.name?.trim().slice(0, 1) || '患'}
-      </div>
-      <div className="xh-patient-copy">
-        <div className="xh-patient-name-row">
-          <Text strong>{p.name || '未命名患者'}</Text>
-          {parts.length > 0 ? <Text type="secondary">{parts.join(' · ')}</Text> : null}
-          <Tag className="xh-stage-tag" color="processing">
-            {stageLabel(detail.current_stage)}
-          </Tag>
-        </div>
-        <Text type="secondary" ellipsis={{ tooltip: detail.chief_complaint }}>
-          主诉：{detail.chief_complaint || '尚未填写'}
-        </Text>
-      </div>
-    </div>
-  )
 }
 
 export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProps) {
@@ -607,38 +578,30 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   return (
     <>
       <main className="xh-clinical-workspace">
-        <div className="xh-case-header">
-          {detail ? <PatientBar detail={detail} /> : null}
-          <Button
-            className="xh-context-trigger"
-            icon={<FileSearchOutlined />}
-            aria-label="打开诊疗摘要"
-            onClick={() => setContextOpen(true)}
-          >
-            诊疗摘要
-          </Button>
-        </div>
-
-        <div className="xh-progress-region">
-          <StepBar
-            currentStage={detail?.current_stage ?? null}
-            agentRuntime={detail?.agent_runtime}
-            readModel={detail?.read_model}
-            agentRuns={streamHook.agentRuns}
-          />
-        </div>
+        <Button
+          className="xh-context-trigger"
+          icon={<ProfileOutlined />}
+          aria-label="打开诊疗摘要"
+          onClick={() => setContextOpen(true)}
+        >
+          诊疗摘要
+        </Button>
 
         <div className="xh-workspace-columns">
           <section className="xh-conversation-pane" aria-label="问诊对话">
             <div className="xh-pane-heading">
-              <div>
-                <Text className="xh-section-kicker">CONSULTATION</Text>
+              <div className="xh-pane-heading-main">
                 <Title level={5}>
                   <MessageOutlined aria-hidden="true" />
                   问诊对话
                 </Title>
               </div>
-              <Text type="secondary">对话记录实时保存</Text>
+            </div>
+            <div className="xh-conversation-flow">
+              <StepBar
+                currentStage={detail?.current_stage ?? null}
+                agentRuns={streamHook.agentRuns}
+              />
             </div>
             <StreamStatus
               state={streamHook.connectionState}
@@ -707,8 +670,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           >
             <div className="xh-context-pane-heading">
               <div>
-                <Text className="xh-section-kicker">CLINICAL SUMMARY</Text>
-                <Title level={5}>诊疗摘要</Title>
+                <Title level={5}>
+                  <ProfileOutlined aria-hidden="true" />
+                  诊疗摘要
+                </Title>
               </div>
               <Button
                 className="xh-context-close"

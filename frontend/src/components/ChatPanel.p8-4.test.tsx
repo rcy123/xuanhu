@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
+import { act, render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react'
 import { Modal } from 'antd'
 import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
@@ -169,9 +169,14 @@ describe('ChatPanel P8-4 集成', () => {
       />,
     )
 
-    expect(screen.getByRole('region', { name: '问诊对话' })).toBeInTheDocument()
+    const conversation = screen.getByRole('region', { name: '问诊对话' })
+    expect(conversation).toBeInTheDocument()
+    expect(within(conversation).getByTestId('step-bar')).toBeInTheDocument()
+    expect(within(conversation).queryByText('CONSULTATION')).not.toBeInTheDocument()
+    expect(within(conversation).queryByText('对话记录实时保存')).not.toBeInTheDocument()
     const summary = screen.getByRole('complementary', { name: '诊疗摘要' })
     expect(summary).toBeInTheDocument()
+    expect(within(summary).queryByText('CLINICAL SUMMARY')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '打开诊疗摘要' }))
     expect(summary).toHaveClass('is-open')

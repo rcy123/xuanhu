@@ -23,12 +23,12 @@ import './styles/workbench.css'
 
 const { Title, Text } = Typography
 
-function DisclaimerBar() {
+function DisclaimerFooter() {
   return (
-    <div className="xh-disclaimer">
+    <footer className="xh-disclaimer">
       <SafetyCertificateOutlined aria-hidden="true" />
       辅助决策工具，所有结论仅供参考，需经执业中医师确认后使用。
-    </div>
+    </footer>
   )
 }
 
@@ -70,6 +70,7 @@ function Workbench() {
   const navigate = useNavigate()
   const params = useParams<{ id?: string }>()
   const [navigationOpen, setNavigationOpen] = useState(false)
+  const [sessionSiderCollapsed, setSessionSiderCollapsed] = useState(false)
 
   const selectedId = params.id ?? null
 
@@ -104,10 +105,9 @@ function Workbench() {
   return (
     <div className="xh-app-shell">
       <BrandHeader onOpenNavigation={() => setNavigationOpen(true)} />
-      <DisclaimerBar />
       <div className="xh-app-body">
         <aside
-          className={`xh-session-rail${navigationOpen ? ' is-open' : ''}`}
+          className={`xh-session-rail${sessionSiderCollapsed ? ' is-collapsed' : ''}${navigationOpen ? ' is-open' : ''}`}
           aria-label="问诊会话导航"
         >
           <SessionSider
@@ -115,6 +115,8 @@ function Workbench() {
             selectedId={selectedId}
             onSelect={handleSelect}
             onCreated={handleCreated}
+            collapsed={sessionSiderCollapsed}
+            onCollapsedChange={setSessionSiderCollapsed}
           />
         </aside>
         <button
@@ -125,6 +127,7 @@ function Workbench() {
         />
         {chatPanel}
       </div>
+      <DisclaimerFooter />
     </div>
   )
 }

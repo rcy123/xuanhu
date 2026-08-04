@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { StageResultsPanel } from './StageResultsPanel'
 import type { SessionDetail, Formula, SafetyReview } from '@/types/api'
 import { emptySessionReadModel } from '@/utils/readModel'
@@ -40,6 +40,78 @@ describe('StageResultsPanel', () => {
     render(<StageResultsPanel detail={detail} />)
     expect(screen.getByText(/完备性判断报告/)).toBeInTheDocument()
     expect(screen.getAllByText('信息充分').length).toBeGreaterThan(0)
+  })
+
+  it('展示结构化的待补充信息，不暴露技术字段名', () => {
+    const detail = makeDetail({
+      sufficiency_report: {
+        sufficient: false,
+        covered: ['chief_complaint.symptom'],
+        missing: ['four_diagnosis'],
+        missing_items: [
+          {
+            key: 'four_diagnosis',
+            label: '四诊信息',
+            reason: '望、闻、问、切相关信息尚未完整。',
+            suggested_question: '请补充舌象、面色、声音或脉象等四诊信息。',
+          },
+        ],
+      },
+    })
+
+    render(<StageResultsPanel detail={detail} />)
+
+    expect(screen.getByText('待补充 1 项')).toBeInTheDocument()
+    expect(screen.getByText('已收集信息')).toBeInTheDocument()
+    expect(screen.getByText('未收集信息')).toBeInTheDocument()
+    expect(screen.getByText('主要不适')).toBeInTheDocument()
+    expect(screen.getByText('四诊信息')).toBeInTheDocument()
+    expect(screen.queryByText(/建议问诊：/)).toBeNull()
+    expect(screen.queryByText(/望、闻、问、切相关信息尚未完整/)).toBeNull()
+    expect(screen.queryByText('four_diagnosis')).toBeNull()
+  })
+
+  it('收纳时仅展示完备性状态，展开后展示已收集与待补充信息', () => {
+    const detail = makeDetail({
+      sufficiency_report: {
+        sufficient: false,
+        covered: ['chief_complaint.symptom'],
+        missing: ['four_diagnosis'],
+        missing_items: [
+          {
+            key: 'four_diagnosis',
+            label: '四诊信息',
+            reason: '望、闻、问、切相关信息尚未完整。',
+            suggested_question: '请补充舌象、面色、声音或脉象等四诊信息。',
+          },
+        ],
+      },
+    })
+    const { container } = render(<StageResultsPanel detail={detail} />)
+    const panel = within(container)
+
+    fireEvent.click(panel.getByRole('button', { name: '收起完备性报告' }))
+    expect(panel.getByText('待补充 1 项')).toBeInTheDocument()
+    expect(panel.queryByText('主要不适')).toBeNull()
+    expect(panel.queryByText('四诊信息')).toBeNull()
+
+    fireEvent.click(panel.getByRole('button', { name: '展开完备性报告' }))
+    expect(panel.getByText('主要不适')).toBeInTheDocument()
+    expect(panel.getByText('四诊信息')).toBeInTheDocument()
+  })
+
+  it('旧报告降级展示中文待补充项目，不暴露技术字段名', () => {
+    const detail = makeDetail({
+      sufficiency_report: {
+        sufficient: false,
+        missing: ['safety.allergy_status'],
+      },
+    })
+
+    render(<StageResultsPanel detail={detail} />)
+
+    expect(screen.getByText('过敏史')).toBeInTheDocument()
+    expect(screen.queryByText('safety.allergy_status')).toBeNull()
   })
 
   it('syndrome_result 渲染辨证卡片', () => {

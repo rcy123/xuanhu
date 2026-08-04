@@ -485,7 +485,17 @@ export interface SufficiencyReport {
   sufficient: boolean
   covered: string[]
   missing: string[]
+  /** 新版接口返回结构化待补充说明；旧快照中可能缺失。 */
+  missing_items?: SufficiencyMissingItem[]
   suggestions: string[]
+}
+
+/** 完备性报告中的单项待补充说明。 */
+export interface SufficiencyMissingItem {
+  key: string
+  label: string
+  reason: string
+  suggested_question: string
 }
 
 /** 消息历史列表项。 */

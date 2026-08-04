@@ -71,10 +71,11 @@ describe('LangGraphAdvanceBar', () => {
   it('keeps advance disabled until authoritative gates are ready', () => {
     render(<LangGraphAdvanceBar detail={detail(false)} onAdvanced={() => {}} />)
     expect(screen.getByTestId('langgraph-advance-button')).toBeDisabled()
-    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('needs_input')
+    expect(screen.getByTestId('langgraph-next-action')).toHaveTextContent('请补充上方未收集信息后继续。')
+    expect(screen.queryByText('流程状态')).not.toBeInTheDocument()
   })
 
-  it('renders triage_hold and manual_required from persisted authority', () => {
+  it('uses clinician-facing action prompts for persisted blocking states', () => {
     const triage = detail(false)
     triage.read_model.gates = [
       {
@@ -89,7 +90,9 @@ describe('LangGraphAdvanceBar', () => {
     const { rerender } = render(
       <LangGraphAdvanceBar detail={triage} onAdvanced={() => {}} />,
     )
-    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('triage_hold')
+    expect(screen.getByTestId('langgraph-next-action')).toHaveTextContent(
+      '发现需人工处理的风险项，自动流程已暂停。',
+    )
 
     rerender(
       <LangGraphAdvanceBar
@@ -97,7 +100,7 @@ describe('LangGraphAdvanceBar', () => {
         onAdvanced={() => {}}
       />,
     )
-    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('manual_required')
+    expect(screen.getByTestId('langgraph-next-action')).toHaveTextContent('当前流程需要人工处置后继续。')
   })
 
   it('recovers a blocked LangGraph control cursor with a stable public key', async () => {
@@ -132,7 +135,7 @@ describe('LangGraphAdvanceBar', () => {
       { idempotencyKey: 'advance-idem-1' },
     )
     expect(screen.getByTestId('langgraph-recovery-required')).toHaveTextContent(
-      '不会切换到 Legacy',
+      '不会跳过安全审核',
     )
   })
 
@@ -154,7 +157,7 @@ describe('LangGraphAdvanceBar', () => {
     ]
 
     render(<LangGraphAdvanceBar detail={triage} onAdvanced={() => {}} />)
-    expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('triage_hold')
+    expect(screen.getByTestId('langgraph-next-action')).toHaveTextContent('发现需人工处理的风险项')
     expect(screen.queryByTestId('langgraph-recover-button')).not.toBeInTheDocument()
   })
 
@@ -199,12 +202,12 @@ describe('LangGraphAdvanceBar', () => {
         />,
       )
 
-      expect(screen.getByTestId('langgraph-disposition')).toHaveTextContent('manual_required')
+      expect(screen.getByTestId('langgraph-next-action')).toHaveTextContent('当前流程需要人工处置后继续。')
       expect(screen.getByTestId('langgraph-advance-button')).toBeDisabled()
     },
   )
 
-  it('renders the authoritative revision and refreshes non-sensitive unresolved items on rerender', () => {
+  it('keeps internal read-model diagnostics out of the clinician-facing control', () => {
     const initial = detail(false)
     initial.read_model.unresolved = [
       { source: 'completeness', kind: 'missing_required', key: 'ten_questions' },
@@ -213,10 +216,8 @@ describe('LangGraphAdvanceBar', () => {
       <LangGraphAdvanceBar detail={initial} onAdvanced={() => {}} />,
     )
 
-    expect(screen.getByTestId('langgraph-graph-revision')).toHaveTextContent('图修订 2')
-    expect(screen.getByTestId('langgraph-unresolved-item')).toHaveTextContent(
-      'completeness · missing_required · ten_questions',
-    )
+    expect(screen.queryByTestId('langgraph-read-model-summary')).not.toBeInTheDocument()
+    expect(screen.queryByText('ten_questions')).not.toBeInTheDocument()
 
     const refreshed = detail(false)
     refreshed.read_model.graph = { ...refreshed.read_model.graph, revision: 7 }
@@ -229,16 +230,8 @@ describe('LangGraphAdvanceBar', () => {
     ]
     rerender(<LangGraphAdvanceBar detail={refreshed} onAdvanced={() => {}} />)
 
-    expect(screen.getByTestId('langgraph-graph-revision')).toHaveTextContent('图修订 7')
     expect(screen.queryByText('ten_questions')).not.toBeInTheDocument()
-    expect(screen.getByTestId('langgraph-unresolved-item')).toHaveTextContent(
-      'safety_confirmation · unconfirmed_safety_fact · allergy',
-    )
-  })
-
-  it('shows an explicit empty state when the authoritative model has no unresolved items', () => {
-    render(<LangGraphAdvanceBar detail={detail()} onAdvanced={() => {}} />)
-    expect(screen.getByTestId('langgraph-unresolved-empty')).toHaveTextContent('未解决项：无')
+    expect(screen.queryByText('allergy')).not.toBeInTheDocument()
   })
 
   it('advances with state version and a stable public idempotency key', async () => {

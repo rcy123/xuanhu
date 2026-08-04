@@ -10,14 +10,17 @@
  * P8-3 只读；P8-4 添加确认/修改/否决按钮。
  */
 
-import { Card, Descriptions, Tag, Typography, Table } from 'antd'
+import { useState } from 'react'
+import { Button, Card, Descriptions, Tag, Typography, Table } from 'antd'
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
+  DownOutlined,
   FileDoneOutlined,
   MedicineBoxOutlined,
   SearchOutlined,
   SafetyCertificateOutlined,
+  UpOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
@@ -28,6 +31,7 @@ import type {
   HerbItem,
   Severity,
   SafetyReview,
+  SufficiencyMissingItem,
 } from '@/types/api'
 
 const { Text, Title } = Typography
@@ -45,38 +49,154 @@ interface StageResultsPanelProps {
 // 子卡片
 // ---------------------------------------------------------------------------
 
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function isSufficiencyMissingItem(value: unknown): value is SufficiencyMissingItem {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Record<string, unknown>
+  return ['key', 'label', 'reason', 'suggested_question'].every(
+    (field) => typeof item[field] === 'string' && item[field].trim().length > 0,
+  )
+}
+
+const LEGACY_MISSING_ITEM_LABELS: Record<string, string> = {
+  'chief_complaint.symptom': '主要不适',
+  'chief_complaint.course': '病程',
+  'present_illness.change': '病情变化',
+  'ten_questions.cold_heat': '寒热情况',
+  'ten_questions.sweat': '出汗情况',
+  'ten_questions.head_body': '头身情况',
+  'ten_questions.stool_urine': '二便情况',
+  'ten_questions.diet': '饮食情况',
+  'ten_questions.chest_abdomen': '胸腹情况',
+  'ten_questions.thirst': '口渴情况',
+  'ten_questions.sleep': '睡眠情况',
+  'ten_questions.menses_leukorrhea': '月经带下',
+  'ten_questions.pain': '疼痛情况',
+  'ten_questions.respiratory': '呼吸情况',
+  'safety.allergy_status': '过敏史',
+  'safety.medication_status': '当前用药',
+  'safety.major_condition_status': '重要疾病史',
+  'safety.pregnancy_status': '妊娠情况',
+  'safety.lactation_status': '哺乳情况',
+  past_history: '既往病史',
+  four_diagnosis: '四诊信息',
+  'patient.sex': '性别',
+  'patient.age': '年龄',
+  'patient.menopause_status': '绝经情况',
+}
+
+function dimensionLabel(key: string): string {
+  return LEGACY_MISSING_ITEM_LABELS[key] ?? '待补充信息'
+}
+
+function legacyMissingItem(key: string): SufficiencyMissingItem {
+  return {
+    key,
+    label: dimensionLabel(key),
+    reason: '该项问诊信息尚未完整。',
+    suggested_question: '请补充与当前症状相关的问诊信息。',
+  }
+}
+
 function SufficiencyCard({ report }: { report: Record<string, unknown> }) {
-  const sufficient = report.sufficient as boolean | undefined
+  const [collapsed, setCollapsed] = useState(false)
+  const sufficient = typeof report.sufficient === 'boolean' ? report.sufficient : undefined
   const summary = report.summary as string | undefined
-  const missingFields = report.missing_fields as string[] | undefined
+  const covered = readStringArray(report.covered)
+  const missingItems = Array.isArray(report.missing_items)
+    ? report.missing_items.filter(isSufficiencyMissingItem)
+    : []
+  const legacyMissing = readStringArray(report.missing_fields ?? report.missing)
+  const displayMissingItems = missingItems.length > 0 ? missingItems : legacyMissing.map(legacyMissingItem)
+  const collectedItems = Array.from(new Set(covered)).map((key) => ({ key, label: dimensionLabel(key) }))
+  const missingCount = displayMissingItems.length
+  const statusText = sufficient
+    ? '信息已满足进入下一步条件'
+    : missingCount > 0
+      ? `待补充 ${missingCount} 项`
+      : '尚未满足进入下一步条件'
 
   return (
     <Card
       size="small"
-      className="xh-summary-card"
+      className={`xh-summary-card xh-sufficiency-card ${sufficient ? 'is-success' : ''}`}
       title={
         <span>
           <SearchOutlined /> 完备性判断报告
         </span>
       }
+      extra={
+        sufficient !== undefined ? (
+          <Button
+            aria-label={collapsed ? '展开完备性报告' : '收起完备性报告'}
+            className="xh-sufficiency-toggle"
+            icon={collapsed ? <DownOutlined /> : <UpOutlined />}
+            size="small"
+            type="text"
+            onClick={() => setCollapsed((value) => !value)}
+          />
+        ) : null
+      }
     >
-      {sufficient !== undefined ? (
-        <div style={{ marginBottom: 8 }}>
-          <Tag color={sufficient ? 'success' : 'warning'}>
-            {sufficient ? '信息充分' : '信息不充分'}
-          </Tag>
-        </div>
-      ) : null}
-      {summary ? (
-        <Text style={{ fontSize: 13, whiteSpace: 'pre-wrap' }}>{summary}</Text>
-      ) : null}
-      {missingFields && missingFields.length > 0 ? (
-        <div style={{ marginTop: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            缺失字段：{missingFields.join(', ')}
-          </Text>
-        </div>
-      ) : null}
+      {collapsed ? (
+        <Tag className="xh-sufficiency-collapsed-status" color={sufficient ? 'success' : 'error'}>
+          {statusText}
+        </Tag>
+      ) : (
+        <>
+          <div className="xh-sufficiency-overview">
+            {sufficient !== undefined ? (
+              <Tag color={sufficient ? 'success' : 'error'}>{statusText}</Tag>
+            ) : null}
+            {collectedItems.length > 0 ? (
+              <Text type="secondary" className="xh-sufficiency-covered">
+                已收集 {collectedItems.length} 项
+              </Text>
+            ) : null}
+          </div>
+          {sufficient ? (
+            <div className="xh-sufficiency-ready">
+              <CheckCircleOutlined aria-hidden="true" />
+              <div>
+                <Text strong>问诊信息已满足进入下一步条件</Text>
+                <Text type="secondary">可继续进入后续诊疗流程。</Text>
+              </div>
+            </div>
+          ) : null}
+          {summary ? (
+            <Text className="xh-sufficiency-summary">{summary}</Text>
+          ) : null}
+          {collectedItems.length > 0 ? (
+            <section className="xh-sufficiency-collected" aria-label="已收集信息">
+              <Text className="xh-sufficiency-section-title">已收集信息</Text>
+              <div className="xh-sufficiency-collected-list">
+                {collectedItems.map((item) => (
+                  <span key={item.key} className="xh-sufficiency-collected-item">
+                    <CheckCircleOutlined aria-hidden="true" />
+                    {item.label}
+                  </span>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {!sufficient && displayMissingItems.length > 0 ? (
+            <section className="xh-sufficiency-uncollected" aria-label="未收集信息">
+              <Text className="xh-sufficiency-section-title">未收集信息</Text>
+              <div className="xh-sufficiency-uncollected-list">
+                {displayMissingItems.map((item) => (
+                  <span key={item.key} className="xh-sufficiency-uncollected-item">
+                    <CloseCircleOutlined aria-hidden="true" />
+                    {item.label}
+                  </span>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </>
+      )}
     </Card>
   )
 }

@@ -23,9 +23,9 @@ from app.agent_runtime.completeness_policy import (
     evaluate_completeness_policy,
 )
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
-from app.core.config import agent_model_timeout_seconds, get_settings
 from app.agent_runtime.triage_policy import to_gate_result_schema
 from app.agents.question_composer import compose_question
+from app.core.config import agent_model_timeout_seconds, get_settings
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import GateResult, GraphRun, GraphRunStep
@@ -40,6 +40,7 @@ from app.schemas.domain import ObservationStatus
 from app.schemas.domain_seed import InitialDomainSeed
 from app.schemas.question import QuestionCompositionStatus
 from app.schemas.triage import TriagePolicyResult
+from app.services.sufficiency_report import missing_item_payloads
 
 INITIAL_INTAKE_QUESTION_VERSION = "initial-intake-question.v1"
 
@@ -193,9 +194,7 @@ async def create_initial_intake_question(
     if outcome.status is QuestionCompositionStatus.NO_QUESTION:
         return None
     if outcome.status is not QuestionCompositionStatus.SUCCEEDED or outcome.result is None:
-        raise RuntimeError(
-            f"initial intake question composition failed: {outcome.failure_code}"
-        )
+        raise RuntimeError(f"initial intake question composition failed: {outcome.failure_code}")
 
     question_result = outcome.result
     message = ConsultMessage(
@@ -263,6 +262,7 @@ async def create_initial_intake_question(
                 "sufficient": completeness.disposition.value == "ready",
                 "covered": [item.value for item in completeness.covered_dimensions],
                 "missing": [item.value for item in completeness.missing_required],
+                "missing_items": missing_item_payloads(completeness.missing_required),
                 "suggestions": [],
             },
             "langgraph_intake": {

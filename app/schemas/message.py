@@ -44,12 +44,22 @@ class AgentMessageItem(BaseModel):
     created_at: datetime | None = None
 
 
+class SufficiencyMissingItemData(BaseModel):
+    """One clinician-facing required item still missing from the intake."""
+
+    key: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=160)
+    suggested_question: str = Field(min_length=1, max_length=240)
+
+
 class SufficiencyReportData(BaseModel):
     """完备性报告（嵌入 MessageCreateResponse）。"""
 
     sufficient: bool
     covered: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
+    missing_items: list[SufficiencyMissingItemData] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
 
 

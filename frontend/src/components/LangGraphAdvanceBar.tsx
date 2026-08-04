@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { Alert, Button, Space, Tag, Typography } from 'antd'
+import { Alert, Button, Space, Typography } from 'antd'
 import { ArrowRightOutlined, ReloadOutlined } from '@ant-design/icons'
 import { advanceSession, recoverSession } from '@/api'
 import { ApiRequestError } from '@/api/errors'
@@ -7,37 +7,10 @@ import type { AdvanceData, RecoveryData, SessionDetail } from '@/types/api'
 import {
   canAdvanceLangGraph,
   langGraphDisposition,
-  type LangGraphDisposition,
 } from '@/utils/agent'
 import { generateIdempotencyKey } from '@/utils/id'
 
 const { Text } = Typography
-
-const DISPOSITION_META: Record<
-  LangGraphDisposition,
-  { label: string; color: string; description: string }
-> = {
-  ready: {
-    label: 'ready',
-    color: 'success',
-    description: '确定性 Triage 与 Completeness Gate 均已通过。',
-  },
-  needs_input: {
-    label: 'needs_input',
-    color: 'processing',
-    description: '仍需补充问诊信息，当前不能推进临床推理。',
-  },
-  triage_hold: {
-    label: 'triage_hold',
-    color: 'error',
-    description: '红旗分诊已阻断自动流程，请按分诊要求人工处理。',
-  },
-  manual_required: {
-    label: 'manual_required',
-    color: 'warning',
-    description: '存在冲突、停滞或执行故障，需要人工恢复或处置。',
-  },
-}
 
 interface LangGraphAdvanceBarProps {
   detail: SessionDetail
@@ -80,8 +53,6 @@ export function LangGraphAdvanceBar({
     && detail.status !== 'terminated'
     && !detail.blocked_reason?.startsWith('triage_hold:')
     && (detail.status === 'blocked' || detail.recovery_status !== 'normal')
-  const dispositionMeta = DISPOSITION_META[disposition]
-  const unresolved = detail.read_model.unresolved
   const handleAdvance = async () => {
     setSubmitting(true)
     setError(null)
@@ -152,15 +123,19 @@ export function LangGraphAdvanceBar({
     }
   }
 
-  const hint = detail.current_stage === 'safety'
-    ? '推理草案已持久化，可执行确定性 Safety 硬门禁；前端不会绕过安全审核。'
-    : detail.current_stage === 'record'
-      ? '医师复核已通过，可从权威处方、安全结果与复核引用确定性生成病历。'
-      : canRestartReasoning
-        ? '上一版方子已被否决，可按反馈重新辨证开方。'
-        : canAdvance
-          ? '红旗与问诊完备性门禁均已通过，可进入辨证与方药草案。'
-          : '需先完成问诊，并通过红旗与完备性门禁后才能推进。'
+  const hint = disposition === 'triage_hold'
+    ? '发现需人工处理的风险项，自动流程已暂停。'
+    : disposition === 'manual_required'
+      ? '当前流程需要人工处置后继续。'
+      : detail.current_stage === 'safety'
+        ? '诊疗草案已生成，请执行安全审核。'
+        : detail.current_stage === 'record'
+          ? '医师复核已通过，可生成病历。'
+          : canRestartReasoning
+            ? '上一版方药已退回，请根据反馈重新生成诊疗方案。'
+            : canAdvance
+              ? '问诊信息已满足条件，可进入辨证开方。'
+              : '请补充上方未收集信息后继续。'
 
   const actionLabel = detail.current_stage === 'safety'
     ? '执行安全审核'
@@ -171,50 +146,11 @@ export function LangGraphAdvanceBar({
   return (
     <div data-testid="langgraph-advance-bar" className="xh-runtime-control">
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
-        <Space wrap>
-          <Text strong>流程状态</Text>
-          <Tag color={dispositionMeta.color} data-testid="langgraph-disposition">
-            {dispositionMeta.label}
-          </Tag>
-          <Text type="secondary">{dispositionMeta.description}</Text>
-        </Space>
-        <Text type="secondary">{hint}</Text>
-        <div data-testid="langgraph-read-model-summary">
-          <Space direction="vertical" size={2} style={{ width: '100%' }}>
-            <Text strong data-testid="langgraph-graph-revision">
-              权威 Read Model · 图修订 {detail.read_model.graph.revision}
-              {detail.read_model.graph.status
-                ? ` · ${detail.read_model.graph.status}`
-                : ''}
-            </Text>
-            {unresolved.length > 0 ? (
-              <>
-                <Text type="warning">未解决项（{unresolved.length}）</Text>
-                <ul
-                  aria-label="LangGraph 未解决项"
-                  data-testid="langgraph-unresolved-items"
-                  style={{ margin: 0, paddingInlineStart: 24 }}
-                >
-                  {unresolved.map((item, index) => (
-                    <li
-                      key={`${item.source}:${item.kind}:${item.key}:${index}`}
-                      data-testid="langgraph-unresolved-item"
-                    >
-                      <Text code>{item.source}</Text>
-                      {' · '}
-                      <Text code>{item.kind}</Text>
-                      {' · '}
-                      <Text code>{item.key}</Text>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            ) : (
-              <Text type="secondary" data-testid="langgraph-unresolved-empty">
-                未解决项：无
-              </Text>
-            )}
-          </Space>
+        <div
+          className={`xh-next-action-hint is-${disposition}`}
+          data-testid="langgraph-next-action"
+        >
+          <Text>{hint}</Text>
         </div>
         {detail.read_model.review_required ? (
           <Alert
@@ -230,8 +166,8 @@ export function LangGraphAdvanceBar({
           <Alert
             type="warning"
             showIcon
-            message="LangGraph 控制游标需要恢复"
-            description="恢复只重建当前运行阶段，不会切换到 Legacy，也不会跳过 Safety 或医师复核硬门禁。"
+            message="当前流程需要恢复"
+            description="恢复只重新执行当前步骤，不会跳过安全审核或医师复核。"
             action={(
               <Button
                 icon={<ReloadOutlined />}
