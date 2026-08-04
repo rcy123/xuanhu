@@ -574,6 +574,72 @@
   font-size: 12px;
 }
 
+/* Claude Code 风格思考提示条：三个跳动的点 + 循环短语 */
+.xh-thinking-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  align-self: flex-start;
+  margin: 2px 0 10px 4px;
+  padding: 7px 16px;
+  border: 1px solid var(--xh-border);
+  border-radius: 999px;
+  background: var(--xh-surface, #fff);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 7%);
+}
+
+.xh-thinking-dots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.xh-thinking-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--xh-primary, #1677ff);
+  opacity: 0.35;
+  animation: xh-thinking-bounce 1.2s infinite ease-in-out;
+}
+
+.xh-thinking-dots i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.xh-thinking-dots i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes xh-thinking-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.xh-thinking-phrase {
+  display: inline-block;
+  animation: xh-thinking-fade 0.28s ease-in;
+}
+
+@keyframes xh-thinking-fade {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .xh-message-row {
   display: flex;
   margin-bottom: 16px;

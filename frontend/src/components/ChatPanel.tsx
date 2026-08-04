@@ -33,6 +33,7 @@ import { RejectModal } from './RejectModal'
 import { RecordPanel } from './RecordPanel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
+import { ThinkingHint } from './ThinkingHint'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { stageLabel } from '@/utils/stage'
 import { langGraphDisposition } from '@/utils/agent'
@@ -678,6 +679,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                   onChanged={handleSafetyConfirmationChanged}
                 />
               ) : null}
+              <ThinkingHint
+                active={submitting || runningAgent != null}
+                agent={runningAgent}
+              />
               <MessageInput
                 submitting={submitting}
                 error={submitError}
