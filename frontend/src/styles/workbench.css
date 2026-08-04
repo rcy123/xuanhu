@@ -321,6 +321,29 @@
   opacity: 0.78;
 }
 
+/* 删除按钮：默认隐藏，hover 会话项时显示 */
+.xh-session-remove.ant-btn {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin-left: 2px;
+  color: var(--xh-text-secondary, #8a8a8a);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.xh-session-item:hover .xh-session-remove.ant-btn {
+  opacity: 1;
+  visibility: visible;
+}
+
+.xh-session-remove.ant-btn:hover {
+  color: #ff4d4f !important;
+  background: rgba(255, 77, 79, 0.08);
+}
+
 .xh-centered-state {
   display: grid;
   min-height: 120px;

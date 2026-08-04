@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent, act, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen, fireEvent, act, within } from '@testing-library/react'
 import { ConfigProvider, App as AntdApp } from 'antd'
 import { SessionList } from './SessionList'
 import type { SessionListItem } from '@/types/api'
 import { ApiRequestError } from '@/api/errors'
+
+afterEach(() => {
+  cleanup()
+})
 
 function wrap(node: React.ReactNode) {
   return render(
@@ -85,6 +89,49 @@ describe('SessionList', () => {
       fireEvent.click(item)
     })
     expect(onSelect).toHaveBeenCalledWith('s1')
+  })
+
+  it('点击删除按钮仅隐藏该会话（不触发 onSelect）', () => {
+    const onSelect = vi.fn()
+    wrap(
+      <SessionList
+        sessions={[makeSession('s1'), makeSession('s2')]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        onSelect={onSelect}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    act(() => {
+      fireEvent.click(screen.getByTestId('remove-s1'))
+    })
+    // s1 从展示中消失，s2 保留
+    const lists = screen.getAllByTestId('session-list')
+    const itemList = lists[lists.length - 1]
+    expect(itemList.querySelector('[data-session-id="s1"]')).toBeNull()
+    expect(itemList.querySelector('[data-session-id="s2"]')).not.toBeNull()
+    // 删除不触发选中
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('全部删除后显示空态', () => {
+    wrap(
+      <SessionList
+        sessions={[makeSession('s1')]}
+        loading={false}
+        error={null}
+        selectedId={null}
+        onSelect={() => {}}
+        onRefresh={() => {}}
+        onCreate={() => {}}
+      />,
+    )
+    act(() => {
+      fireEvent.click(screen.getByTestId('remove-s1'))
+    })
+    expect(screen.getByText('暂无会话')).toBeInTheDocument()
   })
 
   it('可按患者与主诉快速筛选会话', () => {

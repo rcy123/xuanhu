@@ -7,7 +7,7 @@
 
 import { useMemo, useState } from 'react'
 import { Button, Empty, Input, Spin, Tag, Typography } from 'antd'
-import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
+import { DeleteOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import type { SessionListItem } from '@/types/api'
 import { formatTime, patientSummary } from '@/utils/format'
 import { sessionTag } from '@/utils/sessionTag'
@@ -29,10 +29,12 @@ function SessionItem({
   session,
   selected,
   onSelect,
+  onRemove,
 }: {
   session: SessionListItem
   selected: boolean
   onSelect: (id: string) => void
+  onRemove: (id: string) => void
 }) {
   const tag = sessionTag(session)
   return (
@@ -81,6 +83,20 @@ function SessionItem({
           >
             {session.agent_runtime === 'langgraph' ? 'LangGraph v2' : 'Legacy'}
           </Tag>
+          <Button
+            type="text"
+            size="small"
+            className="xh-session-remove"
+            aria-label={`删除会话 ${patientSummary(session) || session.session_id}`}
+            data-testid={`remove-${session.session_id}`}
+            onClick={(event) => {
+              // 仅前端隐藏展示，不删除数据库记录。
+              event.stopPropagation()
+              onRemove(session.session_id)
+            }}
+          >
+            <DeleteOutlined />
+          </Button>
       </div>
     </div>
   )
@@ -96,10 +112,26 @@ export function SessionList({
   onCreate,
 }: SessionListProps) {
   const [query, setQuery] = useState('')
+  // 仅前端隐藏的会话 id（不删除数据库，刷新后恢复显示）。
+  const [hiddenIds, setHiddenIds] = useState<ReadonlySet<string>>(() => new Set())
+
+  const handleRemove = (id: string) => {
+    setHiddenIds((prev) => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+  }
+
+  const visibleSessions = useMemo(
+    () => sessions.filter((session) => !hiddenIds.has(session.session_id)),
+    [sessions, hiddenIds],
+  )
+
   const filteredSessions = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
-    if (!normalized) return sessions
-    return sessions.filter((session) => {
+    if (!normalized) return visibleSessions
+    return visibleSessions.filter((session) => {
       const searchable = [
         patientSummary(session),
         session.chief_complaint ?? '',
@@ -107,7 +139,7 @@ export function SessionList({
       ].join(' ').toLocaleLowerCase()
       return searchable.includes(normalized)
     })
-  }, [query, sessions])
+  }, [query, visibleSessions])
 
   return (
     <div data-testid="session-list" className="xh-session-list">
@@ -143,13 +175,13 @@ export function SessionList({
         {error && !loading ? (
           <ErrorBanner error={error as never} onRetry={onRefresh} />
         ) : null}
-        {!loading && !error && sessions.length === 0 ? (
+        {!loading && !error && visibleSessions.length === 0 ? (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={<Text type="secondary">暂无会话</Text>}
           />
         ) : null}
-        {!loading && !error && sessions.length > 0 && filteredSessions.length === 0 ? (
+        {!loading && !error && visibleSessions.length > 0 && filteredSessions.length === 0 ? (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={<Text type="secondary">没有匹配的会话</Text>}
@@ -161,6 +193,7 @@ export function SessionList({
             session={s}
             selected={s.session_id === selectedId}
             onSelect={onSelect}
+            onRemove={handleRemove}
           />
         ))}
       </div>
