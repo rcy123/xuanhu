@@ -69,6 +69,9 @@ export function LangGraphAdvanceBar({
   const canAdvance = canAdvanceLangGraph(detail)
   const isProductStageAction = detail.current_stage === 'safety'
     || detail.current_stage === 'record'
+  // reject 后回到 syndrome（重新辨证开方）也需要推进按钮，否则前端无路可走。
+  const canRestartReasoning = detail.current_stage === 'syndrome'
+    || detail.current_stage === 'modification'
   const canRunStageAction = detail.status === 'active'
     && detail.recovery_status === 'normal'
     && isProductStageAction
@@ -153,9 +156,11 @@ export function LangGraphAdvanceBar({
     ? '推理草案已持久化，可执行确定性 Safety 硬门禁；前端不会绕过安全审核。'
     : detail.current_stage === 'record'
       ? '医师复核已通过，可从权威处方、安全结果与复核引用确定性生成病历。'
-      : canAdvance
-      ? '红旗与问诊完备性门禁均已通过，可进入辨证与方药草案。'
-      : '需先完成问诊，并通过红旗与完备性门禁后才能推进。'
+      : canRestartReasoning
+        ? '上一版方子已被否决，可按反馈重新辨证开方。'
+        : canAdvance
+          ? '红旗与问诊完备性门禁均已通过，可进入辨证与方药草案。'
+          : '需先完成问诊，并通过红旗与完备性门禁后才能推进。'
 
   const actionLabel = detail.current_stage === 'safety'
     ? '执行安全审核'
@@ -240,11 +245,17 @@ export function LangGraphAdvanceBar({
             data-testid="langgraph-recovery-required"
           />
         ) : null}
-        {detail.current_stage === 'inquiry' || isProductStageAction ? (
+        {detail.current_stage === 'inquiry' || canRestartReasoning || isProductStageAction ? (
           <Button
             type="primary"
             icon={<ArrowRightOutlined />}
-            disabled={detail.current_stage === 'inquiry' ? !canAdvance : !canRunStageAction}
+            disabled={
+              detail.current_stage === 'inquiry'
+                ? !canAdvance
+                : canRestartReasoning
+                  ? detail.status !== 'active' || detail.recovery_status !== 'normal'
+                  : !canRunStageAction
+            }
             loading={submitting}
             onClick={() => void handleAdvance()}
             data-testid="langgraph-advance-button"

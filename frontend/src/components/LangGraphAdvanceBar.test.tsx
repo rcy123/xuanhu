@@ -345,4 +345,19 @@ describe('LangGraphAdvanceBar', () => {
       stateVersion: 3,
     })
   })
+
+  it('offers the advance button again after reject rolls back to syndrome', () => {
+    const rejected = detail(true)
+    rejected.current_stage = 'syndrome'
+    render(
+      <LangGraphAdvanceBar
+        detail={rejected}
+        onAdvanced={() => {}}
+        onRefresh={async () => ({})}
+      />,
+    )
+    // reject 回到 syndrome 后必须出现「进入辨证开方」按钮，否则前端无路可走。
+    expect(screen.getByTestId('langgraph-advance-button')).toBeEnabled()
+    expect(screen.getByTestId('langgraph-advance-button')).toHaveTextContent('进入辨证开方')
+  })
 })
