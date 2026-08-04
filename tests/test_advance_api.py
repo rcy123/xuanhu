@@ -337,3 +337,21 @@ async def test_advance_session_not_found(client: AsyncClient, db: AsyncSession) 
         client, str(uuid.uuid4()), expect_status=404
     )
     assert body["code"] == "SESSION_NOT_FOUND"
+
+
+def test_advance_claim_stale_boundary() -> None:
+    """陈旧判定：超过 60 秒无更新的 running claim 视为已死（可被 reclaim）。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.api.advance import _advance_claim_is_stale
+
+    class _Claim:
+        def __init__(self, updated_at):
+            self.updated_at = updated_at
+
+    fresh = _Claim(datetime.now(UTC) - timedelta(seconds=30))
+    assert _advance_claim_is_stale(fresh) is False
+    border = _Claim(datetime.now(UTC) - timedelta(seconds=61))
+    assert _advance_claim_is_stale(border) is True
+    naive = _Claim(datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=120))
+    assert _advance_claim_is_stale(naive) is True

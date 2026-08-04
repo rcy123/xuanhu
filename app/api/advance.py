@@ -506,17 +506,24 @@ async def _run_langgraph_advance(
                     existing.error_code = None
 
             in_flight = await db.scalar(
-                select(IntakeCommandClaim.id).where(
+                select(IntakeCommandClaim).where(
                     IntakeCommandClaim.session_id == sid,
                     IntakeCommandClaim.status == "running",
                     IntakeCommandClaim.idempotency_key != command_key,
                 )
             )
             if in_flight is not None:
-                raise SessionBusyError(
-                    detail=f"session_id={session_id} already has an in-flight command",
-                    retryable=True,
-                )
+                # 陈旧 running claim（>60s 无心跳）视为已死：标记 failed 释放会话，
+                # 否则取消/崩溃遗留的 claim 会让后续命令永远 SESSION_BUSY。
+                if _advance_claim_is_stale(in_flight):
+                    in_flight.status = "failed"
+                    in_flight.error_code = "STALE_RUNNING_RECLAIMED"
+                    in_flight.updated_at = func.now()
+                else:
+                    raise SessionBusyError(
+                        detail=f"session_id={session_id} already has an in-flight command",
+                        retryable=True,
+                    )
 
             run_id = (
                 existing.run_id
@@ -751,6 +758,26 @@ async def _run_langgraph_advance(
             f"session_id={session_id} advance reasoning graph failed",
             retryable=True,
         ) from exc
+    except asyncio.CancelledError:
+        # 图执行被取消（客户端断开/超时）：CancelledError 不继承 Exception，
+        # 不捕获会留下永久 running 的 claim → 后续请求全部 SESSION_BUSY。
+        # best-effort 收尾后保持取消语义向上传播。
+        _logger.warning(
+            "advance reasoning graph cancelled: session_id=%s command=%s",
+            session_id,
+            command_key,
+        )
+        try:
+            await _mark_advance_failed(
+                db,
+                run_id=run_id,
+                session_id=sid,
+                command_key=command_key,
+                error_code="REASONING_GRAPH_CANCELLED",
+            )
+        except BaseException:
+            pass
+        raise
     return await _completed_advance_response(
         db,
         session_id=sid,
