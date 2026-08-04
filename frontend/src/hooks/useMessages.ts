@@ -97,6 +97,7 @@ export function useMessages(): UseMessagesResult {
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionGenerationRef = useRef(0)
   const loadGenerationRef = useRef(0)
+  const hasMessagesRef = useRef(false)
   const mounted = useRef(true)
 
   useEffect(() => {
@@ -124,14 +125,16 @@ export function useMessages(): UseMessagesResult {
       && loadGenerationRef.current === loadGeneration
     )
 
-    setLoading(true)
+    setLoading(!hasMessagesRef.current)
     setError(null)
     try {
       const data = await listMessages(sessionId, { limit: 100 })
       if (isCurrentLoad()) {
         // 后端默认可能按时间倒序，前端统一升序展示（旧→新）。
         const items = [...data.items].sort((a, b) => a.created_at.localeCompare(b.created_at))
+        hasMessagesRef.current = items.length > 0
         setMessages(items)
+        setLoading(false)
         return items
       }
       return null
@@ -149,6 +152,7 @@ export function useMessages(): UseMessagesResult {
     activeSessionIdRef.current = null
     sessionGenerationRef.current += 1
     loadGenerationRef.current += 1
+    hasMessagesRef.current = false
     setMessages([])
     setLoading(false)
     setError(null)

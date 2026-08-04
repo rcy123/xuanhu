@@ -556,6 +556,24 @@
   overflow-y: auto;
 }
 
+/* 有历史消息时后台同步的轻量提示条（不替换对话栏） */
+.xh-message-refresh-hint {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--xh-border);
+  border-radius: 999px;
+  background: var(--xh-surface, #fff);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 8%);
+  font-size: 12px;
+}
+
 .xh-message-row {
   display: flex;
   margin-bottom: 16px;

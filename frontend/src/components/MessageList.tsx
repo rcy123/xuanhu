@@ -68,11 +68,11 @@ export function MessageList({ messages, loading, error, onRetry }: MessageListPr
       data-testid="message-list"
       className="xh-message-list"
     >
-      {loading ? (
+      {loading && messages.length === 0 ? (
         <div style={{ textAlign: 'center', padding: 48 }}>
           <Spin />
         </div>
-      ) : error ? (
+      ) : error && messages.length === 0 ? (
         <ErrorBanner error={error as never} onRetry={onRetry} />
       ) : messages.length === 0 ? (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1 }}>
@@ -82,7 +82,16 @@ export function MessageList({ messages, loading, error, onRetry }: MessageListPr
           />
         </div>
       ) : (
-        messages.map((msg) => <MessageBubble key={msg.id} msg={msg} />)
+        <>
+          {loading ? (
+            <div className="xh-message-refresh-hint" role="status">
+              <Spin size="small" />
+              <Text type="secondary">正在同步最新对话…</Text>
+            </div>
+          ) : null}
+          {error ? <ErrorBanner error={error as never} onRetry={onRetry} /> : null}
+          {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} />)}
+        </>
       )}
       <div ref={bottomRef} />
     </div>
