@@ -27,6 +27,7 @@ from app.core.exceptions import (
     ModelGatewayTimeoutError,
     ModelGatewayUnavailableError,
 )
+from app.core.metrics import measure
 
 logger = logging.getLogger("xuanhu.gateway")
 
@@ -344,11 +345,14 @@ class ModelGatewayClient:
             agent_name,
         )
 
-        response = await self._request_with_retry(
-            method="POST",
-            path="/chat/completions",
-            payload=payload,
-        )
+        host = self._base_url
+        route = self._route_profile or "default"
+        async with measure("gateway.chat", labels={"host": host, "route_profile": route}):
+            response = await self._request_with_retry(
+                method="POST",
+                path="/chat/completions",
+                payload=payload,
+            )
 
         data: Any = response.json()
         try:
@@ -913,11 +917,12 @@ class ModelGatewayClient:
         )
 
         try:
-            response = await self._request_with_retry(
-                method="POST",
-                path="/embeddings",
-                payload=payload,
-            )
+            async with measure("gateway.embed"):
+                response = await self._request_with_retry(
+                    method="POST",
+                    path="/embeddings",
+                    payload=payload,
+                )
         except ModelGatewayUnavailableError as exc:
             raise EmbeddingUnavailableError(str(exc), retryable=exc.retryable) from exc
         except ModelGatewayTimeoutError as exc:

@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from app.core.config import get_settings
 from app.core.embedding_gateway import build_embedding_gateway_settings
 from app.core.gateway import ModelGatewayClient
+from app.core.metrics import measure
 from app.db.session import get_session_factory
 from app.models.knowledge import KnowledgeChunk
 from app.rag.reranker import (
@@ -316,9 +317,10 @@ class RAGRetriever:
 
         # ---- 向量检索 ----
         try:
-            vector_hits = await self._vector_search(
-                query, sources, top_k=vector_top_k, filters=filters,
-            )
+            async with measure("rag.vector"):
+                vector_hits = await self._vector_search(
+                    query, sources, top_k=vector_top_k, filters=filters,
+                )
         except Exception as exc:
             vector_failed = True
             # 不泄露 API key 或完整异常响应
@@ -328,9 +330,10 @@ class RAGRetriever:
             )
 
         # ---- PG 全文检索 ----
-        fulltext_hits = await self._fulltext_search(
-            query, sources, top_k=fulltext_top_k, filters=filters,
-        )
+        async with measure("rag.fulltext"):
+            fulltext_hits = await self._fulltext_search(
+                query, sources, top_k=fulltext_top_k, filters=filters,
+            )
 
         # ---- 降级：向量失败且全文也无结果 ----
         if vector_failed and not fulltext_hits:
@@ -343,7 +346,8 @@ class RAGRetriever:
             return []
 
         # ---- 回填向量命中缺失的 content_snippet ----
-        await self._backfill_content_snippets(merged)
+        async with measure("rag.backfill"):
+            await self._backfill_content_snippets(merged)
 
         # ---- MVP 重排（对全部合并结果按最终加权分排序后截取 top_k）----
         evidences = rerank(
@@ -388,7 +392,8 @@ class RAGRetriever:
         """
         # 1. 生成 query embedding
         trace_id = f"rag-vector-{uuid.uuid4().hex[:8]}"
-        embeddings = await self._gateway.embed([query], trace_id=trace_id)
+        async with measure("rag.embed"):
+            embeddings = await self._gateway.embed([query], trace_id=trace_id)
         query_vector = embeddings[0]
 
         # 2. Milvus 检索

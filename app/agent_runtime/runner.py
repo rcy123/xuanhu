@@ -22,6 +22,7 @@ L1-4 范围：
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -41,6 +42,7 @@ from app.agent_runtime.events import (
     make_graph_failed_event,
     make_graph_started_event,
 )
+from app.core.metrics import graph_node
 
 # 默认总超时（秒）。设为 0 表示不限制。
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
@@ -246,6 +248,7 @@ class GraphRunner:
         )
 
         execution_error: GraphRunnerError | None = None
+        _t0_node = time.perf_counter()
 
         try:
             async with timeout_ctx:
@@ -258,6 +261,21 @@ class GraphRunner:
                 ):  # type: ignore[call-overload]
                     event = convert_updates_chunk(chunk)
                     if event is not None:
+                        # Emit per-node histogram: extract subgraph+node from the event
+                        node_full = event.get("node_name", "unknown")
+                        # Infer subgraph from node name prefix (convention: subgraph__node)
+                        subgraph = "main"
+                        if "__" in node_full:
+                            parts = node_full.split("__", 1)
+                            subgraph = parts[0]
+                            node_name = parts[1]
+                        else:
+                            node_name = node_full
+                        graph_node.observe(
+                            time.perf_counter() - _t0_node,
+                            labels={"subgraph": subgraph, "node": node_name},
+                        )
+                        _t0_node = time.perf_counter()
                         yield event
 
                 yield make_graph_completed_event(run_id=run_id)
