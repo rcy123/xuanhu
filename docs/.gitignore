@@ -4,6 +4,8 @@
 !.gitignore
 !01_agent部分优化/
 !01_agent部分优化/**
+!03_agent性能优化/
+!03_agent性能优化/**
 !dev-handoff/
 dev-handoff/*
 !dev-handoff/agent-refactor-*.md
