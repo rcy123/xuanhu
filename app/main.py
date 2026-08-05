@@ -46,6 +46,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Own process-scoped runtime resources and close them reliably."""
     settings = get_settings()
     logger.info("应用启动，当前配置（已脱敏）: %s", settings.safe_dump())
+
+    # ── shared ModelGatewayClient（lifespan 托管连接池） ──
+    gateway = ModelGatewayClient()
+    app.state.gateway_client = gateway
+
     runtime_cm = shared_langgraph_runtime(settings.database_url)
     runtime_entered = False
     app.state.langgraph_runtime_state = LangGraphRuntimeState(status="starting")
@@ -111,6 +116,8 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                 app.state.langgraph_runtime_state = LangGraphRuntimeState(
                     status="closed"
                 )
+                # 关闭 gateway 连接池
+                await gateway.aclose()
 
 
 app = FastAPI(
@@ -220,13 +227,12 @@ async def health_root() -> JSONResponse:
 
 
 @app.get("/health/llm")
-async def health_llm_root() -> JSONResponse:
+async def health_llm_root(request: Request) -> JSONResponse:
     """根路径模型网关连通性检查（兼容运维探针）。
 
-    Returns:
-        JSONResponse: 扁平 JSON，含 status、checks、timestamp。
+    复用 lifespan 托管的共享 ``ModelGatewayClient`` 实例，避免临时创建。
     """
-    client = ModelGatewayClient()
+    client: ModelGatewayClient = request.app.state.gateway_client
     checks = await client.health_check()
 
     all_ok = all(v == "ok" for v in checks.values())
