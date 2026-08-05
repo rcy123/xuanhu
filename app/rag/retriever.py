@@ -390,11 +390,20 @@ class RAGRetriever:
             EmbeddingUnavailableError: Embedding 不可用。
             Exception: Milvus 不可用或其他错误。
         """
-        # 1. 生成 query embedding
+        # 1. 生成 query embedding —— 先查 Redis 缓存，未命中再调网关
         trace_id = f"rag-vector-{uuid.uuid4().hex[:8]}"
-        async with measure("rag.embed"):
-            embeddings = await self._gateway.embed([query], trace_id=trace_id)
-        query_vector = embeddings[0]
+        from app.rag.embedding_cache import get_embedding, set_embedding
+
+        cached = await get_embedding(query)
+        if cached is not None:
+            query_vector = cached
+            logger.debug("embedding cache 命中: query_len=%d", len(query))
+        else:
+            async with measure("rag.embed"):
+                embeddings = await self._gateway.embed([query], trace_id=trace_id)
+            query_vector = embeddings[0]
+            # 命中率统计留给后续；此处只缓存单条 query embedding（TTL 1h）
+            await set_embedding(query, query_vector)
 
         # 2. Milvus 检索
         milvus = self._get_milvus_client()

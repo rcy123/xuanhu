@@ -155,6 +155,11 @@ class Settings(BaseSettings):
         default=0, ge=0, description="Embedding 网关最大重试次数，0=回退 MODEL_GATEWAY_MAX_RETRIES"
     )
 
+    # ---- Embedding 缓存 ----
+    embedding_cache_ttl_seconds: int = Field(
+        default=3600, ge=0, description="Embedding 向量缓存 TTL（秒），0=不缓存"
+    )
+
     # ---- 模型名称 ----
     chat_model: str = Field(..., description="对话模型名称（必填）")
     embedding_model: str = Field(..., description="Embedding 模型名称（必填）")

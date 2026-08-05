@@ -103,9 +103,29 @@ class ModelGatewayClient:
         )
         # 复用 httpx.AsyncClient 连接池，避免每次请求重建 TCP 连接。
         # 单个 client 实例在 asyncio 事件循环中是线程安全的。
+        # 配有限制参数以控制最大并发连接和连接池保持活跃数。
+        _limits = httpx.Limits(
+            max_connections=64,
+            max_keepalive_connections=16,
+            keepalive_expiry=30.0,
+        )
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._timeout, connect=10.0),
+            limits=_limits,
         )
+
+    async def aclose(self) -> None:
+        """关闭底层 httpx 客户端连接池。
+
+        应在应用 lifespan 中调用，类比 shared_langgraph_runtime 的启停模式。
+        调用后 client 不可再用于请求。
+        """
+        await self._client.aclose()
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """返回底层 httpx 客户端（供 embedding gateway 复用）。"""
+        return self._client
 
     @staticmethod
     def _resolve_structured_mode(settings: Any) -> str:
