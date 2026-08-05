@@ -101,6 +101,11 @@ class ModelGatewayClient:
         self._json_object_disable_thinking = any(
             hint in str(settings.model_gateway_base_url).lower() for hint in _JSON_OBJECT_HOST_HINTS
         )
+        # 复用 httpx.AsyncClient 连接池，避免每次请求重建 TCP 连接。
+        # 单个 client 实例在 asyncio 事件循环中是线程安全的。
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._timeout, connect=10.0),
+        )
 
     @staticmethod
     def _resolve_structured_mode(settings: Any) -> str:
@@ -214,15 +219,12 @@ class ModelGatewayClient:
 
         for attempt in range(max_attempts):
             try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(self._timeout, connect=10.0),
-                ) as client:
-                    response = await client.request(
-                        method=method,
-                        url=url,
-                        json=request_payload,
-                        headers=headers,
-                    )
+                response = await self._client.request(
+                    method=method,
+                    url=url,
+                    json=request_payload,
+                    headers=headers,
+                )
 
                 if response.status_code >= 200 and response.status_code < 300:
                     return response
@@ -966,46 +968,39 @@ class ModelGatewayClient:
             dict[str, str]: 各模型连通状态，如 {"chat": "ok", "embedding": "unavailable"}。
         """
         checks: dict[str, str] = {}
-        health_timeout = self._settings.gateway_health_check_timeout_seconds
 
         # 检查 chat 连通性
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(float(health_timeout), connect=5.0),
-            ) as client:
-                response = await client.post(
-                    f"{self._base_url}/chat/completions",
-                    json={
-                        "model": self._chat_model,
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 1,
-                    },
-                    headers=self._build_headers(),
-                )
-                if response.status_code < 300:
-                    checks["chat"] = "ok"
-                else:
-                    checks["chat"] = "unavailable"
+            response = await self._client.post(
+                f"{self._base_url}/chat/completions",
+                json={
+                    "model": self._chat_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                },
+                headers=self._build_headers(),
+            )
+            if response.status_code < 300:
+                checks["chat"] = "ok"
+            else:
+                checks["chat"] = "unavailable"
         except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError):
             checks["chat"] = "unavailable"
 
         # 检查 embedding 连通性
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(float(health_timeout), connect=5.0),
-            ) as client:
-                response = await client.post(
-                    f"{self._base_url}/embeddings",
-                    json={
-                        "model": self._embedding_model,
-                        "input": ["ping"],
-                    },
-                    headers=self._build_headers(),
-                )
-                if response.status_code < 300:
-                    checks["embedding"] = "ok"
-                else:
-                    checks["embedding"] = "unavailable"
+            response = await self._client.post(
+                f"{self._base_url}/embeddings",
+                json={
+                    "model": self._embedding_model,
+                    "input": ["ping"],
+                },
+                headers=self._build_headers(),
+            )
+            if response.status_code < 300:
+                checks["embedding"] = "ok"
+            else:
+                checks["embedding"] = "unavailable"
         except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError):
             checks["embedding"] = "unavailable"
 

@@ -1531,8 +1531,19 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         ):
             raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
 
+        # 批量预加载所有实体，避免在循环中逐条 session.get()
+        safety_keys = {item.safety_rule_run_id for item in safety_rule_runs}
+        existing_safety_map: dict[UUID, SafetyRuleRun] = {}
+        if safety_keys:
+            for row in (
+                await session.scalars(
+                    select(SafetyRuleRun).where(SafetyRuleRun.id.in_(safety_keys))
+                )
+            ).all():
+                existing_safety_map[row.id] = row
+
         for safety_item in safety_rule_runs:
-            existing_safety = await session.get(SafetyRuleRun, safety_item.safety_rule_run_id)
+            existing_safety = existing_safety_map.get(safety_item.safety_rule_run_id)
             safety_values: dict[str, object] = {
                 "session_id": safety_item.session_id,
                 "agent_run_id": safety_item.agent_run_id,
@@ -1557,8 +1568,17 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         event_ids = {item.event_id for item in audit_events}
         if len(event_ids) != len(audit_events):
             raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+        existing_audit_map: dict[UUID, AuditEvent] = {}
+        if event_ids:
+            for row in (
+                await session.scalars(
+                    select(AuditEvent).where(AuditEvent.id.in_(event_ids))
+                )
+            ).all():
+                existing_audit_map[row.id] = row
+
         for audit_item in audit_events:
-            existing_audit = await session.get(AuditEvent, audit_item.event_id)
+            existing_audit = existing_audit_map.get(audit_item.event_id)
             audit_values: dict[str, object] = {
                 "session_id": audit_item.session_id,
                 "event_type": audit_item.event_type,
@@ -1576,12 +1596,25 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             ):
                 raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
 
+        review_ids_pending = {item.review_id for item in doctor_reviews}
+        existing_review_map: dict[UUID, DoctorReview] = {}
+        if review_ids_pending:
+            for row in (
+                await session.scalars(
+                    select(DoctorReview).where(DoctorReview.id.in_(review_ids_pending))
+                )
+            ).all():
+                existing_review_map[row.id] = row
+
         for review_item in doctor_reviews:
             if review_item.safety_rule_run_id not in safety_ids:
-                safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
-                if safety_exists is None or safety_exists.session_id != delta.session_id:
-                    raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
-            existing_review = await session.get(DoctorReview, review_item.review_id)
+                # 不在本次批次内的 safety_run → 单独查
+                if review_item.safety_rule_run_id not in existing_safety_map:
+                    safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
+                    if safety_exists is None or safety_exists.session_id != delta.session_id:
+                        raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+                    existing_safety_map[review_item.safety_rule_run_id] = safety_exists
+            existing_review = existing_review_map.get(review_item.review_id)
             review_values: dict[str, object] = {
                 "session_id": review_item.session_id,
                 "agent_run_id": review_item.agent_run_id,
@@ -1601,8 +1634,31 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             ):
                 raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
 
+        record_ids_pending = {item.record_id for item in medical_records}
+        existing_record_map: dict[UUID, MedicalRecord] = {}
+        if record_ids_pending:
+            for row in (
+                await session.scalars(
+                    select(MedicalRecord).where(MedicalRecord.id.in_(record_ids_pending))
+                )
+            ).all():
+                existing_record_map[row.id] = row
+        # 预加载 medical_records 中引用的 DoctorReview（用于校验）
+        review_ref_ids = {item.doctor_review_id for item in medical_records} - review_ids_pending
+        if review_ref_ids:
+            for row in (
+                await session.scalars(
+                    select(DoctorReview).where(DoctorReview.id.in_(review_ref_ids))
+                )
+            ).all():
+                existing_review_map[row.id] = row
+
         for record_item in medical_records:
-            review = await session.get(DoctorReview, record_item.doctor_review_id)
+            review = existing_review_map.get(record_item.doctor_review_id)
+            if review is None:
+                review = await session.get(DoctorReview, record_item.doctor_review_id)
+                if review is not None:
+                    existing_review_map[record_item.doctor_review_id] = review
             if (
                 review is None
                 or review.session_id != delta.session_id
@@ -1617,7 +1673,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             )
             if version_owner is not None and version_owner.id != record_item.record_id:
                 raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
-            existing_record = await session.get(MedicalRecord, record_item.record_id)
+            existing_record = existing_record_map.get(record_item.record_id)
             record_values: dict[str, object] = {
                 "session_id": record_item.session_id,
                 "version": record_item.version,
@@ -1637,13 +1693,22 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             ):
                 raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
 
-        run_ids = {item.run_id for item in agent_runs}
-        if len(run_ids) != len(agent_runs):
+        run_ids_pending = {item.run_id for item in agent_runs}
+        if len(run_ids_pending) != len(agent_runs):
             raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
         if any(run_item.session_id != delta.session_id for run_item in agent_runs):
             raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+        existing_run_map: dict[UUID, AgentRun] = {}
+        if run_ids_pending:
+            for row in (
+                await session.scalars(
+                    select(AgentRun).where(AgentRun.id.in_(run_ids_pending))
+                )
+            ).all():
+                existing_run_map[row.id] = row
+
         for run_item in agent_runs:
-            existing_run = await session.get(AgentRun, run_item.run_id)
+            existing_run = existing_run_map.get(run_item.run_id)
             run_values: dict[str, object] = {
                 "session_id": run_item.session_id,
                 "agent_name": run_item.agent_name,
@@ -1672,12 +1737,21 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
         if any(
             evidence_item.session_id != delta.session_id
-            or evidence_item.agent_run_id not in run_ids
+            or evidence_item.agent_run_id not in run_ids_pending
             for evidence_item in agent_evidences
         ):
             raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+        existing_evidence_map: dict[UUID, AgentEvidence] = {}
+        if evidence_row_ids:
+            for row in (
+                await session.scalars(
+                    select(AgentEvidence).where(AgentEvidence.id.in_(evidence_row_ids))
+                )
+            ).all():
+                existing_evidence_map[row.id] = row
+
         for evidence_item in agent_evidences:
-            existing_evidence = await session.get(AgentEvidence, evidence_item.evidence_row_id)
+            existing_evidence = existing_evidence_map.get(evidence_item.evidence_row_id)
             evidence_values: dict[str, object] = {
                 "agent_run_id": evidence_item.agent_run_id,
                 "session_id": evidence_item.session_id,
