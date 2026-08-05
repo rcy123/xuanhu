@@ -98,6 +98,7 @@ async def test_embedding_cache_hit() -> dict:
     对比两次耗时应能观察到"网关 RTT 被抹掉"的效果。
     """
     from app.core.config import get_settings
+    from app.core.embedding_gateway import build_embedding_gateway_settings
     from app.core.gateway import ModelGatewayClient
     from app.rag.embedding_cache import get_embedding, set_embedding, clear_cache
 
@@ -105,7 +106,10 @@ async def test_embedding_cache_hit() -> dict:
     query = "__perf_benchmark_embedding_cache_probe__"
     await clear_cache(query)
 
-    client = ModelGatewayClient(get_settings())
+    # 走 embedding 专用网关（EMBEDDING_GATEWAY_BASE_URL，dmxapi），
+    # 而非默认 chat 网关（xiaomimimo /v1 无 /embeddings 端点）。
+    emb_settings = build_embedding_gateway_settings(get_settings())
+    client = ModelGatewayClient(emb_settings)
     trace_id = "perf-embedding-cache"
 
     # 第 1 次：miss → 网关
@@ -131,7 +135,8 @@ async def test_embedding_cache_hit() -> dict:
     )
     return {
         "test": "embedding_cache_hit",
-        "description": "同一 query 连续取 embedding，对比 miss(网关) vs hit(Redis)",
+        "description": "同一 query 连续取 embedding，对比 miss(embedding 网关) vs hit(Redis)",
+        "embedding_gateway_url": emb_settings.model_gateway_base_url,
         "miss_seconds": round(miss_elapsed, 3),
         "hit_seconds": round(hit_elapsed, 3),
         "hit_ok": hit_ok,
