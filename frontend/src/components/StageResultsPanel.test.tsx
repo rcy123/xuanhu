@@ -117,18 +117,28 @@ describe('StageResultsPanel', () => {
   it('syndrome_result 渲染辨证卡片', () => {
     const detail = makeDetail({
       syndrome_result: {
-        pattern: '脾胃虚弱',
-        organs: ['脾', '胃'],
-        evidence: '舌淡苔白',
-        basis: '《中医诊断学》',
+        syndrome: '风寒束表，肺气不宣证',
+        syndrome_basis: ['恶寒发热，脉浮。', '舌质淡红、苔薄白润泽。'],
+        treatment_principle: '辛温解表，宣肺散寒。',
+        differential: ['需结合后续病情变化排除里热。'],
       },
     })
     render(<StageResultsPanel detail={detail} />)
     expect(screen.getByText(/辨证结论/)).toBeInTheDocument()
-    expect(screen.getByText('脾胃虚弱')).toBeInTheDocument()
+    expect(screen.getByText('风寒束表，肺气不宣证')).toBeInTheDocument()
+    expect(screen.getByText(/恶寒发热，脉浮/)).toBeInTheDocument()
+    expect(screen.getByText('辛温解表，宣肺散寒。')).toBeInTheDocument()
+    expect(screen.getByText(/需结合后续病情变化排除里热/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '收起辨证结论' }))
+    expect(screen.getByText('风寒束表，肺气不宣证')).toBeInTheDocument()
+    expect(screen.queryByText(/恶寒发热，脉浮/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '展开辨证结论' }))
+    expect(screen.getByText(/恶寒发热，脉浮/)).toBeInTheDocument()
   })
 
-  it('base_formula + modified_formula 渲染处方卡片', () => {
+  it('以当前加减方案为主，并将基方与调整项收纳展示', () => {
     const base: Formula = {
       name: '四君子汤',
       composition: [{ herb: '人参', dose: 9, unit: 'g' }],
@@ -140,8 +150,25 @@ describe('StageResultsPanel', () => {
     const detail = makeDetail({ base_formula: base, modified_formula: modified })
     render(<StageResultsPanel detail={detail} />)
     expect(screen.getByText(/处方/)).toBeInTheDocument()
-    expect(screen.getByText('参考基础方：四君子汤')).toBeInTheDocument()
-    expect(screen.getByText('加减方：四君子汤加减')).toBeInTheDocument()
+    expect(screen.getByText('当前加减方案')).toBeInTheDocument()
+    expect(screen.getByText('四君子汤加减')).toBeInTheDocument()
+    expect(screen.getByText('新增 黄芪')).toBeInTheDocument()
+    expect(screen.getByText('人参 9g → 6g')).toBeInTheDocument()
+    expect(screen.getByText('基方：四君子汤')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '展开基方' })).toBeInTheDocument()
+    expect(screen.getAllByRole('table')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: '收起处方' }))
+    expect(screen.getByRole('button', { name: '展开处方' })).toBeInTheDocument()
+    expect(screen.getByText('当前加减方案')).toBeInTheDocument()
+    expect(screen.queryByRole('table')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '展开处方' }))
+    expect(screen.getAllByRole('table')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: '展开基方' }))
+    expect(screen.getByRole('button', { name: '收起基方' })).toBeInTheDocument()
+    expect(screen.getAllByRole('table')).toHaveLength(2)
   })
 
   it('pendingReviewFormula 渲染待确认处方，断言无确认按钮', () => {
@@ -149,15 +176,17 @@ describe('StageResultsPanel', () => {
       name: '待确认方',
       composition: [{ herb: '甘草', dose: 6, unit: 'g' }],
     }
-    render(
+    const { container } = render(
       <StageResultsPanel
         detail={makeDetail()}
         pendingReviewFormula={pendingFormula}
       />,
     )
     expect(screen.getByTestId('pending-review-formula')).toBeInTheDocument()
-    expect(screen.getByText('待确认处方：待确认方')).toBeInTheDocument()
+    expect(screen.getByText('待医师确认')).toBeInTheDocument()
+    expect(screen.getByText(/当前方案：待确认方 · 1 味药/)).toBeInTheDocument()
     expect(screen.getByText(/仅供参考/)).toBeInTheDocument()
+    expect(within(container).getAllByRole('table')).toHaveLength(1)
     // 断言无确认/修改/否决按钮
     expect(screen.queryByText('确认处方')).toBeNull()
     expect(screen.queryByText('修改处方')).toBeNull()

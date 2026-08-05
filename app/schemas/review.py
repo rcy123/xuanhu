@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ReviewAction = Literal["confirm", "modify", "reject", "request_more_info"]
 
@@ -45,14 +45,20 @@ class ReviewRequest(BaseModel):
 
     - ``action=confirm``：仅传 action。
     - ``action=modify``：必填 ``formula_override``，可选 ``feedback``。
-    - ``action=reject`` 或 ``request_more_info``：建议填 ``feedback``。
+    - ``action=reject`` 或 ``request_more_info``：必须填写 ``feedback``，保留回退原因。
     """
 
     action: ReviewAction = Field(..., description="医师确认动作")
     formula_override: FormulaOverride | None = Field(
         default=None, description="action=modify 时必填的修改后处方"
     )
-    feedback: str | None = Field(default=None, max_length=2000, description="修改或否决原因")
+    feedback: str | None = Field(default=None, max_length=2000, description="修改或回退原因")
+
+    @model_validator(mode="after")
+    def require_feedback_for_return_actions(self) -> ReviewRequest:
+        if self.action in {"reject", "request_more_info"} and not (self.feedback or "").strip():
+            raise ValueError(f"action={self.action} 时必须填写 feedback")
+        return self
 
 
 class ReviewResponse(BaseModel):

@@ -30,6 +30,7 @@ import { StageResultsPanel } from './StageResultsPanel'
 import { ReviewActionsBar } from './ReviewActionsBar'
 import { FormulaEditModal } from './FormulaEditModal'
 import { RejectModal } from './RejectModal'
+import { RequestMoreInfoModal } from './RequestMoreInfoModal'
 import { RecordPanel } from './RecordPanel'
 import { LangGraphAdvanceBar } from './LangGraphAdvanceBar'
 import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
@@ -235,6 +236,9 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     && detail.status === 'active'
     && langGraphDisposition(detail) === 'ready',
   )
+  const clinicalWorkspaceMode = Boolean(
+    detail && (detail.current_stage !== 'inquiry' || intakeReady),
+  )
 
   useEffect(() => {
     if (intakeReady) setContextOpen(true)
@@ -250,10 +254,12 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const [reviewError, setReviewError] = useState<ApiRequestError | null>(null)
   const [modifyModalOpen, setModifyModalOpen] = useState(false)
   const [rejectModalOpen, setRejectModalOpen] = useState(false)
+  const [requestMoreInfoModalOpen, setRequestMoreInfoModalOpen] = useState(false)
   const [modifyReviewError, setModifyReviewError] = useState<ApiRequestError | null>(null)
 
   // 病历
   const [record, setRecord] = useState<RecordResponse | null>(null)
+  const [recordGenerationRequested, setRecordGenerationRequested] = useState(false)
   const [recordLoading, setRecordLoading] = useState(false)
   const [recordError, setRecordError] = useState<ApiRequestError | null>(null)
   const [recordEditing, setRecordEditing] = useState(false)
@@ -265,6 +271,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   useEffect(() => {
     if (!sessionId || detail?.session_id !== sessionId) {
       setRecord(null)
+      setRecordGenerationRequested(false)
       setRecordError(null)
       setRecordEditing(false)
       return
@@ -286,6 +293,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
       setRecordError(null)
       setRecordEditing(false)
       setRecordExportError(null)
+      if (detail?.current_stage !== 'record') setRecordGenerationRequested(false)
     }
   }, [sessionId, detail?.session_id, detail?.current_stage, detail?.status])
 
@@ -355,16 +363,22 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   }, [])
 
   const handleRequestMoreInfo = useCallback(() => {
+    setRequestMoreInfoModalOpen(true)
+    setReviewError(null)
+  }, [])
+
+  const handleRequestMoreInfoSubmit = useCallback((feedback: string) => {
     if (!sessionId || !detail || detail.session_id !== sessionId) return
     setReviewSubmitting(true)
     setReviewError(null)
     reviewPrescription(
       sessionId,
-      { action: 'request_more_info' },
+      { action: 'request_more_info', feedback },
       { stateVersion: detail.state_version },
     )
       .then(() => {
         setReviewSubmitting(false)
+        setRequestMoreInfoModalOpen(false)
         void refreshDetail()
       })
       .catch((err: unknown) => {
@@ -401,6 +415,17 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     setReviewError(null)
     void refreshDetail()
   }, [refreshDetail])
+
+  const handleRecordGenerationStart = useCallback(() => {
+    setRecordGenerationRequested(true)
+    setRecordLoading(true)
+    setRecordError(null)
+  }, [])
+
+  const handleRecordGenerationFailed = useCallback(() => {
+    setRecordGenerationRequested(false)
+    setRecordLoading(false)
+  }, [])
 
   // ---------- 病历操作 ----------
 
@@ -581,19 +606,19 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
         <Button
           className="xh-context-trigger"
           icon={<ProfileOutlined />}
-          aria-label="打开诊疗摘要"
+          aria-label={clinicalWorkspaceMode ? '打开诊疗工作台' : '打开诊疗摘要'}
           onClick={() => setContextOpen(true)}
         >
-          诊疗摘要
+          {clinicalWorkspaceMode ? '诊疗工作台' : '诊疗摘要'}
         </Button>
 
-        <div className="xh-workspace-columns">
-          <section className="xh-conversation-pane" aria-label="问诊对话">
+        <div className={`xh-workspace-columns${clinicalWorkspaceMode ? ' is-clinical-workspace' : ''}`}>
+          <section className="xh-conversation-pane" aria-label={clinicalWorkspaceMode ? '问诊记录' : '问诊对话'}>
             <div className="xh-pane-heading">
               <div className="xh-pane-heading-main">
                 <Title level={5}>
                   <MessageOutlined aria-hidden="true" />
-                  问诊对话
+                  {clinicalWorkspaceMode ? '问诊记录' : '问诊对话'}
                 </Title>
               </div>
             </div>
@@ -666,20 +691,20 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
           <aside
             className={`xh-context-pane${contextOpen ? ' is-open' : ''}`}
-            aria-label="诊疗摘要"
+            aria-label={clinicalWorkspaceMode ? '诊疗工作台' : '诊疗摘要'}
           >
             <div className="xh-context-pane-heading">
               <div>
                 <Title level={5}>
                   <ProfileOutlined aria-hidden="true" />
-                  诊疗摘要
+                  {clinicalWorkspaceMode ? '诊疗工作台' : '诊疗摘要'}
                 </Title>
               </div>
               <Button
                 className="xh-context-close"
                 type="text"
                 icon={<CloseOutlined />}
-                aria-label="关闭诊疗摘要"
+                aria-label={clinicalWorkspaceMode ? '关闭诊疗工作台' : '关闭诊疗摘要'}
                 onClick={() => setContextOpen(false)}
               />
             </div>
@@ -703,6 +728,8 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 <LangGraphAdvanceBar
                   detail={detail}
                   onRefresh={refreshDetail}
+                  onRecordGenerationStart={handleRecordGenerationStart}
+                  onRecordGenerationFailed={handleRecordGenerationFailed}
                   onAdvanced={async () => {
                     await refreshDetail()
                     if (sessionId) await loadMessages(sessionId)
@@ -731,6 +758,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 <RecordPanel
                   detail={detail}
                   record={record}
+                  generationRequested={recordGenerationRequested}
                   loading={recordLoading}
                   error={recordError}
                   editing={recordEditing}
@@ -761,7 +789,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           <button
             type="button"
             className={`xh-context-scrim${contextOpen ? ' is-open' : ''}`}
-            aria-label="关闭诊疗摘要"
+            aria-label={clinicalWorkspaceMode ? '关闭诊疗工作台' : '关闭诊疗摘要'}
             onClick={() => setContextOpen(false)}
           />
         </div>
@@ -780,6 +808,12 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
         submitting={reviewSubmitting}
         onCancel={() => setRejectModalOpen(false)}
         onSubmit={handleRejectSubmit}
+      />
+      <RequestMoreInfoModal
+        open={requestMoreInfoModalOpen}
+        submitting={reviewSubmitting}
+        onCancel={() => setRequestMoreInfoModalOpen(false)}
+        onSubmit={handleRequestMoreInfoSubmit}
       />
     </>
   )

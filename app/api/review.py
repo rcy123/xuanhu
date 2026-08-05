@@ -99,7 +99,7 @@ async def review_prescription(
     - confirm：确认安全审核通过的处方，推进到 record 阶段
     - modify：修改处方，系统执行二次安全审核后推进到 record
     - reject：否决处方，回退到 syndrome 阶段
-    - request_more_info：要求补充信息，回退到 inquiry 阶段
+    - request_more_info：补充辨证信息，回退到 syndrome 阶段重新辨证开方
 
     每次提交均写入 doctor_reviews 和 audit_events(doctor.reviewed)。
     """

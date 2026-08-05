@@ -17,6 +17,8 @@ interface LangGraphAdvanceBarProps {
   onAdvanced: (result: AdvanceData) => Promise<void> | void
   onRefresh?: () => Promise<unknown> | void
   onRecovered?: (result: RecoveryData) => Promise<void> | void
+  onRecordGenerationStart?: () => void
+  onRecordGenerationFailed?: () => void
 }
 
 interface PendingAdvanceRequest {
@@ -30,6 +32,8 @@ export function LangGraphAdvanceBar({
   onAdvanced,
   onRefresh,
   onRecovered,
+  onRecordGenerationStart,
+  onRecordGenerationFailed,
 }: LangGraphAdvanceBarProps) {
   const [submitting, setSubmitting] = useState(false)
   const [recoverySubmitting, setRecoverySubmitting] = useState(false)
@@ -54,6 +58,8 @@ export function LangGraphAdvanceBar({
     && !detail.blocked_reason?.startsWith('triage_hold:')
     && (detail.status === 'blocked' || detail.recovery_status !== 'normal')
   const handleAdvance = async () => {
+    const generatingRecord = detail.current_stage === 'record'
+    if (generatingRecord) onRecordGenerationStart?.()
     setSubmitting(true)
     setError(null)
     if (pendingAdvance.current?.sessionId !== detail.session_id) {
@@ -92,6 +98,7 @@ export function LangGraphAdvanceBar({
           // Preserve the original command error; the clinician can retry refresh separately.
         }
       }
+      if (generatingRecord) onRecordGenerationFailed?.()
       setError(commandError)
     } finally {
       setSubmitting(false)
@@ -152,15 +159,6 @@ export function LangGraphAdvanceBar({
         >
           <Text>{hint}</Text>
         </div>
-        {detail.read_model.review_required ? (
-          <Alert
-            type="info"
-            showIcon
-            message="医师复核要求已从权威 Read Model 恢复"
-            description="刷新页面不会丢失待复核草案；只有后端 Safety 与 Doctor Review 硬门禁完成后才会开放确认操作。"
-            data-testid="langgraph-review-restored"
-          />
-        ) : null}
         {error ? <Alert type="error" showIcon message={error.userMessage} /> : null}
         {canRecover ? (
           <Alert

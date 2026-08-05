@@ -48,7 +48,8 @@ describe('RejectModal', () => {
       />,
     )
     fireEvent.click(screen.getByTestId('reject-submit-btn'))
-    expect(onSubmit).toHaveBeenCalledWith('')
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByTestId('reject-submit-btn')).toBeDisabled()
   })
 
   it('关闭时调用 onCancel', () => {

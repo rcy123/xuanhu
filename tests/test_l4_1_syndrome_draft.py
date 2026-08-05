@@ -34,6 +34,7 @@ from app.agents.syndrome_draft import (
     build_syndrome_agent_spec,
     execute_syndrome_draft,
 )
+from app.core.config import get_settings
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION, InquiryDimension
 from app.schemas.domain import (
     CollectionStatus,
@@ -612,6 +613,88 @@ async def test_slot_projected_context_is_accepted_by_verifier() -> None:
         gate_authority=_gate_authority(leaked_payload),
     )
     assert leaked_report.failure_code is SyndromeVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+
+
+def test_recovery_authority_matches_slot_projected_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """3a 回归（REAL-SESSION 342f70ae）：恢复路径 _authority_still_matches_input 必须
+    与新鲜路径同口径投影比较。
+
+    intake_slot_path_enabled 时 syndrome_draft._context_from_domain_state 产出槽位行
+    （每维度一行、合成 uuid5 id），存储的 input_payload.context_observations 也是槽位行。
+    旧实现把 domain_state 的裸观测投影（_active_fact_projection）和存储的槽位行硬比较，
+    结构不同恒不相等 → recover/回退后复用已提交 syndrome 永远失败 → 卡在 syndrome 死锁。
+    修复后恢复路径用 _authoritative_input 重建 context（与新鲜路径同一投影），
+    对同一 domain state 重算应与存储一致。
+    """
+    monkeypatch.setattr(get_settings(), "intake_slot_path_enabled", True)
+
+    payload = _input()
+    # 用槽位投影重建 context，模拟新鲜辨证存储的 input payload。
+    from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+    from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+
+    rows = derive_slot_context_rows(
+        payload.domain_state.observations,
+        dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+        state_version=payload.state_version,
+        session_id=payload.session_id,
+    )
+    projected_context = tuple(
+        SyndromeObservationContext(
+            observation_id=UUID(item["observation_id"]),
+            session_id=payload.session_id,
+            state_version=item["state_version"],
+            fact_key=item["fact_key"],
+            value=item["value"],
+            normalized_value=None,
+            status=ObservationStatus.ACTIVE,
+        )
+        for item in rows
+    )
+    stored_payload = payload.model_copy(update={"context_observations": projected_context})
+
+    authority = ReasoningAuthoritySnapshot(
+        session_id=payload.session_id,
+        current_state_version=payload.state_version,
+        current_stage="syndrome",
+        session_status="active",
+        agent_runtime="langgraph",
+        domain_state=payload.domain_state,
+        source_gate_id=uuid.uuid4(),
+        source_gate_state_version=payload.completeness_gate.input_state_version,
+        triage_gate=payload.triage_gate,
+        completeness_gate=payload.completeness_gate,
+        intake_graph_run_id=uuid.uuid4(),
+    )
+    from app.agents.syndrome_draft import _authority_still_matches_input
+
+    # 槽位模式下：裸观测投影 ≠ 槽位行，但同口径重建后必须匹配。
+    assert _authority_still_matches_input(authority, stored_payload)
+
+    # 篡改任一槽位行的值（同 id 换值）仍必须被拒——不是放行一切。
+    tampered = projected_context[0].model_copy(update={"value": {"forged": True}})
+    tampered_payload = stored_payload.model_copy(
+        update={"context_observations": (tampered, *projected_context[1:])}
+    )
+    assert not _authority_still_matches_input(authority, tampered_payload)
+
+    # 关闭槽位路径时（历史 session 裸键口径）也必须成立。
+    monkeypatch.setattr(get_settings(), "intake_slot_path_enabled", False)
+    raw_payload = _input()  # 裸键 context
+    raw_authority = ReasoningAuthoritySnapshot(
+        session_id=raw_payload.session_id,
+        current_state_version=raw_payload.state_version,
+        current_stage="syndrome",
+        session_status="active",
+        agent_runtime="langgraph",
+        domain_state=raw_payload.domain_state,
+        source_gate_id=uuid.uuid4(),
+        source_gate_state_version=raw_payload.completeness_gate.input_state_version,
+        triage_gate=raw_payload.triage_gate,
+        completeness_gate=raw_payload.completeness_gate,
+        intake_graph_run_id=uuid.uuid4(),
+    )
+    assert _authority_still_matches_input(raw_authority, raw_payload)
 
 
 def test_prune_syndrome_fact_links_drops_unknown_ids_and_keeps_supported_claims() -> None:

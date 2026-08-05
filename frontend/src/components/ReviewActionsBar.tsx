@@ -1,16 +1,12 @@
-/**
- * 悬壶 WebUI —— 医师确认操作区（P8-4）
- *
- * 在 review/pending_review 阶段展示确认/修改/否决按钮。
- * 阻断态（safety_review 未通过或存在 blocker/high issue）下隐藏确认/修改按钮。
- */
+/** 医师处方复核操作区。 */
 
-import { Button, Modal, Space } from 'antd'
+import { Button, Modal } from 'antd'
 import {
   CheckOutlined,
   EditOutlined,
   CloseOutlined,
   QuestionCircleOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import type { SessionDetail, Formula, SafetyIssue } from '@/types/api'
 import type { ApiRequestError } from '@/api/errors'
@@ -42,8 +38,18 @@ export function ReviewActionsBar({
   onRequestMoreInfo,
   onRetry,
 }: ReviewActionsBarProps) {
-  // 仅 review 阶段且 pending_review 为 true 时显示
-  if (detail.current_stage !== 'review' || !detail.pending_review) return null
+  // 渲染条件与后端 _prepared_from_current 对齐：
+  // - review/pending_review：常规复核
+  // - blocked/safety_rule_blocked：安全拦截后仍可修改处方（modify → 二次安全审核），
+  //   否则医生被困在 recover→advance 循环里无法调剂量。
+  const blockedSafety = detail.current_stage === 'blocked'
+    && detail.blocked_reason === 'safety_rule_blocked'
+  if (
+    !blockedSafety
+    && (detail.current_stage !== 'review' || !detail.pending_review)
+  ) {
+    return null
+  }
 
   const blocked = isReviewBlocked(detail, blockedIssues)
   const hasFormula = pendingReviewFormula?.composition && pendingReviewFormula.composition.length > 0
@@ -51,7 +57,7 @@ export function ReviewActionsBar({
   const handleConfirmClick = () => {
     Modal.confirm({
       title: '确认处方',
-      content: '确认处方后系统将进入病历生成阶段，请确认处方无误。',
+      content: '确认后将进入病历生成阶段，请确认处方无误。',
       okText: '确认',
       cancelText: '取消',
       okButtonProps: { disabled: submitting },
@@ -61,24 +67,12 @@ export function ReviewActionsBar({
 
   const handleRequestMoreInfoClick = () => {
     if (!onRequestMoreInfo) return
-    Modal.confirm({
-      title: '退回补充问诊',
-      content: '当前处方及其下游安全结果将失效，会话将返回问诊阶段。确认继续吗？',
-      okText: '确认退回',
-      cancelText: '取消',
-      okButtonProps: { disabled: submitting },
-      onOk: onRequestMoreInfo,
-    })
+    onRequestMoreInfo()
   }
 
   return (
-    <div
-      data-testid="review-actions-bar"
-      className="xh-review-actions"
-    >
-      {error ? (
-        <ErrorBanner error={error} onRetry={onRetry} />
-      ) : null}
+    <div data-testid="review-actions-bar" className="xh-review-actions">
+      {error ? <ErrorBanner error={error} onRetry={onRetry} /> : null}
 
       {!hasFormula ? (
         <div style={{ color: 'var(--xh-text-secondary)', fontSize: 13 }}>
@@ -86,18 +80,26 @@ export function ReviewActionsBar({
         </div>
       ) : (
         <div>
-          <div style={{ fontSize: 13, marginBottom: 'var(--xh-space-m)', color: 'var(--xh-text-secondary)' }}>
-            ⚠ 请仔细审核以上处方内容
+          <div className="xh-review-actions-heading">
+            <span className="xh-review-actions-icon" aria-hidden="true">
+              <SafetyCertificateOutlined />
+            </span>
+            <div>
+              <strong>处方复核</strong>
+              <span>核对方药、剂量与安全审核结论</span>
+            </div>
           </div>
-          <Space size="small" wrap>
+          <div className="xh-review-actions-grid">
             {detail.agent_runtime === 'langgraph' && onRequestMoreInfo ? (
               <Button
                 icon={<QuestionCircleOutlined />}
                 onClick={handleRequestMoreInfoClick}
                 loading={submitting}
                 data-testid="review-request-more-info-btn"
+                className="xh-review-action-button is-return"
+                title="补充信息后重新辨证开方"
               >
-                补充问诊
+                补充信息
               </Button>
             ) : null}
             <Button
@@ -107,19 +109,20 @@ export function ReviewActionsBar({
               onClick={onReject}
               loading={submitting}
               data-testid="review-reject-btn"
+              className="xh-review-action-button is-reject"
+              title="回到辨证阶段，重新开方"
             >
-              否决，重新开方
+              否决并重开
             </Button>
-            {/* 修改处方是阻断态的合法出路：提交后重新执行 Safety 硬门禁，
-                通过后才能确认（确认按钮仍隐藏）。否则医生被困在
-                recover→advance 循环里无法改方子。 */}
             <Button
               icon={<EditOutlined />}
               onClick={onModify}
               loading={submitting}
               data-testid="review-modify-btn"
+              className="xh-review-action-button is-modify"
+              title="修改后重新执行安全审核"
             >
-              修改处方
+              修改并复审
             </Button>
             {!blocked ? (
               <Button
@@ -128,12 +131,13 @@ export function ReviewActionsBar({
                 onClick={handleConfirmClick}
                 loading={submitting}
                 data-testid="review-confirm-btn"
-                style={{ background: 'var(--xh-primary)' }}
+                className="xh-review-action-button is-confirm"
+                title="确认当前安全审核通过的处方"
               >
                 确认处方
               </Button>
             ) : null}
-          </Space>
+          </div>
         </div>
       )}
     </div>

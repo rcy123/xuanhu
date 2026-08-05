@@ -10,6 +10,8 @@
 - base_formula 必须包含有序的 composition（组成，含 herb/dose/unit/note）和非空的 basis（依据，含 fact_ids），fact_ids 须引用活跃观察记录或上游辨证依据声明中的 observation_id。
 - **composition 必须完整列出所选方剂的全部药味及其剂量**——下一阶段的加减模型将严格对照本 composition 逐味操作，漏列任何一味药都会导致后续加减无法正确引用。
 - **herb 必须使用规范中文药名**（如「麻黄」「杏仁」「甘草」），**不得使用拼音**（如 "Ma Huang"/"Xing Ren"/"Gan Cao"）或英文名——拼音/英文名无法通过中药知识库安全校验。
+- **所有剂量必须使用克（g）为单位，unit 字段一律填 "g"**。禁止「枚、个、片、条、适量、少许」等非克单位。计数药须换算为克，例如「大枣 3 枚」→ dose=9, unit="g"；「生姜 3 片」→ dose=9, unit="g"。
+- **所有剂量必须遵守《中国药典》安全上限**（如半夏≤9g、白术≤12g、苍术≤9g、细辛≤3g）。超限将导致安全审核拦截；请按常用量范围取值，毒性/峻猛药取下限。
 - 若关键信息缺失，使用 needs_more_info 并仅填写 missing_inputs；**不得**包含 base_formula 或 rationale。
 - 若无法安全起草，使用 abstained 且不含任何方剂结论。
 - evidence_mode 必须始终为 rag_retrieved。

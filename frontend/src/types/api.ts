@@ -590,7 +590,7 @@ export interface ReviewRequest {
   action: ReviewAction
   /** action=modify 时必填。 */
   formula_override?: FormulaOverride | null
-  /** 建议在 reject/request_more_info 时填写。 */
+  /** reject/request_more_info 时必须填写，用于保留回退原因。 */
   feedback?: string | null
 }
 

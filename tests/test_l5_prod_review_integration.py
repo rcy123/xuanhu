@@ -640,11 +640,11 @@ async def test_failed_modify_is_auditable_and_can_still_return_for_more_informat
             shared_runtime=None,
             allow_request_local_runtime=True,
         )
-    assert response.current_stage == "inquiry"
+    assert response.current_stage == "syndrome"
     assert response.pending_review is False
     async with factory() as db:
         session = await db.get(ConsultSession, seed.session_id)
-        assert session is not None and session.current_stage == "inquiry"
+        assert session is not None and session.current_stage == "syndrome"
         assert not session.pending_review
         passed_gate = await db.scalar(
             select(func.count())
@@ -664,7 +664,7 @@ async def test_failed_modify_is_auditable_and_can_still_return_for_more_informat
         ("confirm", "record"),
         ("modify", "record"),
         ("reject", "syndrome"),
-        ("request_more_info", "inquiry"),
+        ("request_more_info", "syndrome"),
     ],
 )
 async def test_all_four_review_actions_remain_atomic_and_resumable(

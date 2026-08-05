@@ -650,6 +650,12 @@ def _authoritative_input(
     The caller's ``domain_state``, gates and context_observations are
     replaced.  The ``syndrome_draft`` is replaced with the sealed L4-1 output;
     caller-provided clinical text is never copied into model context.
+
+    ``knowledge_correction`` / ``review_feedback`` are operational correction
+    hints (not clinical patient text) and MUST survive the rebuild — otherwise
+    the retry path's injected hint is silently dropped before
+    ``build_formula_context`` runs, making every model retry a blind replay
+    (REAL-SESSION 342f70ae / cb5fe635 复盘).
     """
     return FormulaDraftInput(
         schema_version=input_payload.schema_version,
@@ -662,6 +668,8 @@ def _authoritative_input(
         completeness_gate=authority.completeness_gate,
         context_observations=_context_from_domain_state(authority.domain_state),
         syndrome_draft=trusted_syndrome,
+        review_feedback=input_payload.review_feedback,
+        knowledge_correction=input_payload.knowledge_correction,
     )
 
 

@@ -587,25 +587,12 @@ def _authority_still_matches_input(
         or authority.completeness_gate != input_payload.completeness_gate
     ):
         return False
-    return _active_fact_projection(authority.domain_state) == _context_fact_projection(input_payload)
-
-
-def _active_fact_projection(domain_state: DomainState) -> tuple[tuple[UUID, UUID, str, object, object], ...]:
-    return tuple(
-        sorted(
-            (
-                (
-                    item.observation_id,
-                    item.session_id,
-                    item.fact_key,
-                    item.value,
-                    item.normalized_value,
-                )
-                for item in _active_observations(domain_state.observations)
-            ),
-            key=lambda item: str(item[0]),
-        )
-    )
+    # 3a(灰度)：恢复路径必须与新鲜路径用同一投影口径（_context_from_domain_state）。
+    # 槽位模式开启时两者都是 derive_slot_context_rows 的槽位行；关闭时都是裸观测行。
+    # 旧实现用 _active_fact_projection（裸观测）去比存储的槽位行，结构不同恒不相等，
+    # 导致 recover/回退后复用已提交 syndrome 永远失败（REAL-SESSION 342f70ae 死锁）。
+    rebuilt = _authoritative_input(input_payload, authority)
+    return _context_fact_projection(rebuilt) == _context_fact_projection(input_payload)
 
 
 def _context_fact_projection(input_payload: SyndromeDraftInput) -> tuple[tuple[UUID, UUID, str, object, object], ...]:

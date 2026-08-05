@@ -27,6 +27,8 @@ from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.formula_consistency import (
     FORMULA_CONSISTENCY_POLICY_VERSION,
+    FormulaConsistencyCheck,
+    FormulaConsistencyCheckStatus,
     FormulaConsistencyFailureCode,
     FormulaConsistencyReport,
     verify_trusted_formula_execution,
@@ -323,6 +325,11 @@ _REASONING_RETRYABLE_MODEL_CODES = frozenset(
         "FORMULA_FACT_LINK_INVALID",
         "FORMULA_SYNDROME_FACT_LINK_INVALID",
         "STRUCTURED_OUTPUT_INVALID",
+        # 0d-2: 模型输出解析失败（runtime._one_attempt 对 chat_structured 返回的
+        # 有效响应做 output_schema.model_validate 失败）——随机质量/格式漂移，
+        # 同输入重放大概率自愈（REAL-SESSION d384ff26 复盘：BaseFormulaDraft
+        # 解析失败一次崩死，连 _REASONING_MAX_RETRIES 预算都没用上）。
+        "OUTPUT_SCHEMA_INVALID",
         "MODEL_OUTPUT_TRUNCATED",
         "MODEL_GATEWAY_TIMEOUT",
         "MODEL_GATEWAY_UNAVAILABLE",
@@ -331,6 +338,9 @@ _REASONING_RETRYABLE_MODEL_CODES = frozenset(
         *(code.value for code in FormulaConsistencyFailureCode),
         # 3.0 开方预检：方子含知识库未收录药（safety 必拦）→ 带修正提示重试。
         "FORMULA_HERB_NOT_IN_KNOWLEDGE_BASE",
+        # 3.1 draft-time 安全预检：候选方超剂量/配伍禁忌等（safety 必拦 HIGH/BLOCKER）
+        # → 带 issues 修正提示自动重开方，避免走到 blocked 死锁（REAL-SESSION cb5fe635）。
+        "FORMULA_SAFETY_VIOLATION",
     }
 )
 
@@ -413,6 +423,64 @@ async def _unknown_herbs_in_candidate(output: object) -> tuple[str, ...]:
     return tuple(unknown)
 
 
+async def _safety_violations_in_candidate(
+    output: object,
+    repository: PostgresDomainRepository,
+    session_id: uuid.UUID,
+) -> tuple[str, ...]:
+    """draft-time 安全预检：候选方含 HIGH/BLOCKER 安全拦截项时返回修正提示。
+
+    返回 issues 的 suggestion 列表（每条已是中文修正指令，如
+    「半夏」剂量 10.0g 超过上限 9.0g（一般超量）。请调整剂量。）；
+    无拦截项或安全引擎不可用时返回空元组（safety 硬门禁兜底）。
+
+    复用 SafetyRuleEngine.evaluate 的纯函数边界（不写 run 行），与
+    prepare_review_interrupt 同口径——只是把拦截提前到开方阶段，让模型带
+    issues 提示自动重开方，避免走到 blocked 死锁（REAL-SESSION cb5fe635）。
+    """
+    from app.schemas.formula import FormulaDraftDecision
+
+    if output is None or getattr(output, "decision", None) is not FormulaDraftDecision.COMPLETED:
+        return ()
+    candidate = getattr(output, "candidate_formula", None)
+    if candidate is None:
+        return ()
+    try:
+        domain_state = await repository.get_state(session_id)
+        profile = domain_state.safety_profile
+        if profile is None:
+            return ()
+        from app.safety.engine import SafetyRuleEngine
+        from app.schemas.agent import FormulaResult, HerbDose
+        from app.services.langgraph_review import _patient_info_from_domain
+
+        formula_result = FormulaResult(
+            name=candidate.name,
+            composition=[
+                HerbDose(herb=item.herb, dose=item.dose, unit=item.unit, note=item.note)
+                for item in candidate.composition
+            ],
+            source=None,
+            rationale=candidate.rationale,
+            citations=[],
+        )
+        patient_info = _patient_info_from_domain(profile, observations=domain_state.observations)
+        factory = get_session_factory()
+        async with factory() as safety_db:
+            result = await SafetyRuleEngine(safety_db).evaluate(formula_result, patient_info)
+    except Exception as exc:  # noqa: BLE001 - 安全引擎/知识库不可用：跳过预检，safety 硬门禁兜底
+        _logger.warning(
+            "safety pre-check skipped: session_id=%s error=%s: %s",
+            session_id,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return ()
+    if result.passed:
+        return ()
+    return tuple(item.suggestion for item in result.issues)
+
+
 def _herb_correction_hint(unknown: tuple[str, ...]) -> str:
     """构造未收录药名的修正提示（注入重试输入，模型据此改用规范药名）。"""
     names = "、".join(unknown)
@@ -420,6 +488,15 @@ def _herb_correction_hint(unknown: tuple[str, ...]) -> str:
         f"以下药名不在系统中药知识库中：{names}。"
         "请将其替换为知识库收录的规范药名或别名（如「紫苏子」应写「苏子」、"
         "「生石膏」应写「石膏」），不得保留未收录药名。"
+    )
+
+
+def _formula_unit_correction_hint() -> str:
+    """构造剂量单位修正提示，避免模型反复输出无法自动换算的非克单位。"""
+    return (
+        "处方中所有药物剂量必须统一使用克（g）作为单位，unit 字段一律填 \"g\"。"
+        "不得使用「枚、个、片、条、适量、少许」等非克单位；计数药须换算为克，"
+        "例如「大枣 3 枚」→ 9g、「生姜 3 片」→ 9g；请将每味药的剂量改写为克后重新生成完整处方。"
     )
 
 
@@ -687,6 +764,35 @@ async def run_reasoning_build_formula_context_node(state: XuanhuGraphState) -> d
         await db.close()
 
 
+def _failed_consistency_report() -> FormulaConsistencyReport:
+    """构造合法的「未通过」一致性报告（用于模型执行失败的重试结果占位）。
+
+    仅当 ``result.output is None``（模型执行失败）时作为循环内的 ``consistency``
+    占位——决策分支 line 793 只在 ``result.output`` 非空时读取它，因此占位值
+    不影响 retry/give-up 判定。必须满足 FormulaConsistencyReport 全部必填字段
+    与其 outcome_is_derived 校验（passed == (首个 failing check is None)）。
+    """
+    failed_check = FormulaConsistencyCheck(
+        verifier="trusted_formula_source",
+        status=FormulaConsistencyCheckStatus.FAILED,
+        failure_code=FormulaConsistencyFailureCode.SOURCE_NOT_TRUSTED,
+    )
+    return FormulaConsistencyReport(
+        trusted_formula_source=False,
+        checks=tuple(
+            failed_check if index == 0 else FormulaConsistencyCheck(
+                verifier=f"placeholder_{index}",
+                status=FormulaConsistencyCheckStatus.PASSED,
+            )
+            for index in range(10)
+        ),
+        passed=False,
+        requires_human=True,
+        failure_code=FormulaConsistencyFailureCode.SOURCE_NOT_TRUSTED,
+        subject_digest="0" * 64,
+    )
+
+
 async def _run_formula_stage_with_retry(
     claim: IntakeCommandClaim,
     repository: PostgresDomainRepository,
@@ -722,12 +828,32 @@ async def _run_formula_stage_with_retry(
             retry_code = str(result.failure_code or "FORMULA_FAILED")
         elif result.output.decision is FormulaDraftDecision.COMPLETED and not consistency.passed:
             retry_code = str(consistency.failure_code or "FORMULA_CONSISTENCY_FAILED")
+            if retry_code in {
+                FormulaConsistencyFailureCode.UNIT_HERB_SPECIFIC.value,
+                FormulaConsistencyFailureCode.UNIT_UNSUPPORTED.value,
+                FormulaConsistencyFailureCode.UNIT_UNKNOWN.value,
+            }:
+                correction_hint = _formula_unit_correction_hint()
         if retry_code is None and result.output is not None:
             # 3.0 开方预检：方子含知识库未收录药 → safety 必拦，提前重试。
             unknown = await _unknown_herbs_in_candidate(result.output)
             if unknown:
                 correction_hint = _herb_correction_hint(unknown)
                 retry_code = "FORMULA_HERB_NOT_IN_KNOWLEDGE_BASE"
+        if retry_code is None and result.output is not None:
+            # 3.1 draft-time 安全预检：候选方超剂量/配伍禁忌等（HIGH/BLOCKER）
+            # → safety 必拦。把 issues 修正提示注入重试输入，模型据此自动降剂量，
+            # 避免一次拦截就卡死 blocked。仅 modification 阶段有 candidate_formula。
+            violations = await _safety_violations_in_candidate(
+                result.output,
+                repository,
+                claim.session_id,
+            )
+            if violations:
+                correction_hint = "以下安全审核问题必须修正：\n" + "\n".join(
+                    f"- {item}" for item in violations
+                )
+                retry_code = "FORMULA_SAFETY_VIOLATION"
         if retry_code is None:
             break
         if not _reasoning_failure_is_retryable(retry_code) or retried >= _REASONING_MAX_RETRIES:
@@ -772,7 +898,7 @@ async def _run_formula_stage_with_retry(
         )
         if retried_result.status is not FormulaExecutionStatus.SUCCEEDED or retried_result.output is None:
             result = retried_result
-            consistency = FormulaConsistencyReport(passed=False, failure_code=None)
+            consistency = _failed_consistency_report()
             continue
         result = retried_result
         consistency = verify_trusted_formula_execution(result)

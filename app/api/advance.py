@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 _logger = logging.getLogger("xuanhu.api.advance")
 
 from app.agent_runtime.checkpoint import postgres_checkpointer
-from app.agent_runtime.commands import XuanhuCommand
+from app.agent_runtime.commands import NODE_REASONING_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.lifecycle import (
@@ -58,6 +58,7 @@ from app.db.session import get_db, get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
 from app.models.domain import (
+    ArtifactRevision,
     GateResult,
     GraphRun,
     IntakeCommandClaim,
@@ -71,6 +72,8 @@ from app.services.http_idempotency import HttpCommandExecutor, session_http_scop
 from app.services.session_lock import SessionLock
 
 router = APIRouter(prefix="/api/v1/consult", tags=["advance"])
+
+_SYNDROME_ARTIFACT_TYPE = "syndrome_draft"
 
 
 def _get_trace_id(request: Request) -> str:
@@ -150,6 +153,138 @@ def _advance_payload_digest(force: bool) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+async def _resolve_committed_advance_stage(
+    *,
+    session_id: uuid.UUID,
+    command_key: str,
+    payload_digest: str,
+    complete: bool,
+    allow_running: bool,
+) -> dict[str, Any] | None:
+    """Resolve an advance whose syndrome artifact was durably committed.
+
+    The reasoning graph can time out or fail after committing the syndrome
+    draft but before the advance claim is closed.  In that case the client
+    should still see the durable stage transition (inquiry -> syndrome)
+    instead of a 503, and a later retry should be able to repair the claim.
+    """
+
+    factory = get_session_factory()
+    async with factory() as db, db.begin():
+        claim = await db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key == command_key,
+            )
+            .with_for_update()
+        )
+        if claim is None:
+            return None
+        if claim.payload_digest != payload_digest:
+            raise IdempotencyConflictError(
+                message="相同幂等键不能用于不同的 advance 命令",
+                detail=(
+                    f"session_id={session_id} command_id={command_key} "
+                    "payload_digest_mismatch"
+                ),
+                retryable=False,
+            )
+        if claim.status == "completed" and isinstance(claim.response_payload, dict):
+            return dict(claim.response_payload)
+        if claim.status == "failed":
+            pass
+        elif claim.status == "running" and (allow_running or await _claim_graph_is_terminal(db, claim.run_id)):
+            pass
+        else:
+            return None
+
+        session = await db.get(ConsultSession, session_id, with_for_update=True)
+        if session is None or session.status != "active" or session.current_stage != "syndrome":
+            return None
+
+        intermediate = claim.intermediate_payload or {}
+        syndrome_meta = intermediate.get("syndrome")
+        if not isinstance(syndrome_meta, dict) or syndrome_meta.get("decision") != "completed":
+            return None
+
+        artifact = await db.scalar(
+            select(ArtifactRevision)
+            .where(
+                ArtifactRevision.session_id == session_id,
+                ArtifactRevision.artifact_type == _SYNDROME_ARTIFACT_TYPE,
+                ArtifactRevision.status == "current",
+            )
+            .order_by(ArtifactRevision.revision.desc())
+            .limit(1)
+        )
+        if artifact is None:
+            return None
+        revision = syndrome_meta.get("revision")
+        if isinstance(revision, int) and revision != artifact.revision:
+            return None
+
+        advance_meta = intermediate.get("advance")
+        if not isinstance(advance_meta, dict):
+            advance_meta = {}
+        gate = await db.scalar(
+            select(GateResult)
+            .where(
+                GateResult.session_id == session_id,
+                GateResult.gate_name == "syndrome_verifier",
+                GateResult.decision == "passed",
+            )
+            .order_by(GateResult.created_at.desc(), GateResult.id.desc())
+            .limit(1)
+        )
+        response: dict[str, Any] = {
+            "session_id": str(session_id),
+            "current_stage": "syndrome",
+            "from_stage": advance_meta.get("from_stage", "inquiry"),
+            "state_version": session.state_version,
+            "blocked_reason": None,
+            "agent_name": "reasoning_subgraph",
+            "trace_id": advance_meta.get("trace_id"),
+            "route": NODE_REASONING_SUBGRAPH_V1,
+            "artifact_refs": [
+                {
+                    "kind": _SYNDROME_ARTIFACT_TYPE,
+                    "artifact_id": str(artifact.artifact_id),
+                    "revision": artifact.revision,
+                }
+            ],
+            "gate_results": [
+                {
+                    "gate_name": "syndrome_verifier",
+                    "decision": "passed",
+                    "policy_version": (
+                        gate.policy_version if gate is not None else "syndrome-verifier.v1"
+                    ),
+                }
+            ],
+        }
+
+        if complete:
+            claim.status = "completed"
+            claim.output_state_version = session.state_version
+            claim.response_payload = response
+            claim.error_code = None
+            claim.updated_at = func.now()
+            graph_run = await db.get(GraphRun, claim.run_id, with_for_update=True)
+            if graph_run is not None and graph_run.status != "completed":
+                graph_run.status = "completed"
+                graph_run.completed_at = func.now()
+            if session.recovery_status != "normal":
+                session.recovery_status = "normal"
+                session.updated_at = func.now()
+        return response
+
+
+async def _claim_graph_is_terminal(db: AsyncSession, run_id: uuid.UUID) -> bool:
+    graph_run = await db.get(GraphRun, run_id)
+    return graph_run is not None and graph_run.status != "running"
+
+
 async def _read_durable_advance_response(
     *,
     session_id: uuid.UUID,
@@ -179,6 +314,16 @@ async def _read_durable_advance_response(
             )
         if claim.status == "completed" and isinstance(claim.response_payload, dict):
             return dict(claim.response_payload)
+
+    stage_response = await _resolve_committed_advance_stage(
+        session_id=session_id,
+        command_key=command_key,
+        payload_digest=payload_digest,
+        complete=False,
+        allow_running=False,
+    )
+    if stage_response is not None:
+        return stage_response
 
     from app.agent_runtime.repository import RepositoryError, RepositoryErrorCode
     from app.services.langgraph_record import resolve_committed_record_advance
@@ -740,6 +885,15 @@ async def _run_langgraph_advance(
         else:
             raise LangGraphRuntimeUnavailableError
     except Exception as exc:
+        partial_response = await _resolve_committed_advance_stage(
+            session_id=sid,
+            command_key=command_key,
+            payload_digest=payload_digest,
+            complete=True,
+            allow_running=True,
+        )
+        if partial_response is not None:
+            return partial_response
         await _mark_advance_failed(
             db,
             run_id=run_id,
@@ -847,25 +1001,53 @@ async def advance_session(
 
     async def run_advance() -> dict[str, Any]:
         session = await _load_session_for_advance(db, session_id)
-        if getattr(session, "agent_runtime", "langgraph") == "langgraph":
-            return await _run_langgraph_advance(
+        if getattr(session, "agent_runtime", "langgraph") != "langgraph":
+            # 3d: legacy 路径已下线——历史 legacy session 仅兼容读,不再推进。
+            raise AgentTriggerFailedError(
+                detail=f"session_id={session_id} legacy runtime has been decommissioned; session is read-only",
+                agent_error_code="LEGACY_RUNTIME_DECOMMISSIONED",
+                retryable=False,
+            )
+
+        # 自动重开方（REAL-SESSION cb5fe635 复盘）：安全审核失败时，prepare_review_interrupt
+        # 会把会话重置回 syndrome + 写拦截原因 + 失效方子，并返回 reopened_for_safety 标记。
+        # 此处在一个 HTTP 请求内循环：下一轮以 syndrome 进入 ADVANCE（reasoning 重开方），
+        # 重开方后再次安全审核……直到通过（review）或尝试耗尽（blocked）。
+        # 幂等：首轮用 HTTP key（保留乐观并发契约）；后续轮用 fresh internal key 派生
+        # 新 IntakeCommandClaim，避免命中幂等重放路径返回旧响应。
+        from app.services.langgraph_review import MAX_SAFETY_REOPEN_ATTEMPTS
+
+        last_response: dict[str, Any] | None = None
+        for attempt in range(MAX_SAFETY_REOPEN_ATTEMPTS + 1):
+            internal_key = (
+                context.idempotency_key
+                if attempt == 0
+                else f"{context.idempotency_key}:safety-reopen:{attempt}"
+            )
+            response = await _run_langgraph_advance(
                 db,
                 session,
                 session_id=session_id,
-                state_version=state_version,
+                # 首轮校验 HTTP header（乐观并发）；后续轮会话 state_version 已递增，
+                # 传 None 跳过陈旧 header 校验，让内部重新加载最新 session。
+                state_version=state_version if attempt == 0 else None,
                 trace_id=trace_id,
                 force=body.force,
-                idempotency_key=context.idempotency_key,
+                idempotency_key=internal_key,
                 shared_runtime=shared_runtime,
                 allow_request_local_runtime=test_runtime_fallback,
             )
-
-        # 3d: legacy 路径已下线——历史 legacy session 仅兼容读,不再推进。
-        raise AgentTriggerFailedError(
-            detail=f"session_id={session_id} legacy runtime has been decommissioned; session is read-only",
-            agent_error_code="LEGACY_RUNTIME_DECOMMISSIONED",
-            retryable=False,
-        )
+            last_response = response
+            # 自动重开：会话已重置回 syndrome（等下一轮 reasoning 重开方），继续循环。
+            if response.get("reopened_for_safety"):
+                continue
+            # reasoning 刚提交方子到 safety，等下一轮 REVIEW 安全审核，继续循环。
+            if response.get("current_stage") == "safety":
+                continue
+            # review（通过）或 blocked（尝试耗尽）→ 终态，返回。
+            return response
+        assert last_response is not None
+        return last_response
 
     scope = session_http_scope(session_id)
 

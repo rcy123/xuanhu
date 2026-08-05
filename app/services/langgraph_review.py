@@ -89,6 +89,61 @@ REVIEW_POLICY_VERSION = "doctor-review-interrupt.product.v1"
 PRODUCT_AGENT_SPEC_VERSION = "langgraph-product-domain-delta.v1"
 PRODUCT_PROMPT_VERSION = "deterministic-no-prompt.v1"
 
+# 安全硬门禁不通过时自动重开方的最大尝试次数（含首次）。
+# 每次安全失败自动重置回 syndrome + 写入拦截原因 + 失效方子 → 模型带原因重开方。
+# 超过此次数仍失败才落 blocked（前端「修改处方」兜底）。REAL-SESSION cb5fe635 复盘。
+MAX_SAFETY_REOPEN_ATTEMPTS = 3
+
+
+def _safety_feedback_text(result: SafetyRuleResult) -> str:
+    """把安全引擎拦截原因拼成注入重新开方的模型反馈（review_feedback 通道）。"""
+    suggestions = [item.suggestion for item in result.issues if item.suggestion]
+    if not suggestions:
+        return ""
+    return "以下安全审核问题必须修正：\n" + "\n".join(f"- {item}" for item in suggestions)
+
+
+async def _safety_attempt_count(
+    repository: PostgresDomainRepository,
+    session_id: uuid.UUID,
+    formula_revision: int,
+) -> int:
+    """统计当前方子已接受安全引擎评估的次数（safety_result artifact 版本数）。
+
+    计数按方子 revision 维度（而非全局），保证每次重新开方后自动重开次数重置——
+    新方子应获得全新的自动重开预算，不被历史方子的失败次数耗尽。
+    """
+    safety_id = _stable_id(session_id, SAFETY_ARTIFACT_TYPE)
+    try:
+        from app.models.domain import ArtifactRevision, ArtifactRevisionPayload
+
+        factory = get_session_factory()
+        async with factory() as db:
+            rows = (
+                await db.execute(
+                    select(ArtifactRevision, ArtifactRevisionPayload)
+                    .join(
+                        ArtifactRevisionPayload,
+                        ArtifactRevisionPayload.artifact_revision_id == ArtifactRevision.id,
+                    )
+                    .where(
+                        ArtifactRevision.session_id == session_id,
+                        ArtifactRevision.artifact_id == safety_id,
+                    )
+                    .order_by(ArtifactRevision.revision.desc())
+                )
+            ).all()
+    except Exception:  # noqa: BLE001 - 计数失败保守按 0（自动重开，safety 硬门禁兜底）
+        return 0
+    count = 0
+    for artifact, payload in rows:
+        if payload is None or not isinstance(payload.payload, dict):
+            continue
+        formula_ref = payload.payload.get("formula_ref")
+        if isinstance(formula_ref, dict) and formula_ref.get("revision") == formula_revision:
+            count += 1
+    return count
+
 
 class _NoInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -521,7 +576,7 @@ def _session_updates(
     # REASONING_PRECHECK_FAILED（被否决的方子无法重新开方）。
     if preserve_advance is not None:
         snapshot["advance"] = preserve_advance
-    # 医师否决反馈：reject 时写入 state_snapshot，重新辨证/开方时注入模型输入。
+    # 医师回退反馈：重新辨证/开方时注入模型输入。
     if review_feedback:
         snapshot["review_feedback"] = review_feedback
     return {
@@ -588,8 +643,10 @@ def _advance_response(
     safety_record: ArtifactPayloadRecord,
     passed: bool,
     trace_id: str,
+    reopened_for_safety: bool = False,
+    safety_attempt: int = 1,
 ) -> dict[str, Any]:
-    return {
+    response: dict[str, Any] = {
         "session_id": str(session_id),
         "current_stage": current_stage,
         "from_stage": "safety",
@@ -616,6 +673,12 @@ def _advance_response(
         "pending_review": passed,
         "safety_executed": True,
     }
+    # 自动重开方标记：安全失败且尝试次数未耗尽 → 会话已重置回 syndrome，
+    # advance 处理循环据此继续下一轮 reasoning 重开方，而非落 blocked。
+    if reopened_for_safety:
+        response["reopened_for_safety"] = True
+        response["safety_attempt"] = safety_attempt
+    return response
 
 
 def _safety_projection_matches(
@@ -882,15 +945,33 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         "trace_id": trace_id,
     }
     payload_spec = _payload_spec(artifact, schema_version=SAFETY_PAYLOAD_SCHEMA_VERSION, payload=payload)
+    # 自动重开方：安全失败且当前方子尝试次数未耗尽 → 重置回 syndrome 重开方（而非 blocked）。
+    # 尝试次数按方子 revision 计数（_safety_attempt_count），新方子重置预算。
+    safety_attempt = await _safety_attempt_count(
+        repository,
+        session_id,
+        formula.record.revision,
+    ) + 1
+    reopened_for_safety = (not result.passed) and safety_attempt < MAX_SAFETY_REOPEN_ATTEMPTS
     delta = DomainDelta(
         delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:safety:{run_id}"),
         run_id=run_id,
         session_id=session_id,
         expected_state_version=domain_state.state_version,
         artifact_revisions=(artifact,),
+        invalidate_artifact_ids=(
+            (formula.record.artifact_id,) if reopened_for_safety else ()
+        ),
     )
-    target_stage = "review" if result.passed else "blocked"
-    target_status = "pending_review" if result.passed else "blocked"
+    if reopened_for_safety:
+        # 拦截原因注入重新开方：模型看到 issues 自动降剂量/换药。失效方子保留辨证。
+        target_stage = "syndrome"
+        target_status = "active"
+        feedback = _safety_feedback_text(result)
+    else:
+        target_stage = "review" if result.passed else "blocked"
+        target_status = "pending_review" if result.passed else "blocked"
+        feedback = None
     await repository.commit(
         delta,
         _verification_context(
@@ -917,7 +998,13 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         graph_steps=(
             GraphStepSpec(step_name="safety_rule_engine", status="completed", metadata={}),
             GraphStepSpec(
-                step_name="doctor_review_interrupt" if result.passed else "safety_blocked",
+                step_name=(
+                    "safety_reopen"
+                    if reopened_for_safety
+                    else "doctor_review_interrupt"
+                    if result.passed
+                    else "safety_blocked"
+                ),
                 status="completed",
                 metadata={},
             ),
@@ -955,6 +1042,8 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
                     "safety_revision": artifact.revision,
                     "safety_rule_run_id": str(safety_run_id),
                     "passed": result.passed,
+                    "reopened_for_safety": reopened_for_safety,
+                    "safety_attempt": safety_attempt,
                 },
                 trace_id=trace_id,
             ),
@@ -962,18 +1051,32 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         session_updates=_session_updates(
             current_stage=target_stage,
             status=target_status,
-            pending_review=result.passed,
+            pending_review=result.passed and not reopened_for_safety,
             state_version=domain_state.state_version + 1,
-            route="review_required" if result.passed else "safety_blocked",
-            blocked_reason=None if result.passed else "safety_rule_blocked",
+            route=(
+                "safety_reopen"
+                if reopened_for_safety
+                else "review_required"
+                if result.passed
+                else "safety_blocked"
+            ),
+            blocked_reason=None if result.passed or reopened_for_safety else "safety_rule_blocked",
             preserve_advance=_preserved_advance(meta),
+            review_feedback=feedback,
         ),
-        outbox_event_type="review.required.v1" if result.passed else "safety.blocked.v1",
+        outbox_event_type=(
+            "safety.reopened.v1"
+            if reopened_for_safety
+            else "review.required.v1"
+            if result.passed
+            else "safety.blocked.v1"
+        ),
         outbox_payload={
             "session_id": str(session_id),
             "safety_artifact_id": str(artifact.artifact_id),
             "safety_revision": artifact.revision,
             "passed": result.passed,
+            "reopened_for_safety": reopened_for_safety,
             "issue_count": len(result.issues),
             "input_state_version": domain_state.state_version,
             "output_state_version": domain_state.state_version + 1,
@@ -993,8 +1096,10 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         state_version=domain_state.state_version + 1,
         current_stage=target_stage,
         safety_record=safety_record,
-        passed=result.passed,
+        passed=result.passed and not reopened_for_safety,
         trace_id=trace_id,
+        reopened_for_safety=reopened_for_safety,
+        safety_attempt=safety_attempt,
     )
     await _complete_advance_claim(
         session_id=session_id,
@@ -1002,9 +1107,10 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         response=response,
         state_version=domain_state.state_version + 1,
     )
-    if not result.passed:
-        # safety 硬门禁不通过：路由到 blocked 终态（与 session stage=blocked 一致），
-        # 否则 checkpoint 记成 review_placeholder → recover 时状态错乱 → 死循环。
+    if not result.passed and not reopened_for_safety:
+        # safety 硬门禁不通过（且未自动重开）：路由到 blocked 终态（与 session
+        # stage=blocked 一致），否则 checkpoint 记成 review_placeholder →
+        # recover 时状态错乱 → 死循环。
         return {
             "route": NODE_BLOCKED_TERMINAL,
             "domain_state_version": domain_state.state_version + 1,
@@ -1016,6 +1122,19 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
                 "trace_id": trace_id,
                 "detail": "deterministic safety gate blocked the formula",
             },
+        }
+    if reopened_for_safety:
+        # 自动重开方：会话已重置回 syndrome/active，REVIEW 图命令在此干净结束，
+        # advance 处理循环据此发起下一轮 reasoning 重开方。
+        return {
+            "route": NODE_REVIEW_PLACEHOLDER,
+            "domain_state_version": domain_state.state_version + 1,
+            "artifact_refs": response["artifact_refs"],
+            "gate_results": response["gate_results"],
+            "pending_interrupt": None,
+            "last_error": None,
+            "reopened_for_safety": True,
+            "safety_attempt": safety_attempt,
         }
     return _pending_update(await _prepared_from_current(session_id))
 
@@ -1226,8 +1345,8 @@ async def apply_review_resume(
         artifact_revisions=(artifact,),
         invalidate_artifact_ids=invalidation_ids,
     )
-    target_stage = "record" if action in {"confirm", "modify"} else "syndrome" if action == "reject" else "inquiry"
-    # 保留 intake→syndrome 的 advance 出处：reject 回 syndrome 后重新 advance
+    target_stage = "record" if action in {"confirm", "modify"} else "syndrome"
+    # 保留 intake→syndrome 的 advance 出处：回到 syndrome 后重新 advance
     # 时 reasoning 预检复用 completeness gate，否则 REASONING_PRECHECK_FAILED。
     preserve_advance = _preserved_advance(meta)
     trace_id = _node_trace_id(state)
@@ -1281,8 +1400,8 @@ async def apply_review_resume(
             state_version=domain_state.state_version + 1,
             route=f"review_{action}",
             preserve_advance=preserve_advance,
-            # 否决反馈持久化：reject 后重新辨证/开方时注入模型输入。
-            review_feedback=payload.get("feedback") if action == "reject" else None,
+            # 回退反馈持久化：重新辨证/开方时注入模型输入。
+            review_feedback=payload.get("feedback") if action in {"reject", "request_more_info"} else None,
         ),
         outbox_event_type="doctor.review_applied.v1",
         outbox_payload={

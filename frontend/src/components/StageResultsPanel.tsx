@@ -11,7 +11,7 @@
  */
 
 import { useState } from 'react'
-import { Button, Card, Descriptions, Tag, Typography, Table } from 'antd'
+import { Button, Card, Tag, Typography, Table } from 'antd'
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -34,7 +34,7 @@ import type {
   SufficiencyMissingItem,
 } from '@/types/api'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 
 interface StageResultsPanelProps {
   detail: SessionDetail | null
@@ -51,6 +51,10 @@ interface StageResultsPanelProps {
 
 function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
 function isSufficiencyMissingItem(value: unknown): value is SufficiencyMissingItem {
@@ -202,43 +206,91 @@ function SufficiencyCard({ report }: { report: Record<string, unknown> }) {
 }
 
 function SyndromeCard({ result }: { result: Record<string, unknown> }) {
-  const pattern = result.pattern as string | undefined
-  const organs = result.organs as string[] | undefined
-  const evidence = result.evidence as string | undefined
-  const basis = result.basis as string | undefined
+  const [collapsed, setCollapsed] = useState(false)
+  // LangGraph 的辨证产物使用 syndrome / syndrome_basis /
+  // treatment_principle；保留旧字段兼容已存的 legacy 会话。
+  const syndrome = readNonEmptyString(result.syndrome) ?? readNonEmptyString(result.pattern)
+  const organs = readStringArray(result.organs)
+  const syndromeBasis = readStringArray(result.syndrome_basis)
+  const legacyEvidence = readNonEmptyString(result.evidence)
+  const evidenceItems = syndromeBasis.length > 0
+    ? syndromeBasis
+    : legacyEvidence
+      ? [legacyEvidence]
+      : []
+  const treatmentPrinciple = readNonEmptyString(result.treatment_principle)
+  const differential = readStringArray(result.differential)
+  const legacyBasis = readNonEmptyString(result.basis)
+  const collapsedSummary = syndrome ?? '已生成辨证结论'
 
   return (
     <Card
       size="small"
-      className="xh-summary-card"
+      className="xh-summary-card xh-syndrome-card"
       title={
         <span>
           <FileDoneOutlined /> 辨证结论
         </span>
       }
+      extra={
+        <Button
+          aria-label={collapsed ? '展开辨证结论' : '收起辨证结论'}
+          className="xh-syndrome-toggle"
+          icon={collapsed ? <DownOutlined /> : <UpOutlined />}
+          size="small"
+          type="text"
+          onClick={() => setCollapsed((value) => !value)}
+        />
+      }
     >
-      {pattern ? (
-        <Descriptions column={1} size="small" style={{ marginBottom: 8 }}>
-          <Descriptions.Item label="证型">{pattern}</Descriptions.Item>
-          {organs ? (
-            <Descriptions.Item label="病位">
-              {organs.join('、')}
-            </Descriptions.Item>
+      {collapsed ? (
+        <div className="xh-syndrome-collapsed" aria-label="已收起的辨证结论">
+          <span>证型</span>
+          <Text strong>{collapsedSummary}</Text>
+        </div>
+      ) : (
+        <div className="xh-syndrome-content">
+          {syndrome ? (
+            <section className="xh-syndrome-hero">
+              <span className="xh-syndrome-eyebrow">辨证证型</span>
+              <Text className="xh-syndrome-pattern">{syndrome}</Text>
+              {organs.length > 0 ? (
+                <div className="xh-syndrome-organs">
+                  {organs.map((organ) => <span key={organ}>{organ}</span>)}
+                </div>
+              ) : null}
+            </section>
           ) : null}
-        </Descriptions>
-      ) : null}
-      {evidence ? (
-        <div style={{ marginBottom: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>辨证依据：</Text>
-          <Text style={{ fontSize: 13, whiteSpace: 'pre-wrap' }}>{evidence}</Text>
+          {evidenceItems.length > 0 ? (
+            <section className="xh-syndrome-section">
+              <Text className="xh-syndrome-section-title">辨证依据</Text>
+              <ul className="xh-syndrome-evidence-list">
+                {evidenceItems.map((item, index) => (
+                  <li key={`${item}-${index}`}>{item}</li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+          {treatmentPrinciple ? (
+            <section className="xh-syndrome-treatment">
+              <Text className="xh-syndrome-section-title">治则治法</Text>
+              <Text>{treatmentPrinciple}</Text>
+            </section>
+          ) : null}
+          {differential.length > 0 ? (
+            <section className="xh-syndrome-section">
+              <Text className="xh-syndrome-section-title">鉴别考虑</Text>
+              <Text className="xh-syndrome-secondary-copy">{differential.join('；')}</Text>
+            </section>
+          ) : null}
+          {legacyBasis ? (
+            <section className="xh-syndrome-section">
+              <Text className="xh-syndrome-section-title">文献参考</Text>
+              <Text className="xh-syndrome-secondary-copy">{legacyBasis}</Text>
+            </section>
+          ) : null}
         </div>
-      ) : null}
-      {basis ? (
-        <div>
-          <Text type="secondary" style={{ fontSize: 12 }}>文献参考：</Text>
-          <Text style={{ fontSize: 13, whiteSpace: 'pre-wrap' }}>{basis}</Text>
-        </div>
-      ) : null}
+      )}
     </Card>
   )
 }
@@ -252,11 +304,48 @@ function FormulaCard({
   modifiedFormula?: Formula | null
   pendingReviewFormula?: Formula | null
 }) {
+  const [collapsed, setCollapsed] = useState(false)
+  const [baseExpanded, setBaseExpanded] = useState(false)
+  const [rationaleExpanded, setRationaleExpanded] = useState(false)
   const hasBase = baseFormula?.composition && baseFormula.composition.length > 0
   const hasModified = modifiedFormula?.composition && modifiedFormula.composition.length > 0
   const hasPending = pendingReviewFormula?.composition && pendingReviewFormula.composition.length > 0
 
   if (!hasBase && !hasModified && !hasPending) return null
+
+  const currentFormula = hasPending
+    ? pendingReviewFormula!
+    : hasModified
+      ? modifiedFormula!
+      : baseFormula!
+  const currentLabel = hasPending ? '待确认方案' : hasModified ? '当前加减方案' : '当前方案'
+  const currentHerbs = new Map(currentFormula.composition.map((item) => [item.herb, item]))
+  const baseHerbs = new Map((hasBase ? baseFormula!.composition : []).map((item) => [item.herb, item]))
+  const formulaChanged = hasBase && (
+    baseFormula!.composition.length !== currentFormula.composition.length
+    || baseFormula!.composition.some((item) => {
+      const current = currentHerbs.get(item.herb)
+      return !current || current.dose !== item.dose || current.unit !== item.unit
+    })
+  )
+  const showBaseReference = hasBase && formulaChanged
+  const adjustmentItems = showBaseReference
+    ? [
+        ...currentFormula.composition
+          .filter((item) => !baseHerbs.has(item.herb))
+          .map((item) => ({ key: `add-${item.herb}`, tone: 'add', label: `新增 ${item.herb}` })),
+        ...baseFormula!.composition
+          .filter((item) => !currentHerbs.has(item.herb))
+          .map((item) => ({ key: `remove-${item.herb}`, tone: 'remove', label: `去除 ${item.herb}` })),
+        ...currentFormula.composition.flatMap((item) => {
+          const base = baseHerbs.get(item.herb)
+          if (!base || (base.dose === item.dose && base.unit === item.unit)) return []
+          const baseDose = base.dose != null ? `${base.dose}${base.unit ?? ''}` : '-'
+          const currentDose = item.dose != null ? `${item.dose}${item.unit ?? ''}` : '-'
+          return [{ key: `dose-${item.herb}`, tone: 'change', label: `${item.herb} ${baseDose} → ${currentDose}` }]
+        }),
+      ]
+    : []
 
   const herbColumns: ColumnsType<HerbItem> = [
     { title: '药材', dataIndex: 'herb', key: 'herb' },
@@ -276,86 +365,118 @@ function FormulaCard({
   return (
     <Card
       size="small"
-      className="xh-summary-card"
+      className="xh-summary-card xh-formula-card"
       title={
         <span>
           <MedicineBoxOutlined /> 处方
         </span>
       }
+      extra={
+        <Button
+          aria-label={collapsed ? '展开处方' : '收起处方'}
+          className="xh-formula-toggle"
+          icon={collapsed ? <DownOutlined /> : <UpOutlined />}
+          size="small"
+          type="text"
+          onClick={() => setCollapsed((value) => !value)}
+        />
+      }
     >
-      <div className="xh-formula-grid">
-        {hasBase ? (
-          <div className="xh-formula-column">
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              参考基础方
-              {baseFormula!.name ? `：${baseFormula!.name}` : ''}
-            </Text>
-            <Table
-              dataSource={baseFormula!.composition}
-              columns={herbColumns}
-              rowKey="herb"
-              size="small"
-              pagination={false}
-              style={{ marginTop: 4 }}
-            />
-            {baseFormula!.rationale ? (
-              <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>
-                {baseFormula!.rationale}
-              </Text>
-            ) : null}
-          </div>
-        ) : null}
-        {hasModified ? (
-          <div className="xh-formula-column">
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              加减方
-              {modifiedFormula!.name ? `：${modifiedFormula!.name}` : ''}
-            </Text>
-            <Table
-              dataSource={modifiedFormula!.composition}
-              columns={herbColumns}
-              rowKey="herb"
-              size="small"
-              pagination={false}
-              style={{ marginTop: 4 }}
-            />
-            {modifiedFormula!.rationale ? (
-              <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>
-                {modifiedFormula!.rationale}
-              </Text>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-      {hasPending ? (
-        <div
-          className="xh-pending-formula"
-          data-testid="pending-review-formula"
-        >
-          <Title level={5} style={{ color: 'var(--xh-primary)', marginTop: 0 }}>
-            待确认处方
-            {pendingReviewFormula!.name ? `：${pendingReviewFormula!.name}` : ''}
-          </Title>
-          <Table
-            dataSource={pendingReviewFormula!.composition}
-            columns={herbColumns}
-            rowKey="herb"
-            size="small"
-            pagination={false}
-          />
-          {pendingReviewFormula!.rationale ? (
-            <Text style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>
-              {pendingReviewFormula!.rationale}
-            </Text>
-          ) : null}
-          <div style={{ marginTop: 8 }}>
-            <Text type="warning" style={{ fontSize: 12 }}>
-              ⚠ 以上处方仅供参考，需经执业中医师审核确认后方可使用
-            </Text>
-          </div>
-          {/* 注意：P8-3 不添加确认/修改/否决按钮 */}
+      {collapsed ? (
+        <div className="xh-formula-collapsed" aria-label="已收起的处方">
+          <span>{currentLabel}</span>
+          <Text strong>{currentFormula.name ?? '未命名处方'}</Text>
+          <span>{currentFormula.composition.length} 味药</span>
+          {hasPending ? <Text type="warning">待医师确认</Text> : null}
         </div>
-      ) : null}
+      ) : (
+        <>
+          <section className="xh-current-formula">
+            <div className="xh-current-formula-heading">
+              <div>
+                <span>{currentLabel}</span>
+                <Text strong>{currentFormula.name ?? '未命名处方'}</Text>
+              </div>
+              <span className="xh-formula-herb-count">{currentFormula.composition.length} 味药</span>
+            </div>
+            {adjustmentItems.length > 0 ? (
+              <div className="xh-formula-adjustments" aria-label="处方调整">
+                {adjustmentItems.map((item) => (
+                  <span key={item.key} className={`is-${item.tone}`}>{item.label}</span>
+                ))}
+              </div>
+            ) : null}
+            <Table
+              className="xh-current-formula-table"
+              dataSource={currentFormula.composition}
+              columns={herbColumns}
+              rowKey="herb"
+              size="small"
+              pagination={false}
+            />
+            {currentFormula.rationale ? (
+              <div className="xh-formula-rationale">
+                <div>
+                  <Text className="xh-formula-section-title">方义说明</Text>
+                  <Button
+                    aria-label={rationaleExpanded ? '收起方义说明' : '展开方义说明'}
+                    className="xh-formula-disclosure"
+                    size="small"
+                    type="text"
+                    onClick={() => setRationaleExpanded((value) => !value)}
+                  >
+                    {rationaleExpanded ? '收起' : '查看'}
+                  </Button>
+                </div>
+                {rationaleExpanded ? <Text>{currentFormula.rationale}</Text> : null}
+              </div>
+            ) : null}
+          </section>
+          {showBaseReference ? (
+            <section className="xh-base-formula">
+              <div className="xh-base-formula-heading">
+                <div>
+                  <Text>基方：{baseFormula!.name ?? '未命名处方'}</Text>
+                  <Text type="secondary">{baseFormula!.composition.length} 味药</Text>
+                </div>
+                <Button
+                  aria-label={baseExpanded ? '收起基方' : '展开基方'}
+                  className="xh-formula-disclosure"
+                  size="small"
+                  type="text"
+                  onClick={() => setBaseExpanded((value) => !value)}
+                >
+                  {baseExpanded ? '收起' : '查看基方'}
+                </Button>
+              </div>
+              {baseExpanded ? (
+                <Table
+                  dataSource={baseFormula!.composition}
+                  columns={herbColumns}
+                  rowKey="herb"
+                  size="small"
+                  pagination={false}
+                />
+              ) : null}
+            </section>
+          ) : null}
+          {hasPending ? (
+            <div
+              className="xh-pending-formula"
+              data-testid="pending-review-formula"
+            >
+              <div>
+                <Text strong>待医师确认</Text>
+                <Text type="secondary">
+                  当前方案：{currentFormula.name ?? '未命名处方'} · {currentFormula.composition.length} 味药
+                </Text>
+              </div>
+              <Text type="warning">⚠ 以上处方仅供参考，需经执业中医师审核确认后方可使用</Text>
+              {/* 注意：P8-3 不添加确认/修改/否决按钮 */}
+            </div>
+          ) : null}
+        </>
+      )}
     </Card>
   )
 }

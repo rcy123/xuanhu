@@ -72,6 +72,16 @@ describe('isReviewBlocked', () => {
     const blocked: SafetyIssue[] = [{ severity: 'blocker', message: '外部阻断' }]
     expect(isReviewBlocked(detail, blocked)).toBe(true)
   })
+
+  it('blocked_reason=safety_rule_blocked 视为阻断（即使 SSE issues 为空）', () => {
+    const detail = makeDetail({
+      current_stage: 'blocked',
+      blocked_reason: 'safety_rule_blocked',
+      safety_review: { passed: true, issues: [] },
+    })
+    expect(isReviewBlocked(detail)).toBe(true)
+    expect(isReviewBlocked(detail, null)).toBe(true)
+  })
 })
 
 describe('ReviewActionsBar', () => {
@@ -130,6 +140,32 @@ describe('ReviewActionsBar', () => {
         onRetry={vi.fn()}
       />,
     )
+    expect(screen.queryByTestId('review-confirm-btn')).not.toBeInTheDocument()
+    expect(screen.getByTestId('review-modify-btn')).toBeInTheDocument()
+    expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
+  })
+
+  it('blocked/safety_rule_blocked 状态露出修改/否决出口（确认仍隐藏）', () => {
+    const detail = makeDetail({
+      current_stage: 'blocked',
+      status: 'blocked',
+      blocked_reason: 'safety_rule_blocked',
+      pending_review: false,
+      safety_review: { passed: true, issues: [] },
+    })
+    render(
+      <ReviewActionsBar
+        detail={detail}
+        pendingReviewFormula={makeFormula()}
+        submitting={false}
+        error={null}
+        onConfirm={vi.fn()}
+        onModify={vi.fn()}
+        onReject={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    )
+    // 确认按钮必须隐藏：blocked/safety_rule_blocked 后端不允许 confirm。
     expect(screen.queryByTestId('review-confirm-btn')).not.toBeInTheDocument()
     expect(screen.getByTestId('review-modify-btn')).toBeInTheDocument()
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
@@ -201,10 +237,6 @@ describe('ReviewActionsBar', () => {
 
   it('LangGraph 会话可退回补充问诊', () => {
     const onRequestMoreInfo = vi.fn()
-    const confirmSpy = vi.spyOn(Modal, 'confirm').mockImplementation(({ onOk }) => {
-      onOk?.()
-      return { destroy: vi.fn(), update: vi.fn() } as ReturnType<typeof Modal.confirm>
-    })
     render(
       <ReviewActionsBar
         detail={makeDetail({
@@ -223,9 +255,7 @@ describe('ReviewActionsBar', () => {
     )
 
     fireEvent.click(screen.getByTestId('review-request-more-info-btn'))
-    expect(confirmSpy).toHaveBeenCalled()
     expect(onRequestMoreInfo).toHaveBeenCalled()
-    confirmSpy.mockRestore()
   })
 
   it('submitting 时按钮 loading', () => {

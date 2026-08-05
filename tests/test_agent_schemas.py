@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.rag.schemas import Evidence as RAGEvidence
+from app.schemas.review import ReviewRequest
 from app.schemas.agent import (
     Evidence,
     FormulaResult,
@@ -245,3 +246,13 @@ def test_inquiry_nested_defaults() -> None:
 
     assert ten.menstruation_detail is not None
     assert ten.menstruation_detail.menopause_status == "unknown"
+
+
+@pytest.mark.parametrize("action", ["reject", "request_more_info"])
+def test_review_return_actions_require_feedback(action: str) -> None:
+    with pytest.raises(ValidationError, match="必须填写 feedback"):
+        ReviewRequest(action=action)
+
+
+def test_review_confirm_does_not_require_feedback() -> None:
+    assert ReviewRequest(action="confirm").feedback is None

@@ -260,8 +260,6 @@ async def _load_doctor_review_authority(
 def _render_record_text(
     *,
     formula: FormulaAuthority,
-    action: str,
-    safety_rule_version: str,
     clinical: dict[str, str],
     narrative: dict[str, str] | None = None,
 ) -> str:
@@ -270,24 +268,24 @@ def _render_record_text(
     lines = [
         f"主诉：{clinical.get('chief_complaint') or '未记录'}",
         f"现病史：{clinical.get('present_illness') or '未记录'}",
-        f"辨证过程：{clinical.get('syndrome_process') or '未记录'}",
-        f"中医诊断：{clinical.get('diagnosis') or '未记录'}",
-        f"治则治法：{clinical.get('treatment_principle') or '未记录'}",
-        f"处方：{formula.formula.name or '未命名处方'}",
-        f"组成：{clinical.get('formula_composition') or ''}",
-        f"注意事项：{clinical.get('precautions') or '无'}",
     ]
+    if clinical.get("past_history"):
+        lines.append(f"既往史：{clinical['past_history']}")
+    lines.extend(
+        (
+            f"辨证过程：{clinical.get('syndrome_process') or '未记录'}",
+            f"中医诊断：{clinical.get('diagnosis') or '未记录'}",
+            f"治则治法：{clinical.get('treatment_principle') or '未记录'}",
+            f"处方：{formula.formula.name or '未命名处方'}",
+            f"组成：{clinical.get('formula_composition') or ''}",
+            f"注意事项：{clinical.get('precautions') or '无'}",
+        )
+    )
     if narrative.get("diet_advice"):
         lines.append(f"饮食建议：{narrative['diet_advice']}")
     if narrative.get("prognosis"):
         lines.append(f"预后情况：{narrative['prognosis']}")
-    lines.extend(
-        (
-            f"安全审核：通过（{safety_rule_version}）",
-            f"医师复核：{action}",
-            f"免责声明：{RECORD_DISCLAIMER}",
-        )
-    )
+    lines.append(f"免责声明：{RECORD_DISCLAIMER}")
     return "\n".join(lines)
 
 
@@ -652,6 +650,152 @@ async def resolve_committed_record_advance(
         )
 
 
+_NON_CLINICAL_RECORD_VALUES = frozenset({"无", "没有", "未诉", "未见", "不详", "未知", "否"})
+
+
+def _record_values(
+    facts: dict[str, str],
+    *,
+    primary_keys: tuple[str, ...] = (),
+    fallback_keys: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """按临床语义取已采集事实，优先使用完整维度回答并过滤无上下文的空否定。"""
+
+    def collect(keys: tuple[str, ...]) -> tuple[str, ...]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            value = facts.get(key, "").strip().rstrip("；。")
+            if not value or value in _NON_CLINICAL_RECORD_VALUES or value in seen:
+                continue
+            values.append(value)
+            seen.add(value)
+        return tuple(values)
+
+    primary = collect(primary_keys)
+    return primary or collect(fallback_keys)
+
+
+def _join_record_sentence(prefix: str, values: tuple[str, ...]) -> str:
+    if not values:
+        return ""
+    return f"{prefix}{'；'.join(values)}。"
+
+
+def _present_illness_narrative(
+    *,
+    facts: dict[str, str],
+    chief_complaint: str,
+) -> str:
+    """从问诊事实生成现病史，不引入舌脉或辨证结论。"""
+    sentences: list[str] = []
+    if chief_complaint:
+        sentences.append(f"患者因“{chief_complaint}”就诊。")
+
+    change = _record_values(
+        facts,
+        primary_keys=("present_illness.change",),
+        fallback_keys=("present_illness.associated_symptom",),
+    )
+    if change:
+        sentences.append(_join_record_sentence("病程中症状", change))
+
+    cold_heat = _record_values(
+        facts,
+        primary_keys=("ten_questions.cold_heat",),
+        fallback_keys=(
+            "present_illness.chills",
+            "present_illness.fever",
+            "present_illness.aversion_cold",
+            "present_illness.symptom.chills",
+            "present_illness.symptom.fever",
+        ),
+    )
+    respiratory_and_body = _record_values(
+        facts,
+        primary_keys=(
+            "ten_questions.respiratory",
+            "ten_questions.chest_abdomen",
+            "ten_questions.head_body",
+        ),
+        fallback_keys=(
+            "present_illness.cough",
+            "present_illness.sputum",
+            "present_illness.rhinorrhea",
+            "present_illness.sore_throat",
+            "present_illness.nasal_congestion",
+            "present_illness.shortness_of_breath",
+            "present_illness.chest",
+            "present_illness.abdomen",
+            "present_illness.head_body",
+            "present_illness.body_ache",
+            "present_illness.pain",
+            "present_illness.symptom.cough",
+            "present_illness.symptom.sputum",
+            "present_illness.symptom.rhinorrhea",
+            "present_illness.symptom.sore_throat",
+            "present_illness.symptom.head_body",
+            "present_illness.symptom.chest",
+            "present_illness.symptom.abdomen",
+            "present_illness.symptom.pain",
+        ),
+    )
+    associated = (*cold_heat, *respiratory_and_body)
+    if associated:
+        sentences.append(_join_record_sentence("伴", associated))
+
+    diet = _record_values(
+        facts,
+        primary_keys=("ten_questions.diet", "ten_questions.appetite"),
+        fallback_keys=("present_illness.diet", "present_illness.appetite", "present_illness.symptom.appetite"),
+    )
+    if diet:
+        sentences.append(_join_record_sentence("饮食方面，", diet))
+
+    thirst = _record_values(
+        facts,
+        primary_keys=("ten_questions.thirst",),
+        fallback_keys=("present_illness.thirst", "present_illness.symptom.thirst"),
+    )
+    if thirst:
+        sentences.append(_join_record_sentence("口渴情况，", thirst))
+
+    sweat = _record_values(
+        facts,
+        primary_keys=("ten_questions.sweat",),
+        fallback_keys=("present_illness.sweat", "present_illness.sweating", "present_illness.symptom.sweat"),
+    )
+    if sweat:
+        sentences.append(_join_record_sentence("汗出情况，", sweat))
+
+    stool_urine = _record_values(
+        facts,
+        primary_keys=("ten_questions.stool_urine",),
+        fallback_keys=(
+            "ten_questions.stool",
+            "ten_questions.urine",
+            "ten_questions.stool_urine.stool",
+            "ten_questions.stool_urine.urine",
+            "present_illness.stool",
+            "present_illness.urine",
+            "present_illness.symptom.stool",
+            "present_illness.symptom.urine",
+        ),
+    )
+    if stool_urine:
+        sentences.append(_join_record_sentence("二便方面，", stool_urine))
+
+    sleep = _record_values(
+        facts,
+        primary_keys=("ten_questions.sleep",),
+        fallback_keys=("present_illness.sleep", "present_illness.insomnia", "present_illness.symptom.sleep"),
+    )
+    if sleep:
+        sentences.append(_join_record_sentence("睡眠方面，", sleep))
+
+    return "".join(sentences)
+
+
 def _clinical_record_fields(
     *,
     observations: tuple[Any, ...],
@@ -670,15 +814,26 @@ def _clinical_record_fields(
         if value is not None:
             facts.setdefault(key, str(value))
 
-    chief_complaint = " ".join(
-        str(v) for v in (facts.get("chief_complaint.symptom"), facts.get("chief_complaint.course")) if v
+    chief_symptom = _record_values(facts, primary_keys=("chief_complaint.symptom",))
+    chief_course = _record_values(
+        facts,
+        primary_keys=("chief_complaint.course", "chief_complaint.duration", "onset.duration"),
     )
-    present_items = [
-        facts.get("present_illness.change"),
-        *(facts.get(key) for key in sorted(facts) if key.startswith("ten_questions.")),
-        facts.get("past_history"),
-    ]
-    present_illness = "；".join(str(v) for v in present_items if v)
+    chief_complaint = "；".join(chief_symptom)
+    if chief_course:
+        course_text = "；".join(chief_course)
+        chief_complaint = (
+            chief_complaint
+            if course_text in chief_complaint
+            else f"{chief_complaint}{course_text}"
+            if chief_complaint
+            else course_text
+        )
+    present_illness = _present_illness_narrative(
+        facts=facts,
+        chief_complaint=chief_complaint,
+    )
+    past_history = _record_values(facts, primary_keys=("past_history",))
 
     syndrome_process = ""
     diagnosis = ""
@@ -706,6 +861,7 @@ def _clinical_record_fields(
     return {
         "chief_complaint": chief_complaint,
         "present_illness": present_illness,
+        "past_history": "；".join(past_history),
         "syndrome_process": syndrome_process,
         "diagnosis": diagnosis,
         "treatment_principle": treatment_principle,
@@ -761,7 +917,14 @@ async def _draft_record_narrative(
         session_id=str(session_id),
         state_version=state_version,
         policy_version=RECORD_NARRATIVE_POLICY_VERSION,
-        **clinical,
+        chief_complaint=clinical.get("chief_complaint", ""),
+        present_illness=clinical.get("present_illness", ""),
+        syndrome_process=clinical.get("syndrome_process", ""),
+        diagnosis=clinical.get("diagnosis", ""),
+        treatment_principle=clinical.get("treatment_principle", ""),
+        formula_name=clinical.get("formula_name", ""),
+        formula_composition=clinical.get("formula_composition", ""),
+        precautions=clinical.get("precautions", ""),
     )
     run_spec = RunSpec(
         run_id=run_id,
@@ -870,8 +1033,6 @@ async def execute_record_command(state: XuanhuGraphState) -> dict[str, Any]:
     )
     record_text = _render_record_text(
         formula=formula,
-        action=review.action,
-        safety_rule_version=safety_result.rule_version,
         clinical=clinical,
         narrative=narrative,
     )

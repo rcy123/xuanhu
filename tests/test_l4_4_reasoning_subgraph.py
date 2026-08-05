@@ -878,6 +878,63 @@ async def test_persisted_payload_uses_trusted_run_artifact_for_syndrome_and_form
     assert captured["formula"]["model_actual"] != "fake-model"
 
 
+async def test_advance_returns_committed_syndrome_when_formula_stage_fails(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, factory = store
+    session_id, _, fact_ids = await _ready_session(factory)
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids)])
+    _install_gateway(monkeypatch, gateway)
+
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        response = await _run_langgraph_advance(
+            db,
+            session,
+            session_id=str(session_id),
+            state_version=1,
+            trace_id="advance-syndrome-committed",
+        )
+
+    assert response["current_stage"] == "syndrome"
+    assert response["from_stage"] == "inquiry"
+    assert response["state_version"] == 2
+    assert response["artifact_refs"][0]["kind"] == "syndrome_draft"
+
+    async with factory() as db:
+        claim = await db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.idempotency_key.startswith("advance:"),
+            )
+            .order_by(IntakeCommandClaim.created_at.desc())
+            .limit(1)
+        )
+        assert claim is not None
+        assert claim.status == "completed"
+        assert claim.response_payload is not None
+        graph_run = await db.get(GraphRun, claim.run_id)
+        assert graph_run is not None and graph_run.status == "completed"
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        assert session.current_stage == "syndrome"
+        assert session.recovery_status == "normal"
+
+    formula_record = await repository.get_artifact_payload(
+        session_id,
+        artifact_type=reasoning_module.FORMULA_ARTIFACT_TYPE,
+        artifact_id=reasoning_module._artifact_id(  # noqa: SLF001
+            session_id,
+            reasoning_module.FORMULA_ARTIFACT_TYPE,
+        ),
+        status="current",
+    )
+    assert formula_record is None
+
+
 async def test_syndrome_recovery_rejects_any_run_artifact_provenance_tamper(
     store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
     monkeypatch: pytest.MonkeyPatch,
@@ -1346,6 +1403,68 @@ async def test_formula_consistency_failure_routes_to_manual_required_without_for
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "formula_draft")
         )
         assert formula_count == 0
+
+
+async def test_formula_schema_invalid_retries_then_succeeds(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0d-2 回归：模型输出 schema 解析失败（STRUCTURED_OUTPUT_INVALID）属随机质量
+    问题，开方阶段必须自动重试（_REASONING_RETRYABLE_MODEL_CODES 含该码）。
+
+    REAL-SESSION d384ff26 复盘：chat_structured 解析 BaseFormulaDraft 失败后
+    runtime.run 因 FailurePolicy.retryable_codes 为空集直接抛
+    RuntimeErrorCode.STRUCTURED_OUTPUT_INVALID → _run_formula_stage_with_retry
+    收到该码应重试而非一次崩死。
+    """
+    from app.core.gateway import ChatStructuredParseError
+
+    _, factory = store
+    session_id, _, fact_ids = await _ready_session(factory)
+
+    class _SchemaRetryGateway(_ReasoningFakeGateway):
+        def __init__(self, syndrome: BaseModel, formula: BaseModel) -> None:
+            super().__init__([syndrome, formula])
+            self.failed_formula_parse = False
+
+        async def chat_structured(self, messages, output_schema, **kwargs):
+            self.calls.append(output_schema)
+            if output_schema is FormulaDraft and not self.failed_formula_parse:
+                # 首次开方：模型输出无法解析成 FormulaDraft → 网关抛解析异常。
+                self.failed_formula_parse = True
+                raise ChatStructuredParseError("structured output invalid")
+            if not self.outcomes:
+                raise AssertionError(f"unexpected model call for {output_schema.__name__}")
+            outcome = self.outcomes.pop(0)
+            if not isinstance(outcome, output_schema):
+                raise AssertionError(f"expected {type(outcome).__name__}, got {output_schema.__name__}")
+            return outcome
+
+    gateway = _SchemaRetryGateway(_syndrome_completed(fact_ids), _formula_completed(fact_ids))
+    _install_gateway(monkeypatch, gateway)
+
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        response = await _run_langgraph_advance(
+            db,
+            session,
+            session_id=str(session_id),
+            state_version=1,
+            trace_id="l4-4-schema-retry",
+        )
+
+    # 重试成功：FormulaDraft 被调用两次（首次失败 + 重试成功）。
+    assert response["current_stage"] == "safety"
+    assert gateway.calls == [SyndromeDraft, FormulaDraft, FormulaDraft]
+    async with factory() as db:
+        formula_count = await db.scalar(
+            select(func.count()).select_from(ArtifactRevision).where(
+                ArtifactRevision.artifact_type == "formula_draft",
+                ArtifactRevision.status == "current",
+            )
+        )
+        assert formula_count == 1
 
 
 async def test_recovery_after_syndrome_rebuilds_from_payload_without_second_syndrome_call(

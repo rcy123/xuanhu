@@ -6,7 +6,6 @@
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react'
-import { Modal } from 'antd'
 import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
@@ -182,6 +181,28 @@ describe('ChatPanel P8-4 集成', () => {
     expect(summary).toHaveClass('is-open')
   })
 
+  it('问诊结束后将诊疗工作台切换为主工作区', () => {
+    const detail = makeDetail({
+      current_stage: 'review',
+      pending_review: true,
+      modified_formula: {
+        name: '待确认方',
+        composition: [{ herb: '麻黄', dose: 6, unit: 'g' }],
+      },
+    })
+    const { container } = render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail })}
+        messagesHook={makeMessagesHook()}
+      />,
+    )
+
+    expect(container.querySelector('.xh-workspace-columns')).toHaveClass('is-clinical-workspace')
+    expect(screen.getByRole('region', { name: '问诊记录' })).toBeInTheDocument()
+    expect(screen.getByRole('complementary', { name: '诊疗工作台' })).toBeInTheDocument()
+  })
+
   it('阻断态（safety_review.passed=false）不显示确认/修改按钮', () => {
     const detail = makeDetail({
       current_stage: 'review',
@@ -211,20 +232,16 @@ describe('ChatPanel P8-4 集成', () => {
     expect(screen.getByTestId('review-reject-btn')).toBeInTheDocument()
   })
 
-  it('LangGraph 补充问诊动作调用 request_more_info', async () => {
+  it('LangGraph 补充信息动作调用 request_more_info', async () => {
     const reviewSpy = vi.spyOn(api, 'reviewPrescription').mockResolvedValue({
       session_id: 's1',
       action: 'request_more_info',
-      current_stage: 'inquiry',
+      current_stage: 'syndrome',
       status: 'active',
       pending_review: false,
       review_id: 'review-1',
       state_version: 6,
       updated_at: '2026-07-04T10:30:00+08:00',
-    })
-    const confirmSpy = vi.spyOn(Modal, 'confirm').mockImplementation(({ onOk }) => {
-      onOk?.()
-      return { destroy: vi.fn(), update: vi.fn() } as ReturnType<typeof Modal.confirm>
     })
     const detail = makeDetail({
       agent_runtime: 'langgraph',
@@ -247,19 +264,22 @@ describe('ChatPanel P8-4 集成', () => {
       />,
     )
     fireEvent.click(screen.getByTestId('review-request-more-info-btn'))
+    fireEvent.change(screen.getByTestId('request-more-info-feedback'), {
+      target: { value: '请补充舌象和脉象' },
+    })
+    fireEvent.click(screen.getByTestId('request-more-info-submit-btn'))
 
     await waitFor(() => {
       expect(reviewSpy).toHaveBeenCalledWith(
         's1',
-        { action: 'request_more_info' },
+        { action: 'request_more_info', feedback: '请补充舌象和脉象' },
         { stateVersion: 5 },
       )
     })
-    confirmSpy.mockRestore()
     reviewSpy.mockRestore()
   })
 
-  it('record 阶段显示 RecordPanel 生成中', () => {
+  it('record 阶段在未点击生成病历前不显示 RecordPanel', () => {
     const detail = makeDetail({
       current_stage: 'record',
       status: 'active',
@@ -275,8 +295,7 @@ describe('ChatPanel P8-4 集成', () => {
       />,
     )
 
-    expect(screen.getByTestId('record-panel')).toBeInTheDocument()
-    expect(screen.getByText(/正在汇总生成病历/)).toBeInTheDocument()
+    expect(screen.queryByTestId('record-panel')).not.toBeInTheDocument()
   })
 
   it('done 阶段拉取病历并展示', async () => {

@@ -4,14 +4,19 @@ import type { ButtonProps } from 'antd'
 
 const { Text } = Typography
 
-export interface RejectModalProps {
+export interface RequestMoreInfoModalProps {
   open: boolean
   submitting: boolean
   onCancel: () => void
   onSubmit: (feedback: string) => void
 }
 
-export function RejectModal({ open, submitting, onCancel, onSubmit }: RejectModalProps) {
+export function RequestMoreInfoModal({
+  open,
+  submitting,
+  onCancel,
+  onSubmit,
+}: RequestMoreInfoModalProps) {
   const [feedback, setFeedback] = useState('')
 
   useEffect(() => {
@@ -20,37 +25,36 @@ export function RejectModal({ open, submitting, onCancel, onSubmit }: RejectModa
 
   return (
     <Modal
-      title="否决并重新辨证"
+      title="补充辨证信息"
       open={open}
       onCancel={onCancel}
       onOk={() => onSubmit(feedback.trim())}
-      okText="确认否决"
+      okText="保存并进入辨证"
       cancelText="取消"
       confirmLoading={submitting}
       okButtonProps={{
-        danger: true,
         disabled: submitting || !feedback.trim(),
-        'data-testid': 'reject-submit-btn',
+        'data-testid': 'request-more-info-submit-btn',
       } as ButtonProps}
       destroyOnHidden
     >
       <div style={{ marginBottom: 'var(--xh-space-m)' }}>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          否决后将回到辨证阶段重新开方。请填写原因，以便后续辨证时参考。
+          保存后将进入辨证阶段，补充内容会带入新的辨证和开方；当前处方与安全审核结果将失效。
         </Text>
       </div>
       <Text strong style={{ display: 'block', marginBottom: 6, fontSize: 12 }}>
-        否决原因 <Text type="danger">*</Text>
+        补充信息 <Text type="danger">*</Text>
       </Text>
       <Input.TextArea
-        placeholder="如：辨证结论存疑，患者舌象不符合风寒表证"
+        placeholder="如：舌质淡红、苔薄白，脉浮；近期未服用其他药物"
         value={feedback}
         onChange={(event) => setFeedback(event.target.value)}
         rows={4}
-        data-testid="reject-feedback"
+        data-testid="request-more-info-feedback"
       />
     </Modal>
   )
 }
 
-export default RejectModal
+export default RequestMoreInfoModal

@@ -53,6 +53,7 @@ describe('RecordPanel', () => {
       <RecordPanel
         detail={detail}
         record={null}
+        generationRequested={true}
         loading={false}
         error={null}
         editing={false}
@@ -98,6 +99,49 @@ describe('RecordPanel', () => {
     expect(screen.getByTestId('record-export-json')).toBeInTheDocument()
     expect(screen.getByTestId('record-export-md')).toBeInTheDocument()
     expect(screen.getByTestId('record-edit-btn')).toBeInTheDocument()
+  })
+
+  it('以患者信息与日期呈现病历，并隐藏系统审核行', () => {
+    render(
+      <RecordPanel
+        detail={makeDetail({
+          patient_info: { name: '王兴明', gender: 'male', age: 27, visit_time: '2026-07-03T09:30:00+08:00' },
+        })}
+        record={makeRecord({
+          record_text: [
+            '主诉：感冒一周',
+            '中医诊断：风寒束表证',
+            '处方：麻黄汤',
+            '组成：麻黄6g，桂枝6g',
+            '安全审核：通过（v1.0.0）',
+            '医师复核：modify',
+          ].join('\n'),
+          record_json: {
+            clinical: { chief_complaint: '感冒一周' },
+            safety_review: { passed: true },
+            doctor_review: { action: 'modify' },
+          },
+        })}
+        loading={false}
+        error={null}
+        editing={false}
+        saving={false}
+        saveError={null}
+        exportError={null}
+        onEdit={vi.fn()}
+        onCancelEdit={vi.fn()}
+        onSave={vi.fn()}
+        onExport={vi.fn()}
+        onExportErrorDismiss={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId('record-identity')).toHaveTextContent('王兴明')
+    expect(screen.getByTestId('record-identity')).toHaveTextContent('病历日期 2026年7月3日')
+    expect(screen.getByTestId('record-text')).toHaveTextContent('麻黄汤')
+    expect(screen.getByTestId('record-text')).not.toHaveTextContent('安全审核')
+    expect(screen.getByTestId('record-text')).not.toHaveTextContent('医师复核')
   })
 
   it('点击编辑进入编辑态', () => {

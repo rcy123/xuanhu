@@ -161,16 +161,6 @@ describe('LangGraphAdvanceBar', () => {
     expect(screen.queryByTestId('langgraph-recover-button')).not.toBeInTheDocument()
   })
 
-  it('restores the review-required status from the read model', () => {
-    const review = detail()
-    review.current_stage = 'safety'
-    review.read_model.review_required = true
-    render(<LangGraphAdvanceBar detail={review} onAdvanced={() => {}} />)
-    expect(screen.getByTestId('langgraph-review-restored')).toHaveTextContent(
-      '医师复核要求已从权威 Read Model 恢复',
-    )
-  })
-
   it('exposes explicit Safety and Record product actions', () => {
     const safety = detail()
     safety.current_stage = 'safety'

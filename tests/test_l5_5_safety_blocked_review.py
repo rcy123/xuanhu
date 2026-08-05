@@ -646,3 +646,176 @@ async def test_blocked_safety_modify_over_limit_override_stays_reviewable() -> N
             allow_request_local_runtime=True,
         )
     assert response.current_stage == "record"
+
+
+@pytest.mark.asyncio
+async def test_safety_fail_auto_reopens_to_syndrome_with_feedback() -> None:
+    """3.1 自动重开：安全失败且尝试次数未耗尽 → 会话重置回 syndrome + 写入拦截原因。
+
+    验证 prepare_review_interrupt 不再直接把 safety/active 会话打到 blocked，
+    而是重置回 syndrome/active/normal、写 review_feedback（safety issues）、
+    失效 formula_draft（保留 syndrome_draft），返回 reopened_for_safety 标记，
+    供 advance 处理循环下一轮 reasoning 重开方。
+    """
+    from app.agent_runtime.state import XuanhuGraphState
+    from app.models.domain import ArtifactRevision, IntakeCommandClaim
+    from app.services.langgraph_review import (
+        MAX_SAFETY_REOPEN_ATTEMPTS,
+        prepare_review_interrupt,
+    )
+
+    factory = get_session_factory()
+    # 复用 seed：v1+v2 把会话推到 safety/active（公式 12g 超 9g 上限）。
+    session_id = uuid.uuid4()
+    suffix = session_id.hex[:6]
+    herb_name = f"blockedherb{suffix}"
+    unit_name = f"bu{suffix}"
+    completeness_gate_id = uuid.uuid4()
+    triage_gate_id = uuid.uuid4()
+    completeness_run_id = uuid.uuid4()
+
+    async with factory() as db, db.begin():
+        db.add(
+            ConsultSession(
+                id=session_id,
+                patient_info={"name": "integration-only"},
+                chief_complaint="integration-only",
+                current_stage="safety",
+                status="active",
+                agent_runtime="langgraph",
+                pending_review=False,
+                rollback_counts={},
+                state_snapshot={
+                    "agent_runtime": "langgraph",
+                    "advance": {
+                        "source_gate_id": str(completeness_gate_id),
+                        "source_gate_state_version": 1,
+                        "trace_id": f"reopen-seed-{suffix}",
+                    },
+                },
+                state_version=2,
+                recovery_status="normal",
+            )
+        )
+        db.add(GraphRun(id=completeness_run_id, session_id=session_id,
+                        graph_version=DEFAULT_GRAPH_VERSION,
+                        command_id=f"intake:{session_id}", input_state_version=1,
+                        status="completed"))
+        await db.flush()
+        db.add(GateResult(id=completeness_gate_id, session_id=session_id,
+                          graph_run_id=completeness_run_id, gate_name="completeness",
+                          policy_version="completeness-policy.v1", input_state_version=1,
+                          decision="passed", details={"disposition": "ready"}))
+        db.add(GateResult(id=triage_gate_id, session_id=session_id,
+                          graph_run_id=completeness_run_id, gate_name="triage",
+                          policy_version="triage-red-flag.v1", input_state_version=1,
+                          decision="passed", details={"disposition": "continue", "candidate_count": 0}))
+        db.add(SafetyProfile(id=uuid.uuid4(), session_id=session_id,
+                             allergy_collection_status="explicitly_none", allergens=None,
+                             pregnancy_collection_status="explicitly_none", pregnancy_value=None,
+                             lactation_collection_status="explicitly_none", lactation_value=None,
+                             medications_collection_status="explicitly_none", medications=None,
+                             major_conditions_collection_status="explicitly_none", major_conditions=None,
+                             contraindications_collection_status="explicitly_none", contraindications=None))
+        db.add(Herb(id=uuid.uuid4(), name=herb_name, aliases=[], meridians=[],
+                    contraindications=[], eighteen_incompatibilities=[], nineteen_fears=[],
+                    pregnancy_contraindication="none", incompatibilities=[],
+                    max_dose=9, doc_text="integration-only herb"))
+        db.add(DosageUnit(id=uuid.uuid4(), unit_name=unit_name, aliases=[],
+                          to_grams=1, conversion_type="standard",
+                          is_standard=True, enabled=True))
+
+    # 提交 formula artifact（12g 超限），会话停在 safety/active。
+    repository = PostgresDomainRepository(factory)
+    state = await repository.get_state(session_id)
+    formula_run_id = uuid.uuid4()
+    formula_artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:{FORMULA_ARTIFACT_TYPE}:{session_id}")
+    fact_id = uuid.uuid4()
+    formula = FormulaComposition(
+        name="integration formula",
+        composition=(HerbItem(herb=herb_name, dose=12, unit=unit_name),),
+        rationale="integration-only",
+        basis=(FormulaFactClaim(claim="integration authority", fact_ids=(fact_id,)),),
+    )
+    draft = FormulaDraft(decision=FormulaDraftDecision.COMPLETED, base_formula=formula,
+                         candidate_formula=formula, rationale="integration-only",
+                         confidence=0.5, evidence_mode=FORMULA_EVIDENCE_MODE, review_required=True)
+    formula_payload: dict[str, object] = {
+        "kind": FORMULA_ARTIFACT_TYPE, "output": draft.model_dump(mode="json"),
+        "input_payload": {"state_version": state.state_version}, "run_spec": {},
+        "run_artifact": {}, "verification": {"passed": True}, "consistency": {"passed": True},
+    }
+    formula_digest = artifact_payload_digest(FORMULA_PAYLOAD_SCHEMA_VERSION, formula_payload)
+    f_artifact = ArtifactRevisionSchema(
+        artifact_id=formula_artifact_id, artifact_type=FORMULA_ARTIFACT_TYPE, revision=1,
+        session_id=session_id, input_state_version=state.state_version,
+        status=ArtifactStatus.CURRENT, produced_by_run_id=formula_run_id,
+        created_at=datetime.now(UTC),
+    )
+    delta = DomainDelta(delta_id=uuid.uuid4(), run_id=formula_run_id, session_id=session_id,
+                        expected_state_version=state.state_version, artifact_revisions=(f_artifact,))
+    await repository.commit(
+        delta, _verification_context(delta, state, stage="formula",
+                                     idempotency_key=f"reopen-formula:{session_id}",
+                                     trace_id=f"reopen-seed-{suffix}"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+        gate_results=(GateResultSchema(gate_name="formula_consistency",
+                                       policy_version=FORMULA_CONSISTENCY_POLICY_VERSION,
+                                       input_state_version=state.state_version,
+                                       decision=GateDecision.PASSED,
+                                       details={"artifact_digest": formula_digest}),),
+        artifact_payloads=(ArtifactPayloadSpec(session_id=session_id, artifact_id=formula_artifact_id,
+                                               revision=1, payload_schema_version=FORMULA_PAYLOAD_SCHEMA_VERSION,
+                                               payload=formula_payload, content_digest=formula_digest),),
+        session_updates=_session_updates(current_stage="safety", status="active", pending_review=False,
+                                         state_version=state.state_version + 1, route="ready_for_safety",
+                                         preserve_advance={"source_gate_id": str(completeness_gate_id),
+                                                           "source_gate_state_version": 1,
+                                                           "trace_id": f"reopen-seed-{suffix}"}),
+        outbox_event_type="integration.formula_ready.v1",
+        outbox_payload={"session_id": str(session_id)},
+    )
+
+    # 触发 prepare_review_interrupt：安全引擎应判定失败并自动重开。
+    # 生产路径中 advance 先创建 IntakeCommandClaim，图节点再跑；这里补齐 claim。
+    # 公式提交后会话 state_version = 2 + 1 = 3。
+    claim_id = uuid.uuid4()
+    graph_run_id = uuid.uuid4()
+    command_id = f"advance:{uuid.uuid4()}"
+    async with factory() as db, db.begin():
+        db.add(GraphRun(id=graph_run_id, session_id=session_id,
+                        graph_version=DEFAULT_GRAPH_VERSION, command_id=command_id,
+                        input_state_version=3, status="running"))
+        db.add(IntakeCommandClaim(id=claim_id, session_id=session_id,
+                                  idempotency_key=command_id,
+                                  payload_digest=artifact_payload_digest("x", {}),
+                                  input_state_version=3, status="running",
+                                  run_id=graph_run_id))
+    graph_state: XuanhuGraphState = {
+        "session_id": str(session_id), "run_id": str(graph_run_id),
+        "command_id": command_id, "command": "review",
+    }
+    result = await prepare_review_interrupt(graph_state)
+    assert result.get("reopened_for_safety") is True
+    assert result.get("pending_interrupt") is None
+
+    # 会话重置回 syndrome/active/normal，review_feedback 含拦截原因。
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        assert session.current_stage == "syndrome"
+        assert session.status == "active"
+        assert session.recovery_status == "normal"
+        assert session.blocked_reason is None
+        snapshot = session.state_snapshot or {}
+        feedback = snapshot.get("review_feedback") or ""
+        assert herb_name in feedback and "超过上限" in feedback
+        # formula_draft 失效（STALE），syndrome 不受影响。
+        formula_row = (await db.execute(
+            select(ArtifactRevision).where(
+                ArtifactRevision.session_id == session_id,
+                ArtifactRevision.artifact_type == FORMULA_ARTIFACT_TYPE,
+            ).order_by(ArtifactRevision.revision.desc()).limit(1)
+        )).scalar_one_or_none()
+        assert formula_row is not None
+        assert formula_row.status == ArtifactStatus.STALE.value or formula_row.status == ArtifactStatus.STALE

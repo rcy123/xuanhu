@@ -102,6 +102,23 @@ def test_bound_four_diagnosis_fallback_records_tongue_and_pulse() -> None:
     ]
 
 
+def test_bound_four_diagnosis_explicit_reply_skips_model_and_records_slots() -> None:
+    content = "舌淡红，苔薄白，脉弦。"
+
+    out = _bound_required_reply_normal_output(_input(content, "four_diagnosis"))
+
+    assert out is not None
+    assert out.decision.value == "extracted"
+    assert [(item.fact_key, item.value) for item in out.observations] == [
+        ("four_diagnosis.inspection", content),
+        ("four_diagnosis.palpation", content),
+    ]
+
+
+def test_bound_four_diagnosis_confirmation_is_not_used_as_clinical_fact() -> None:
+    assert _bound_required_reply_normal_output(_input("是的，基本完整。", "four_diagnosis")) is None
+
+
 def test_bound_four_diagnosis_fallback_never_infers_an_unmentioned_component() -> None:
     content = "舌质淡红，舌苔薄白。"
 

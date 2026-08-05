@@ -2429,7 +2429,11 @@ async def _load_or_retry_intake_output(
         return output
     run_id = _stable_intake_extraction_run_id(claim)
     intake_input = _build_intake_input(domain_state, patient_message)
-    bound_output = _bound_explicit_none_output(intake_input) or _bound_social_reply_output(intake_input)
+    bound_output = (
+        _bound_explicit_none_output(intake_input)
+        or _bound_social_reply_output(intake_input)
+        or _bound_required_reply_normal_output(intake_input)
+    )
     if bound_output is not None:
         _INTAKE_OUTPUT_CACHE[claim.id] = bound_output
         await _save_intermediate(
@@ -3220,6 +3224,8 @@ def _bound_required_reply_normal_output(
         selected_dimension = InquiryDimension(context.selected_dimension)
     except ValueError:
         return None
+    if selected_dimension is InquiryDimension.FOUR_DIAGNOSIS:
+        return _bound_four_diagnosis_reply_fallback_output(input_payload)
     if selected_dimension not in _BOUND_REQUIRED_OBSERVATION_DIMENSIONS:
         return None
     message = input_payload.current_messages[0]
