@@ -1409,7 +1409,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         *,
         safety_fact_assertions: Sequence[SafetyFactAssertionSpec],
     ) -> None:
-        """Persist safety proposals and their audits in the Domain transaction."""
+        """Persist safety proposals and their audits in the Domain transaction.
+
+        Batch-loads source messages, assertion rows, and audit rows before
+        iterating to avoid N+1 SELECT patterns (was 4+ session.get() calls per
+        assertion item, now 4 total queries regardless of item count).
+        """
 
         assertion_ids = {item.assertion_id for item in safety_fact_assertions}
         audit_ids = {item.audit_event_id for item in safety_fact_assertions}
@@ -1417,8 +1422,54 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
         cls._validate_safety_fact_spec_scope(delta, safety_fact_assertions)
 
+        # ---- batch 1: load all source ConsultMessages ----
+        source_message_ids = {item.source_message_id for item in safety_fact_assertions}
+        source_messages: dict[UUID, ConsultMessage] = {}
+        if source_message_ids:
+            for row in (
+                await session.scalars(
+                    select(ConsultMessage).where(ConsultMessage.id.in_(source_message_ids))
+                )
+            ).all():
+                source_messages[row.id] = row
+
+        # ---- batch 2: find all referenced reply question IDs ----
+        reply_ids: set[UUID] = set()
         for item in safety_fact_assertions:
-            source = await session.get(ConsultMessage, item.source_message_id)
+            for evidence in item.evidence_spans:
+                if evidence.reply_to_question_message_id is not None:
+                    reply_ids.add(evidence.reply_to_question_message_id)
+        reply_messages: dict[UUID, ConsultMessage] = {}
+        if reply_ids:
+            for row in (
+                await session.scalars(
+                    select(ConsultMessage).where(ConsultMessage.id.in_(reply_ids))
+                )
+            ).all():
+                reply_messages[row.id] = row
+
+        # ---- batch 3: load existing SafetyFactAssertion rows ----
+        existing_assertions: dict[UUID, SafetyFactAssertion] = {}
+        if assertion_ids:
+            for row in (
+                await session.scalars(
+                    select(SafetyFactAssertion).where(SafetyFactAssertion.id.in_(assertion_ids))
+                )
+            ).all():
+                existing_assertions[row.id] = row
+
+        # ---- batch 4: load existing AuditEvent rows ----
+        existing_audits: dict[UUID, AuditEvent] = {}
+        if audit_ids:
+            for row in (
+                await session.scalars(
+                    select(AuditEvent).where(AuditEvent.id.in_(audit_ids))
+                )
+            ).all():
+                existing_audits[row.id] = row
+
+        for item in safety_fact_assertions:
+            source = source_messages.get(item.source_message_id)
             if source is None or source.session_id != delta.session_id:
                 raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
             await cls._validate_safety_fact_provenance(session, item, source)
@@ -1433,7 +1484,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 if hashlib.sha256(quote.encode("utf-8")).hexdigest() != evidence.quote_digest:
                     raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
                 if evidence.reply_to_question_message_id is not None:
-                    question = await session.get(ConsultMessage, evidence.reply_to_question_message_id)
+                    question = reply_messages.get(evidence.reply_to_question_message_id)
                     structured = question.structured_delta if question is not None else None
                     if (
                         question is None
@@ -1461,7 +1512,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 "proposed_by_actor_type": item.proposed_by_actor_type,
                 "proposed_by_actor_id": item.proposed_by_actor_id,
             }
-            existing_assertion = await session.get(SafetyFactAssertion, item.assertion_id)
+            existing_assertion = existing_assertions.get(item.assertion_id)
             if existing_assertion is None:
                 session.add(
                     SafetyFactAssertion(
@@ -1494,7 +1545,7 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 "payload": audit_payload,
                 "trace_id": item.audit_trace_id,
             }
-            existing_audit = await session.get(AuditEvent, item.audit_event_id)
+            existing_audit = existing_audits.get(item.audit_event_id)
             if existing_audit is None:
                 session.add(AuditEvent(id=item.audit_event_id, **audit_values))
             elif any(getattr(existing_audit, name) != value for name, value in audit_values.items()):
@@ -1608,8 +1659,8 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
 
         for review_item in doctor_reviews:
             if review_item.safety_rule_run_id not in safety_ids:
-                # 不在本次批次内的 safety_run → 单独查
                 if review_item.safety_rule_run_id not in existing_safety_map:
+                    # 不在本次批次内 → 单独查并缓存
                     safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
                     if safety_exists is None or safety_exists.session_id != delta.session_id:
                         raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
@@ -1655,10 +1706,6 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
 
         for record_item in medical_records:
             review = existing_review_map.get(record_item.doctor_review_id)
-            if review is None:
-                review = await session.get(DoctorReview, record_item.doctor_review_id)
-                if review is not None:
-                    existing_review_map[record_item.doctor_review_id] = review
             if (
                 review is None
                 or review.session_id != delta.session_id
