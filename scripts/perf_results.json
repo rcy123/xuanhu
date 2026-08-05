@@ -1,0 +1,33 @@
+{
+  "health_llm": {
+    "test": "health_llm_connection_reuse",
+    "description": "LLM健康检查6轮 — 首轮新建TCP连接，后续复用连接池",
+    "results": [
+      3.691,
+      2.793,
+      0.741,
+      1.095,
+      0.777,
+      0.7
+    ],
+    "first_vs_avg": "3.691s vs 1.221s"
+  },
+  "concurrent": {
+    "test": "concurrent_health",
+    "description": "5个并发health/llm请求，利用连接池复用",
+    "total_seconds": 2.701,
+    "statuses": [
+      200,
+      200,
+      200,
+      200,
+      200
+    ]
+  },
+  "metrics": {
+    "test": "prometheus_metrics",
+    "description": "Prometheus /api/v1/metrics 端点",
+    "status": 404,
+    "note": "metrics端点不可用"
+  }
+}
