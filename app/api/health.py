@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 
 from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient
+from app.core.metrics import render_perf_metrics
 from app.services.health import HealthService
 from app.services.outbox_metrics import PROMETHEUS_CONTENT_TYPE, render_outbox_prometheus
 
@@ -102,6 +103,37 @@ async def health_outbox() -> JSONResponse:
     """Outbox backlog/DLQ health with aggregate, privacy-safe metrics only."""
     service = HealthService()
     return JSONResponse(content=await service.outbox_check())
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Expose all xuanhu_* performance histograms for Prometheus scraping.
+
+    Delegates to :func:`render_perf_metrics` which generates text format from
+    the ``prometheus_client`` registry.  Returns 200 with ``text/plain`` when
+    the library is installed, or 501 with a plain-text explanation when it is
+    not.
+    """
+    document = render_perf_metrics()
+    if not document:
+        return Response(
+            content="# prometheus_client not installed — performance metrics are no-ops\n",
+            status_code=501,
+            headers={
+                "Content-Type": PROMETHEUS_CONTENT_TYPE,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    return Response(
+        content=document,
+        status_code=200,
+        headers={
+            "Content-Type": PROMETHEUS_CONTENT_TYPE,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/metrics/outbox", include_in_schema=False)
