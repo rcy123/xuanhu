@@ -6,6 +6,7 @@ P3-4 实现 ready 和 RAG 健康检查。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -228,8 +229,8 @@ class HealthService:
                 uri=f"http://{settings.milvus_host}:{settings.milvus_port}",
                 timeout=settings.milvus_timeout_seconds,
             )
-            # 尝试列出 collections 以验证连通性
-            client.list_collections()
+            # T3.4: to_thread 释放事件循环；pymilvus 同步阻塞无成熟 async。
+            await asyncio.to_thread(client.list_collections)
             return "ok"
         except Exception as exc:
             logger.warning("milvus 健康检查失败: %s", type(exc).__name__)
@@ -285,10 +286,11 @@ class HealthService:
                 uri=f"http://{settings.milvus_host}:{settings.milvus_port}",
                 timeout=settings.milvus_timeout_seconds,
             )
-            collections = client.list_collections()
+            # T3.4: to_thread 释放事件循环
+            collections = await asyncio.to_thread(client.list_collections)
             if settings.milvus_collection in collections:
                 # 进一步检查 collection 是否可查询
-                client.describe_collection(settings.milvus_collection)
+                await asyncio.to_thread(client.describe_collection, settings.milvus_collection)
                 return "ok"
             else:
                 logger.warning(

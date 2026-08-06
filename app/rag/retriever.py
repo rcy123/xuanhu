@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Sequence
@@ -60,6 +61,39 @@ def _truncate_snippet(content: str, max_length: int = _SNIPPET_MAX_LENGTH) -> st
 
 
 # ---------------------------------------------------------------------------
+# 进程级共享 RAGRetriever（TP3.2: Milvus client 进程单例）
+# ---------------------------------------------------------------------------
+
+# 进程级共享实例：推理子图每 stage 调一次 _rag_retriever()（辨证+开方两阶段
+# 合计 6 次），逐次构造会让 _get_milvus_client 各懒建一次 Milvus gRPC channel，
+# 多路并发检索时复用率低。共享后 Milvus 内部 channel 池能合并，连接建立
+# 开销由 N 次/推理降为 1 次/进程。
+#
+# first-call race：多线程/协程并发首次调用时可能各构造一个 RAGRetriever，但
+# RAGRetriever.__init__ 不做 I/O（httpx.AsyncClient 延迟建连、Milvus 延迟实例化），
+# 未被引用的实例随 GC 释放，不留副作用——最后持久化的实例即为"共享单例"。
+_shared_rag_retriever: RAGRetriever | None = None
+
+
+def get_shared_rag_retriever() -> RAGRetriever:
+    """获取进程级共享 RAGRetriever（懒加载，sync 与 async 上下文均可调）。
+
+    返回共享实例。``settings.rag_enabled=False`` 时调用方应自行短路；
+    本函数不检查该开关（推理侧 ``_rag_retriever`` 自己做开关短路）。
+    """
+    global _shared_rag_retriever
+    if _shared_rag_retriever is None:
+        _shared_rag_retriever = RAGRetriever()
+    return _shared_rag_retriever
+
+
+def reset_shared_rag_retriever() -> None:
+    """测试隔离：清理进程级共享 RAGRetriever（next call 重建）。"""
+    global _shared_rag_retriever
+    _shared_rag_retriever = None
+
+
+# ---------------------------------------------------------------------------
 # 合并去重
 # ---------------------------------------------------------------------------
 
@@ -72,7 +106,8 @@ def merge_deduplicate(
     """以 chunk_id 为主去重，合并向量与全文命中结果。
 
     同一 chunk 同时命中向量和全文时合并分数，保留原始 vector_score 与 fulltext_score。
-    向量命中无完整 content，content_snippet 由调用方在合并后回填。
+    向量命中优先用 Milvus output_fields.content（TP3.5/M1），缺失则由调用方的
+    ``_backfill_content_snippets`` 回退到 PG 回填——保留向后兼容（旧 collection 无 content 字段）。
     """
     merged: dict[str, MergedHit] = {}
 
@@ -83,7 +118,7 @@ def merge_deduplicate(
             source_type=vh.source_type,
             source_id=vh.source_id,
             title=vh.title,
-            content_snippet="",  # 向量检索无完整内容，后续由 _backfill_content_snippets 回填
+            content_snippet=_truncate_snippet(vh.content) if vh.content else "",
             vector_score=vh.vector_score,
             fulltext_score=0.0,
             is_primary=vh.source_type in primary_sources,
@@ -92,7 +127,7 @@ def merge_deduplicate(
     # 合并全文命中
     for fh in fulltext_hits:
         if fh.chunk_id in merged:
-            # 同一 chunk 同时命中：合并分数，以全文内容覆盖 snippet
+            # 同一 chunk 同时命中：合并分数，以全文内容覆盖 snippet（全文内容通常更完整）
             existing = merged[fh.chunk_id]
             merged[fh.chunk_id] = MergedHit(
                 chunk_id=fh.chunk_id,
@@ -405,22 +440,24 @@ class RAGRetriever:
             # 命中率统计留给后续；此处只缓存单条 query embedding（TTL 1h）
             await set_embedding(query, query_vector)
 
-        # 2. Milvus 检索
+        # 2. Milvus 检索（to_thread 释放事件循环；pymilvus 同步阻塞无成熟 async）
         milvus = self._get_milvus_client()
         collection_name = self._settings.milvus_collection
 
         # 构建过滤表达式（含 source_type + filters）
         filter_expr = _build_milvus_filter_expr(sources, filters)
 
+        # T3.5/M1: output_fields 含 content 省去 PG 回填往返（chunks p99=783 chars，
+        # max=800 chars，~1.3MB 集合膨胀可忽略；旧 collection 无该字段时 hit.content 为空）
         search_params = {
             "collection_name": collection_name,
             "data": [query_vector],
             "limit": top_k,
-            "output_fields": ["chunk_id", "source_type", "source_id", "title", "content_hash"],
+            "output_fields": ["chunk_id", "source_type", "source_id", "title", "content_hash", "content"],
             "filter": filter_expr,
         }
 
-        results = milvus.search(**search_params)
+        results = await asyncio.to_thread(milvus.search, **search_params)
 
         # 3. 解析结果
         hits: list[VectorHit] = []
@@ -439,6 +476,7 @@ class RAGRetriever:
                         title=str(entity.get("title", "")),
                         content_hash=str(entity.get("content_hash", "")),
                         vector_score=score,
+                        content=str(entity.get("content", "")),
                     )
                 )
 

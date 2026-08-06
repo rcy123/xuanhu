@@ -57,6 +57,9 @@ class VectorHit(BaseModel):
     title: str = Field(description="标题")
     content_hash: str = Field(default="", description="内容 hash")
     vector_score: float = Field(ge=0.0, le=1.0, description="向量相似度得分")
+    # T3.5/M1: Milvus output_fields 加 content 后随命中带回，省去 PG 回填往返。
+    # 未配置/旧 collection 无 content 字段时为空串，_backfill_content_snippets 回退到 PG。
+    content: str = Field(default="", description="原文片段（来自 Milvus output_fields.content）")
 
 
 class FulltextHit(BaseModel):
