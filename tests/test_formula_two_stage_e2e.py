@@ -28,6 +28,8 @@ from app.schemas.syndrome import SyndromeDraft, SyndromeDraftDecision, SyndromeF
 from app.services import langgraph_reasoning as reasoning_module
 from tests._database_safety import destructive_database_environment
 
+pytestmark = pytest.mark.integration
+
 
 async def _run_langgraph_advance(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Explicitly opt direct integration calls into request-local runtime."""

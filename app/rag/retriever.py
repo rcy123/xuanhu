@@ -231,6 +231,11 @@ class RAGRetriever:
         )
         self._milvus_client = milvus_client
         self._session_factory = session_factory
+        # T3.5/M1 容错：collection 是否含 content 字段（一次性检测，进程内缓存）。
+        # 旧 collection（sync 脚本 schema 无 content）搜带 content 的 output_fields
+        # 会抛 MilvusException field content not exist → 向量检索整路静默降级为纯全文。
+        # None=未检测；True/False=已知。
+        self._milvus_has_content: bool | None = None
 
     def _get_session_factory(self) -> Any:
         """延迟获取 session factory，便于测试注入。"""
@@ -248,6 +253,26 @@ class RAGRetriever:
                 timeout=self._settings.milvus_timeout_seconds,
             )
         return self._milvus_client
+
+    async def _collection_has_content(self, milvus: Any, collection_name: str) -> bool:
+        """一次性探测 collection 是否含 content 字段（进程内缓存）。
+
+        旧 collection（sync 脚本老 schema 无 content）搜未知 output_field 会抛
+        ``MilvusException: field content not exist``，必须显式探测后才决定字段列表。
+        ``describe_collection`` 是同步阻塞调用 → to_thread 包裹。
+        """
+        if self._milvus_has_content is None:
+            try:
+                desc = await asyncio.to_thread(milvus.describe_collection, collection_name)
+                fields = {str(f.get("name", "")) for f in desc.get("fields", [])}
+                self._milvus_has_content = "content" in fields
+            except Exception as exc:  # noqa: BLE001 - 探测失败保守回退（不阻塞检索主路径）
+                logger.warning(
+                    "Milvus collection 字段探测失败，按无 content 处理: error_type=%s",
+                    type(exc).__name__,
+                )
+                self._milvus_has_content = False
+        return self._milvus_has_content
 
     # -------------------------------------------------------------------
     # 公开接口
@@ -447,13 +472,19 @@ class RAGRetriever:
         # 构建过滤表达式（含 source_type + filters）
         filter_expr = _build_milvus_filter_expr(sources, filters)
 
-        # T3.5/M1: output_fields 含 content 省去 PG 回填往返（chunks p99=783 chars，
-        # max=800 chars，~1.3MB 集合膨胀可忽略；旧 collection 无该字段时 hit.content 为空）
+        # T3.5/M1: 仅当 collection 含 content 字段时加入 output_fields（省 PG 回填往返；
+        # chunks p99=783 chars, max=800 chars, 集合膨胀可忽略）。字段检测一次性缓存，
+        # 避免旧 collection 每次搜索都先抛 MilvusException 再回退（双倍 RTT + 错误日志刷屏）。
+        has_content = await self._collection_has_content(milvus, collection_name)
+        output_fields = ["chunk_id", "source_type", "source_id", "title", "content_hash"]
+        if has_content:
+            output_fields.append("content")
+
         search_params = {
             "collection_name": collection_name,
             "data": [query_vector],
             "limit": top_k,
-            "output_fields": ["chunk_id", "source_type", "source_id", "title", "content_hash", "content"],
+            "output_fields": output_fields,
             "filter": filter_expr,
         }
 

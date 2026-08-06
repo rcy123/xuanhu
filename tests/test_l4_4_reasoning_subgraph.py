@@ -810,8 +810,13 @@ async def test_persisted_payload_uses_trusted_run_artifact_for_syndrome_and_form
     )
     monkeypatch.setattr(
         reasoning_module,
-        "build_formula_agent_spec",
-        lambda: formula_agent_module.build_formula_agent_spec(model=formula_model),
+        "build_base_formula_agent_spec",
+        lambda: formula_agent_module.build_base_formula_agent_spec(model=formula_model),
+    )
+    monkeypatch.setattr(
+        reasoning_module,
+        "build_modification_draft_agent_spec",
+        lambda: formula_agent_module.build_modification_draft_agent_spec(model=formula_model),
     )
     original_syndrome_commit = reasoning_module._commit_syndrome_artifact  # noqa: SLF001
     original_formula_commit = reasoning_module._commit_formula_artifact  # noqa: SLF001
@@ -843,7 +848,10 @@ async def test_persisted_payload_uses_trusted_run_artifact_for_syndrome_and_form
 
     monkeypatch.setattr(reasoning_module, "_commit_syndrome_artifact", spy_syndrome_commit)
     monkeypatch.setattr(reasoning_module, "_commit_formula_artifact", spy_formula_commit)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    # 2.8 两阶段开方：syndrome(1) + base_formula(1) + modification(1) 共 3 次模型调用
+    gateway = _ReasoningFakeGateway(
+        [_syndrome_completed(fact_ids), _formula_completed(fact_ids), _formula_completed(fact_ids)]
+    )
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:

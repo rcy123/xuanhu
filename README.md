@@ -316,6 +316,47 @@ xuanhu/
 
 ---
 
+## ⚡ Performance
+
+The agent runtime has been systematically profiled and optimized across four dimensions. All numbers below are measured on a local Docker (PG/Redis/Milvus) + cloud model gateway stack.
+
+### Optimization Summary
+
+| Category | Metric | Before | After | Improvement |
+|---|---|---|---|---|
+| **OP1 State Push-down** | Reasoning DB round-trips per claim | 10+ | 1–2 | ~60–70% reduction |
+| **OP1 Intake** | `_compute_intake_from_claim` calls per finalize | 4× (once per route) | 1× (cached) | 4→1 |
+| **OP2 Gateway Pooling** | Health/LLM first vs reuse | ~5.0s vs ~2.0s | ~5.0s vs ~1.1s | Reuse ~4.7× faster |
+| **OP2 Embedding Cache** | Cache hit rate (TCM consult scenario) | 0% (no cache) | **60.0%** | Gate: ≥40% ✅ |
+| **OP2 Embedding Cache** | Miss (gateway RTT) vs hit (Redis) | ~570ms | ~4ms | **~89–209×** speedup |
+| **OP3 Milvus Async** | 8-way concurrent vector search wall-clock | Serial-blocked | 0.38–0.43s | **2.84–3.14×** speedup |
+| **OP3 M1 Content** | PG backfill round-trip per chunk hit | 1 DB query | **~0ms** (Milvus direct) | Eliminated |
+
+### Observability
+
+- `GET /api/v1/metrics` — 84 custom `xuanhu_*` metric lines, 8 Prometheus histograms
+- Histograms: `rag_vector_search`, `rag_fulltext_search`, `rag_backfill`, `rag_embed`, `gateway_chat`, `gateway_embed`, `graph_node`, `reasoning_get_state`
+
+### Benchmarks
+
+```bash
+# Run the full benchmark suite (requires running API + infrastructure)
+uv run python scripts/perf_benchmark.py
+```
+
+Results are written to `scripts/perf_results.json`.
+
+### Regression Gates (CI)
+
+- Full `pytest` suite (2460+ tests) — no regressions
+- `tests/golden/test_langgraph_performance_baseline.py` — P95 < 5000ms
+- Embedding cache hit rate — ≥ 40%
+- Structured parse success rate — no ≥1pp drop
+
+> 📊 Detailed methodology, before/after tables, and per-stage analysis: [Agent Performance Optimization](docs/03_agent性能优化/)
+
+---
+
 ## 🧪 Development
 
 ### Running Tests

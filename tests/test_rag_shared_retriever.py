@@ -107,3 +107,43 @@ def test_merge_deduplicate_fulltext_overrides_milvus_content_when_both_hit() -> 
     merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources=set())
     assert len(merged) == 1
     assert merged[0].content_snippet == "fulltext 更完整的内容"
+
+
+class _FakeMilvus:
+    """模拟 MilvusClient.describe_collection，测试 _collection_has_content 字段探测。"""
+
+    def __init__(self, *, has_content: bool) -> None:
+        self._has_content = has_content
+        self.describe_calls = 0
+
+    def describe_collection(self, collection_name: str) -> dict[str, object]:
+        del collection_name
+        self.describe_calls += 1
+        fields = [
+            {"name": "chunk_id"},
+            {"name": "source_type"},
+            {"name": "source_id"},
+            {"name": "title"},
+            {"name": "content_hash"},
+        ]
+        if self._has_content:
+            fields.append({"name": "content"})
+        return {"fields": fields}
+
+
+async def test_collection_has_content_detects_content_field() -> None:
+    """collection 含 content 字段 → True；探测只做一次（进程内缓存）。"""
+    fake = _FakeMilvus(has_content=True)
+    retriever = RAGRetriever(settings=object(), gateway_client=object(), milvus_client=fake)
+    first = await retriever._collection_has_content(fake, "c")
+    second = await retriever._collection_has_content(fake, "c")
+    assert first is True and second is True
+    assert fake.describe_calls == 1  # 缓存命中，不再探测
+
+
+async def test_collection_has_content_missing_field_falls_back() -> None:
+    """旧 collection 无 content 字段 → False（运行时回退，不静默降级向量检索）。"""
+    fake = _FakeMilvus(has_content=False)
+    retriever = RAGRetriever(settings=object(), gateway_client=object(), milvus_client=fake)
+    result = await retriever._collection_has_content(fake, "c")
+    assert result is False

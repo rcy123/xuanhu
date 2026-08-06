@@ -177,6 +177,7 @@ async def db_factory(migrated_database: str) -> object:
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_strong_signal_message_replies_with_clarification_without_intake_extraction(
     db_factory: object,
     monkeypatch: pytest.MonkeyPatch,

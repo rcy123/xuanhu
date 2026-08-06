@@ -103,8 +103,7 @@ jobs:
       - name: Run production-shaped orchestration baselines without xdist contention
         run: >-
           uv run pytest -o addopts="" -m "integration and performance"
-          --strict-markers tests/golden/test_legacy_performance_baseline.py
-          tests/golden/test_langgraph_performance_baseline.py
+          --strict-markers tests/golden/test_langgraph_performance_baseline.py
       - name: Prove workers cannot collide on identical PG and Redis keys
         run: >-
           uv run pytest -o addopts="" -m integration -n 2 --dist=each

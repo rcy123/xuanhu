@@ -16,7 +16,7 @@
 - 重复 build-chunks 不产生重复 active chunk
 - vector_id = knowledge_chunks.id::text，PG 与 Milvus 主键一致
 
-Milvus payload：vector_id / chunk_id / source_type / source_id / title / content_hash
+Milvus payload：vector_id / chunk_id / source_type / source_id / title / content_hash / content（T3.5/M1）
 """
 
 from __future__ import annotations
@@ -613,6 +613,14 @@ class VectorSyncer:
                 datatype=DataType.VARCHAR,
                 max_length=128,
             )
+            # T3.5/M1: 把 chunk 原文存进 Milvus，检索时 output_fields 直返 content，
+            # 省去 PG 回填往返。chunks p99=783 / max=800 chars → max_length=4096 余量充足。
+            # 旧 collection 无该字段时运行时 _collection_has_content 探测自动回退。
+            schema.add_field(
+                field_name="content",
+                datatype=DataType.VARCHAR,
+                max_length=4096,
+            )
             schema.add_field(
                 field_name="embedding",
                 datatype=DataType.FLOAT_VECTOR,
@@ -924,6 +932,7 @@ class VectorSyncer:
                     "source_id": chunk["source_id"],
                     "title": chunk["title"][:512],
                     "content_hash": chunk["content_hash"],
+                    "content": content[:4096],
                     "embedding": embedding,
                 }
             )
