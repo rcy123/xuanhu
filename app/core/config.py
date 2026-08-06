@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     # ---- Milvus ----
     milvus_host: str = Field(default="localhost", description="Milvus 服务地址")
     milvus_port: int = Field(default=19530, ge=1, le=65535, description="Milvus 端口")
-    milvus_collection: str = Field(default="xuanhu_knowledge_v3", description="Milvus collection 名称")
+    milvus_collection: str = Field(default="xuanhu_knowledge_v4", description="Milvus collection 名称（v4=含 content 字段 M1 直返）")
     milvus_timeout_seconds: int = Field(default=30, ge=1, description="Milvus 连接超时（秒）")
 
     # ---- 模型网关（生产统一口径） ----

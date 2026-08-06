@@ -98,7 +98,7 @@ def test_load_with_defaults(monkeypatch) -> None:
     assert settings.api_port == 8000
     assert settings.milvus_host == "localhost"
     assert settings.milvus_port == 19530
-    assert settings.milvus_collection == "xuanhu_knowledge_v3"
+    assert settings.milvus_collection == "xuanhu_knowledge_v4"
     assert settings.model_gateway_timeout_seconds == 60
     assert settings.model_gateway_max_retries == 2
     assert settings.model_gateway_route_profile == "default"
