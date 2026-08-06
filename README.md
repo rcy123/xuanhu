@@ -330,7 +330,7 @@ The agent runtime has been systematically profiled and optimized across four dim
 | **OP2 Embedding Cache** | Cache hit rate (TCM consult scenario) | 0% (no cache) | **60.0%** | Gate: ≥40% ✅ |
 | **OP2 Embedding Cache** | Miss (gateway RTT) vs hit (Redis) | ~570ms | ~4ms | **~89–209×** speedup |
 | **OP3 Milvus Async** | 8-way concurrent vector search wall-clock | Serial-blocked | 0.38–0.43s | **2.84–3.14×** speedup |
-| **OP3 M1 Content** | PG backfill round-trip per chunk hit | 1 DB query | **~0ms** (Milvus direct) | Eliminated |
+| **OP3 M1 Content** | PG backfill round-trip per chunk hit | 1 DB query | **~0ms** (Milvus direct) | Eliminated after re-sync (`sync_knowledge_chunks.py` now stores `content`; runtime auto-detects field presence so old collections fall back to PG) |
 
 ### Observability
 

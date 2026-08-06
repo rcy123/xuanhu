@@ -1,0 +1,91 @@
+{
+  "session_id": "193a9727-7dc7-4671-a0d1-3ceb46d61da2",
+  "advance_results": [
+    {
+      "status": 200,
+      "elapsed": 56.161,
+      "body": {
+        "code": "SUCCESS",
+        "message": "ok",
+        "data": {
+          "route": "review_placeholder",
+          "trace_id": "065532d4-2789-503b-a85e-c30458fe39a7",
+          "agent_name": "safety_review_subgraph",
+          "from_stage": "safety",
+          "session_id": "77a69f49-1c70-4f47-86d9-040e74fc1476",
+          "gate_results": [
+            {
+              "decision": "passed",
+              "gate_name": "safety_rule_engine",
+              "policy_version": "safety-rule-engine.product.v1"
+            }
+          ],
+          "artifact_refs": [
+            {
+              "kind": "safety_result",
+              "revision": 1,
+              "artifact_id": "07377f73-bf88-5059-8d9e-4ede9c6c5bc0"
+            }
+          ],
+          "current_stage": "review",
+          "state_version": 35,
+          "blocked_reason": null,
+          "pending_review": true,
+          "review_required": true,
+          "safety_executed": true
+        },
+        "trace_id": "perf-reasoning-session-1"
+      }
+    },
+    {
+      "status": 400,
+      "elapsed": 0.318,
+      "body": {
+        "code": "INSUFFICIENT_INQUIRY",
+        "message": "问诊信息不充分，不能推进",
+        "detail": "session_id=b91e94fe-717a-4c36-a318-1c3c145598ec LangGraph advance requires all proposed safety facts to be explicitly resolved by a doctor",
+        "retryable": false,
+        "stage": null,
+        "trace_id": "perf-reasoning-session-2"
+      }
+    },
+    {
+      "status": 200,
+      "elapsed": 51.735,
+      "body": {
+        "code": "SUCCESS",
+        "message": "ok",
+        "data": {
+          "route": "review_placeholder",
+          "trace_id": "95500250-0cf6-5e4d-9010-3d2c76dca352",
+          "agent_name": "safety_review_subgraph",
+          "from_stage": "safety",
+          "session_id": "193a9727-7dc7-4671-a0d1-3ceb46d61da2",
+          "gate_results": [
+            {
+              "decision": "passed",
+              "gate_name": "safety_rule_engine",
+              "policy_version": "safety-rule-engine.product.v1"
+            }
+          ],
+          "artifact_refs": [
+            {
+              "kind": "safety_result",
+              "revision": 1,
+              "artifact_id": "3e31585f-0ac0-571a-a3c8-380a9c8dea06"
+            }
+          ],
+          "current_stage": "review",
+          "state_version": 32,
+          "blocked_reason": null,
+          "pending_review": true,
+          "review_required": true,
+          "safety_executed": true
+        },
+        "trace_id": "perf-reasoning-session-3"
+      }
+    }
+  ],
+  "metrics_before": {},
+  "metrics_after": {}
+}

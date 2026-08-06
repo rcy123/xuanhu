@@ -152,8 +152,13 @@ async def test_langgraph_message_round_performance_baseline(
 
     assert failures == 0
     assert gateway.intake_calls == 20
-    assert gateway.question_model_calls == 20
-    assert gateway.prompt_tokens == 680
-    assert gateway.completion_tokens == 200
-    assert gateway.total_tokens == 880
+    # 2.8 起 compose 引入 SINGLE_QUESTION_INVALID 重试：本测试的 fake gateway 返回
+    # 不含维度关键词的通用问句 → _question_targets_dimension 失败 → 每次 compose 触发
+    # 一次重试 → 每会话 2 次 question 模型调用（40 = 20 × 2）。这是 2.8 意图行为
+    # （同输入重放提升模型问句质量），重试仍失败才回落模板，不影响 p95 门禁。
+    assert gateway.question_model_calls == 40
+    # 80 = intake 20 + question 40（2.8 retry）+ classify 20；每次调用 usage 17/5/22。
+    assert gateway.prompt_tokens == 1360
+    assert gateway.completion_tokens == 400
+    assert gateway.total_tokens == 1760
     assert p95 < 5000, f"p50_ms={p50:.2f} p95_ms={p95:.2f} max_ms={maximum:.2f}"
