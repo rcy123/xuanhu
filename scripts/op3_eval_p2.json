@@ -1,0 +1,68 @@
+[
+  {
+    "case": "风寒咳嗽案",
+    "original": "chief_complaint=受凉后咳嗽三天；cough=咳嗽；sputum=痰白稀；aversion_cold=怕冷明显；nasal=流清涕",
+    "rewritten": "",
+    "rewrite_latency_ms": 7418.1,
+    "is_rewritten": true,
+    "orig_count": 8,
+    "rw_count": 8,
+    "orig_top3": [
+      "风寒束表证（外感风寒）（受凉后咳嗽三天，痰白稀，怕冷，流清涕）",
+      "外感风寒，痰湿蕴肺证（兼有郁热）（咳嗽反复发作一月，痰多色白黏稠，胸闷） (第1段)",
+      "小青龙汤治疗外感咳嗽医案"
+    ],
+    "rw_top3": [
+      "当归四逆汤治疗脉痹医案 [9132e6d513f0] (第2段)",
+      "防风通圣散治疗月经过少医案 (第2段)",
+      "半夏厚朴汤加减治疗晚期肺癌医案 (第3段)"
+    ],
+    "title_overlap": 0,
+    "new_in_rw": 8,
+    "verdict": "PASS"
+  },
+  {
+    "case": "心脾两虚失眠案",
+    "original": "chief_complaint=失眠多梦三个月；palpitations=心悸健忘；fatigue=神疲乏力；dizziness=头晕",
+    "rewritten": "",
+    "rewrite_latency_ms": 4703.4,
+    "is_rewritten": true,
+    "orig_count": 8,
+    "rw_count": 8,
+    "orig_top3": [
+      "心脾两虚证（失眠多梦三个月，心悸健忘，神疲乏力）",
+      "酸枣仁汤合当归芍药散加龙牡治疗失眠兼眩晕心悸医案",
+      "酸枣仁汤、香砂六君子丸合黄芪桂枝五物汤加减治疗不寐医案"
+    ],
+    "rw_top3": [
+      "当归四逆汤治疗脉痹医案 [9132e6d513f0] (第2段)",
+      "防风通圣散治疗月经过少医案 (第2段)",
+      "半夏厚朴汤加减治疗晚期肺癌医案 (第3段)"
+    ],
+    "title_overlap": 0,
+    "new_in_rw": 8,
+    "verdict": "PASS"
+  },
+  {
+    "case": "脾阳虚泄泻案",
+    "original": "chief_complaint=大便溏稀两个月；appetite=食少；fatigue=乏力；bloating=腹胀",
+    "rewritten": "",
+    "rewrite_latency_ms": 4304.5,
+    "is_rewritten": true,
+    "orig_count": 8,
+    "rw_count": 8,
+    "orig_top3": [
+      "脾阳虚证（兼气滞）（大便溏稀两个月，食少乏力，腹胀）",
+      "脾阳虚证（兼气虚）（大便溏稀两个月，食少乏力，腹胀）",
+      "五苓散合四君子汤治疗水肿医案 (第2段)"
+    ],
+    "rw_top3": [
+      "当归四逆汤治疗脉痹医案 [9132e6d513f0] (第2段)",
+      "防风通圣散治疗月经过少医案 (第2段)",
+      "半夏厚朴汤加减治疗晚期肺癌医案 (第3段)"
+    ],
+    "title_overlap": 0,
+    "new_in_rw": 8,
+    "verdict": "PASS"
+  }
+]

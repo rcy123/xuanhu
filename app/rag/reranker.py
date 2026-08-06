@@ -191,14 +191,13 @@ async def _call_reranker_api(
     settings = get_settings()
     reranker_model = model or settings.rag_reranker_model or "jina-reranker-m0"
 
-    pairs = [
-        {"query": query, "document": doc}
-        for doc in documents
-    ]
-
+    # 使用 Cohere-style 格式（dmxapi / 通用 reranker API 兼容）：
+    #   {"model": "...", "query": "...", "documents": ["...", ...], "top_n": N}
     payload = {
         "model": reranker_model,
-        "input": pairs,
+        "query": query,
+        "documents": documents,
+        "top_n": len(documents),
     }
 
     try:
@@ -216,7 +215,8 @@ async def _call_reranker_api(
 
     data = response.json()
     # 尝试解析不同格式的 reranker 响应
-    # 标准 Jina-style: {"results": [{"index": 0, "relevance_score": 0.85}, ...]}
+    # Cohere-style: {"results": [{"index": 0, "relevance_score": 0.85}, ...]}
+    # Jina-style:  {"results": [{"index": 0, "relevance_score": 0.85}, ...]}
     # OpenAI-style: {"results": [{"index": 0, "score": 0.85}, ...]}
     results = data.get("results", data.get("data", []))
     if isinstance(results, list) and len(results) > 0:

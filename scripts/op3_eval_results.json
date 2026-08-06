@@ -1,0 +1,162 @@
+{
+  "generated_at": "2026-08-06T13:06:40.816135+00:00",
+  "p0_pass_rate": 1.0,
+  "p2_overlap_improvement": 0.0,
+  "p0_results": [
+    {
+      "case": "风寒束表证—麻黄汤",
+      "syndrome": "风寒束表证",
+      "base_formula": "麻黄汤",
+      "formula_count": 8,
+      "modification_count": 8,
+      "formula_sources": [
+        "case",
+        "formula"
+      ],
+      "modification_sources": [
+        "case"
+      ],
+      "overlap_ratio": 0.0,
+      "distinct_mod_count": 5,
+      "formula_top": [
+        "风寒束表证（外感风寒）（受凉后咳嗽三天，痰白稀，怕冷，流清涕） (case)",
+        "桂枝汤合桔梗汤加减治疗鼻窒医案 (第2段) (case)",
+        "麻黄汤治疗太阳表实证医案 (case)"
+      ],
+      "modification_top": [
+        "风寒束表证（外感风寒）（受凉后咳嗽三天，痰白稀，怕冷，流清涕） (case)",
+        "麻黄汤治疗太阳表实证医案 (case)",
+        "麻黄汤治疗风寒感冒医案 (case)"
+      ],
+      "verdict": "PASS"
+    },
+    {
+      "case": "脾虚湿困证—参苓白术散",
+      "syndrome": "脾虚湿困证",
+      "base_formula": "参苓白术散",
+      "formula_count": 8,
+      "modification_count": 8,
+      "formula_sources": [
+        "case"
+      ],
+      "modification_sources": [
+        "case",
+        "herb"
+      ],
+      "overlap_ratio": 0.0,
+      "distinct_mod_count": 5,
+      "formula_top": [
+        "脾阳虚证（兼气滞）（大便溏稀两个月，食少乏力，腹胀） (case)",
+        "脾阳虚证（兼气虚）（大便溏稀两个月，食少乏力，腹胀） (case)",
+        "五苓散合四君子汤治疗水肿医案 (第2段) (case)"
+      ],
+      "modification_top": [
+        "脾阳虚证（兼气虚）（大便溏稀两个月，食少乏力，腹胀） (case)",
+        "脾阳虚证（兼气滞）（大便溏稀两个月，食少乏力，腹胀） (case)",
+        "白术 (herb)"
+      ],
+      "verdict": "PASS"
+    },
+    {
+      "case": "肝郁气滞证—柴胡疏肝散",
+      "syndrome": "肝郁气滞证",
+      "base_formula": "柴胡疏肝散",
+      "formula_count": 8,
+      "modification_count": 8,
+      "formula_sources": [
+        "case"
+      ],
+      "modification_sources": [
+        "case"
+      ],
+      "overlap_ratio": 0.0,
+      "distinct_mod_count": 5,
+      "formula_top": [
+        "肝郁气滞证（兼少阳枢机不利）（情志不舒后右胁胀痛一月，嗳气频作） (第1段) (case)",
+        "疏肝泄热镇心安神方治疗郁证医案 (case)",
+        "肝郁气滞证（兼少阳枢机不利）（情志不舒后右胁胀痛一月，嗳气频作） (第2段) (case)"
+      ],
+      "modification_top": [
+        "肝郁气滞证（兼少阳枢机不利）（情志不舒后右胁胀痛一月，嗳气频作） (第1段) (case)",
+        "肝郁气滞证（兼少阳枢机不利）（情志不舒后右胁胀痛一月，嗳气频作） (第2段) (case)",
+        "大柴胡汤合逍遥散治疗胁痛医案 (case)"
+      ],
+      "verdict": "PASS"
+    }
+  ],
+  "p2_results": [
+    {
+      "case": "风寒咳嗽案",
+      "original_query": "chief_complaint=受凉后咳嗽三天；cough=咳嗽；sputum=痰白稀；aversion_cold=怕冷明显；sweat=无汗；nasal=流清涕",
+      "rewritten_query": "chief_complaint=受凉后咳嗽三天；cough=咳嗽；sputum=痰白稀；aversion_cold=怕冷明显；sweat=无汗；nasal=流清涕",
+      "rewrite_latency_ms": 0.0,
+      "original_count": 8,
+      "rewritten_count": 8,
+      "original_top": [
+        "风寒束表证（外感风寒）（受凉后咳嗽三天，痰白稀，怕冷，流清涕）",
+        "外感风寒，痰湿蕴肺证（兼有郁热）（咳嗽反复发作一月，痰多色白黏稠，胸闷） (第1段)",
+        "小青龙汤治疗外感咳嗽医案",
+        "小青龙汤加减治疗太阳太阴少阳阳明合病医案",
+        "小青龙汤治疗咳嗽医案 [109555f400f5]"
+      ],
+      "rewritten_top": [
+        "风寒束表证（外感风寒）（受凉后咳嗽三天，痰白稀，怕冷，流清涕）",
+        "外感风寒，痰湿蕴肺证（兼有郁热）（咳嗽反复发作一月，痰多色白黏稠，胸闷） (第1段)",
+        "小青龙汤治疗外感咳嗽医案",
+        "小青龙汤加减治疗太阳太阴少阳阳明合病医案",
+        "小青龙汤治疗咳嗽医案 [109555f400f5]"
+      ],
+      "overlap": 0,
+      "verdict": "PASS"
+    },
+    {
+      "case": "心脾两虚失眠案",
+      "original_query": "chief_complaint=失眠多梦三个月；palpitations=心悸健忘；fatigue=神疲乏力；dizziness=头晕",
+      "rewritten_query": "chief_complaint=失眠多梦三个月；palpitations=心悸健忘；fatigue=神疲乏力；dizziness=头晕",
+      "rewrite_latency_ms": 0.0,
+      "original_count": 8,
+      "rewritten_count": 8,
+      "original_top": [
+        "心脾两虚证（失眠多梦三个月，心悸健忘，神疲乏力）",
+        "酸枣仁汤合当归芍药散加龙牡治疗失眠兼眩晕心悸医案",
+        "酸枣仁汤、香砂六君子丸合黄芪桂枝五物汤加减治疗不寐医案",
+        "归脾汤加减治疗失眠医案",
+        "酸枣仁汤合归脾汤治疗失眠医案"
+      ],
+      "rewritten_top": [
+        "心脾两虚证（失眠多梦三个月，心悸健忘，神疲乏力）",
+        "酸枣仁汤合当归芍药散加龙牡治疗失眠兼眩晕心悸医案",
+        "酸枣仁汤、香砂六君子丸合黄芪桂枝五物汤加减治疗不寐医案",
+        "归脾汤加减治疗失眠医案",
+        "酸枣仁汤合归脾汤治疗失眠医案"
+      ],
+      "overlap": 0,
+      "verdict": "PASS"
+    },
+    {
+      "case": "脾阳虚泄泻案",
+      "original_query": "chief_complaint=大便溏稀两个月；appetite=食少；fatigue=乏力；bloating=腹胀",
+      "rewritten_query": "chief_complaint=大便溏稀两个月；appetite=食少；fatigue=乏力；bloating=腹胀",
+      "rewrite_latency_ms": 0.0,
+      "original_count": 8,
+      "rewritten_count": 8,
+      "original_top": [
+        "脾阳虚证（兼气滞）（大便溏稀两个月，食少乏力，腹胀）",
+        "脾阳虚证（兼气虚）（大便溏稀两个月，食少乏力，腹胀）",
+        "五苓散合四君子汤治疗水肿医案 (第2段)",
+        "五苓散合四君子汤治疗特发性水肿医案 (第2段)",
+        "大柴胡汤合小承气汤加味治疗腹胀吐涎医案"
+      ],
+      "rewritten_top": [
+        "脾阳虚证（兼气滞）（大便溏稀两个月，食少乏力，腹胀）",
+        "脾阳虚证（兼气虚）（大便溏稀两个月，食少乏力，腹胀）",
+        "五苓散合四君子汤治疗水肿医案 (第2段)",
+        "五苓散合四君子汤治疗特发性水肿医案 (第2段)",
+        "大柴胡汤合小承气汤加味治疗腹胀吐涎医案"
+      ],
+      "overlap": 0,
+      "verdict": "PASS"
+    }
+  ],
+  "reranker_results": []
+}
