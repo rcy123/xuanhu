@@ -113,6 +113,7 @@ async def store(migrated_database: str) -> tuple[PostgresDomainRepository, async
         )
     reasoning_module._SYNDROME_RESULT_CACHE.clear()
     reasoning_module._FORMULA_ROUTE_CACHE.clear()
+    reasoning_module._REASONING_AUTHORITY_CACHE.clear()
     try:
         yield PostgresDomainRepository(factory), factory
     finally:

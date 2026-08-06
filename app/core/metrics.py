@@ -110,6 +110,12 @@ graph_node = _Histogram(
     labelnames=("subgraph", "node"),
 )
 
+# Reasoning get_state durations (OP1: authority snapshot cache)
+reasoning_get_state = _Histogram(
+    "xuanhu_reasoning_get_state_seconds",
+    "Reasoning authority snapshot get_state DB round-trip duration",
+)
+
 # ---------------------------------------------------------------------------
 # Measure context manager
 # ---------------------------------------------------------------------------
@@ -155,6 +161,7 @@ def _observe(stage: str, value: float, labels: dict[str, str] | None = None) -> 
         "gateway.chat": gateway_chat,
         "gateway.embed": gateway_embed,
         "graph.node": graph_node,
+        "reasoning.get_state": reasoning_get_state,
     }
     h = _MAP.get(stage)
     if h is not None:

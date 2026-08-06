@@ -151,6 +151,10 @@ _SYNDROME_RESULT_CACHE: BoundedTTLCache[uuid.UUID, SyndromeExecutionResult] = Bo
     ttl_seconds=300,
 )
 _FORMULA_ROUTE_CACHE: BoundedTTLCache[uuid.UUID, str] = BoundedTTLCache(max_size=256, ttl_seconds=300)
+_REASONING_AUTHORITY_CACHE: BoundedTTLCache[uuid.UUID, ReasoningAuthoritySnapshot] = BoundedTTLCache(
+    max_size=256,
+    ttl_seconds=300,
+)
 _execute_syndrome = cast(Callable[..., Awaitable[SyndromeExecutionResult]], execute_syndrome_draft)
 _execute_formula = cast(Callable[..., Awaitable[Any]], execute_formula_draft)
 
@@ -288,14 +292,18 @@ def _rag_retriever() -> Any | None:
     """编排层构造推理检索器（延迟 import，避免启动耦合）。
 
     总开关关闭时返回 None；构造失败返回 None（agent 内走空证据 RAG 模式，
-    不阻断推理——D3 降级）。RAGRetriever 构造不建立连接（延迟连接）。
+    不阻断推理——D3 降级）。
+
+    TP3.2: 使用进程级共享 RAGRetriever，避免每 stage 重建 Milvus gRPC channel。
+    ``RAGRetriever.__init__`` 本身无 I/O（httpx/Milvus 延迟建连），共享后
+    MilvusClient 仅在首次 search 时建一次，后续 6 次 stage 复用同一 gRPC pool。
     """
     if not get_settings().rag_enabled:
         return None
     try:
-        from app.rag.retriever import RAGRetriever
+        from app.rag.retriever import get_shared_rag_retriever
 
-        return RAGRetriever()
+        return get_shared_rag_retriever()
     except Exception as exc:  # noqa: BLE001 - 检索器不可用必须降级而非阻断
         _logger.warning("RAG retriever 构造失败，推理将走空证据降级: %s: %s", type(exc).__name__, str(exc))
         return None
@@ -514,7 +522,7 @@ async def run_reasoning_precheck_node(state: XuanhuGraphState) -> dict[str, Any]
         if completed is not None:
             return completed
         repository = PostgresDomainRepository(get_session_factory())
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         if authority is None:
             await _mark_claim_failed(claim.id, "REASONING_PRECHECK_FAILED")
             return _sanitized_graph_error(state, "REASONING_PRECHECK_FAILED", "reasoning authority is unavailable")
@@ -548,7 +556,7 @@ async def run_reasoning_build_syndrome_context_node(state: XuanhuGraphState) -> 
         if completed is not None:
             return completed
         repository = PostgresDomainRepository(get_session_factory())
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         if authority is None:
             return _sanitized_graph_error(state, "REASONING_AUTHORITY_MISSING", "reasoning authority is unavailable")
         feedback = await _load_review_feedback(claim.session_id)
@@ -582,7 +590,7 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
         if completed is not None:
             return completed
         repository = PostgresDomainRepository(get_session_factory())
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         if authority is None:
             return _sanitized_graph_error(state, "REASONING_AUTHORITY_MISSING", "reasoning authority is unavailable")
         recovered = await _load_trusted_syndrome_result(repository, claim.session_id, authority)
@@ -697,7 +705,7 @@ async def run_reasoning_verify_syndrome_node(state: XuanhuGraphState) -> dict[st
         if completed is not None:
             return completed
         repository = PostgresDomainRepository(get_session_factory())
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         result = (
             _SYNDROME_RESULT_CACHE.get(claim.id)
             or await _load_trusted_syndrome_result(repository, claim.session_id, authority)
@@ -735,7 +743,7 @@ async def run_reasoning_build_formula_context_node(state: XuanhuGraphState) -> d
         if completed is not None:
             return completed
         repository = PostgresDomainRepository(get_session_factory())
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         syndrome_result = (
             _SYNDROME_RESULT_CACHE.get(claim.id)
             or await _load_trusted_syndrome_result(repository, claim.session_id, authority)
@@ -933,7 +941,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             await _save_intermediate_step(claim.id, "draft_formula")
             return _formula_graph_update(existing, route)
 
-        authority = await _current_authority(repository, claim.session_id)
+        authority = await _current_authority(repository, claim.session_id, claim_id=claim.id)
         syndrome_result = (
             _SYNDROME_RESULT_CACHE.get(claim.id)
             or await _load_trusted_syndrome_result(repository, claim.session_id, authority)
@@ -1309,9 +1317,20 @@ async def _load_reasoning_claim(
 async def _current_authority(
     repository: PostgresDomainRepository,
     session_id: uuid.UUID,
+    *,
+    claim_id: uuid.UUID | None = None,
 ) -> ReasoningAuthoritySnapshot | None:
-    state = await repository.get_state(session_id)
-    return await repository.get_reasoning_authority(session_id, state.state_version)
+    if claim_id is not None:
+        cached = _REASONING_AUTHORITY_CACHE.get(claim_id)
+        if cached is not None and cached.session_id == session_id:
+            return cached
+    from app.core.metrics import measure
+    async with measure("reasoning.get_state"):
+        state = await repository.get_state(session_id)
+    authority = await repository.get_reasoning_authority(session_id, state.state_version)
+    if authority is not None and claim_id is not None:
+        _REASONING_AUTHORITY_CACHE[claim_id] = authority
+    return authority
 
 
 def _build_syndrome_input(
@@ -1382,7 +1401,7 @@ async def _commit_syndrome_artifact(
     payload["retrieved_evidence"] = [
         evidence.model_dump(mode="json") for evidence in trusted.retrieved_evidence
     ]
-    return await _commit_artifact_payload(
+    commit = await _commit_artifact_payload(
         repository,
         claim,
         artifact_type=SYNDROME_ARTIFACT_TYPE,
@@ -1413,6 +1432,10 @@ async def _commit_syndrome_artifact(
             retrieved_evidence=trusted.retrieved_evidence,
         ),
     )
+    # state_version bumped N→N+1: 下游 build_formula_context 必须重新读取 authority
+    # （缓存的 N 版本会让 formula input state_version=N，提交时撞 STATE_VERSION_CONFLICT）。
+    _REASONING_AUTHORITY_CACHE.pop(claim.id, None)
+    return commit
 
 
 async def _commit_formula_artifact(
@@ -1457,6 +1480,9 @@ async def _commit_formula_artifact(
             preserve_advance=preserve_advance,
         )
         outbox_event_type = REASONING_COMMAND_COMPLETED
+    # 提交前失效 authority 缓存：state_version 将 bump（formula 路径还含 session_updates 跳到 N+2）。
+    # 当前图拓扑无下游 reader，防御性保留避免拓扑变更后漏失效。
+    _REASONING_AUTHORITY_CACHE.pop(claim.id, None)
     return await _commit_artifact_payload(
         repository,
         claim,
@@ -2175,12 +2201,14 @@ async def _mark_claim_failed(claim_id: uuid.UUID, error_code: str) -> None:
     finally:
         _SYNDROME_RESULT_CACHE.pop(claim_id, None)
         _FORMULA_ROUTE_CACHE.pop(claim_id, None)
+        _REASONING_AUTHORITY_CACHE.pop(claim_id, None)
 
 
 async def _completed_graph_update(claim: IntakeCommandClaim) -> dict[str, Any] | None:
     if claim.status == "completed" and claim.response_payload is not None:
         _SYNDROME_RESULT_CACHE.pop(claim.id, None)
         _FORMULA_ROUTE_CACHE.pop(claim.id, None)
+        _REASONING_AUTHORITY_CACHE.pop(claim.id, None)
         return _graph_update_from_response(dict(claim.response_payload))
     return None
 
