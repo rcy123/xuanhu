@@ -231,9 +231,18 @@ async def health_llm_root(request: Request) -> JSONResponse:
     """根路径模型网关连通性检查（兼容运维探针）。
 
     复用 lifespan 托管的共享 ``ModelGatewayClient`` 实例，避免临时创建。
+    未运行 lifespan 的环境（如无 lifespan 的 ASGI 测试客户端）回退到临时
+    实例并即时关闭，保证不依赖 lifespan 也能探测。
     """
-    client: ModelGatewayClient = request.app.state.gateway_client
-    checks = await client.health_check()
+    client: ModelGatewayClient | None = getattr(request.app.state, "gateway_client", None)
+    if client is None:
+        client = ModelGatewayClient()
+        try:
+            checks = await client.health_check()
+        finally:
+            await client.aclose()
+    else:
+        checks = await client.health_check()
 
     all_ok = all(v == "ok" for v in checks.values())
     overall_status = "ok" if all_ok else "degraded"
