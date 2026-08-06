@@ -129,6 +129,8 @@ class FormulaExecutionResult(BaseModel):
     output: FormulaDraft | None = None
     verification: FormulaVerificationReport | None = None
     failure_code: RuntimeErrorCode | FormulaVerificationFailureCode | FormulaBoundaryFailureCode | None = None
+    # P1: 多方案候选（从 BaseFormulaDraft.alternatives 保留，assembly 后不丢失）
+    alternatives: tuple[BaseFormulaAlternative, ...] = ()
 
     @model_validator(mode="after")
     def consistent_result(self) -> FormulaExecutionResult:
@@ -905,7 +907,10 @@ async def execute_base_formula_draft(
         assert report.failure_code is not None
         return _failed(report.failure_code, verification=report)
     result = FormulaExecutionResult(
-        status=FormulaExecutionStatus.SUCCEEDED, output=canonical_output, verification=report
+        status=FormulaExecutionStatus.SUCCEEDED,
+        output=canonical_output,
+        verification=report,
+        alternatives=model_output.alternatives,
     )
     _register_success(
         result,

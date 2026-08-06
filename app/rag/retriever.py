@@ -288,7 +288,9 @@ class RAGRetriever:
             from app.rag.entity_index import get_entity_index
             from sqlalchemy import select
 
-            sf = self._get_session_factory()
+            # 使用全局 session factory 而非 self._get_session_factory()：
+            # 实体索引是进程级单例，应直连 PG，不受测试 mock 注入影响。
+            sf = get_session_factory()
             async with sf() as session:
                 result = await session.execute(
                     select(KnowledgeChunk.title)
@@ -314,6 +316,9 @@ class RAGRetriever:
         失败不影响检索主路径。
         """
         try:
+            # 延迟加载实体索引（首次调用从 PG 拉取，后续 no-op）
+            await self._ensure_entity_index()
+
             from app.rag.embedding_cache import (
                 FORMULA_QUERY_TEMPLATES,
                 HERB_QUERY_TEMPLATES,
@@ -594,7 +599,6 @@ class RAGRetriever:
             # 命中率统计留给后续；此处只缓存单条 query embedding（TTL 1h）
             await set_embedding(query, query_vector)
             # L3: 运行时关联预热（fire-and-forget，不阻塞检索主路径）
-            await self._ensure_entity_index()
             asyncio.ensure_future(self._warm_related_queries(query))
 
         # 2. Milvus 检索（to_thread 释放事件循环；pymilvus 同步阻塞无成熟 async）

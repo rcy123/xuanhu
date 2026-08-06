@@ -1014,7 +1014,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         # ---- P1: 提取并筛选候选方案 ----
         from app.schemas.formula import BaseFormulaAlternative as BFA
 
-        raw_alternatives = base_result.output.alternatives
+        raw_alternatives = base_result.alternatives  # P1: alternatives 在 FormulaExecutionResult 上，不在已装配的 FormulaDraft 上
         if raw_alternatives:
             settings = get_settings()
             alternatives = filter_alternatives(

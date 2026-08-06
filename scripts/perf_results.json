@@ -3,19 +3,19 @@
     "test": "health_llm_connection_reuse",
     "description": "LLM健康检查6轮 — 首轮新建TCP连接，后续复用连接池",
     "results": [
-      1.861,
-      0.863,
-      1.383,
-      2.074,
-      4.11,
-      1.939
+      0.943,
+      0.846,
+      0.735,
+      0.979,
+      2.553,
+      1.237
     ],
-    "first_vs_avg": "1.861s vs 2.074s"
+    "first_vs_avg": "0.943s vs 1.270s"
   },
   "concurrent": {
     "test": "concurrent_health",
     "description": "5个并发health/llm请求，利用连接池复用",
-    "total_seconds": 4.342,
+    "total_seconds": 1.741,
     "statuses": [
       200,
       200,
@@ -28,10 +28,10 @@
     "test": "embedding_cache_hit",
     "description": "同一 query 连续取 embedding，对比 miss(embedding 网关) vs hit(Redis)",
     "embedding_gateway_url": "https://www.dmxapi.cn/v1",
-    "miss_seconds": 0.397,
-    "hit_seconds": 0.003,
+    "miss_seconds": 0.263,
+    "hit_seconds": 0.006,
     "hit_ok": true,
-    "approx_speedup": 113.5
+    "approx_speedup": 41.5
   },
   "embedding_cache_hit_rate": {
     "test": "embedding_cache_hit_rate",
@@ -40,17 +40,17 @@
     "hits": 12,
     "misses": 8,
     "hit_rate": 0.6,
-    "miss_total_seconds": 1.834,
+    "miss_total_seconds": 112.752,
     "hit_total_seconds": 0.0002,
     "plan_gate_40pct": true
   },
   "concurrent_vector": {
     "test": "concurrent_vector_retrieval",
     "description": "8 路并发 _vector_search wall-clock 总耗时 vs 串行理论（TP3.1 to_thread）",
-    "single_seconds": 0.161,
-    "concurrent_8_seconds": 0.416,
-    "serial_theory_seconds": 1.287,
-    "speedup_factor": 3.09,
+    "single_seconds": 0.139,
+    "concurrent_8_seconds": 0.361,
+    "serial_theory_seconds": 1.111,
+    "speedup_factor": 3.08,
     "successes": 8,
     "shared_retriever": true
   },
@@ -73,7 +73,7 @@
       "xuanhu_rag_vector_search_seconds_bucket{le=\"+Inf\"} 0.0",
       "xuanhu_rag_vector_search_seconds_count 0.0",
       "xuanhu_rag_vector_search_seconds_sum 0.0",
-      "xuanhu_rag_vector_search_seconds_created 1.7860107257471986e+09",
+      "xuanhu_rag_vector_search_seconds_created 1.7860156475169108e+09",
       "xuanhu_rag_fulltext_search_seconds_bucket{le=\"0.01\"} 0.0"
     ]
   }

@@ -3569,11 +3569,19 @@ def _project_explicit_none_safety(
     *,
     session_id: uuid.UUID,
 ) -> SafetyProfileSchema | None:
-    """Project deterministic explicit negatives into the safety profile.
+    """Project deterministic safety collection outcomes into the safety profile.
 
-    Only ``EXPLICITLY_NONE`` collection outcomes from the intake safety delta
-    are projected here.  Collected candidates and red flags stay proposal-only
-    (doctor confirmation required).
+    Two collection outcomes are projected immediately (bypassing doctor confirmation):
+
+    - ``EXPLICITLY_NONE`` — deterministic reply-binding for explicit negative
+      answers (\"无\"/\"没有\") to safety questions.
+    - ``COLLECTED`` — model-extracted safety data from a direct answer to a
+      safety question (e.g. \"有高血压病史3年\" → major_conditions collected).
+
+    Without the COLLECTED projection, safety dimensions that receive a substantive
+    affirmative answer can never be marked covered by the completeness gate
+    (the safety profile stays UNKNOWN), causing the same question to be re-asked
+    indefinitely (REAL-SESSION 0a456c42 疾病史 重复追问).
     """
 
     if not delta.has_candidate():
@@ -3596,24 +3604,42 @@ def _project_explicit_none_safety(
             "contraindications": None,
         }
     )
-    updates: list[tuple[str, str | None]] = []
+    updates: list[tuple[str, str | None, Any]] = []
+    # EXPLICITLY_NONE: deterministic reply-binding for "无"/"没有" answers.
     if delta.allergy.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("allergy_collection_status", "allergens"))
+        updates.append(("allergy_collection_status", "allergens", None))
     if delta.medications.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("medications_collection_status", "medications"))
+        updates.append(("medications_collection_status", "medications", None))
     if delta.major_conditions.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("major_conditions_collection_status", "major_conditions"))
+        updates.append(("major_conditions_collection_status", "major_conditions", None))
     if delta.pregnancy.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("pregnancy_collection_status", "pregnancy_value"))
+        updates.append(("pregnancy_collection_status", "pregnancy_value", None))
     if delta.lactation.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("lactation_collection_status", "lactation_value"))
+        updates.append(("lactation_collection_status", "lactation_value", None))
     if delta.contraindications.status is CollectionStatus.EXPLICITLY_NONE:
-        updates.append(("contraindications_collection_status", "contraindications"))
+        updates.append(("contraindications_collection_status", "contraindications", None))
+    # COLLECTED: model-extracted safety data from substantive answers.
+    if delta.allergy.status is CollectionStatus.COLLECTED:
+        updates.append(("allergy_collection_status", "allergens", list(delta.allergy.values or [])))
+    if delta.medications.status is CollectionStatus.COLLECTED:
+        updates.append(("medications_collection_status", "medications", list(delta.medications.values or [])))
+    if delta.major_conditions.status is CollectionStatus.COLLECTED:
+        updates.append(("major_conditions_collection_status", "major_conditions", list(delta.major_conditions.values or [])))
+    if delta.pregnancy.status is CollectionStatus.COLLECTED:
+        updates.append(("pregnancy_collection_status", "pregnancy_value", delta.pregnancy.value))
+    if delta.lactation.status is CollectionStatus.COLLECTED:
+        updates.append(("lactation_collection_status", "lactation_value", delta.lactation.value))
+    if delta.contraindications.status is CollectionStatus.COLLECTED:
+        updates.append(("contraindications_collection_status", "contraindications", list(delta.contraindications.values or [])))
     if not updates:
         return None
-    for status_column, value_column in updates:
-        profile_values[status_column] = CollectionStatus.EXPLICITLY_NONE.value
-        profile_values[value_column] = None
+    for status_column, value_column, value in updates:
+        profile_values[status_column] = (
+            CollectionStatus.EXPLICITLY_NONE.value
+            if value is None
+            else CollectionStatus.COLLECTED.value
+        )
+        profile_values[value_column] = value
     projected = SafetyProfileSchema.model_validate({"session_id": session_id, **profile_values})
     # Only return a profile when something actually changed; otherwise the
     # reducer sees safety_profile as a no-op and may mix it with an empty
