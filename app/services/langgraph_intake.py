@@ -268,7 +268,7 @@ _BOUND_REPLY_NORMAL_PATTERN = re.compile(
     r"^\s*(?:正常|正常吧|正常啊|还好|还行|可以|没问题|没大碍|都正常|差不多|一般|无异常|没有不适|没什么不舒服|是的|对的|对，正常|是，正常|嗯|好)\s*[。.!！?？]*\s*$"
 )
 _SOCIAL_ACKNOWLEDGEMENT_PATTERN = re.compile(
-    r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|谢谢|感谢)(?:呀|啊|哦|哈)?\s*[。.!！?？]*\s*$",
+    r"^\s*(?:你好|您好|嗨|哈喽|hello|hi|谢谢|感谢|诊毕|问诊结束|采集完成|好了|结束|完成|完毕|就这样|差不多了|可以了|先这样|暂时这些)(?:呀|啊|哦|哈|啦)?\s*[。.!！?？]*\s*$",
     re.IGNORECASE,
 )
 
@@ -1600,6 +1600,35 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             return {
                 "route": NODE_INTAKE_SUBGRAPH_V1,
                 "intake_decision": bound_output.decision.value,
+                "last_error": None,
+            }
+        # L3-6 修复 (REAL-SESSION 0a456c42): 无 reply_context 的社交消息
+        # 和问诊结束信号（"诊毕""结束"等）不应调用模型也不应触发澄清。
+        # bound_output 已处理有 reply_context 的社交回复；此处拦截无上下文的
+        # 独立消息，跳过模型调用，标记 skip_clarification 以绕过澄清路由。
+        patient_content = patient_message.content.strip()
+        if patient_content and _is_social_acknowledgement(patient_content):
+            skip_output = IntakeExtractionOutput(
+                decision=IntakeExtractionDecision.ABSTAINED,
+            )
+            _INTAKE_OUTPUT_CACHE[claim.id] = skip_output
+            end_requested = _is_intake_end_signal(patient_content)
+            await _save_intermediate(
+                claim.id,
+                {
+                    "extraction": {
+                        "decision": "abstained",
+                        "skip_reason": "intake_end_signal" if end_requested else "social_acknowledgement",
+                        "input_state_version": claim.input_state_version,
+                    }
+                },
+                step="extract_intake",
+            )
+            return {
+                "route": NODE_INTAKE_SUBGRAPH_V1,
+                "intake_decision": skip_output.decision.value,
+                "intake_skip_clarification": True,
+                "intake_end_requested": end_requested,
                 "last_error": None,
             }
         run_id = _stable_intake_extraction_run_id(claim)
@@ -3399,6 +3428,26 @@ def _is_social_acknowledgement(content: str) -> bool:
     """Do not treat a greeting-only doctor/patient turn as clinical stagnation."""
 
     return _SOCIAL_ACKNOWLEDGEMENT_PATTERN.fullmatch(content) is not None
+
+
+# L3-6 修复: 问诊结束信号子集（"诊毕""问诊结束"等）。
+# 这些同时也是社交消息，但额外携带"医生认为问诊已可结束"的语义，
+# 用于在 gates/route 层推动 PARTIAL 降级而非持续追问。
+_INTAKE_END_SIGNAL_PATTERN = re.compile(
+    r"^\s*(?:诊毕|问诊结束|采集完成|结束|完成|完毕|就这样|差不多了|可以了|先这样|暂时这些)\s*[。.!！?？]*\s*$"
+)
+
+
+def _is_intake_end_signal(content: str) -> bool:
+    """Recognise clinician signals that intake collection is intentionally complete.
+
+    These are a subset of social acknowledgements that carry an explicit
+    "I'm done collecting" intent, used to nudge the completeness gate toward
+    PARTIAL rather than trapping the session in a re-ask loop.
+    """
+    if not content or not content.strip():
+        return False
+    return _INTAKE_END_SIGNAL_PATTERN.fullmatch(content) is not None
 
 
 def _active_observation_ids_by_fact_key(

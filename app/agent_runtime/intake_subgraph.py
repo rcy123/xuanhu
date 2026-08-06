@@ -155,7 +155,12 @@ def _route_after_clarify_precheck(state: XuanhuGraphState) -> str:
 
 def _route_after_extract(state: XuanhuGraphState) -> str:
     # L3-6：抽取放弃提取（abstained）时转向澄清 Agent，避免对非回答输入静默重问。
+    # 社交消息和问诊结束信号（"诊毕"等）例外：跳过澄清，走正常 verify→reduce→gates
+    # 管线重新计算 completeness，避免非医疗输入永久困在澄清循环中
+    # （REAL-SESSION 0a456c42 "诊毕"→clarification 死锁）。
     if state.get("intake_decision") == "abstained":
+        if state.get("intake_skip_clarification"):
+            return NODE_INTAKE_VERIFY
         return NODE_INTAKE_CLARIFY_REPLY
     return NODE_INTAKE_VERIFY
 
