@@ -250,9 +250,19 @@ async def _execute_syndrome_draft(
         # 不抛出、不 503）；无 retriever（测试注入缺省）同样走空证据模式。
         if retriever is not None:
             # P2: 可选的 query LLM 改写（由 rag_query_rewrite_enabled 配置控制）
+            # 优先使用 rewrite 专用网关（如轻量模型在 dmxapi），否则回退 runtime.gateway
+            from app.core.gateway import ModelGatewayClient
+            from app.core.rewrite_gateway import build_rewrite_gateway_settings
+
+            rewrite_gs = build_rewrite_gateway_settings(get_settings())
+            if rewrite_gs is not None:
+                rewrite_gateway = ModelGatewayClient(settings=rewrite_gs)
+            else:
+                rewrite_gateway = getattr(runtime, "gateway", None)
+
             rewritten_query = await rewrite_syndrome_query(
                 input_payload.context_observations,
-                gateway=getattr(runtime, "gateway", None),
+                gateway=rewrite_gateway,
                 trace_id=run_spec.trace_id,
             )
             retrieved_evidence = tuple(

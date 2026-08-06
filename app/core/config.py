@@ -264,6 +264,28 @@ class Settings(BaseSettings):
         description="改写调用超时秒数（超时降级为原始 query）"
     )
 
+    # ---- Query 改写网关覆盖（可选，轻量模型专用） ----
+    # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 query 改写调用
+    # 未设置时回退到 runtime.gateway（主推理网关）
+    rag_query_rewrite_gateway_base_url: str = Field(
+        default="",
+        description="Query 改写专用网关地址（可选，未设置时回退 runtime.gateway）"
+    )
+    rag_query_rewrite_gateway_api_key: str = Field(
+        default="",
+        description="Query 改写专用网关 API 密钥（可选，未设置时回退 runtime.gateway）"
+    )
+    rag_query_rewrite_gateway_timeout_seconds: float = Field(
+        default=0,
+        ge=0,
+        description="改写网关超时（秒），0=回退 rag_query_rewrite_timeout_seconds"
+    )
+    rag_query_rewrite_gateway_max_retries: int = Field(
+        default=0,
+        ge=0,
+        description="改写网关最大重试次数，0=回退 model_gateway_max_retries"
+    )
+
     # ═══════════════════════════════════════════════════════════════
     # Reranker: Cross-Encoder / LLM Reranker
     # ═══════════════════════════════════════════════════════════════
