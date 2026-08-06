@@ -3,19 +3,19 @@
     "test": "health_llm_connection_reuse",
     "description": "LLM健康检查6轮 — 首轮新建TCP连接，后续复用连接池",
     "results": [
-      4.983,
-      2.561,
-      2.528,
-      0.996,
-      2.753,
-      0.881
+      2.137,
+      4.273,
+      8.454,
+      3.096,
+      2.12,
+      2.53
     ],
-    "first_vs_avg": "4.983s vs 1.944s"
+    "first_vs_avg": "2.137s vs 4.095s"
   },
   "concurrent": {
     "test": "concurrent_health",
     "description": "5个并发health/llm请求，利用连接池复用",
-    "total_seconds": 2.209,
+    "total_seconds": 3.574,
     "statuses": [
       200,
       200,
@@ -28,16 +28,37 @@
     "test": "embedding_cache_hit",
     "description": "同一 query 连续取 embedding，对比 miss(embedding 网关) vs hit(Redis)",
     "embedding_gateway_url": "https://www.dmxapi.cn/v1",
-    "miss_seconds": 1.64,
-    "hit_seconds": 0.004,
+    "miss_seconds": 0.482,
+    "hit_seconds": 0.005,
     "hit_ok": true,
-    "approx_speedup": 381.5
+    "approx_speedup": 89.2
+  },
+  "embedding_cache_hit_rate": {
+    "test": "embedding_cache_hit_rate",
+    "description": "20 条 query（60% 重复率）下 EmbeddingCache 命中率（TP2.7）",
+    "total_queries": 20,
+    "hits": 12,
+    "misses": 8,
+    "hit_rate": 0.6,
+    "miss_total_seconds": 4.371,
+    "hit_total_seconds": 0.0002,
+    "plan_gate_40pct": true
+  },
+  "concurrent_vector": {
+    "test": "concurrent_vector_retrieval",
+    "description": "8 路并发 _vector_search wall-clock 总耗时 vs 串行理论（TP3.1 to_thread）",
+    "single_seconds": 0.146,
+    "concurrent_8_seconds": 0.374,
+    "serial_theory_seconds": 1.167,
+    "speedup_factor": 3.12,
+    "successes": 8,
+    "shared_retriever": true
   },
   "metrics": {
     "test": "prometheus_metrics",
     "description": "Prometheus /api/v1/metrics 自定义指标曝光",
-    "metric_count": 70,
-    "total_xuanhu_lines": 112,
+    "metric_count": 84,
+    "total_xuanhu_lines": 130,
     "sample_metrics": [
       "xuanhu_rag_vector_search_seconds_bucket{le=\"0.01\"} 0.0",
       "xuanhu_rag_vector_search_seconds_bucket{le=\"0.05\"} 0.0",
@@ -52,7 +73,7 @@
       "xuanhu_rag_vector_search_seconds_bucket{le=\"+Inf\"} 0.0",
       "xuanhu_rag_vector_search_seconds_count 0.0",
       "xuanhu_rag_vector_search_seconds_sum 0.0",
-      "xuanhu_rag_vector_search_seconds_created 1.7859520133894472e+09",
+      "xuanhu_rag_vector_search_seconds_created 1.7860032882459273e+09",
       "xuanhu_rag_fulltext_search_seconds_bucket{le=\"0.01\"} 0.0"
     ]
   }
