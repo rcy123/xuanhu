@@ -351,6 +351,17 @@ _CLASSIFY_TRACE_CACHE: BoundedTTLCache[uuid.UUID, tuple[Any, ObservationSchema]]
     ttl_seconds=300,
 )
 
+# T1.3 状态下推：``_finalize_intake_route`` 四路由（ready/incomplete/conflict/manual）
+# 复用 ``run_intake_gates_node`` 已算好的 _IntakeComputation，避免重复跑 get_state +
+# reduce_domain_state + progress/pending_safety_dimensions 三个 DB round-trip。
+# LLM 调用（intake extraction 35-55s + classify 5-10s）已有 _INTAKE_OUTPUT_CACHE /
+# _CLASSIFY_TRACE_CACHE 去重；此处补的是 reduce + 3 DB 查询的 ~10-30ms 重算。
+# claim.id 为 key，TTL 与 _CLASSIFY_TRACE_CACHE 对齐（300s 覆盖 claim 生命周期）。
+_INTAKE_COMPUTATION_CACHE: BoundedTTLCache[uuid.UUID, _IntakeComputation] = BoundedTTLCache(
+    max_size=256,
+    ttl_seconds=300,
+)
+
 
 @dataclass(frozen=True)
 class _IntakeComputation:
@@ -1763,6 +1774,9 @@ async def run_intake_gates_node(state: XuanhuGraphState) -> dict[str, Any]:
                 },
             )
             return _sanitized_graph_error(state, code, "intake verification failed")
+        # T1.3 状态下推：把 gates 节点算好的完整 computation 留给四路由 finalize 复用
+        # （gate→finalize 之间无 commit，computation 不变可放心复用）。
+        _INTAKE_COMPUTATION_CACHE[claim.id] = computation
         intake_route = _route_for_disposition(computation.completeness_result.disposition)
         await _save_intermediate(
             claim.id,
@@ -1776,6 +1790,8 @@ async def run_intake_gates_node(state: XuanhuGraphState) -> dict[str, Any]:
                     "progress": computation.progress.model_dump(mode="json"),
                     "route": intake_route,
                     "output_state_version": computation.next_state.state_version,
+                    "classify_trace_payload": computation.classify_trace_payload,
+                    "pending_safety_dimensions": [d.value for d in computation.pending_safety_dimensions],
                 },
             },
             step="gates_and_route",
@@ -2735,29 +2751,33 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
         if state_route is not None and state_route != expected_route:
             return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "intake route does not match graph state")
 
-        try:
-            computation = await _compute_intake_from_claim(
-                claim,
-                patient_message,
-                _node_trace_id(state),
-                runner=runner,
-            )
-        except KeyError:
-            return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
-        except AgentTriggerFailedError as exc:
-            # 0d-2/1b: verify 校验失败不能 raise 崩图——标记 claim=failed(具体码可重试)。
-            code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
-            await runner._mark_claim_failed(  # noqa: SLF001
-                claim.id,
-                code,
-                failure_context={
-                    "failed_node": "verify_intake",
-                    "last_step": "verify_intake",
-                    "degraded": True,
-                    "last_failure_code": code,
-                },
-            )
-            return _sanitized_graph_error(state, code, "intake verification failed")
+        # T1.3 状态下推：优先复用 run_intake_gates_node 已算好的 _IntakeComputation；
+        # 缓存缺失（不同进程 resume / 进程内首次调用）回退重算，不破坏现有契约。
+        computation = _INTAKE_COMPUTATION_CACHE.get(claim.id)
+        if computation is None:
+            try:
+                computation = await _compute_intake_from_claim(
+                    claim,
+                    patient_message,
+                    _node_trace_id(state),
+                    runner=runner,
+                )
+            except KeyError:
+                return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+            except AgentTriggerFailedError as exc:
+                # 0d-2/1b: verify 校验失败不能 raise 崩图——标记 claim=failed(具体码可重试)。
+                code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+                await runner._mark_claim_failed(  # noqa: SLF001
+                    claim.id,
+                    code,
+                    failure_context={
+                        "failed_node": "verify_intake",
+                        "last_step": "verify_intake",
+                        "degraded": True,
+                        "last_failure_code": code,
+                    },
+                )
+                return _sanitized_graph_error(state, code, "intake verification failed")
         disposition = computation.completeness_result.disposition
         if _route_for_disposition(disposition) != expected_route:
             return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "intake route does not match recomputed gate")
