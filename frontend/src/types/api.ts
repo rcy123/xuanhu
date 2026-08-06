@@ -433,6 +433,7 @@ export interface SessionDetail {
   base_formula?: Formula | null
   modified_formula?: Formula | null
   modifications?: Modification[] | null
+  base_formula_alternatives?: BaseFormulaAlternative[] | null
   safety_review?: SafetyReview | null
   medical_record?: Record<string, unknown> | null
   created_at: string
@@ -526,6 +527,8 @@ export interface MessageListParams {
 export interface AdvanceRequest {
   target_stage?: string | null
   force?: boolean
+  /** P1 多方案：医师选择的基础方方案索引（0-based）。 */
+  alternative_index?: number | null
 }
 
 /** 阶段推进响应 data。 */
@@ -537,6 +540,9 @@ export interface AdvanceData {
   blocked_reason?: string | null
   agent_name?: string | null
   trace_id?: string | null
+  /** P1 多方案：候选方案已就绪，等待医师选择。 */
+  alternatives_ready?: boolean
+  alternatives_count?: number
 }
 
 /** 恢复中断会话请求体。 */
@@ -575,6 +581,21 @@ export interface Formula {
   composition: HerbItem[]
   source?: string | null
   rationale?: string | null
+}
+
+/** P1 多方案：基础方候选方案。 */
+export interface BaseFormulaAlternative {
+  index: number
+  angle: string
+  rationale: string
+  confidence: number
+  modification_query?: string | null
+  formula: {
+    name: string
+    composition: HerbItem[]
+    rationale?: string | null
+    basis?: string | null
+  }
 }
 
 /** 医师修改后的完整处方。composition 必填且至少一味药。 */

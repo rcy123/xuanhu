@@ -259,6 +259,7 @@ class SessionService:
             base_formula=projection.base_formula,
             modified_formula=projection.modified_formula,
             modifications=projection.modifications,
+            base_formula_alternatives=projection.base_formula_alternatives,
             created_at=session.created_at,
             updated_at=session.updated_at,
         )

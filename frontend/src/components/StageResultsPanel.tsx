@@ -32,6 +32,7 @@ import type {
   Severity,
   SafetyReview,
   SufficiencyMissingItem,
+  BaseFormulaAlternative,
 } from '@/types/api'
 
 const { Text } = Typography
@@ -43,6 +44,15 @@ interface StageResultsPanelProps {
   /** safety.blocked 事件携带的阻断信息。 */
   blockedIssues?: SafetyIssue[] | null
   rollbackTarget?: string | null
+  /** P1 多方案：候选基础方方案列表。 */
+  baseFormulaAlternatives?: BaseFormulaAlternative[] | null
+  /** P1 多方案：医师选择方案的回调。 */
+  onSelectAlternative?: (index: number) => void
+  /** P1 多方案：是否正在提交选择。 */
+  alternativeSubmitting?: boolean
+  /** P1 多方案：当前选中的方案索引（用于高亮）。 */
+  selectedAlternativeIndex?: number | null
+  onHoverAlternative?: (index: number | null) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +608,115 @@ function SafetyReviewCard({
 }
 
 // ---------------------------------------------------------------------------
+// P1 多方案：候选方案选择卡片
+// ---------------------------------------------------------------------------
+
+function AlternativeSelectionCard({
+  alternatives,
+  selectedIndex,
+  submitting,
+  onSelect,
+  onHover,
+}: {
+  alternatives: BaseFormulaAlternative[]
+  selectedIndex: number | null
+  submitting: boolean
+  onSelect: (index: number) => void
+  onHover?: (index: number | null) => void
+}) {
+  const herbColumns: ColumnsType<HerbItem> = [
+    { title: '药材', dataIndex: 'herb', key: 'herb' },
+    {
+      title: '剂量',
+      key: 'dose',
+      render: (_: unknown, r: HerbItem) => (r.dose != null ? `${r.dose}${r.unit ?? ''}` : '-'),
+    },
+    {
+      title: '备注',
+      dataIndex: 'note',
+      key: 'note',
+      render: (v: string | null | undefined) => v ?? '-',
+    },
+  ]
+
+  const confidenceColor = (c: number): 'green' | 'orange' | 'red' => {
+    if (c >= 0.7) return 'green'
+    if (c >= 0.5) return 'orange'
+    return 'red'
+  }
+
+  return (
+    <Card
+      size="small"
+      className="xh-summary-card xh-alternatives-card"
+      title={
+        <span>
+          <CheckCircleOutlined /> 请选择基础方案
+        </span>
+      }
+    >
+      <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+        AI 生成了 {alternatives.length} 套侧重不同的基础方案，请选择一套继续加减
+      </Text>
+      <div className="xh-alternatives-list">
+        {alternatives.map((alt) => {
+          const isSelected = selectedIndex === alt.index
+          return (
+            <Card
+              key={alt.index}
+              size="small"
+              className={`xh-alternative-item${isSelected ? ' is-selected' : ''}`}
+              onMouseEnter={() => onHover?.(alt.index)}
+              onMouseLeave={() => onHover?.(null)}
+              title={
+                <span>
+                  方案{alt.index + 1}：{alt.formula.name ?? '未命名方'}
+                </span>
+              }
+              extra={
+                <Tag color={confidenceColor(alt.confidence)}>
+                  置信度 {(alt.confidence * 100).toFixed(0)}%
+                </Tag>
+              }
+            >
+              <div className="xh-alternative-angle">
+                <Text strong>侧重：</Text>
+                <Text>{alt.angle}</Text>
+              </div>
+              <div className="xh-alternative-rationale">
+                <Text strong>方义：</Text>
+                <Text>{alt.rationale}</Text>
+              </div>
+              <div className="xh-alternative-composition">
+                <Text strong style={{ display: 'block', marginBottom: 4 }}>
+                  药味组成：
+                </Text>
+                <Table
+                  columns={herbColumns}
+                  dataSource={alt.formula.composition.map((item, idx) => ({ ...item, key: idx }))}
+                  pagination={false}
+                  size="small"
+                />
+              </div>
+              <div style={{ marginTop: 8, textAlign: 'right' }}>
+                <Button
+                  type={isSelected ? 'primary' : 'default'}
+                  disabled={submitting}
+                  loading={submitting && isSelected}
+                  onClick={() => onSelect(alt.index)}
+                >
+                  {isSelected ? '已选中' : '选择此方案'}
+                </Button>
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // 主组件
 // ---------------------------------------------------------------------------
 
@@ -606,19 +725,28 @@ export function StageResultsPanel({
   pendingReviewFormula,
   blockedIssues,
   rollbackTarget,
+  baseFormulaAlternatives,
+  onSelectAlternative,
+  alternativeSubmitting = false,
+  selectedAlternativeIndex = null,
+  onHoverAlternative,
 }: StageResultsPanelProps) {
   if (!detail) return null
+
+  const hasAlternatives =
+    baseFormulaAlternatives != null && baseFormulaAlternatives.length > 0
 
   const hasSufficiency = detail.sufficiency_report != null
   const hasSyndrome = detail.syndrome_result != null
   const hasFormula =
-    detail.base_formula != null ||
-    detail.modified_formula != null ||
-    pendingReviewFormula != null
+    !hasAlternatives &&
+    (detail.base_formula != null ||
+      detail.modified_formula != null ||
+      pendingReviewFormula != null)
   const hasSafety =
     detail.safety_review != null || blockedIssues != null
 
-  if (!hasSufficiency && !hasSyndrome && !hasFormula && !hasSafety) return null
+  if (!hasSufficiency && !hasSyndrome && !hasFormula && !hasSafety && !hasAlternatives) return null
 
   return (
     <div
@@ -630,6 +758,15 @@ export function StageResultsPanel({
       ) : null}
       {hasSyndrome ? (
         <SyndromeCard result={detail.syndrome_result!} />
+      ) : null}
+      {hasAlternatives ? (
+        <AlternativeSelectionCard
+          alternatives={baseFormulaAlternatives!}
+          selectedIndex={selectedAlternativeIndex}
+          submitting={alternativeSubmitting}
+          onSelect={(index) => onSelectAlternative?.(index)}
+          onHover={onHoverAlternative}
+        />
       ) : null}
       {hasFormula ? (
         <FormulaCard

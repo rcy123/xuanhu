@@ -42,6 +42,7 @@ from app.agent_runtime.formula_verifier import (
     FormulaVerificationReport,
 )
 from app.agent_runtime.reasoning_subgraph import (
+    ROUTE_ALTERNATIVES_READY,
     ROUTE_FORMULA_COMPLETED,
     ROUTE_MANUAL_REQUIRED,
     ROUTE_NEEDS_MORE_INFO,
@@ -122,6 +123,8 @@ from app.schemas.formula import (
     MODIFICATION_DRAFT_POLICY_VERSION,
     MODIFICATION_DRAFT_PROMPT_VERSION,
     MODIFICATION_DRAFT_RAG_PROMPT_VERSION,
+    BaseFormulaAlternative,
+    FormulaComposition,
     FormulaDraft,
     FormulaDraftDecision,
     FormulaDraftInput,
@@ -920,6 +923,75 @@ async def _run_formula_stage_with_retry(
     return result, consistency
 
 
+def _serialize_alternative(index: int, alt: BaseFormulaAlternative) -> dict[str, Any]:
+    """将 BaseFormulaAlternative 序列化为可持久化的 dict。
+
+    存储在 intermediate_payload / state_snapshot 中，供读模型和 resume 路径使用。
+    """
+    return {
+        "index": index,
+        "angle": alt.angle,
+        "rationale": alt.rationale,
+        "confidence": alt.confidence,
+        "modification_query": alt.modification_query,
+        "formula": alt.formula.model_dump(mode="json"),
+    }
+
+
+async def _save_alternatives_to_session_snapshot(
+    session_id: uuid.UUID,
+    serialized: list[dict[str, Any]],
+) -> None:
+    """将候选方案列表写入 ConsultSession.state_snapshot（独立事务）。"""
+    factory = get_session_factory()
+    async with factory() as db:
+        if db.in_transaction():
+            await db.rollback()
+        async with db.begin():
+            session = await db.get(ConsultSession, session_id, with_for_update=True)
+            if session is not None:
+                snapshot = dict(session.state_snapshot or {})
+                snapshot["formula_alternatives"] = serialized
+                session.state_snapshot = snapshot
+
+
+async def _reconstruct_selected_alternative(
+    db: AsyncSession,
+    claim: IntakeCommandClaim,
+    state: XuanhuGraphState,
+) -> BaseFormulaAlternative | None:
+    """从 session.state_snapshot 重建医师选中的方案。"""
+    session = await db.get(ConsultSession, claim.session_id)
+    if session is None:
+        return None
+    state_snapshot = session.state_snapshot or {}
+    if not isinstance(state_snapshot, dict):
+        return None
+    alternatives_data = state_snapshot.get("formula_alternatives")
+    if not alternatives_data or not isinstance(alternatives_data, list):
+        return None
+    formula_meta = (claim.intermediate_payload or {}).get("formula", {})
+    selected_index = formula_meta.get("selected_alternative_index")
+    if selected_index is None or not isinstance(selected_index, int):
+        return None
+    if selected_index < 0 or selected_index >= len(alternatives_data):
+        return None
+    selected_data = alternatives_data[selected_index]
+    if not isinstance(selected_data, dict):
+        return None
+    try:
+        selected_formula = FormulaComposition.model_validate(selected_data["formula"])
+    except Exception:
+        return None
+    return BaseFormulaAlternative(
+        formula=selected_formula,
+        angle=selected_data.get("angle", ""),
+        rationale=selected_data.get("rationale", ""),
+        confidence=selected_data.get("confidence", 0.0),
+        modification_query=selected_data.get("modification_query"),
+    )
+
+
 async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str, Any]:
     loaded = await _load_reasoning_claim(state)
     if isinstance(loaded, dict):
@@ -951,95 +1023,132 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             return _sanitized_graph_error(state, "FORMULA_CONTEXT_MISSING", "formula context authority is unavailable")
         feedback = await _load_review_feedback(claim.session_id)
         input_payload = _build_formula_input(authority, syndrome_result.output, feedback)
-        # ---- 2.8 阶段 1：基础方草稿（仅选方，不做加减）----
-        base_policy, base_prompt = _reasoning_policy("base_formula")
-        # preflight 强制 input.policy_version == run_spec.policy_version：
-        # 基础方阶段使用 base 专属 policy/prompt 配对。
-        input_payload = input_payload.model_copy(update={"policy_version": base_policy})
-        base_policy, base_prompt = _reasoning_policy("base_formula")
-        base_run_spec = RunSpec(
-            run_id=_commit_run_id(claim, "base_formula"),
-            session_id=claim.session_id,
-            state_version=input_payload.state_version,
-            stage=FORMULA_READY_STAGE,
-            agent_spec_version=BASE_FORMULA_AGENT_VERSION,
-            prompt_version=base_prompt,
-            policy_version=base_policy,
-            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
-            total_attempt_budget=1,
-            idempotency_key=f"{claim.idempotency_key}:base_formula",
-            trace_id=_node_trace_id(state),
-        )
-        base_stage = await _run_formula_stage_with_retry(
-            claim,
-            repository,
-            syndrome_result,
-            execute_base_formula_draft,
-            base_run_spec,
-            input_payload=input_payload,
-            agent_spec=build_base_formula_agent_spec(),
-            step_label="base_formula",
-        )
-        if base_stage is None:
-            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-            return {
-                "route": NODE_REASONING_SUBGRAPH_V1,
-                "reasoning_route": ROUTE_MANUAL_REQUIRED,
-                "last_error": None,
-            }
-        base_result, _ = base_stage
-        base_formula = base_result.output.base_formula
-        base_missing = _formula_missing_dimension(base_result.output)
-        if base_result.output.decision is not FormulaDraftDecision.COMPLETED or base_formula is None:
-            # 基础方阶段 needs_more_info/abstained：走与单步一致的缺失分支
-            if base_result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and base_missing is None:
+
+        # ---- 判断是否为医师选方后恢复 ----
+        formula_meta = (claim.intermediate_payload or {}).get("formula", {})
+        if formula_meta.get("phase") == "resume_after_selection":
+            # 恢复路径：从 session.state_snapshot 重建选中方案，跳过基础方
+            selected_alt = await _reconstruct_selected_alternative(db, claim, state)
+            if selected_alt is None:
+                return _sanitized_graph_error(
+                    state, "ALTERNATIVES_RECONSTRUCT_FAILED",
+                    "failed to reconstruct selected alternative from session state_snapshot",
+                )
+            alternatives = [selected_alt]
+            # _SYNDROME_RESULT_CACHE 可能在初次基础方阶段已填充，复用避免重复查询
+            _SYNDROME_RESULT_CACHE[claim.id] = syndrome_result
+        else:
+            # ---- 2.8 阶段 1：基础方草稿（仅选方，不做加减）----
+            base_policy, base_prompt = _reasoning_policy("base_formula")
+            # preflight 强制 input.policy_version == run_spec.policy_version：
+            # 基础方阶段使用 base 专属 policy/prompt 配对。
+            input_payload = input_payload.model_copy(update={"policy_version": base_policy})
+            base_policy, base_prompt = _reasoning_policy("base_formula")
+            base_run_spec = RunSpec(
+                run_id=_commit_run_id(claim, "base_formula"),
+                session_id=claim.session_id,
+                state_version=input_payload.state_version,
+                stage=FORMULA_READY_STAGE,
+                agent_spec_version=BASE_FORMULA_AGENT_VERSION,
+                prompt_version=base_prompt,
+                policy_version=base_policy,
+                deadline_at=_deadline(agent_model_timeout_seconds() + 15),
+                total_attempt_budget=1,
+                idempotency_key=f"{claim.idempotency_key}:base_formula",
+                trace_id=_node_trace_id(state),
+            )
+            base_stage = await _run_formula_stage_with_retry(
+                claim,
+                repository,
+                syndrome_result,
+                execute_base_formula_draft,
+                base_run_spec,
+                input_payload=input_payload,
+                agent_spec=build_base_formula_agent_spec(),
+                step_label="base_formula",
+            )
+            if base_stage is None:
+                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+                return {
+                    "route": NODE_REASONING_SUBGRAPH_V1,
+                    "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                    "last_error": None,
+                }
+            base_result, _ = base_stage
+            base_formula = base_result.output.base_formula
+            base_missing = _formula_missing_dimension(base_result.output)
+            if base_result.output.decision is not FormulaDraftDecision.COMPLETED or base_formula is None:
+                # 基础方阶段 needs_more_info/abstained：走与单步一致的缺失分支
+                if base_result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and base_missing is None:
+                    await _save_intermediate(
+                        claim.id,
+                        {
+                            "formula": {
+                                "stage": "base_formula",
+                                "decision": base_result.output.decision.value,
+                                "failure_code": "FORMULA_MISSING_INPUT_UNMAPPED",
+                            }
+                        },
+                        step="draft_formula",
+                    )
+                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
+                return {
+                    "route": NODE_REASONING_SUBGRAPH_V1,
+                    "reasoning_route": ROUTE_MANUAL_REQUIRED,
+                    "last_error": None,
+                }
+
+            # ---- P1: 提取并筛选候选方案 ----
+            raw_alternatives = base_result.alternatives  # P1: alternatives 在 FormulaExecutionResult 上，不在已装配的 FormulaDraft 上
+            if raw_alternatives:
+                settings = get_settings()
+                alternatives = list(filter_alternatives(
+                    raw_alternatives,
+                    threshold=settings.base_formula_confidence_threshold,
+                    min_keep=settings.base_formula_min_alternatives,
+                    max_keep=settings.base_formula_max_alternatives,
+                ))
+            else:
+                # 降级：模型只输出了 1 套方案（兼容旧 prompt 行为）
+                alternatives = [
+                    BaseFormulaAlternative(
+                        formula=base_formula,
+                        angle="默认方案",
+                        rationale=base_result.output.rationale or "",
+                        confidence=base_result.output.confidence,
+                    )
+                ]
+
+            # ---- P1 多方案：暂停等待医师选择 ----
+            if len(alternatives) > 1:
+                serialized = [_serialize_alternative(i, alt) for i, alt in enumerate(alternatives)]
                 await _save_intermediate(
                     claim.id,
                     {
                         "formula": {
-                            "stage": "base_formula",
-                            "decision": base_result.output.decision.value,
-                            "failure_code": "FORMULA_MISSING_INPUT_UNMAPPED",
+                            "phase": "awaiting_alternative_selection",
+                            "alternatives": serialized,
+                            "alternatives_count": len(alternatives),
                         }
                     },
                     step="draft_formula",
                 )
-            _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
-            return {
-                "route": NODE_REASONING_SUBGRAPH_V1,
-                "reasoning_route": ROUTE_MANUAL_REQUIRED,
-                "last_error": None,
-            }
-
-        # ---- P1: 提取并筛选候选方案 ----
-        from app.schemas.formula import BaseFormulaAlternative as BFA
-
-        raw_alternatives = base_result.alternatives  # P1: alternatives 在 FormulaExecutionResult 上，不在已装配的 FormulaDraft 上
-        if raw_alternatives:
-            settings = get_settings()
-            alternatives = filter_alternatives(
-                raw_alternatives,
-                threshold=settings.base_formula_confidence_threshold,
-                min_keep=settings.base_formula_min_alternatives,
-                max_keep=settings.base_formula_max_alternatives,
-            )
-        else:
-            # 降级：模型只输出了 1 套方案（兼容旧 prompt 行为）
-            alternatives = [
-                BFA(
-                    formula=base_formula,
-                    angle="默认方案",
-                    rationale=base_result.output.rationale or "",
-                    confidence=base_result.output.confidence,
-                )
-            ]
+                # 同时写入 session.state_snapshot，供 resume 路径跨 claim 读取
+                # 使用独立事务确保写持久化（当前 db session 无自动提交）
+                await _save_alternatives_to_session_snapshot(claim.session_id, serialized)
+                _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_ALTERNATIVES_READY
+                return {
+                    "route": NODE_REASONING_SUBGRAPH_V1,
+                    "reasoning_route": ROUTE_ALTERNATIVES_READY,
+                    "last_error": None,
+                }
 
         # ---- 2.8 阶段 2：并行加减草稿（每套通过筛选的方案一个）----
         mod_policy, mod_prompt = _reasoning_policy("modification")
 
         async def _run_mod_for_alternative(
             i: int,
-            alt: BFA,
+            alt: BaseFormulaAlternative,
         ) -> tuple[int, FormulaExecutionResult | None, FormulaConsistencyReport | None]:
             mod_input = ModificationDraftInput(
                 schema_version=MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION,
@@ -1300,6 +1409,55 @@ async def run_reasoning_manual_required_node(state: XuanhuGraphState) -> dict[st
             "route": NODE_REASONING_SUBGRAPH_V1,
             "reasoning_route": ROUTE_MANUAL_REQUIRED,
             "domain_state_version": output_state_version,
+            "gate_results": response["gate_results"],
+            "last_error": None,
+        }
+    finally:
+        await db.close()
+
+
+async def run_reasoning_alternatives_ready_node(state: XuanhuGraphState) -> dict[str, Any]:
+    """Complete the claim with an alternatives_ready response.
+
+    The reasoning subgraph pauses here — session stays at syndrome stage,
+    and the doctor chooses which alternative to use before modification runs.
+    """
+    loaded = await _load_reasoning_claim(state)
+    if isinstance(loaded, dict):
+        return loaded
+    db, claim = loaded
+    try:
+        completed = await _completed_graph_update(claim)
+        if completed is not None:
+            return completed
+        repository = PostgresDomainRepository(get_session_factory())
+        domain_state = await repository.get_state(claim.session_id)
+        response = _response_payload(
+            session_id=claim.session_id,
+            current_stage="syndrome",
+            from_stage="syndrome",
+            state_version=domain_state.state_version,
+            blocked_reason=None,
+            trace_id=_node_trace_id(state),
+            route=NODE_REASONING_SUBGRAPH_V1,
+            artifact_refs=[],
+            gate_results=[
+                {
+                    "gate_name": "reasoning_alternatives_ready",
+                    "decision": "passed",
+                    "policy_version": "reasoning-branch-policy.v1",
+                }
+            ],
+        )
+        response["alternatives_ready"] = True
+        formula_meta = (claim.intermediate_payload or {}).get("formula", {})
+        response["alternatives_count"] = formula_meta.get("alternatives_count", 0)
+        await _complete_claim(claim.id, response, domain_state.state_version)
+        return {
+            "route": NODE_REASONING_SUBGRAPH_V1,
+            "reasoning_route": ROUTE_ALTERNATIVES_READY,
+            "domain_state_version": domain_state.state_version,
+            "artifact_refs": [],
             "gate_results": response["gate_results"],
             "last_error": None,
         }
@@ -2295,6 +2453,8 @@ def _graph_update_from_response(response: dict[str, Any]) -> dict[str, Any]:
         "reasoning_route": (
             ROUTE_FORMULA_COMPLETED
             if response.get("current_stage") == "safety"
+            else ROUTE_ALTERNATIVES_READY
+            if response.get("alternatives_ready")
             else ROUTE_NEEDS_MORE_INFO
             if response.get("current_stage") == "inquiry"
             else ROUTE_MANUAL_REQUIRED

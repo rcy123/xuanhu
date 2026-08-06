@@ -17,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.repository import artifact_payload_digest
 from app.models.consult import ConsultSession
-from app.models.domain import ArtifactRevision, ArtifactRevisionPayload, GateResult, GraphRun, SafetyFactAssertion
+from app.models.domain import (
+    ArtifactRevision,
+    ArtifactRevisionPayload,
+    GateResult,
+    GraphRun,
+    IntakeCommandClaim,
+    SafetyFactAssertion,
+)
 from app.schemas.formula import FormulaComposition, FormulaDraft
 from app.schemas.session_read_model import (
     SessionArtifactReadModelV1,
@@ -617,6 +624,12 @@ class SessionReadModelService:
             gates=gate_rows,
             artifacts=artifact_rows,
         )
+
+        # ---- P1 多方案：从 IntakeCommandClaim.intermediate_payload 读取候选方案 ----
+        base_formula_alternatives = await self._load_alternatives_from_claim(session.id)
+        if base_formula_alternatives is not None:
+            projection = projection.model_copy(update={"base_formula_alternatives": base_formula_alternatives})
+
         pending_fields = tuple(
             sorted(
                 set(
@@ -632,6 +645,38 @@ class SessionReadModelService:
         if not pending_fields:
             return projection
         return _merge_pending_safety_assertions(projection, pending_fields)
+
+    async def _load_alternatives_from_claim(
+        self, session_id: uuid.UUID
+    ) -> list[dict[str, Any]] | None:
+        """从最近一条 IntakeCommandClaim 的 intermediate_payload 读取候选方案。
+
+        仅当 phase == "awaiting_alternative_selection" 时返回 alternatives 列表；
+        否则返回 None（前端不渲染选择卡片）。
+        """
+        claim = await self._db.scalar(
+            select(IntakeCommandClaim)
+            .where(
+                IntakeCommandClaim.session_id == session_id,
+                IntakeCommandClaim.status == "completed",
+            )
+            .order_by(IntakeCommandClaim.updated_at.desc())
+            .limit(1)
+        )
+        if claim is None:
+            return None
+        intermediate = claim.intermediate_payload or {}
+        if not isinstance(intermediate, dict):
+            return None
+        formula_meta = intermediate.get("formula")
+        if not isinstance(formula_meta, dict):
+            return None
+        if formula_meta.get("phase") != "awaiting_alternative_selection":
+            return None
+        alternatives = formula_meta.get("alternatives")
+        if not isinstance(alternatives, list) or len(alternatives) == 0:
+            return None
+        return alternatives
 
 
 __all__ = [

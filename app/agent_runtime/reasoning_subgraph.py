@@ -30,9 +30,11 @@ NODE_REASONING_VERIFY_FORMULA = "reasoning.verify_formula_consistency"
 NODE_REASONING_INVALIDATE_DOWNSTREAM = "reasoning.invalidate_downstream"
 NODE_REASONING_MANUAL_REQUIRED = "reasoning.manual_required"
 NODE_REASONING_READY_FOR_SAFETY = "reasoning.ready_for_safety"
+NODE_REASONING_ALTERNATIVES_READY = "reasoning.alternatives_ready"
 
 ROUTE_SYNDROME_COMPLETED = "syndrome_completed"
 ROUTE_FORMULA_COMPLETED = "formula_completed"
+ROUTE_ALTERNATIVES_READY = "alternatives_ready"
 ROUTE_NEEDS_MORE_INFO = "needs_more_info"
 ROUTE_MANUAL_REQUIRED = "manual_required"
 
@@ -113,6 +115,12 @@ async def _manual_required_node(state: XuanhuGraphState) -> dict[str, Any]:
     return await run_reasoning_manual_required_node(state)
 
 
+async def _alternatives_ready_node(state: XuanhuGraphState) -> dict[str, Any]:
+    from app.services.langgraph_reasoning import run_reasoning_alternatives_ready_node
+
+    return await run_reasoning_alternatives_ready_node(state)
+
+
 async def _ready_for_safety_node(state: XuanhuGraphState) -> dict[str, Any]:
     from app.services.langgraph_reasoning import run_reasoning_ready_for_safety_node
 
@@ -132,6 +140,8 @@ def _route_after_formula(state: XuanhuGraphState) -> str:
     route = state.get("reasoning_route")
     if route == ROUTE_FORMULA_COMPLETED:
         return NODE_REASONING_READY_FOR_SAFETY
+    if route == ROUTE_ALTERNATIVES_READY:
+        return NODE_REASONING_ALTERNATIVES_READY
     if route == ROUTE_NEEDS_MORE_INFO:
         return NODE_REASONING_INVALIDATE_DOWNSTREAM
     return NODE_REASONING_MANUAL_REQUIRED
@@ -168,6 +178,7 @@ def build_reasoning_subgraph(
     graph.add_node(NODE_REASONING_INVALIDATE_DOWNSTREAM, _invalidate_downstream_node)
     graph.add_node(NODE_REASONING_MANUAL_REQUIRED, _manual_required_node)
     graph.add_node(NODE_REASONING_READY_FOR_SAFETY, _ready_for_safety_node)
+    graph.add_node(NODE_REASONING_ALTERNATIVES_READY, _alternatives_ready_node)
 
     graph.add_edge(START, NODE_REASONING_PRECHECK)
     graph.add_edge(NODE_REASONING_PRECHECK, NODE_REASONING_BUILD_SYNDROME_CONTEXT)
@@ -189,10 +200,12 @@ def build_reasoning_subgraph(
         _route_after_formula,
         {
             NODE_REASONING_READY_FOR_SAFETY: NODE_REASONING_READY_FOR_SAFETY,
+            NODE_REASONING_ALTERNATIVES_READY: NODE_REASONING_ALTERNATIVES_READY,
             NODE_REASONING_INVALIDATE_DOWNSTREAM: NODE_REASONING_INVALIDATE_DOWNSTREAM,
             NODE_REASONING_MANUAL_REQUIRED: NODE_REASONING_MANUAL_REQUIRED,
         },
     )
+    graph.add_edge(NODE_REASONING_ALTERNATIVES_READY, END)
     graph.add_edge(NODE_REASONING_INVALIDATE_DOWNSTREAM, END)
     graph.add_edge(NODE_REASONING_MANUAL_REQUIRED, END)
     graph.add_edge(NODE_REASONING_READY_FOR_SAFETY, END)

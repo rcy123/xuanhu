@@ -2703,6 +2703,76 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * P1 多方案：候选方案选择卡片
+ * --------------------------------------------------------------------------- */
+
+.xh-alternatives-card .ant-card-body {
+  display: grid;
+  gap: 12px;
+}
+
+.xh-alternatives-list {
+  display: grid;
+  gap: 10px;
+}
+
+.xh-alternative-item {
+  border: 1px solid var(--xh-border);
+  border-radius: 9px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.xh-alternative-item:hover {
+  border-color: var(--xh-primary);
+  box-shadow: 0 0 0 2px var(--xh-primary-soft);
+}
+
+.xh-alternative-item.is-selected {
+  border-color: var(--xh-primary);
+  box-shadow: 0 0 0 2px var(--xh-primary-soft);
+  background: var(--xh-primary-soft);
+}
+
+.xh-alternative-item .ant-card-head {
+  border-bottom: 1px solid var(--xh-border);
+  min-height: auto;
+  padding: 8px 11px;
+}
+
+.xh-alternative-item .ant-card-body {
+  padding: 11px;
+  display: grid;
+  gap: 8px;
+}
+
+.xh-alternative-angle {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.xh-alternative-rationale {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--xh-text-secondary);
+  max-height: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.xh-alternative-composition {
+  font-size: 12px;
+}
+
+.xh-alternative-composition .ant-table {
+  font-size: 12px;
+}
+
+.xh-alternative-composition .ant-table-cell {
+  padding: 3px 8px !important;
+  font-size: 12px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

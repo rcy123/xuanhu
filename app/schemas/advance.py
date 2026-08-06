@@ -14,6 +14,7 @@ class AdvanceRequest(BaseModel):
 
     - target_stage: 指定目标阶段，不传则由 Supervisor 自动判断
     - force: 是否强制推进（仅允许在完备性阶段 sufficient=false 时使用）
+    - alternative_index: 医师选择的基础方方案索引（0-3），用于多方案选方阶段
     """
 
     target_stage: str | None = Field(
@@ -23,4 +24,10 @@ class AdvanceRequest(BaseModel):
     force: bool = Field(
         default=False,
         description="是否强制推进（仅完备性不足时可用）",
+    )
+    alternative_index: int | None = Field(
+        default=None,
+        ge=0,
+        le=3,
+        description="医师选择的基础方方案索引（0-based，对应 alternatives 列表顺序）",
     )

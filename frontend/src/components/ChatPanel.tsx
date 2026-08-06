@@ -20,7 +20,7 @@ import {
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import { useSessionStream } from '@/hooks/useSessionStream'
-import type { Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest } from '@/types/api'
+import type { Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest, BaseFormulaAlternative } from '@/types/api'
 import { StepBar } from './StepBar'
 import { MessageList } from './MessageList'
 import { MessageInput } from './MessageInput'
@@ -37,9 +37,10 @@ import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
 import { ThinkingHint } from './ThinkingHint'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { langGraphDisposition } from '@/utils/agent'
-import { reviewPrescription, getRecord, updateRecord, exportRecord } from '@/api/index'
+import { reviewPrescription, getRecord, updateRecord, exportRecord, advanceSession } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
+import { generateIdempotencyKey } from '@/utils/id'
 
 const { Text, Title } = Typography
 
@@ -55,6 +56,11 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null)
   const [contextOpen, setContextOpen] = useState(false)
   const [pendingSafetyCount, setPendingSafetyCount] = useState<number | null>(null)
+  // P1 多方案：候选方案状态
+  const [baseFormulaAlternatives, setBaseFormulaAlternatives] = useState<BaseFormulaAlternative[] | null>(null)
+  const [alternativeSubmitting, setAlternativeSubmitting] = useState(false)
+  const [selectedAlternativeIndex, setSelectedAlternativeIndex] = useState<number | null>(null)
+  const [alternativeError, setAlternativeError] = useState<string | null>(null)
 
   const { detail, loading, error, selectSession, refreshDetail } = detailHook
   const {
@@ -176,6 +182,51 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const handleSessionTerminated = useCallback(() => {
     void refreshDetail()
   }, [refreshDetail])
+
+  // P1 多方案：从 detail 同步候选方案到本地状态
+  useEffect(() => {
+    const alts = detail?.base_formula_alternatives
+    if (alts && alts.length > 0) {
+      setBaseFormulaAlternatives(alts)
+      setAlternativeError(null)
+    } else {
+      setBaseFormulaAlternatives(null)
+      setSelectedAlternativeIndex(null)
+    }
+  }, [detail?.base_formula_alternatives, detail?.state_version])
+
+  // P1 多方案：医师选择方案
+  const handleSelectAlternative = useCallback(
+    async (index: number) => {
+      if (!sessionId || !detail) return
+      setSelectedAlternativeIndex(index)
+      setAlternativeSubmitting(true)
+      setAlternativeError(null)
+      try {
+        await advanceSession(
+          sessionId,
+          { alternative_index: index },
+          { idempotencyKey: generateIdempotencyKey(), stateVersion: detail.state_version },
+        )
+        // 选择后立即刷新：后端会走 resume 路径，完成后推进到 safety/review
+        setBaseFormulaAlternatives(null)
+        setSelectedAlternativeIndex(null)
+        await refreshDetail()
+        if (sessionId) await loadMessages(sessionId)
+      } catch (err) {
+        const apiErr = err instanceof ApiRequestError ? err : null
+        setAlternativeError(apiErr?.message ?? '方案选择失败，请重试')
+        setSelectedAlternativeIndex(null)
+      } finally {
+        setAlternativeSubmitting(false)
+      }
+    },
+    [sessionId, detail, refreshDetail, loadMessages],
+  )
+
+  const handleHoverAlternative = useCallback((index: number | null) => {
+    // 预留 hover 交互（如高亮对应药味对比）
+  }, [])
 
   const streamHook = useSessionStream({
     sessionId,
@@ -639,6 +690,14 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 <ErrorBanner error={error} onRetry={refreshDetail} />
               </div>
             ) : null}
+            {alternativeError ? (
+              <div className="xh-inline-feedback">
+                <ErrorBanner
+                  error={new ApiRequestError(alternativeError, 500, 'ALTERNATIVE_SELECTION_FAILED')}
+                  onRetry={() => setAlternativeError(null)}
+                />
+              </div>
+            ) : null}
             {loading && !detail ? (
               <div className="xh-centered-state xh-detail-loading">
                 <Spin />
@@ -723,6 +782,11 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                 pendingReviewFormula={effectivePendingFormula}
                 blockedIssues={blockedIssues}
                 rollbackTarget={rollbackTarget}
+                baseFormulaAlternatives={baseFormulaAlternatives}
+                onSelectAlternative={handleSelectAlternative}
+                alternativeSubmitting={alternativeSubmitting}
+                selectedAlternativeIndex={selectedAlternativeIndex}
+                onHoverAlternative={handleHoverAlternative}
               />
               {detail ? (
                 <LangGraphAdvanceBar

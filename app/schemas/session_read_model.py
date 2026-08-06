@@ -107,6 +107,7 @@ class SessionReadProjection(BaseModel):
     base_formula: dict[str, Any] | None = None
     modified_formula: dict[str, Any] | None = None
     modifications: list[dict[str, Any]] | None = None
+    base_formula_alternatives: list[dict[str, Any]] | None = None
 
 
 __all__ = [

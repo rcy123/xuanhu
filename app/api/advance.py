@@ -593,6 +593,7 @@ async def _run_langgraph_advance(
     trace_id: str,
     force: bool = False,
     idempotency_key: str | None = None,
+    alternative_index: int | None = None,
     shared_runtime: SharedLangGraphRuntime | None = None,
     allow_request_local_runtime: bool = False,
 ) -> dict[str, Any]:
@@ -825,7 +826,7 @@ async def _run_langgraph_advance(
                     trace_id=trace_id,
                 )
             )
-            intermediate_payload = {
+            intermediate_payload: dict[str, Any] = {
                 "advance": {
                     "from_stage": from_stage,
                     "trace_id": trace_id,
@@ -833,6 +834,11 @@ async def _run_langgraph_advance(
                     "source_gate_state_version": gate_state_version,
                 }
             }
+            if alternative_index is not None:
+                intermediate_payload["formula"] = {
+                    "phase": "resume_after_selection",
+                    "selected_alternative_index": alternative_index,
+                }
             if existing is None:
                 db.add(
                     IntakeCommandClaim(
@@ -1034,6 +1040,7 @@ async def advance_session(
                 trace_id=trace_id,
                 force=body.force,
                 idempotency_key=internal_key,
+                alternative_index=body.alternative_index if attempt == 0 else None,
                 shared_runtime=shared_runtime,
                 allow_request_local_runtime=test_runtime_fallback,
             )

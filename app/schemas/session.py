@@ -107,6 +107,7 @@ class SessionDetailResponse(BaseModel):
     base_formula: dict[str, Any] | None = None
     modified_formula: dict[str, Any] | None = None
     modifications: list[dict[str, Any]] | None = None
+    base_formula_alternatives: list[dict[str, Any]] | None = None
     safety_review: dict[str, Any] | None = None
     medical_record: dict[str, Any] | None = None
     created_at: datetime
