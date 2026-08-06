@@ -56,6 +56,7 @@ from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY
 from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus, GateDecision, ObservationStatus
 from app.schemas.formula import (
     FORMULA_EVIDENCE_MODE,
+    BaseFormulaDraft,
     FormulaComposition,
     FormulaDraft,
     FormulaDraftDecision,
@@ -63,6 +64,7 @@ from app.schemas.formula import (
     FormulaModification,
     HerbItem,
     ModificationAction,
+    ModificationDraft,
 )
 from app.schemas.syndrome import (
     SYNDROME_EVIDENCE_MODE,
@@ -376,6 +378,88 @@ def _formula_needs_more_info(raw: str = "sleep") -> FormulaDraft:
         decision=FormulaDraftDecision.NEEDS_MORE_INFO,
         confidence=0.2,
         missing_inputs=(raw,),
+        review_required=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2.8 两阶段开方 helpers — BaseFormulaDraft / ModificationDraft
+# ---------------------------------------------------------------------------
+
+
+def _base_formula_completed(fact_ids: tuple[uuid.UUID, ...]) -> BaseFormulaDraft:
+    base = FormulaComposition(
+        name="Test Formula",
+        composition=(
+            HerbItem(herb="Chuanxiong", dose=10.0, unit="g"),
+            HerbItem(herb="Jingjie", dose=10.0, unit="g"),
+        ),
+        rationale="release exterior and relieve pain",
+        basis=(FormulaFactClaim(claim="syndrome and symptoms support base formula", fact_ids=fact_ids),),
+    )
+    return BaseFormulaDraft(
+        decision=FormulaDraftDecision.COMPLETED,
+        base_formula=base,
+        rationale="release exterior and relieve pain",
+        confidence=0.55,
+        evidence_mode=FORMULA_EVIDENCE_MODE,
+        claim_evidence_links=(),
+        missing_inputs=(),
+        review_required=True,
+    )
+
+
+def _base_formula_needs_more_info(raw: str = "sleep") -> BaseFormulaDraft:
+    return BaseFormulaDraft(
+        decision=FormulaDraftDecision.NEEDS_MORE_INFO,
+        confidence=0.2,
+        missing_inputs=(raw,),
+        review_required=True,
+    )
+
+
+def _base_formula_abstained() -> BaseFormulaDraft:
+    return BaseFormulaDraft(
+        decision=FormulaDraftDecision.ABSTAINED,
+        confidence=0.1,
+        review_required=True,
+    )
+
+
+def _modification_completed(fact_ids: tuple[uuid.UUID, ...]) -> ModificationDraft:
+    add_herb = FormulaModification(
+        action=ModificationAction.ADD,
+        herb="Baizhi",
+        dose=10.0,
+        unit="g",
+        reason="headache remains prominent",
+        basis=FormulaFactClaim(claim="headache supports adding Baizhi", fact_ids=(fact_ids[0],)),
+    )
+    return ModificationDraft(
+        decision=FormulaDraftDecision.COMPLETED,
+        modifications=(add_herb,),
+        rationale="candidate follows the syndrome treatment principle",
+        confidence=0.55,
+        evidence_mode=FORMULA_EVIDENCE_MODE,
+        claim_evidence_links=(),
+        missing_inputs=(),
+        review_required=True,
+    )
+
+
+def _modification_needs_more_info(raw: str = "sleep") -> ModificationDraft:
+    return ModificationDraft(
+        decision=FormulaDraftDecision.NEEDS_MORE_INFO,
+        confidence=0.2,
+        missing_inputs=(raw,),
+        review_required=True,
+    )
+
+
+def _modification_abstained() -> ModificationDraft:
+    return ModificationDraft(
+        decision=FormulaDraftDecision.ABSTAINED,
+        confidence=0.1,
         review_required=True,
     )
 
@@ -850,7 +934,7 @@ async def test_persisted_payload_uses_trusted_run_artifact_for_syndrome_and_form
     monkeypatch.setattr(reasoning_module, "_commit_formula_artifact", spy_formula_commit)
     # 2.8 两阶段开方：syndrome(1) + base_formula(1) + modification(1) 共 3 次模型调用
     gateway = _ReasoningFakeGateway(
-        [_syndrome_completed(fact_ids), _formula_completed(fact_ids), _formula_completed(fact_ids)]
+        [_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)]
     )
     _install_gateway(monkeypatch, gateway)
 
@@ -1025,7 +1109,7 @@ async def test_formula_route_rejects_any_run_artifact_provenance_tamper(
 ) -> None:
     repository, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1136,7 +1220,7 @@ async def test_formula_consumer_failure_does_not_write_formula_payload(
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
     monkeypatch.setattr(reasoning_module, "_consume_trusted_formula_execution", lambda result: None)
 
@@ -1152,7 +1236,7 @@ async def test_formula_consumer_failure_does_not_write_formula_payload(
         )
 
     assert response["current_stage"] == "blocked"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         formula_count = await db.scalar(
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "formula_draft")
@@ -1168,7 +1252,7 @@ async def test_langgraph_advance_completes_reasoning_without_safety_execution(
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1185,7 +1269,7 @@ async def test_langgraph_advance_completes_reasoning_without_safety_execution(
     assert response["current_stage"] == "safety"
     assert response["route"] == NODE_REASONING_SUBGRAPH_V1
     assert response["gate_results"][0]["gate_name"] == "ready_for_safety"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         session = await db.get(ConsultSession, session_id)
         assert session is not None and session.current_stage == "safety"
@@ -1294,7 +1378,7 @@ async def test_formula_needs_more_info_invalidates_current_artifacts_and_returns
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_needs_more_info("sleep")])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_needs_more_info("sleep")])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1336,7 +1420,7 @@ async def test_formula_abstained_routes_to_manual_required(
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_abstained()])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_abstained()])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1352,7 +1436,7 @@ async def test_formula_abstained_routes_to_manual_required(
 
     assert response["current_stage"] == "blocked"
     assert response["blocked_reason"] == "reasoning_manual_required"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
 
 
 async def test_formula_verifier_failure_routes_to_manual_required_without_formula_artifact(
@@ -1361,8 +1445,8 @@ async def test_formula_verifier_failure_routes_to_manual_required_without_formul
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    invalid_formula = _formula_completed(fact_ids).model_copy(update={"confidence": 0.95})
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), invalid_formula])
+    invalid_modification = _modification_completed(fact_ids).model_copy(update={"confidence": 0.95})
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), invalid_modification])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1377,7 +1461,7 @@ async def test_formula_verifier_failure_routes_to_manual_required_without_formul
         )
 
     assert response["current_stage"] == "blocked"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         formula_count = await db.scalar(
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "formula_draft")
@@ -1391,7 +1475,14 @@ async def test_formula_consistency_failure_routes_to_manual_required_without_for
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_consistency_mismatch(fact_ids)])
+    invalid_modification = ModificationDraft(
+        decision=FormulaDraftDecision.COMPLETED,
+        modifications=(FormulaModification(action=ModificationAction.REMOVE, herb="NonExistentHerb", reason="remove non-existent", basis=FormulaFactClaim(claim="test", fact_ids=(fact_ids[0],))),),
+        confidence=0.55,
+        evidence_mode=FORMULA_EVIDENCE_MODE,
+        review_required=True,
+    )
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), invalid_modification])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1406,7 +1497,7 @@ async def test_formula_consistency_failure_routes_to_manual_required_without_for
         )
 
     assert response["current_stage"] == "blocked"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         formula_count = await db.scalar(
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "formula_draft")
@@ -1432,15 +1523,15 @@ async def test_formula_schema_invalid_retries_then_succeeds(
     session_id, _, fact_ids = await _ready_session(factory)
 
     class _SchemaRetryGateway(_ReasoningFakeGateway):
-        def __init__(self, syndrome: BaseModel, formula: BaseModel) -> None:
-            super().__init__([syndrome, formula])
-            self.failed_formula_parse = False
+        def __init__(self, syndrome: BaseModel, base_formula: BaseModel, modification: BaseModel) -> None:
+            super().__init__([syndrome, base_formula, modification])
+            self.failed_base_parse = False
 
         async def chat_structured(self, messages, output_schema, **kwargs):
             self.calls.append(output_schema)
-            if output_schema is FormulaDraft and not self.failed_formula_parse:
-                # 首次开方：模型输出无法解析成 FormulaDraft → 网关抛解析异常。
-                self.failed_formula_parse = True
+            if output_schema is BaseFormulaDraft and not self.failed_base_parse:
+                # 首次基础方：模型输出无法解析成 BaseFormulaDraft → 网关抛解析异常。
+                self.failed_base_parse = True
                 raise ChatStructuredParseError("structured output invalid")
             if not self.outcomes:
                 raise AssertionError(f"unexpected model call for {output_schema.__name__}")
@@ -1449,7 +1540,7 @@ async def test_formula_schema_invalid_retries_then_succeeds(
                 raise AssertionError(f"expected {type(outcome).__name__}, got {output_schema.__name__}")
             return outcome
 
-    gateway = _SchemaRetryGateway(_syndrome_completed(fact_ids), _formula_completed(fact_ids))
+    gateway = _SchemaRetryGateway(_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids))
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1463,9 +1554,9 @@ async def test_formula_schema_invalid_retries_then_succeeds(
             trace_id="l4-4-schema-retry",
         )
 
-    # 重试成功：FormulaDraft 被调用两次（首次失败 + 重试成功）。
+    # 重试成功：BaseFormulaDraft 被调用两次（首次失败 + 重试成功），ModificationDraft 一次。
     assert response["current_stage"] == "safety"
-    assert gateway.calls == [SyndromeDraft, FormulaDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         formula_count = await db.scalar(
             select(func.count()).select_from(ArtifactRevision).where(
@@ -1507,7 +1598,7 @@ async def test_recovery_after_syndrome_rebuilds_from_payload_without_second_synd
                 run_id=run_id,
             )
         )
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
     state = _graph_state(session_id, command_key, run_id)
 
@@ -1521,7 +1612,7 @@ async def test_recovery_after_syndrome_rebuilds_from_payload_without_second_synd
         runner = GraphRunner(graph, timeout_seconds=120)
         await runner.ainvoke(state, config=make_run_config(str(session_id)))
 
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
     async with factory() as db:
         session = await db.get(ConsultSession, session_id)
         assert session is not None and session.current_stage == "safety"
@@ -1533,7 +1624,7 @@ async def test_concurrent_same_advance_command_does_not_duplicate_model_calls(
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
 
     async def invoke(trace_id: str) -> dict[str, Any] | BaseException:
@@ -1562,7 +1653,7 @@ async def test_concurrent_same_advance_command_does_not_duplicate_model_calls(
     assert len(responses) == 2
     assert not errors
     assert responses[0] == responses[1]
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
 
 
 async def test_completed_advance_command_replay_returns_cached_response_without_model_calls(
@@ -1571,7 +1662,7 @@ async def test_completed_advance_command_replay_returns_cached_response_without_
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_completed(fact_ids)])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_completed(fact_ids)])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1595,7 +1686,7 @@ async def test_completed_advance_command_replay_returns_cached_response_without_
         )
 
     assert first == second
-    assert gateway.calls == [SyndromeDraft, FormulaDraft]
+    assert gateway.calls == [SyndromeDraft, BaseFormulaDraft, ModificationDraft]
 
 
 async def test_stale_state_version_rejects_before_reasoning_model_call(
@@ -1628,7 +1719,7 @@ async def test_unmapped_formula_missing_input_routes_to_manual_required(
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _formula_needs_more_info("constitution details")])
+    gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), _modification_needs_more_info("constitution details")])
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:

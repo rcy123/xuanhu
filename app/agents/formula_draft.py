@@ -67,6 +67,8 @@ from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.formula import (
     BASE_FORMULA_AGENT_NAME,
     BASE_FORMULA_AGENT_VERSION,
+    BASE_FORMULA_POLICY_VERSION,
+    BASE_FORMULA_PROMPT_VERSION,
     BASE_FORMULA_RAG_AGENT_NAME,
     BASE_FORMULA_RAG_POLICY_VERSION,
     BASE_FORMULA_RAG_PROMPT_VERSION,
@@ -80,6 +82,8 @@ from app.schemas.formula import (
     FORMULA_RAG_POLICY_VERSION,
     MODIFICATION_DRAFT_AGENT_NAME,
     MODIFICATION_DRAFT_AGENT_VERSION,
+    MODIFICATION_DRAFT_POLICY_VERSION,
+    MODIFICATION_DRAFT_PROMPT_VERSION,
     MODIFICATION_DRAFT_RAG_AGENT_NAME,
     MODIFICATION_DRAFT_RAG_POLICY_VERSION,
     MODIFICATION_DRAFT_RAG_PROMPT_VERSION,
@@ -282,6 +286,12 @@ def build_formula_context(
     elif input_payload.policy_version == MODIFICATION_DRAFT_RAG_POLICY_VERSION:
         agent_key = MODIFICATION_DRAFT_RAG_AGENT_NAME
         expected_version = MODIFICATION_DRAFT_RAG_PROMPT_VERSION
+    elif input_payload.policy_version == BASE_FORMULA_POLICY_VERSION:
+        agent_key = BASE_FORMULA_AGENT_NAME
+        expected_version = BASE_FORMULA_PROMPT_VERSION
+    elif input_payload.policy_version == MODIFICATION_DRAFT_POLICY_VERSION:
+        agent_key = MODIFICATION_DRAFT_AGENT_NAME
+        expected_version = MODIFICATION_DRAFT_PROMPT_VERSION
     else:
         agent_key = FORMULA_RAG_AGENT_NAME if rag_mode else FORMULA_AGENT_NAME
         expected_version = FORMULA_RAG_PROMPT_VERSION if rag_mode else FORMULA_PROMPT_VERSION

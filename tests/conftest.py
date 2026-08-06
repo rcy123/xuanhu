@@ -52,6 +52,8 @@ def _set_test_defaults() -> None:
     os.environ.setdefault("CHAT_MODEL", "test-chat-model")
     os.environ.setdefault("EMBEDDING_MODEL", "test-embedding-model")
     os.environ.setdefault("EMBEDDING_DIM", "768")
+    # 测试环境默认关闭 RAG（测试 fakes 按 no-rag 契约编写）。
+    os.environ["XUANHU_RAG_ENABLED"] = "false"
     # 测试环境关闭 reasoning 重试退避（避免失败路径测试等待 10s/20s）。
     os.environ["REASONING_RETRY_BACKOFF_BASE_SECONDS"] = "0"
 
