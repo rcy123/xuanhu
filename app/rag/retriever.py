@@ -236,6 +236,8 @@ class RAGRetriever:
         self._session_factory = session_factory
         # Reranker 网关（Cross-Encoder/LLM 模式专用，延迟建连）
         self._reranker_gateway: ModelGatewayClient | None = None
+        # L3 实体名索引（运行时关联预热，延迟加载）
+        self._entity_index_loaded: bool = False
         # T3.5/M1 容错：collection 是否含 content 字段（一次性检测，进程内缓存）。
         # 旧 collection（sync 脚本 schema 无 content）搜带 content 的 output_fields
         # 会抛 MilvusException field content not exist → 向量检索整路静默降级为纯全文。
@@ -272,6 +274,86 @@ class RAGRetriever:
                 settings=build_reranker_gateway_settings(self._settings),
             )
         return self._reranker_gateway
+
+    async def _ensure_entity_index(self) -> None:
+        """L3: 延迟加载实体名索引（从 knowledge_chunks 表）。
+
+        首次调用时从 PG 拉取 herb + formula title，构建内存索引。
+        后续调用为 no-op。
+        """
+        if self._entity_index_loaded:
+            return
+        try:
+            from app.models.knowledge import KnowledgeChunk
+            from app.rag.entity_index import get_entity_index
+            from sqlalchemy import select
+
+            sf = self._get_session_factory()
+            async with sf() as session:
+                result = await session.execute(
+                    select(KnowledgeChunk.title)
+                    .where(
+                        KnowledgeChunk.source_type.in_(["herb", "formula"]),
+                        KnowledgeChunk.deleted_at.is_(None),
+                    )
+                    .distinct()
+                )
+                titles = list(result.scalars().all())
+            if titles:
+                get_entity_index().load(titles)
+                logger.info("entity index 加载完成: %d titles", len(titles))
+        except Exception:
+            logger.warning("entity index 加载失败（不影响检索主路径）", exc_info=True)
+        finally:
+            self._entity_index_loaded = True
+
+    async def _warm_related_queries(self, query: str) -> None:
+        """L3: 运行时关联预热（fire-and-forget）。
+
+        从 cache miss 的查询文本中提取已知实体名，异步预热其模板查询。
+        失败不影响检索主路径。
+        """
+        try:
+            from app.rag.embedding_cache import (
+                FORMULA_QUERY_TEMPLATES,
+                HERB_QUERY_TEMPLATES,
+                batch_set_embeddings,
+                get_embedding,
+            )
+            from app.rag.entity_index import get_entity_index
+
+            entity = get_entity_index().extract_entity(query)
+            if entity is None:
+                return
+
+            # 判断是 herb 还是 formula（简单启发式：查 formula 模板时用全名判断）
+            # 这里不区分类型，两种模板都生成
+            templates: list[str] = []
+            for tpl in HERB_QUERY_TEMPLATES:
+                templates.append(tpl.format(herb=entity))
+            for tpl in FORMULA_QUERY_TEMPLATES:
+                templates.append(tpl.format(formula=entity))
+
+            # 只为未缓存的模板生成 embedding（需 await，但在此 fire-and-forget
+            # 协程内完成——不阻塞检索主路径，由 asyncio 调度）
+            to_embed: list[str] = []
+            for t in templates:
+                if await get_embedding(t) is None:
+                    to_embed.append(t)
+
+            if not to_embed:
+                return
+
+            vectors = await self._gateway.embed(to_embed, trace_id="l3-warm")
+            pairs = [
+                (text, vec.tolist() if hasattr(vec, "tolist") else vec)
+                for text, vec in zip(to_embed, vectors)
+            ]
+            n = await batch_set_embeddings(pairs)
+            if n:
+                logger.debug("L3 预热完成: entity=%s, cached=%d", entity, n)
+        except Exception:
+            logger.debug("L3 预热放弃（不影响检索主路径）", exc_info=True)
 
     async def _collection_has_content(self, milvus: Any, collection_name: str) -> bool:
         """一次性探测 collection 是否含 content 字段（进程内缓存）。
@@ -511,6 +593,9 @@ class RAGRetriever:
             query_vector = embeddings[0]
             # 命中率统计留给后续；此处只缓存单条 query embedding（TTL 1h）
             await set_embedding(query, query_vector)
+            # L3: 运行时关联预热（fire-and-forget，不阻塞检索主路径）
+            await self._ensure_entity_index()
+            asyncio.ensure_future(self._warm_related_queries(query))
 
         # 2. Milvus 检索（to_thread 释放事件循环；pymilvus 同步阻塞无成熟 async）
         milvus = self._get_milvus_client()

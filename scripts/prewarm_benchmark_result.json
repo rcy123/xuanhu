@@ -1,0 +1,56 @@
+{
+  "test_date": "2026-08-06",
+  "preheat": {
+    "l1_entity_names": {
+      "herbs": 355,
+      "formulas": 112,
+      "unique": 467,
+      "cached": 467,
+      "elapsed_s": 51.1
+    },
+    "l2_template_queries": {
+      "total": 3512,
+      "cached": 3512,
+      "elapsed_s": 487.7
+    },
+    "total_preheated": 3979,
+    "total_elapsed_s": 538.8,
+    "redis_memory_mb_approx": 350
+  },
+  "cache_hit_benchmark": {
+    "test_queries": 23,
+    "cold": {
+      "hits": 0,
+      "misses": 23,
+      "hit_rate": 0.0,
+      "per_miss_ms": 681,
+      "total_estimated_ms": 15663
+    },
+    "warm": {
+      "hits": 22,
+      "misses": 1,
+      "hit_rate": 0.957,
+      "lookup_ms": 70.7,
+      "per_hit_ms": 3.1,
+      "total_estimated_ms": 752
+    },
+    "time_saved_ms": 14911,
+    "time_saved_pct": 95.2,
+    "missed_queries": [
+      "脾胃虚寒用什么药"
+    ]
+  },
+  "real_rag_retrieval_test": {
+    "queries": 5,
+    "total_ms": 17953,
+    "avg_ms_per_query": 3591,
+    "estimated_embed_savings_ms": 3405,
+    "note": "缓存节省约占 RAG 检索总耗时的 15-20%"
+  },
+  "per_advance_impact": {
+    "embeddings_per_advance": 2,
+    "best_case_savings_s": 1.4,
+    "average_case_savings_s": 0.3,
+    "note": "主要价值在于降低 embedding API 配额消耗"
+  }
+}

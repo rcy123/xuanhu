@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     embedding_cache_ttl_seconds: int = Field(
         default=3600, ge=0, description="Embedding 向量缓存 TTL（秒），0=不缓存"
     )
+    embedding_cache_prewarm_on_startup: bool = Field(
+        default=False,
+        description="API 启动时后台预热 embedding 缓存（L1+L2），不阻塞就绪"
+    )
 
     # ---- Reranker 网关覆盖（可选，Cross-Encoder 模式专用） ----
     # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 reranker 调用
