@@ -160,6 +160,22 @@ class Settings(BaseSettings):
         default=3600, ge=0, description="Embedding 向量缓存 TTL（秒），0=不缓存"
     )
 
+    # ---- Reranker 网关覆盖（可选，Cross-Encoder 模式专用） ----
+    # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 reranker 调用
+    # 未设置时回退到 MODEL_GATEWAY_* 生产口径
+    reranker_gateway_base_url: str = Field(
+        default="", description="Reranker 专用网关地址（可选，未设置时回退 MODEL_GATEWAY_BASE_URL）"
+    )
+    reranker_gateway_api_key: str = Field(
+        default="", description="Reranker 专用网关 API 密钥（可选，未设置时回退 MODEL_GATEWAY_API_KEY）"
+    )
+    reranker_gateway_timeout_seconds: int = Field(
+        default=0, ge=0, description="Reranker 网关超时（秒），0=回退 MODEL_GATEWAY_TIMEOUT_SECONDS"
+    )
+    reranker_gateway_max_retries: int = Field(
+        default=0, ge=0, description="Reranker 网关最大重试次数，0=回退 MODEL_GATEWAY_MAX_RETRIES"
+    )
+
     # ---- 模型名称 ----
     chat_model: str = Field(..., description="对话模型名称（必填）")
     embedding_model: str = Field(..., description="Embedding 模型名称（必填）")
@@ -192,6 +208,99 @@ class Settings(BaseSettings):
     rag_syndrome_top_k: int = Field(default=8, ge=1, le=20, description="辨证检索最终返回条数")
     rag_formula_top_k: int = Field(default=8, ge=1, le=20, description="开方检索最终返回条数")
     rag_query_max_chars: int = Field(default=600, ge=50, description="推理检索 query 最大长度")
+
+    # ═══════════════════════════════════════════════════════════════
+    # P1: 基础方多方案筛选
+    # ═══════════════════════════════════════════════════════════════
+    base_formula_confidence_threshold: float = Field(
+        default=0.45,
+        ge=0.0,
+        le=1.0,
+        description="基础方候选方案的置信度阈值——低于此值的方案被丢弃，不进入 modification"
+    )
+    base_formula_min_alternatives: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="至少保留的基础方候选数（即使低于阈值也保留 top-N）"
+    )
+    base_formula_max_alternatives: int = Field(
+        default=3,
+        ge=2,
+        le=4,
+        description="最多保留的基础方候选数"
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # P2: Query 改写模型
+    # ═══════════════════════════════════════════════════════════════
+    rag_query_rewrite_enabled: bool = Field(
+        default=False,
+        description="是否启用辨证 query LLM 改写（默认关闭，需主动开启）"
+    )
+    rag_query_rewrite_model: str = Field(
+        default="",
+        description=(
+            "Query 改写专用模型名称。为空时复用 chat_model。"
+            "改写任务不需要医学推理能力，建议使用轻量快速模型（如 qwen3.7-flash 或更小模型）以控制延迟。"
+        )
+    )
+    rag_query_rewrite_model_temperature: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="改写模型 temperature（低温度保证输出稳定、可复现）"
+    )
+    rag_query_rewrite_model_max_tokens: int = Field(
+        default=400,
+        ge=100,
+        le=1000,
+        description="改写模型最大输出 token 数"
+    )
+    rag_query_rewrite_timeout_seconds: float = Field(
+        default=3.0,
+        ge=0.5,
+        le=10.0,
+        description="改写调用超时秒数（超时降级为原始 query）"
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # Reranker: Cross-Encoder / LLM Reranker
+    # ═══════════════════════════════════════════════════════════════
+    rag_reranker_enabled: bool = Field(
+        default=False,
+        description="是否启用 Cross-Encoder / LLM Reranker（默认关闭，关闭时使用 MVP 加权求和）"
+    )
+    rag_reranker_provider: str = Field(
+        default="cross_encoder",
+        pattern="^(cross_encoder|llm)$",
+        description="Reranker 类型：cross_encoder（专用模型）或 llm（LLM 评判）"
+    )
+    rag_reranker_model: str = Field(
+        default="",
+        description=(
+            "Reranker 模型名称。cross_encoder 模式下为 reranker 模型名（如 BAAI/bge-reranker-v2-m3）；"
+            "llm 模式下为 LLM 模型名（为空时复用 chat_model）。"
+        )
+    )
+    rag_reranker_top_k: int = Field(
+        default=20,
+        ge=10,
+        le=50,
+        description="送入 reranker 的候选 chunk 数量（从 ANN 召回中取 top-K）"
+    )
+    rag_reranker_final_top_k: int = Field(
+        default=8,
+        ge=3,
+        le=20,
+        description="Reranker 重排后最终返回的 chunk 数量"
+    )
+    rag_reranker_timeout_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=15.0,
+        description="Reranker 调用超时秒数（超时降级为 MVP 加权求和）"
+    )
 
     # ---- Agent ----
     agent_runtime_version: Literal["legacy", "langgraph"] = Field(

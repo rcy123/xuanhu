@@ -36,6 +36,8 @@ logger = logging.getLogger("xuanhu.rag.reasoning")
 SYNDROME_PRIMARY_SOURCES: tuple[str, ...] = ("theory", "case")
 # 开方阶段主查库：方剂 + 本草 + 医案。
 FORMULA_PRIMARY_SOURCES: tuple[str, ...] = ("formula", "herb", "case")
+# 加减方阶段主查库：本草 + 医案（基础方已定，不再搜 formula；聚焦药对配伍 + 加减经验）。
+MODIFICATION_PRIMARY_SOURCES: tuple[str, ...] = ("herb", "case")
 
 # 注入 context 的证据条数上限（token 预算：8 条≈500 token，SYNDROME_CONTEXT_TOKEN_LIMIT=4000 内可容）。
 EVIDENCE_CONTEXT_MAX_ITEMS: int = 8
@@ -133,6 +135,141 @@ def _fact_text(value: Any) -> str:
     return str(value)
 
 
+# ---------------------------------------------------------------------------
+# P2: 辨证 query LLM 改写
+# ---------------------------------------------------------------------------
+
+# 改写 prompt（轻量、模板化）
+_SYNDROME_REWRITE_SYSTEM = """你是中医病历书写助手。将结构化病情信息改写为医案首段风格的自然语言描述。
+
+规则：
+1. 以"患者"开头，按主诉→现病史→舌脉的顺序组织
+2. 使用中医病历常用表达（如"伴"、"无汗"、"遇X加重"）
+3. 不要编造输入中没有的症状
+4. 不要添加辨证结论（证型、治法）
+5. 输出纯文本，不超过 400 字
+6. 舌脉信息保留标准表述
+"""
+
+_SYNDROME_REWRITE_USER = """请将以下结构化病情改写为医案首段风格：
+
+{observations_text}
+
+仅输出改写后的病情描述文本，不要加任何前缀或说明。"""
+
+
+# fact_key → 人读标签映射（仅常用键）
+_FACT_KEY_LABELS: dict[str, str] = {
+    "chief_complaint.symptom": "主诉症状",
+    "chief_complaint.course": "病程",
+    "chief_complaint.category": "主诉类别",
+    "present_illness.cough": "咳嗽",
+    "present_illness.sputum": "痰",
+    "present_illness.rhinorrhea": "流涕",
+    "present_illness.nasal_congestion": "鼻塞",
+    "present_illness.sore_throat": "咽喉",
+    "present_illness.chills": "恶寒",
+    "present_illness.fever": "发热",
+    "present_illness.body_ache": "身痛",
+    "present_illness.headache": "头痛",
+    "present_illness.chest": "胸",
+    "present_illness.abdomen": "腹",
+    "present_illness.pain": "疼痛",
+    "present_illness.thirst": "口渴",
+    "present_illness.appetite": "食欲",
+    "present_illness.sleep": "睡眠",
+    "present_illness.stool": "大便",
+    "present_illness.urine": "小便",
+    "ten_questions.cold_heat": "寒热",
+    "ten_questions.sweat": "汗出",
+    "ten_questions.head_body": "头身",
+    "ten_questions.stool_urine": "二便",
+    "ten_questions.diet": "饮食",
+    "ten_questions.chest_abdomen": "胸腹",
+    "ten_questions.thirst": "口渴",
+    "ten_questions.sleep": "睡眠",
+    "ten_questions.menses_leukorrhea": "经带",
+    "ten_questions.pain": "疼痛",
+    "ten_questions.respiratory": "呼吸",
+    "four_diagnosis.inspection": "舌象",
+    "four_diagnosis.palpation": "脉象",
+}
+
+
+def _format_observations_for_rewrite(
+    observations: Sequence[Any],
+) -> str:
+    """把 observations 格式化为 LLM 易于理解的文本。"""
+    lines: list[str] = []
+    for item in observations:
+        key = getattr(item, "fact_key", "")
+        value = _fact_text(getattr(item, "value", None))
+        if not value:
+            continue
+        label = _FACT_KEY_LABELS.get(key, key)
+        lines.append(f"  {label}: {value}")
+    return "\n".join(lines)
+
+
+async def rewrite_syndrome_query(
+    observations: Sequence[Any],
+    *,
+    gateway: Any,
+    max_chars: int | None = None,
+    trace_id: str = "rag-rewrite",
+) -> str:
+    """用 LLM 将结构化 observations 改写为医案首段风格。
+
+    改写失败时降级为原始 ``build_syndrome_query``（不阻断辨证流程）。
+    由 ``rag_query_rewrite_enabled`` 配置控制开关。
+
+    Args:
+        observations: syndrome 阶段 context_observations。
+        gateway: ``ModelGatewayClient`` 实例（用于非结构化 chat 调用）。
+        max_chars: 改写后 query 最大长度。
+        trace_id: 请求链路 ID。
+    """
+    settings = get_settings()
+
+    # 总开关关闭 → 直接返回结构化 query
+    if not settings.rag_query_rewrite_enabled:
+        return build_syndrome_query(observations, max_chars=max_chars)
+
+    limit = max_chars if max_chars is not None else settings.rag_query_max_chars
+
+    observations_text = _format_observations_for_rewrite(observations)
+    if not observations_text.strip():
+        return build_syndrome_query(observations, max_chars=limit)
+
+    # 选择模型：优先用专用改写模型，否则复用 chat_model
+    rewrite_model = settings.rag_query_rewrite_model or settings.chat_model
+
+    try:
+        content = await gateway.chat(
+            messages=[
+                {"role": "system", "content": _SYNDROME_REWRITE_SYSTEM},
+                {"role": "user", "content": _SYNDROME_REWRITE_USER.format(observations_text=observations_text)},
+            ],
+            model=rewrite_model,
+            temperature=settings.rag_query_rewrite_model_temperature,
+            max_tokens=settings.rag_query_rewrite_model_max_tokens,
+            trace_id=trace_id,
+            agent_name="syndrome_query_rewrite",
+        )
+        rewritten = content.strip()
+        if rewritten and len(rewritten) > limit:
+            rewritten = rewritten[:limit]
+        return rewritten or build_syndrome_query(observations, max_chars=limit)
+    except Exception:
+        logger.warning("syndrome query LLM 改写失败，降级为结构化 query", exc_info=True)
+        return build_syndrome_query(observations, max_chars=limit)
+
+
+# ---------------------------------------------------------------------------
+# query 构造
+# ---------------------------------------------------------------------------
+
+
 def build_syndrome_query(
     observations: Sequence[Any],
     *,
@@ -195,6 +332,7 @@ async def retrieve_syndrome_evidence(
     observations: Sequence[Any],
     *,
     top_k: int | None = None,
+    query: str | None = None,
     logger_extra: dict[str, Any] | None = None,
 ) -> list[Evidence]:
     """辨证阶段检索。失败降级为空列表（D3），不抛出。
@@ -203,10 +341,13 @@ async def retrieve_syndrome_evidence(
         retriever: ``app.rag.retriever.RAGRetriever``（或测试 FakeRetriever）。
         observations: syndrome 阶段 context_observations。
         top_k: 覆盖配置的返回条数。
+        query: 可选——预构造的检索 query（如 LLM 改写后的医案文本）。
+            为 None 时由 ``build_syndrome_query`` 自动构造。
     """
     settings = get_settings()
     k = top_k or settings.rag_syndrome_top_k
-    query = build_syndrome_query(observations)
+    if query is None:
+        query = build_syndrome_query(observations)
     if not query:
         logger.warning("syndrome RAG: 无可检索的观察事实，跳过检索（空证据模式）")
         return []
@@ -241,6 +382,86 @@ async def retrieve_formula_evidence(
         primary_sources=list(FORMULA_PRIMARY_SOURCES),
         top_k=k,
         stage="formula",
+        logger_extra=logger_extra,
+    )
+
+
+def build_modification_query(
+    syndrome: Any,
+    observations: Sequence[Any],
+    base_formula: Any,
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """构造加减方检索 query。
+
+    与 ``build_formula_query`` 的关键区别：
+    - 包含基础方名称和组成，让检索聚焦该方的加减经验
+    - 强调待调症状，引导检索药对配伍和单药特性
+    - 不再重复证型/治法主导（base 阶段已覆盖）
+    """
+    limit = max_chars if max_chars is not None else get_settings().rag_query_max_chars
+
+    parts: list[str] = []
+
+    # 1. 基础方信息（核心差异化）
+    formula_name = getattr(base_formula, "name", None)
+    if formula_name:
+        parts.append(f"基础方={formula_name}")
+
+    # 2. 方剂组成（让检索找到涉及相同药味的加减医案）
+    herbs = getattr(base_formula, "composition", None) or ()
+    if herbs:
+        herb_text = "、".join(
+            f"{h.herb}{h.dose}{h.unit}" if hasattr(h, "dose") and h.dose else h.herb
+            for h in herbs
+        )
+        if herb_text:
+            parts.append(f"组成={herb_text}")
+
+    # 3. 证型与治法（保留但不主导）
+    name = getattr(syndrome, "syndrome", None)
+    if name:
+        parts.append(f"证型={name}")
+
+    # 4. 症状摘要（加权：强调待调症状）
+    symptom_query = build_syndrome_query(observations, max_chars=limit // 2)
+    if symptom_query:
+        parts.append(f"待调症状={symptom_query}")
+
+    query = "；".join(parts)
+    if len(query) > limit:
+        query = query[:limit]
+    return query or ""
+
+
+async def retrieve_modification_evidence(
+    retriever: Any,
+    syndrome: Any,
+    observations: Sequence[Any],
+    base_formula: Any,
+    *,
+    top_k: int | None = None,
+    logger_extra: dict[str, Any] | None = None,
+) -> list[Evidence]:
+    """加减方阶段检索。使用 herb+case 源，query 含基础方信息。
+
+    与 ``retrieve_formula_evidence`` 的关键区别：
+    - sources 仅 herb+case（基础方已定，不再搜 formula）
+    - query 含基础方名称和组成，聚焦该方的加减经验
+    """
+    settings = get_settings()
+    k = top_k or settings.rag_formula_top_k
+    query = build_modification_query(syndrome, observations, base_formula)
+    if not query:
+        logger.warning("modification RAG: 无可检索的查询，跳过检索（空证据模式）")
+        return []
+    return await _retrieve_with_degrade(
+        retriever,
+        query=query,
+        primary_sources=list(MODIFICATION_PRIMARY_SOURCES),
+        top_k=k,
+        stage="modification",
         logger_extra=logger_extra,
     )
 

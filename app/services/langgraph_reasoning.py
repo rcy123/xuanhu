@@ -93,6 +93,7 @@ from app.agents.formula_draft import (
     execute_base_formula_draft,
     execute_formula_draft,
     execute_modification_draft,
+    filter_alternatives,
 )
 from app.agents.question_composer import QUESTION_TEMPLATES, validate_single_question_text
 from app.agents.syndrome_draft import (
@@ -1010,55 +1011,127 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                 "last_error": None,
             }
 
-        # ---- 2.8 阶段 2：加减草稿（输入含权威基础方全文）----
+        # ---- P1: 提取并筛选候选方案 ----
+        from app.schemas.formula import BaseFormulaAlternative as BFA
+
+        raw_alternatives = base_result.output.alternatives
+        if raw_alternatives:
+            settings = get_settings()
+            alternatives = filter_alternatives(
+                raw_alternatives,
+                threshold=settings.base_formula_confidence_threshold,
+                min_keep=settings.base_formula_min_alternatives,
+                max_keep=settings.base_formula_max_alternatives,
+            )
+        else:
+            # 降级：模型只输出了 1 套方案（兼容旧 prompt 行为）
+            alternatives = [
+                BFA(
+                    formula=base_formula,
+                    angle="默认方案",
+                    rationale=base_result.output.rationale or "",
+                    confidence=base_result.output.confidence,
+                )
+            ]
+
+        # ---- 2.8 阶段 2：并行加减草稿（每套通过筛选的方案一个）----
         mod_policy, mod_prompt = _reasoning_policy("modification")
-        mod_input = ModificationDraftInput(
-            schema_version=MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION,
-            session_id=input_payload.session_id,
-            state_version=input_payload.state_version,
-            current_stage=input_payload.current_stage,
-            policy_version=mod_policy,
-            domain_state=input_payload.domain_state,
-            triage_gate=input_payload.triage_gate,
-            completeness_gate=input_payload.completeness_gate,
-            context_observations=input_payload.context_observations,
-            syndrome_draft=input_payload.syndrome_draft,
-            base_formula=base_formula,
-            base_formula_rationale=base_result.output.rationale,
-            base_confidence=base_result.output.confidence,
-            review_feedback=input_payload.review_feedback,
-        )
-        mod_run_spec = RunSpec(
-            run_id=_commit_run_id(claim, "modification"),
-            session_id=claim.session_id,
-            state_version=input_payload.state_version,
-            stage=FORMULA_READY_STAGE,
-            agent_spec_version=MODIFICATION_DRAFT_AGENT_VERSION,
-            prompt_version=mod_prompt,
-            policy_version=mod_policy,
-            deadline_at=_deadline(agent_model_timeout_seconds() + 15),
-            total_attempt_budget=1,
-            idempotency_key=f"{claim.idempotency_key}:modification",
-            trace_id=_node_trace_id(state),
-        )
-        mod_stage = await _run_formula_stage_with_retry(
-            claim,
-            repository,
-            syndrome_result,
-            execute_modification_draft,
-            mod_run_spec,
-            input_payload=mod_input,
-            agent_spec=build_modification_draft_agent_spec(),
-            step_label="modification",
-        )
-        if mod_stage is None:
+
+        async def _run_mod_for_alternative(
+            i: int,
+            alt: BFA,
+        ) -> tuple[int, FormulaExecutionResult | None, FormulaConsistencyReport | None]:
+            mod_input = ModificationDraftInput(
+                schema_version=MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION,
+                session_id=input_payload.session_id,
+                state_version=input_payload.state_version,
+                current_stage=input_payload.current_stage,
+                policy_version=mod_policy,
+                domain_state=input_payload.domain_state,
+                triage_gate=input_payload.triage_gate,
+                completeness_gate=input_payload.completeness_gate,
+                context_observations=input_payload.context_observations,
+                syndrome_draft=input_payload.syndrome_draft,
+                base_formula=alt.formula,
+                base_formula_rationale=alt.rationale,
+                base_confidence=alt.confidence,
+                review_feedback=input_payload.review_feedback,
+                modification_query_hint=alt.modification_query,
+            )
+            mod_run_spec = RunSpec(
+                run_id=_commit_run_id(claim, f"modification_{i}"),
+                session_id=claim.session_id,
+                state_version=input_payload.state_version,
+                stage=FORMULA_READY_STAGE,
+                agent_spec_version=MODIFICATION_DRAFT_AGENT_VERSION,
+                prompt_version=mod_prompt,
+                policy_version=mod_policy,
+                deadline_at=_deadline(agent_model_timeout_seconds() + 15),
+                total_attempt_budget=1,
+                idempotency_key=f"{claim.idempotency_key}:modification_{i}",
+                trace_id=_node_trace_id(state),
+            )
+            stage = await _run_formula_stage_with_retry(
+                claim,
+                repository,
+                syndrome_result,
+                execute_modification_draft,
+                mod_run_spec,
+                input_payload=mod_input,
+                agent_spec=build_modification_draft_agent_spec(),
+                step_label=f"modification_alt_{i}",
+            )
+            if stage is None:
+                return (i, None, None)
+            mod_result, mod_consistency = stage
+            return (i, mod_result, mod_consistency)
+
+        # 并行执行所有候选方案的 modification（延迟不叠加）
+        mod_tasks = [
+            _run_mod_for_alternative(i, alt)
+            for i, alt in enumerate(alternatives)
+        ]
+        mod_results_raw = await asyncio.gather(*mod_tasks)
+        # 按原始索引排序，保持置信度降序
+        mod_results_raw.sort(key=lambda x: x[0])
+
+        # 取第一个成功的 modification 结果作为主提交
+        primary: tuple[int, FormulaExecutionResult, FormulaConsistencyReport] | None = None
+        alt_results: list[dict[str, Any]] = []
+        for i, mod_result, mod_consistency in mod_results_raw:
+            if mod_result is not None:
+                alt_results.append({
+                    "index": i,
+                    "angle": alternatives[i].angle,
+                    "confidence": alternatives[i].confidence,
+                    "formula_name": alternatives[i].formula.name,
+                    "mod_decision": mod_result.output.decision.value if mod_result.output else "failed",
+                    "mod_confidence": mod_result.output.confidence if mod_result.output else 0,
+                })
+                if primary is None and mod_result.output is not None:
+                    primary = (i, mod_result, mod_consistency)
+
+        if primary is None:
+            # 所有 modification 均失败
+            await _save_intermediate(
+                claim.id,
+                {
+                    "formula": {
+                        "stage": "modification",
+                        "failure_code": "ALL_MODIFICATION_ALTERNATIVES_FAILED",
+                        "alternatives": alt_results,
+                    }
+                },
+                step="draft_formula",
+            )
             _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
             return {
                 "route": NODE_REASONING_SUBGRAPH_V1,
                 "reasoning_route": ROUTE_MANUAL_REQUIRED,
                 "last_error": None,
             }
-        result, consistency = mod_stage
+
+        _i, result, consistency = primary
         formula_missing_dimension = _formula_missing_dimension(result.output)
         if result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and formula_missing_dimension is None:
             await _save_intermediate(
@@ -1067,6 +1140,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                     "formula": {
                         "decision": result.output.decision.value,
                         "failure_code": "FORMULA_MISSING_INPUT_UNMAPPED",
+                        "alternatives": alt_results,
                     }
                 },
                 step="draft_formula",
@@ -1084,7 +1158,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
         if commit is None:
             await _save_intermediate(
                 claim.id,
-                {"formula": {"failure_code": "FORMULA_TRUSTED_EXECUTION_MISSING"}},
+                {"formula": {"failure_code": "FORMULA_TRUSTED_EXECUTION_MISSING", "alternatives": alt_results}},
                 step="draft_formula",
             )
             _FORMULA_ROUTE_CACHE[claim.id] = ROUTE_MANUAL_REQUIRED
@@ -1106,6 +1180,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                     "content_digest": commit["content_digest"],
                     "output_state_version": commit["output_state_version"],
                     "missing_dimension": formula_missing_dimension,
+                    "alternatives_count": len(alternatives),
+                    "alternatives": alt_results,
                 },
                 "formula_consistency": {
                     "passed": consistency.passed,

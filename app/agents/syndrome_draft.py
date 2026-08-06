@@ -59,6 +59,7 @@ from app.db import session as db_session
 from app.rag.reasoning_retrieval import (
     evidence_context_items,
     retrieve_syndrome_evidence,
+    rewrite_syndrome_query,
 )
 from app.rag.schemas import Evidence
 from app.schemas.domain import ObservationSchema, ObservationStatus
@@ -248,7 +249,19 @@ async def _execute_syndrome_draft(
         # D3：检索失败在 retrieve_syndrome_evidence 内降级为空证据（记 warning，
         # 不抛出、不 503）；无 retriever（测试注入缺省）同样走空证据模式。
         if retriever is not None:
-            retrieved_evidence = tuple(await retrieve_syndrome_evidence(retriever, input_payload.context_observations))
+            # P2: 可选的 query LLM 改写（由 rag_query_rewrite_enabled 配置控制）
+            rewritten_query = await rewrite_syndrome_query(
+                input_payload.context_observations,
+                gateway=getattr(runtime, "gateway", None),
+                trace_id=run_spec.trace_id,
+            )
+            retrieved_evidence = tuple(
+                await retrieve_syndrome_evidence(
+                    retriever,
+                    input_payload.context_observations,
+                    query=rewritten_query,
+                )
+            )
         else:
             _logger.warning("syndrome RAG: 未提供 retriever，走空证据模式（policy=%s）", input_payload.policy_version)
 

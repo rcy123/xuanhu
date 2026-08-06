@@ -227,6 +227,31 @@ MODIFICATION_DRAFT_SCHEMA_VERSION: Literal["modification-draft.v1"] = "modificat
 MODIFICATION_DRAFT_INPUT_SCHEMA_VERSION: Literal["modification-draft-input.v1"] = "modification-draft-input.v1"
 
 
+class BaseFormulaAlternative(BaseModel):
+    """单套基础方候选方案（P1 多方案输出）。
+
+    每套方案有独立的侧重角度（angle），允许同一证型下输出多套
+    方剂组成不同、侧重不同的候选，由医师最终选择。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    formula: FormulaComposition
+    angle: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="该方案的侧重角度，如'偏重祛风止痛，适用于头痛明显者'"
+    )
+    rationale: str = Field(min_length=1, max_length=600)
+    confidence: float = Field(ge=0, le=1)
+    modification_query: str | None = Field(
+        default=None,
+        max_length=600,
+        description="该方加减阶段的检索方向提示"
+    )
+
+
 class BaseFormulaDraft(BaseModel):
     """阶段 1 输出：仅生成基础方（选方），不做加减。
 
@@ -234,6 +259,9 @@ class BaseFormulaDraft(BaseModel):
     - COMPLETED：base_formula 必填（basis 含事实/证候依据）
     - NEEDS_MORE_INFO：missing_inputs 说明还缺什么
     - ABSTAINED：放弃（不应发生，保守校验）
+
+    P1 多方案：alternatives 包含 ≥1 套候选方，按置信度降序排列。
+    base_formula / rationale 保留向后兼容——取 alternatives[0]。
     """
 
     model_config = ConfigDict(
@@ -251,6 +279,13 @@ class BaseFormulaDraft(BaseModel):
     claim_evidence_links: tuple[FormulaClaimEvidenceLink, ...] = Field(default=(), max_length=16)
     missing_inputs: tuple[str, ...] = Field(default=(), max_length=16)
     review_required: bool = True
+    # P1: 侧重不同的基础方候选方案，按置信度降序排列（RAG 模式下≥2套）
+    alternatives: tuple[BaseFormulaAlternative, ...] = Field(
+        default=(),
+        min_length=0,
+        max_length=4,
+        description="侧重不同的基础方候选方案，按置信度降序排列"
+    )
 
     @model_validator(mode="after")
     def completed_requires_base(self) -> BaseFormulaDraft:
@@ -322,3 +357,5 @@ class ModificationDraftInput(BaseModel):
     # 知识库修正提示（开方预检发现未收录药时注入重试输入）：None=无
     knowledge_correction: str | None = Field(default=None, max_length=500)
     base_confidence: float = Field(ge=0, le=1)
+    # P1: 该候选方的加减检索方向提示（来自 BaseFormulaAlternative.modification_query）
+    modification_query_hint: str | None = Field(default=None, max_length=600)

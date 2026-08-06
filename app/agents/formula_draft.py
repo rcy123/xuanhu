@@ -61,7 +61,11 @@ from app.agents.syndrome_draft import (
     _consume_trusted_syndrome_execution,
 )
 from app.core.config import get_settings
-from app.rag.reasoning_retrieval import evidence_context_items, retrieve_formula_evidence
+from app.rag.reasoning_retrieval import (
+    evidence_context_items,
+    retrieve_formula_evidence,
+    retrieve_modification_evidence,
+)
 from app.rag.schemas import Evidence
 from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.formula import (
@@ -87,6 +91,7 @@ from app.schemas.formula import (
     MODIFICATION_DRAFT_RAG_AGENT_NAME,
     MODIFICATION_DRAFT_RAG_POLICY_VERSION,
     MODIFICATION_DRAFT_RAG_PROMPT_VERSION,
+    BaseFormulaAlternative,
     BaseFormulaDraft,
     FormulaComposition,
     FormulaDraft,
@@ -256,12 +261,41 @@ def assemble_modification_output(
     )
 
 
+def filter_alternatives(
+    alternatives: Sequence[BaseFormulaAlternative],
+    threshold: float,
+    min_keep: int,
+    max_keep: int,
+) -> list[BaseFormulaAlternative]:
+    """按置信度阈值筛选候选方案（P1）。
+
+    规则：
+    1. 先按置信度降序排列
+    2. 过滤低于阈值的方案
+    3. 至少保留 min_keep 套（取 top-N，即使低于阈值）
+    4. 最多保留 max_keep 套
+    """
+    # 始终按置信度降序
+    sorted_alts = sorted(alternatives, key=lambda a: a.confidence, reverse=True)
+
+    # 阈值过滤
+    qualified = [a for a in sorted_alts if a.confidence >= threshold]
+
+    # 保底：至少 min_keep 套
+    if len(qualified) < min_keep:
+        qualified = sorted_alts[:min_keep]
+
+    # 封顶：最多 max_keep 套
+    return qualified[:max_keep]
+
+
 def build_formula_context(
     input_payload: FormulaDraftInput,
     *,
     prompt_loader: PromptLoader | None = None,
     retrieved_evidence: tuple[Evidence, ...] = (),
     base_formula: FormulaComposition | None = None,
+    modification_query_hint: str | None = None,
 ) -> tuple[ContextPacket, str]:
     """Build a de-identified model context from authoritative data only.
 
@@ -270,6 +304,7 @@ def build_formula_context(
     - The active observations projected as fact_id + fact_key + value.
     - A policy marker (no-RAG 或 RAG 模式) / review-required marker.
     - RAG 模式下：检索到的方剂/本草/医案证据（untrusted context 层）。
+    - P1 多方案：加减阶段的 modification_query_hint 检索方向提示。
 
     No raw patient messages, names, phone numbers, or IDs are included.
     """
@@ -341,6 +376,10 @@ def build_formula_context(
         base_dict["formula_name"] = base_dict.pop("name")
         context["base_formula"] = base_dict
         allowed_fields.add("base_formula")
+    if modification_query_hint:
+        # P1 多方案：该候选方的加减检索方向提示（来自 BaseFormulaAlternative）。
+        context["modification_query_hint"] = modification_query_hint
+        allowed_fields.add("modification_query_hint")
     if rag_mode:
         # 证据是 untrusted 数据：走 context 消息层（gateway 传输边界 SECURITY NOTICE 包裹）。
         context["retrieved_evidence"] = evidence_context_items(retrieved_evidence)
@@ -959,13 +998,20 @@ async def execute_modification_draft(
     rag_active = formula_input.policy_version in (FORMULA_RAG_POLICY_VERSION, BASE_FORMULA_RAG_POLICY_VERSION, MODIFICATION_DRAFT_RAG_POLICY_VERSION)
     retrieved_evidence: tuple[Evidence, ...] = ()
     if rag_active and retriever is not None:
+        # P0: 加减方阶段使用差异化检索（herb+case 源，query 含基础方信息）
         retrieved_evidence = tuple(
-            await retrieve_formula_evidence(retriever, trusted_syndrome.output, formula_input.context_observations)
+            await retrieve_modification_evidence(
+                retriever,
+                trusted_syndrome.output,
+                formula_input.context_observations,
+                base_formula,
+            )
         )
     try:
         packet, prompt_version = build_formula_context(
             formula_input, prompt_loader=prompt_loader,
             retrieved_evidence=retrieved_evidence, base_formula=base_formula,
+            modification_query_hint=input_payload.modification_query_hint,
         )
     except PromptManifestError:
         return _failed(FormulaBoundaryFailureCode.PROMPT_CONTRACT_MISMATCH)

@@ -27,12 +27,15 @@ from sqlalchemy import func, select
 from app.core.config import get_settings
 from app.core.embedding_gateway import build_embedding_gateway_settings
 from app.core.gateway import ModelGatewayClient
+from app.core.reranker_gateway import build_reranker_gateway_settings
 from app.core.metrics import measure
 from app.db.session import get_session_factory
 from app.models.knowledge import KnowledgeChunk
 from app.rag.reranker import (
     DEFAULT_FULLTEXT_WEIGHT,
     DEFAULT_VECTOR_WEIGHT,
+    cross_encoder_rerank,
+    llm_rerank,
     rerank,
 )
 from app.rag.schemas import (
@@ -231,6 +234,8 @@ class RAGRetriever:
         )
         self._milvus_client = milvus_client
         self._session_factory = session_factory
+        # Reranker 网关（Cross-Encoder/LLM 模式专用，延迟建连）
+        self._reranker_gateway: ModelGatewayClient | None = None
         # T3.5/M1 容错：collection 是否含 content 字段（一次性检测，进程内缓存）。
         # 旧 collection（sync 脚本 schema 无 content）搜带 content 的 output_fields
         # 会抛 MilvusException field content not exist → 向量检索整路静默降级为纯全文。
@@ -253,6 +258,20 @@ class RAGRetriever:
                 timeout=self._settings.milvus_timeout_seconds,
             )
         return self._milvus_client
+
+    def _get_reranker_gateway(self) -> ModelGatewayClient:
+        """延迟创建 reranker 专用 ModelGatewayClient。
+
+        Cross-Encoder / LLM Reranker 共用此网关：Cross-Encoder 模式 POST 到
+        ``/rerank``，LLM 模式走标准 ``/chat/completions``。
+        网关配置优先使用 ``RERANKER_GATEWAY_*`` 覆盖，否则回退
+        ``MODEL_GATEWAY_*``（与 embedding 覆盖同模式）。
+        """
+        if self._reranker_gateway is None:
+            self._reranker_gateway = ModelGatewayClient(
+                settings=build_reranker_gateway_settings(self._settings),
+            )
+        return self._reranker_gateway
 
     async def _collection_has_content(self, milvus: Any, collection_name: str) -> bool:
         """一次性探测 collection 是否含 content 字段（进程内缓存）。
@@ -409,14 +428,42 @@ class RAGRetriever:
         async with measure("rag.backfill"):
             await self._backfill_content_snippets(merged)
 
-        # ---- MVP 重排（对全部合并结果按最终加权分排序后截取 top_k）----
-        evidences = rerank(
-            merged,
-            top_k=top_k,
-            vector_weight=vector_weight,
-            fulltext_weight=fulltext_weight,
-            source_priority_weight=source_priority_weight,
-        )
+        # ---- 重排（MVP 加权 或 Cross-Encoder / LLM Reranker）----
+        settings = get_settings()
+        if (
+            settings.rag_reranker_enabled
+            and len(merged) > settings.rag_reranker_final_top_k
+        ):
+            # 先取 top-K 送入 reranker
+            candidates = merged[:settings.rag_reranker_top_k]
+
+            if settings.rag_reranker_provider == "llm":
+                evidences = await llm_rerank(
+                    query=query,
+                    merged_hits=candidates,
+                    gateway=self._get_reranker_gateway(),
+                    model=settings.rag_reranker_model or settings.chat_model,
+                    top_k=settings.rag_reranker_final_top_k,
+                    timeout=settings.rag_reranker_timeout_seconds,
+                )
+            else:
+                evidences = await cross_encoder_rerank(
+                    query=query,
+                    merged_hits=candidates,
+                    gateway=self._get_reranker_gateway(),
+                    model=settings.rag_reranker_model,
+                    top_k=settings.rag_reranker_final_top_k,
+                    timeout=settings.rag_reranker_timeout_seconds,
+                )
+        else:
+            # MVP 加权求和（默认路径 / 降级路径）
+            evidences = rerank(
+                merged,
+                top_k=top_k,
+                vector_weight=vector_weight,
+                fulltext_weight=fulltext_weight,
+                source_priority_weight=source_priority_weight,
+            )
 
         return evidences
 
