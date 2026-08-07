@@ -38,22 +38,69 @@ Navigate the full TCM consultation lifecycle in one seamless workspace:
 
 | Stage | Description |
 |---|---|
-| **Inquiry** (问诊) | AI-assisted structured patient interview with completeness tracking |
-| **Syndrome Differentiation** (辨证) | Automated syndrome pattern analysis based on collected symptoms |
-| **Formula Drafting** (开方) | AI-generated prescription with herb selection and dosage |
-| **Safety Review** (安全审核) | Deterministic rule engine checks 10+ safety dimensions |
-| **Doctor Review** (医师确认) | Mandatory human-in-the-loop confirmation before finalization |
+| **Inquiry** (问诊) | AI-assisted structured patient interview with completeness tracking & clarification recovery |
+| **Syndrome Differentiation** (辨证) | Multi-agent syndrome analysis with RAG evidence grounding and verifier chain |
+| **Formula Drafting** (开方) | Two-stage drafting: base formula selection → personalized modification (加减方) |
+| **Formula Selection** (医师选方) | Multi-alternative display with confidence scoring — doctor selects from AI-generated options |
+| **Safety Review** (安全审核) | Deterministic rule engine checks 10+ safety dimensions with rollback guidance |
+| **Doctor Review** (医师确认) | Mandatory human-in-the-loop confirmation with modify/reject capabilities |
 | **Medical Record** (病历生成) | Structured consultation documentation export |
 
 ### 🤖 Multi-Agent LangGraph Runtime
 
 Built on **LangGraph**, the agent orchestration layer manages:
 
-- **Intake Agent** — Structured symptom & sign collection, completeness evaluation
-- **Reasoning Agent** — Syndrome differentiation and formula generation
-- **Review Agent** — Prescription safety verification gate
-- **Recovery Agent** — Graceful error handling and state recovery
-- **Triage Policy** — Automated collection sufficiency determination
+- **Intake Agent** — Structured symptom & sign collection, completeness evaluation, ABSTAINED routing, and clarification recovery
+- **SyndromeDraft Agent** — Syndrome differentiation (辨证) with RAG evidence grounding, verifier chain validation, and authority snapshot caching
+- **FormulaDraft Agent** — Two-stage formula generation: base formula drafting from syndrome → personalized modification (加减方) with evidence-grounded adjustments
+- **Safety Agent** — Prescription safety verification gate with deterministic rule engine and rollback guidance
+- **Recovery Agent** — Graceful error handling and state recovery with deadlock prevention
+- **Triage Policy** — Automated collection sufficiency determination with cached gate computation
+
+### 🧠 Intelligent RAG Pipeline
+
+All agent reasoning is grounded in a structured TCM knowledge base via a multi-stage retrieval pipeline:
+
+| Stage | Component | Description |
+|---|---|---|
+| **Rewrite** | Query Rewrite Gateway | Lightweight model (Qwen3.5-2B-free) rewrites clinical queries for better retrieval recall (304–845ms) |
+| **Retrieve** | Hybrid Search | Milvus vector search + PostgreSQL full-text search, 8-way concurrent with shared `RAGRetriever` |
+| **Rerank** | Multi-Tier Reranker | MVP weighted sum → Cross-Encoder API (e.g., jina-reranker-m0) → LLM Reranker (0–10 scoring) |
+| **Evidence** | Structured Evidence | Ranked, traceable `Evidence` objects with source priority, relevance scores, and chunk provenance |
+
+> 🔄 **Graceful degradation** — If Cross-Encoder or LLM reranker calls fail, the system automatically falls back to MVP weighted scoring without blocking the pipeline.
+
+### 📊 Multi-Formula Alternative Selection (医师选方)
+
+The formula drafting stage generates **multiple alternative base formulas** — each with a distinct therapeutic angle (侧重), confidence score, and herb composition — empowering the practitioner to choose the most appropriate approach:
+
+- **Multi-angle generation** — AI produces 2–4 base formula candidates, each emphasizing different treatment priorities
+- **Confidence scoring** — Each alternative includes a 0–100% confidence score with color-coded indicators
+- **Side-by-side comparison** — Full herb composition tables, rationale, and therapeutic angle displayed for each option
+- **One-click select** — Practitioner selects the preferred alternative; the system proceeds with personalized modification (加减方)
+
+### ⚡ Embedding Cache Preheat
+
+Three-layer cache warm-up eliminates cold-start latency for vector embeddings:
+
+| Layer | Scope | Description |
+|---|---|---|
+| **L1 Entity** | Herb + Formula titles | Pre-embeds all known entity names from the knowledge base |
+| **L2 Template** | Entity × Query templates | Pre-computes embeddings for common query patterns (e.g., "{herb} 的功效与禁忌") |
+| **L3 Runtime** | Live query patterns | Cache populated during normal agent operations via Redis |
+
+**Results**: ~60% cache hit rate in TCM consultation scenarios, **89–209×** speedup on cache hits (~4ms Redis vs ~570ms gateway RTT).
+
+```bash
+# Full preheat (L1 + L2)
+uv run python scripts/prewarm_embedding_cache.py --all
+
+# Benchmark before/after
+uv run python scripts/prewarm_embedding_cache.py --all --benchmark
+
+# Check cache statistics
+uv run python scripts/prewarm_embedding_cache.py --stats
+```
 
 ### 🛡️ Deterministic Safety Engine
 
@@ -77,9 +124,10 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 - **Responsive sidebar** with session list and collapsible navigation
 - **Real-time streaming** of agent reasoning via SSE
 - **Stage progress bar** showing current workflow phase
-- **Interactive formula editing** with safety validation
+- **Multi-formula alternative cards** — compare 2–4 base formula options with confidence scores and therapeutic angles before selecting
+- **Interactive formula editing** with safety validation and side-by-side base vs. modified comparison
 - **Doctor review panel** — accept, modify, or reject prescriptions
-- **Safety confirmation** workflow for unresolved assertions
+- **Safety confirmation** workflow for unresolved assertions with rollback guidance
 - **Medical record preview** with structured TCM documentation
 
 ---
@@ -87,32 +135,41 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 ## 🏗 Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Frontend (React)                  │
-│            xuanhu-ui · Vite · Ant Design             │
-└──────────────────────────┬──────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    Frontend (React)                       │
+│            xuanhu-ui · Vite · Ant Design                  │
+└──────────────────────────┬───────────────────────────────┘
                            │ REST + SSE
-┌──────────────────────────▼──────────────────────────┐
-│                Backend API (FastAPI)                  │
-│              app/api · 10+ route modules              │
-└──────────────────────────┬──────────────────────────┘
+┌──────────────────────────▼───────────────────────────────┐
+│                  Backend API (FastAPI)                     │
+│                app/api · 10+ route modules                 │
+└──────────────────────────┬───────────────────────────────┘
                            │
-┌──────────────────────────▼──────────────────────────┐
-│            Agent Runtime (LangGraph)                  │
-│  ┌────────┐ ┌───────────┐ ┌──────┐ ┌──────────┐    │
-│  │ Intake │ │ Reasoning │ │Review│ │ Recovery │    │
-│  │Subgraph│ │ Subgraph  │ │  /   │ │ Subgraph │    │
-│  │        │ │           │ │Safety│ │          │    │
-│  └────────┘ └───────────┘ └──────┘ └──────────┘    │
-└──────────────────────────┬──────────────────────────┘
+┌──────────────────────────▼───────────────────────────────┐
+│              Agent Runtime (LangGraph)                     │
+│  ┌────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐     │
+│  │ Intake │ │ 辨证-开方  │ │  Safety  │ │ Recovery │     │
+│  │Subgraph│ │三Agent流水 │ │   Gate   │ │ Subgraph │     │
+│  │        │ │Syndrome→  │ │          │ │          │     │
+│  │        │ │Formula→   │ │          │ │          │     │
+│  │        │ │Modification│ │          │ │          │     │
+│  └────────┘ └───────────┘ └──────────┘ └──────────┘     │
+└──────────────────────────┬───────────────────────────────┘
                            │
-┌──────────────────────────▼──────────────────────────┐
-│                    Infrastructure                      │
-│  ┌──────────┐ ┌─────┐ ┌──────────┐ ┌──────────┐    │
-│  │PostgreSQL│ │Redis│ │  Milvus  │ │  Model   │    │
-│  │   16     │ │  7  │ │ (Vector) │ │ Gateway  │    │
-│  └──────────┘ └─────┘ └──────────┘ └──────────┘    │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────▼───────────────────────────────┐
+│                    Infrastructure                           │
+│  ┌──────────┐ ┌─────┐ ┌──────────┐ ┌──────────────────┐  │
+│  │PostgreSQL│ │Redis│ │  Milvus  │ │   Model Gateway  │  │
+│  │   16     │ │  7  │ │ (Vector) │ │  ┌────────────┐  │  │
+│  │          │ │     │ │          │ │  │Main (mimo) │  │  │
+│  │          │ │     │ │          │ │  ├────────────┤  │  │
+│  │          │ │     │ │          │ │  │Rewrite(Qwen)│  │  │
+│  │          │ │     │ │          │ │  ├────────────┤  │  │
+│  │          │ │     │ │          │ │  │Reranker   │  │  │
+│  │          │ │     │ │          │ │  ├────────────┤  │  │
+│  │          │ │     │ │          │ │  │Embedding  │  │  │
+│  └──────────┘ └─────┘ └──────────┘ └──┴────────────┘  │  │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Decisions
@@ -122,6 +179,10 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 - **Snapshot-based Read Models** — session state is projected into read-optimized materialized views
 - **Shared LangGraph Runtime** — a lifespan-managed compiled graph instance shared across requests
 - **Safety-first** — deterministic rules are always enforced before any LLM output reaches the user
+- **Multi-Gateway Architecture** — dedicated gateways for main reasoning, query rewriting (Qwen3.5-2B), embedding, and reranker, each independently configurable with fallback chains
+- **Authority Snapshot Caching** — reasoning agent authority snapshots cached at commit with invalidation on write, reducing DB round-trips by 60–70%
+- **Three-Tier Embedding Cache** — entity → template → runtime warming via Redis, achieving ~60% hit rate and ~4ms retrieval
+- **Two-Stage Formula Drafting** — base formula selection (multi-alternative, practitioner-chosen) → personalized modification (加减方), separated for clinical transparency
 
 ---
 
@@ -138,6 +199,10 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 | Database | PostgreSQL 16 |
 | Cache / Locking | Redis 7 |
 | Vector Store | Milvus 2.5 (via etcd + MinIO) |
+| Main LLM Gateway | Mimo-v2.5 (internal) |
+| Rewrite Gateway | Qwen3.5-2B-free @ dmxapi |
+| Reranker | Jina Reranker M0 (Cross-Encoder) + LLM fallback |
+| Embedding | BGE-M3 via dedicated embedding gateway |
 | Validation | Pydantic v2 |
 | Linting | Ruff + mypy (strict mode) |
 
@@ -248,20 +313,37 @@ xuanhu/
 │   │   ├── context_builder.py   # LLM context assembly
 │   │   ├── repository.py        # Domain repository (CQRS + outbox)
 │   │   ├── checkpoint.py        # PostgreSQL-backed checkpointer
+│   │   ├── syndrome_verifier.py # Syndrome output validation chain
+│   │   ├── formula_verifier.py  # Formula output validation chain
 │   │   └── sandbox_*.py         # Sandboxed evaluation modules
 │   ├── agents/                   # LLM agent prompts & logic
+│   │   ├── syndrome_draft.py    # 辨证草稿 Agent (L4-1)
+│   │   ├── formula_draft.py     # 开方+加减 Agent (L4-2, two-stage)
+│   │   ├── prompts/             # Jinja2 prompt templates (30+)
+│   │   │   └── manifest.yaml    # Prompt registry
+│   │   └── prompt_loader.py     # Prompt template loader
 │   ├── api/                      # REST API routes
 │   │   ├── sessions.py           # Session CRUD
 │   │   ├── messages.py           # Message management
-│   │   ├── advance.py            # Stage advancement (idiompotent)
+│   │   ├── advance.py            # Stage advancement (idempotent)
 │   │   ├── review.py             # Doctor review endpoints
 │   │   ├── stream.py             # SSE streaming
 │   │   ├── record.py             # Medical record operations
 │   │   └── recovery.py           # Session recovery
 │   ├── core/                     # Core configuration & infrastructure
 │   │   ├── config.py             # Settings (pydantic-settings)
-│   │   ├── gateway.py            # Model gateway client
+│   │   ├── gateway.py            # Main model gateway client
+│   │   ├── rewrite_gateway.py    # Query rewrite gateway config
+│   │   ├── reranker_gateway.py   # Reranker gateway config
+│   │   ├── embedding_gateway.py  # Embedding gateway config
 │   │   └── redis.py              # Redis client
+│   ├── rag/                      # Retrieval-Augmented Generation
+│   │   ├── retriever.py          # Hybrid search: Milvus + PG full-text
+│   │   ├── reranker.py           # Multi-tier reranker (MVP/Cross-Encoder/LLM)
+│   │   ├── embedding_cache.py    # Redis-backed embedding cache
+│   │   ├── entity_index.py       # Entity-level indexing
+│   │   ├── reasoning_retrieval.py # Agent-triggered RAG retrieval
+│   │   └── schemas.py            # RAG data structures (Evidence, MergedHit)
 │   ├── db/                       # Database session management
 │   ├── models/                   # SQLAlchemy ORM models
 │   ├── safety/                   # Deterministic safety engine
@@ -280,12 +362,14 @@ xuanhu/
 │       │   ├── MessageList.tsx   # Message display
 │       │   ├── MessageInput.tsx  # Input area
 │       │   ├── StepBar.tsx       # Workflow stage indicator
+│       │   ├── StageResultsPanel.tsx  # Stage results (syndrome/formula/safety cards + P1 multi-alternative selection)
 │       │   ├── ReviewActionsBar.tsx  # Doctor review controls
 │       │   ├── FormulaEditModal.tsx   # Formula editing
 │       │   ├── RecordPanel.tsx   # Medical record display
 │       │   └── SafetyConfirmationPanel.tsx  # Safety confirmations
 │       ├── hooks/                # React hooks
 │       ├── api/                  # API client
+│       ├── types/                # TypeScript type definitions
 │       ├── utils/                # Utilities
 │       └── styles/               # CSS & theme
 ├── data/                         # Knowledge base seed data
@@ -293,7 +377,12 @@ xuanhu/
 │   └── prometheus/               # Monitoring rules
 ├── docs/                         # Comprehensive documentation
 ├── scripts/                      # Utility scripts
-├── tests/                        # Test suite
+│   ├── prewarm_embedding_cache.py # Embedding cache preheat CLI
+│   ├── perf_benchmark.py         # Performance benchmark suite
+│   ├── test_p2_rewrite_gateway.py    # Rewrite gateway E2E test
+│   ├── test_reranker_conn.py     # Reranker connectivity test
+│   └── seed_data.py              # Knowledge base seeding
+├── tests/                        # Test suite (2460+ tests)
 ├── docker-compose.yml            # Middleware orchestration
 ├── pyproject.toml                # Python project config
 └── .env.example                  # Environment template
@@ -313,12 +402,17 @@ xuanhu/
 | [Safety Rules](docs/安全审核规则设计文档.md) | Incompatibilities, dosage, pregnancy, blocking rules |
 | [UI Design](docs/UI设计文档.md) | Workspace pages, stage display, review area |
 | [Deployment Guide](docs/部署指南.md) | Environment variables, Docker Compose, health checks |
+| [Perf: Diagnosis](docs/03_agent性能优化/01-性能诊断报告.md) | Initial profiling, bottleneck identification |
+| [Perf: Gateway & Cache](docs/03_agent性能优化/阶段优化记录-OP2网关池化与embedding缓存-2026-08-06.md) | OP2 optimization: gateway pooling, embedding cache, preheat design |
+| [Perf: Milvus & State Cache](docs/03_agent性能优化/阶段优化记录-OP3Milvus异步化与状态缓存-2026-08-06.md) | OP3 optimization: Milvus async, shared retriever, authority cache |
+| [Perf: 三Agent Pipeline](docs/03_agent性能优化/06-辨证开方加减方Agent逻辑优化方案.md) | Three-agent reasoning pipeline design: Syndrome → Formula → Modification |
+| [Perf: Implementation Report](docs/03_agent性能优化/06-实施评估报告-2026-08-06.md) | Post-optimization evaluation, before/after tables, acceptance report |
 
 ---
 
 ## ⚡ Performance
 
-The agent runtime has been systematically profiled and optimized across four dimensions. All numbers below are measured on a local Docker (PG/Redis/Milvus) + cloud model gateway stack.
+The agent runtime has been systematically profiled and optimized across four dimensions (OP1–OP4). All numbers below are measured on a local Docker (PG/Redis/Milvus) + cloud model gateway stack.
 
 ### Optimization Summary
 
@@ -326,11 +420,15 @@ The agent runtime has been systematically profiled and optimized across four dim
 |---|---|---|---|---|
 | **OP1 State Push-down** | Reasoning DB round-trips per claim | 10+ | 1–2 | ~60–70% reduction |
 | **OP1 Intake** | `_compute_intake_from_claim` calls per finalize | 4× (once per route) | 1× (cached) | 4→1 |
+| **OP1 Authority Cache** | Reasoning authority snapshot reads per turn | Cold DB query each time | Redis-cached, commit-invalidated | DB eliminated in hot path |
 | **OP2 Gateway Pooling** | Health/LLM first vs reuse | ~5.0s vs ~2.0s | ~5.0s vs ~1.1s | Reuse ~4.7× faster |
 | **OP2 Embedding Cache** | Cache hit rate (TCM consult scenario) | 0% (no cache) | **60.0%** | Gate: ≥40% ✅ |
 | **OP2 Embedding Cache** | Miss (gateway RTT) vs hit (Redis) | ~570ms | ~4ms | **~89–209×** speedup |
+| **OP2 Embedding Preheat** | Cold-start cache coverage | 0 entries | 3,979 entries (467 L1 + 3,512 L2) | ~350 MB Redis, ~539s preheat |
 | **OP3 Milvus Async** | 8-way concurrent vector search wall-clock | Serial-blocked | 0.38–0.43s | **2.84–3.14×** speedup |
-| **OP3 M1 Content** | PG backfill round-trip per chunk hit | 1 DB query | **~0ms** (Milvus direct) | Eliminated after re-sync (`sync_knowledge_chunks.py` now stores `content`; runtime auto-detects field presence so old collections fall back to PG) |
+| **OP3 M1 Content** | PG backfill round-trip per chunk hit | 1 DB query | **~0ms** (Milvus direct) | Eliminated after v4 collection migration |
+| **OP3 Reranker** | Evidence relevance ranking | MVP weighted sum only | Cross-Encoder / LLM reranker → top-8 | Deep semantic matching; graceful fallback |
+| **OP3 Rewrite Gateway** | RAG query quality | Raw structured query | LLM-rewritten narrative query | Qwen3.5-2B-free @ dmxapi (304–845ms) |
 
 ### Observability
 
@@ -340,11 +438,17 @@ The agent runtime has been systematically profiled and optimized across four dim
 ### Benchmarks
 
 ```bash
-# Run the full benchmark suite (requires running API + infrastructure)
+# Full performance benchmark suite (requires running API + infrastructure)
 uv run python scripts/perf_benchmark.py
+
+# Embedding cache preheat + hit-rate benchmark
+uv run python scripts/prewarm_embedding_cache.py --all --benchmark
+
+# Rewrite gateway E2E latency test
+uv run python scripts/test_p2_rewrite_gateway.py
 ```
 
-Results are written to `scripts/perf_results.json`.
+Results are written to `scripts/perf_results.json` and `scripts/prewarm_benchmark_result.json`.
 
 ### Regression Gates (CI)
 
@@ -352,6 +456,8 @@ Results are written to `scripts/perf_results.json`.
 - `tests/golden/test_langgraph_performance_baseline.py` — P95 < 5000ms
 - Embedding cache hit rate — ≥ 40%
 - Structured parse success rate — no ≥1pp drop
+- Milvus collection v4 with `content` field — backfill ~0ms verified
+- Golden test assertions for real reasoning traffic — after-data validated
 
 > 📊 Detailed methodology, before/after tables, and per-stage analysis: [Agent Performance Optimization](docs/03_agent性能优化/)
 
