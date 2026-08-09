@@ -97,7 +97,9 @@ class Settings(BaseSettings):
     # ---- Milvus ----
     milvus_host: str = Field(default="localhost", description="Milvus 服务地址")
     milvus_port: int = Field(default=19530, ge=1, le=65535, description="Milvus 端口")
-    milvus_collection: str = Field(default="xuanhu_knowledge_v4", description="Milvus collection 名称（v4=含 content 字段 M1 直返）")
+    milvus_collection: str = Field(
+        default="xuanhu_knowledge_v4", description="Milvus collection 名称（v4=含 content 字段 M1 直返）"
+    )
     milvus_timeout_seconds: int = Field(default=30, ge=1, description="Milvus 连接超时（秒）")
 
     # ---- 模型网关（生产统一口径） ----
@@ -109,18 +111,10 @@ class Settings(BaseSettings):
         ...,
         description="模型网关 API 密钥（必填，日志必须脱敏）",
     )
-    model_gateway_timeout_seconds: int = Field(
-        default=60, ge=1, description="网关请求超时（秒）"
-    )
-    gateway_health_check_timeout_seconds: int = Field(
-        default=10, ge=1, description="网关健康检查超时（秒）"
-    )
-    model_gateway_max_retries: int = Field(
-        default=2, ge=0, description="网关请求最大重试次数"
-    )
-    model_gateway_route_profile: str = Field(
-        default="default", description="网关路由 profile"
-    )
+    model_gateway_timeout_seconds: int = Field(default=60, ge=1, description="网关请求超时（秒）")
+    gateway_health_check_timeout_seconds: int = Field(default=10, ge=1, description="网关健康检查超时（秒）")
+    model_gateway_max_retries: int = Field(default=2, ge=0, description="网关请求最大重试次数")
+    model_gateway_route_profile: str = Field(default="default", description="网关路由 profile")
     reasoning_retry_backoff_base_seconds: float = Field(
         default=10.0,
         ge=0,
@@ -156,12 +150,9 @@ class Settings(BaseSettings):
     )
 
     # ---- Embedding 缓存 ----
-    embedding_cache_ttl_seconds: int = Field(
-        default=3600, ge=0, description="Embedding 向量缓存 TTL（秒），0=不缓存"
-    )
+    embedding_cache_ttl_seconds: int = Field(default=3600, ge=0, description="Embedding 向量缓存 TTL（秒），0=不缓存")
     embedding_cache_prewarm_on_startup: bool = Field(
-        default=False,
-        description="API 启动时后台预热 embedding 缓存（L1+L2），不阻塞就绪"
+        default=False, description="API 启动时后台预热 embedding 缓存（L1+L2），不阻塞就绪"
     )
 
     # ---- Reranker 网关覆盖（可选，Cross-Encoder 模式专用） ----
@@ -183,13 +174,31 @@ class Settings(BaseSettings):
     # ---- 模型名称 ----
     chat_model: str = Field(..., description="对话模型名称（必填）")
     embedding_model: str = Field(..., description="Embedding 模型名称（必填）")
-    embedding_dim: int = Field(
-        ..., ge=1, description="向量维度，必须与 Milvus collection 一致（必填）"
-    )
+    embedding_dim: int = Field(..., ge=1, description="向量维度，必须与 Milvus collection 一致（必填）")
 
     # ---- RAG 参数 ----
     rag_top_k_vector: int = Field(default=12, ge=1, description="向量检索 top-k")
     rag_top_k_fulltext: int = Field(default=12, ge=1, description="全文检索 top-k")
+    rag_fulltext_lexical_enabled: bool = Field(
+        default=True,
+        description="是否将中文 Query 拆为短词进行全文候选召回；关闭时保留原整句 FTS/ILIKE 行为",
+    )
+    rag_fulltext_lexical_max_terms: int = Field(
+        default=12,
+        ge=1,
+        le=32,
+        description="中文全文候选召回最多使用的短词数量",
+    )
+    rag_dual_query_enabled: bool = Field(
+        default=False,
+        description="是否对辨证阶段的问诊键 Query 与医案改写 Query 做候选级 RRF 融合；默认关闭",
+    )
+    rag_dual_query_rrf_k: int = Field(
+        default=60,
+        ge=1,
+        le=200,
+        description="双视图候选融合的 Reciprocal Rank Fusion 常数",
+    )
     rag_top_n_final: int = Field(default=8, ge=1, description="合并去重后最终返回条数")
 
     # ---- RAG 推理链路接入开关 ----
@@ -220,121 +229,94 @@ class Settings(BaseSettings):
         default=0.45,
         ge=0.0,
         le=1.0,
-        description="基础方候选方案的置信度阈值——低于此值的方案被丢弃，不进入 modification"
+        description="基础方候选方案的置信度阈值——低于此值的方案被丢弃，不进入 modification",
     )
     base_formula_min_alternatives: int = Field(
-        default=1,
-        ge=1,
-        le=4,
-        description="至少保留的基础方候选数（即使低于阈值也保留 top-N）"
+        default=1, ge=1, le=4, description="至少保留的基础方候选数（即使低于阈值也保留 top-N）"
     )
-    base_formula_max_alternatives: int = Field(
-        default=3,
-        ge=2,
-        le=4,
-        description="最多保留的基础方候选数"
-    )
+    base_formula_max_alternatives: int = Field(default=3, ge=2, le=4, description="最多保留的基础方候选数")
 
     # ═══════════════════════════════════════════════════════════════
     # P2: Query 改写模型
     # ═══════════════════════════════════════════════════════════════
     rag_query_rewrite_enabled: bool = Field(
-        default=False,
-        description="是否启用辨证 query LLM 改写（默认关闭，需主动开启）"
+        default=False, description="是否启用辨证 query LLM 改写（默认关闭，需主动开启）"
     )
     rag_query_rewrite_model: str = Field(
         default="",
         description=(
             "Query 改写专用模型名称。为空时复用 chat_model。"
             "改写任务不需要医学推理能力，建议使用轻量快速模型（如 qwen3.7-flash 或更小模型）以控制延迟。"
-        )
+        ),
     )
     rag_query_rewrite_model_temperature: float = Field(
-        default=0.1,
-        ge=0.0,
-        le=1.0,
-        description="改写模型 temperature（低温度保证输出稳定、可复现）"
+        default=0.1, ge=0.0, le=1.0, description="改写模型 temperature（低温度保证输出稳定、可复现）"
     )
     rag_query_rewrite_model_max_tokens: int = Field(
-        default=400,
-        ge=100,
-        le=1000,
-        description="改写模型最大输出 token 数"
+        default=400, ge=100, le=1000, description="改写模型最大输出 token 数"
     )
     rag_query_rewrite_timeout_seconds: float = Field(
-        default=3.0,
-        ge=0.5,
-        le=10.0,
-        description="改写调用超时秒数（超时降级为原始 query）"
+        default=3.0, ge=0.5, le=10.0, description="改写调用超时秒数（超时降级为原始 query）"
     )
 
     # ---- Query 改写网关覆盖（可选，轻量模型专用） ----
     # 设置后覆盖 MODEL_GATEWAY_BASE_URL / MODEL_GATEWAY_API_KEY 用于 query 改写调用
     # 未设置时回退到 runtime.gateway（主推理网关）
     rag_query_rewrite_gateway_base_url: str = Field(
-        default="",
-        description="Query 改写专用网关地址（可选，未设置时回退 runtime.gateway）"
+        default="", description="Query 改写专用网关地址（可选，未设置时回退 runtime.gateway）"
     )
     rag_query_rewrite_gateway_api_key: str = Field(
-        default="",
-        description="Query 改写专用网关 API 密钥（可选，未设置时回退 runtime.gateway）"
+        default="", description="Query 改写专用网关 API 密钥（可选，未设置时回退 runtime.gateway）"
     )
     rag_query_rewrite_gateway_timeout_seconds: float = Field(
-        default=0,
-        ge=0,
-        description="改写网关超时（秒），0=回退 rag_query_rewrite_timeout_seconds"
+        default=0, ge=0, description="改写网关超时（秒），0=回退 rag_query_rewrite_timeout_seconds"
     )
     rag_query_rewrite_gateway_max_retries: int = Field(
-        default=0,
-        ge=0,
-        description="改写网关最大重试次数，0=回退 model_gateway_max_retries"
+        default=0, ge=0, description="改写网关最大重试次数，0=回退 model_gateway_max_retries"
     )
 
     # ═══════════════════════════════════════════════════════════════
     # Reranker: Cross-Encoder / LLM Reranker
     # ═══════════════════════════════════════════════════════════════
     rag_reranker_enabled: bool = Field(
-        default=False,
-        description="是否启用 Cross-Encoder / LLM Reranker（默认关闭，关闭时使用 MVP 加权求和）"
+        default=False, description="是否启用 Cross-Encoder / LLM Reranker（默认关闭，关闭时使用 MVP 加权求和）"
     )
     rag_reranker_provider: str = Field(
         default="cross_encoder",
         pattern="^(cross_encoder|llm)$",
-        description="Reranker 类型：cross_encoder（专用模型）或 llm（LLM 评判）"
+        description="Reranker 类型：cross_encoder（专用模型）或 llm（LLM 评判）",
     )
     rag_reranker_model: str = Field(
         default="",
         description=(
             "Reranker 模型名称。cross_encoder 模式下为 reranker 模型名（如 BAAI/bge-reranker-v2-m3）；"
             "llm 模式下为 LLM 模型名（为空时复用 chat_model）。"
-        )
+        ),
     )
     rag_reranker_top_k: int = Field(
-        default=20,
-        ge=10,
+        default=20, ge=10, le=50, description="送入 reranker 的候选 chunk 数量（从 ANN 召回中取 top-K）"
+    )
+    rag_reranker_fulltext_quota: int = Field(
+        default=0,
+        ge=0,
         le=50,
-        description="送入 reranker 的候选 chunk 数量（从 ANN 召回中取 top-K）"
+        description="Cross-Encoder 候选池中保留的全文独有候选数，0=保持原有合并顺序",
     )
-    rag_reranker_final_top_k: int = Field(
-        default=8,
-        ge=3,
+    rag_reranker_max_chunks_per_source: int = Field(
+        default=0,
+        ge=0,
         le=20,
-        description="Reranker 重排后最终返回的 chunk 数量"
+        description="Cross-Encoder 候选池内同一来源最多保留的 chunk 数，0=不做来源多样化",
     )
+    rag_reranker_final_top_k: int = Field(default=8, ge=3, le=20, description="Reranker 重排后最终返回的 chunk 数量")
     rag_reranker_timeout_seconds: float = Field(
-        default=5.0,
-        ge=1.0,
-        le=15.0,
-        description="Reranker 调用超时秒数（超时降级为 MVP 加权求和）"
+        default=5.0, ge=1.0, le=15.0, description="Reranker 调用超时秒数（超时降级为 MVP 加权求和）"
     )
 
     # ---- Agent ----
     agent_runtime_version: Literal["legacy", "langgraph"] = Field(
         default="legacy",
-        description=(
-            "新会话默认 Agent 运行时。L0-L8 默认 legacy；"
-            "该开关不得改变既有会话的运行时身份"
-        ),
+        description=("新会话默认 Agent 运行时。L0-L8 默认 legacy；该开关不得改变既有会话的运行时身份"),
     )
     langgraph_public_enabled: bool = Field(
         default=False,
@@ -375,9 +357,7 @@ class Settings(BaseSettings):
         ge=0.1,
         description="SSE 空闲心跳间隔（秒）",
     )
-    prompt_manifest_path: str = Field(
-        default="app/agents/prompts/manifest.yaml", description="Prompt 清单文件路径"
-    )
+    prompt_manifest_path: str = Field(default="app/agents/prompts/manifest.yaml", description="Prompt 清单文件路径")
 
     # ---- Durable Outbox Publisher ----
     outbox_publisher_enabled: bool = Field(

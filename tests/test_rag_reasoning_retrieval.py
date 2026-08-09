@@ -38,6 +38,31 @@ class FakeRetriever:
         return list(self.evidence or ())
 
 
+class DualFakeRetriever(FakeRetriever):
+    def __init__(self, evidence: list[Evidence] | None = None, error: Exception | None = None) -> None:
+        super().__init__(evidence=evidence, error=error)
+        self.dual_calls: list[dict[str, Any]] = []
+
+    async def retrieve_dual_query(
+        self,
+        original_query: str,
+        rewritten_query: str,
+        primary_sources: list[str],
+        **kwargs: Any,
+    ) -> list[Evidence]:
+        self.dual_calls.append(
+            {
+                "original_query": original_query,
+                "rewritten_query": rewritten_query,
+                "primary_sources": primary_sources,
+                **kwargs,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return list(self.evidence or ())
+
+
 def _evidence(evidence_id: str, *, source_type: str = "case", rank: int = 1) -> Evidence:
     return Evidence(
         evidence_id=evidence_id,
@@ -117,6 +142,53 @@ def test_build_syndrome_query_empty_returns_empty_string() -> None:
     assert build_syndrome_query([_Obs("k", None)], max_chars=2000) == ""
 
 
+def test_build_syndrome_query_expands_slot_snapshot_to_real_fact_keys() -> None:
+    slot_snapshot = {
+        "dimension": "ten_questions.cold_heat",
+        "slots": [
+            {
+                "slot_name": "present_illness.chills",
+                "value": "怕冷不明显",
+                "source_message_id": "opaque-id",
+                "confidence": 0.9,
+            },
+            {
+                "slot_name": "present_illness.fever",
+                "value": "不发烧",
+                "source_message_id": "opaque-id-2",
+                "confidence": 0.9,
+            },
+        ],
+        "completeness": "complete",
+        "missing_slots": [],
+    }
+
+    query = build_syndrome_query((_Obs("ten_questions.cold_heat", slot_snapshot),), max_chars=2000)
+
+    assert query == "present_illness.chills=怕冷不明显；present_illness.fever=不发烧"
+    assert "complete" not in query
+    assert "opaque-id" not in query
+
+
+def test_build_syndrome_query_slot_snapshot_uses_real_keys_for_priority_order() -> None:
+    slot_snapshot = {
+        "dimension": "ten_questions.cold_heat",
+        "slots": [{"slot_name": "present_illness.fever", "value": "午后低热"}],
+        "completeness": "complete",
+        "missing_slots": [],
+    }
+    observations = (
+        _Obs("ten_questions.cold_heat", slot_snapshot),
+        _Obs("patient.age", 45),
+        _Obs("chief_complaint.symptom", "咳嗽三天"),
+    )
+
+    query = build_syndrome_query(observations, max_chars=2000)
+
+    assert query.index("chief_complaint.symptom=") < query.index("patient.age=")
+    assert query.index("present_illness.fever=") < query.index("patient.age=")
+
+
 # ---------------------------------------------------------------------------
 # 检索与降级
 # ---------------------------------------------------------------------------
@@ -134,6 +206,34 @@ async def test_retrieve_syndrome_evidence_passes_query_and_sources() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retrieve_syndrome_evidence_uses_dual_query_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "rag_dual_query_enabled", True)
+    retriever = DualFakeRetriever([_evidence("ev-1")])
+    observations = (
+        _Obs("chief_complaint.symptom", "咳嗽"),
+        _Obs("ten_questions.cold_heat", "恶寒"),
+    )
+
+    results = await retrieve_syndrome_evidence(
+        retriever,
+        observations,
+        query="咳嗽恶寒，白痰，夜间加重",
+        top_k=4,
+    )
+
+    assert [ev.evidence_id for ev in results] == ["ev-1"]
+    assert retriever.calls == []
+    assert len(retriever.dual_calls) == 1
+    call = retriever.dual_calls[0]
+    assert "chief_complaint.symptom=咳嗽" in call["original_query"]
+    assert call["rewritten_query"] == "咳嗽恶寒，白痰，夜间加重"
+    assert call["primary_sources"] == list(SYNDROME_PRIMARY_SOURCES)
+    assert call["top_k"] == 4
+
+
+@pytest.mark.asyncio
 async def test_retrieve_formula_evidence_uses_formula_sources() -> None:
     retriever = FakeRetriever([_evidence("ev-1", source_type="formula")])
 
@@ -141,7 +241,9 @@ async def test_retrieve_formula_evidence_uses_formula_sources() -> None:
         syndrome = "肝郁气滞证"
         treatment_principle = "疏肝理气"
 
-    results = await retrieve_formula_evidence(retriever, _Syndrome(), (_Obs("chief_complaint.symptom", "胁痛"),), top_k=6)
+    results = await retrieve_formula_evidence(
+        retriever, _Syndrome(), (_Obs("chief_complaint.symptom", "胁痛"),), top_k=6
+    )
     assert [ev.evidence_id for ev in results] == ["ev-1"]
     call = retriever.calls[0]
     assert call["primary_sources"] == list(FORMULA_PRIMARY_SOURCES)

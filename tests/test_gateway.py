@@ -85,11 +85,7 @@ async def test_chat_success(mock_settings: Settings) -> None:
         respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {"message": {"content": "Hello, this is a test response."}}
-                    ]
-                },
+                json={"choices": [{"message": {"content": "Hello, this is a test response."}}]},
             )
         )
 
@@ -99,6 +95,36 @@ async def test_chat_success(mock_settings: Settings) -> None:
         )
 
     assert result == "Hello, this is a test response."
+
+
+@pytest.mark.asyncio
+async def test_chat_qwen3_disables_thinking_for_non_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen3 chat models must opt out of thinking on non-streaming calls."""
+    monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "https://www.dmxapi.cn/v1")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "sk-test-key-12345")
+    monkeypatch.setenv("MODEL_GATEWAY_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("MODEL_GATEWAY_MAX_RETRIES", "2")
+    monkeypatch.setenv("CHAT_MODEL", "qwen3-8b")
+    monkeypatch.setenv("EMBEDDING_MODEL", "test-embed")
+    monkeypatch.setenv("EMBEDDING_DIM", "768")
+    get_settings.cache_clear()
+    client = ModelGatewayClient(get_settings())
+
+    with respx.mock:
+        route = respx.post("https://www.dmxapi.cn/v1/chat/completions").mock(
+            return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        )
+        result = await client.chat(
+            messages=[{"role": "user", "content": "Hello"}],
+            model="qwen3-8b",
+            trace_id="test-qwen3-thinking",
+        )
+
+    assert result == "ok"
+    payload = json.loads(route.calls[0].request.content.decode())
+    assert payload["enable_thinking"] is False
 
 
 @pytest.mark.asyncio
@@ -180,7 +206,7 @@ async def test_chat_403_retries_once_then_succeeds(mock_settings: Settings) -> N
                         "choices": [
                             {
                                 "message": {
-                                    "content": "{\"reply\": \"ok\"}",
+                                    "content": '{"reply": "ok"}',
                                     "reasoning_content": None,
                                 },
                                 "finish_reason": "stop",
@@ -304,15 +330,7 @@ async def test_chat_structured_success(mock_settings: Settings) -> None:
                     "choices": [
                         {
                             "message": {
-                                "tool_calls": [
-                                    {
-                                        "function": {
-                                            "arguments": json.dumps(
-                                                {"name": "test", "value": 42}
-                                            )
-                                        }
-                                    }
-                                ]
+                                "tool_calls": [{"function": {"arguments": json.dumps({"name": "test", "value": 42})}}]
                             }
                         }
                     ]
@@ -358,11 +376,7 @@ async def test_chat_structured_observed_uses_response_model_and_usage(mock_setti
                         {
                             "message": {
                                 "tool_calls": [
-                                    {
-                                        "function": {
-                                            "arguments": json.dumps({"name": "observed", "value": 42})
-                                        }
-                                    }
+                                    {"function": {"arguments": json.dumps({"name": "observed", "value": 42})}}
                                 ]
                             }
                         }
@@ -395,15 +409,7 @@ async def test_chat_structured_parse_from_content(mock_settings: Settings) -> No
         respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": json.dumps({"name": "from-content", "value": 50})
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"content": json.dumps({"name": "from-content", "value": 50})}}]},
             )
         )
 
@@ -457,15 +463,7 @@ async def test_chat_structured_json_object_mode_builds_compatible_payload(
         route = respx.post("https://api.deepseek.com/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": json.dumps({"name": "json-mode", "value": 7})
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"content": json.dumps({"name": "json-mode", "value": 7})}}]},
             )
         )
 
@@ -503,17 +501,7 @@ async def test_chat_structured_repairs_stringified_intake_safety_delta(
         route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "tool_calls": [
-                                    {"function": {"arguments": json.dumps(arguments)}}
-                                ]
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"tool_calls": [{"function": {"arguments": json.dumps(arguments)}}]}}]},
             )
         )
 
@@ -547,17 +535,7 @@ async def test_chat_structured_rejects_invalid_stringified_intake_safety_delta(
         route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "tool_calls": [
-                                    {"function": {"arguments": json.dumps(arguments)}}
-                                ]
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"tool_calls": [{"function": {"arguments": json.dumps(arguments)}}]}}]},
             )
         )
 
@@ -583,17 +561,7 @@ async def test_chat_structured_does_not_relax_intake_safety_delta_schema(
         route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "tool_calls": [
-                                    {"function": {"arguments": json.dumps(arguments)}}
-                                ]
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"tool_calls": [{"function": {"arguments": json.dumps(arguments)}}]}}]},
             )
         )
 
@@ -645,31 +613,15 @@ async def test_chat_structured_json_mode_fallback(mock_settings: Settings) -> No
         if len(call_payloads) == 1:
             return Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "tool_calls": [
-                                    {"function": {"arguments": "not valid json"}}
-                                ]
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"tool_calls": [{"function": {"arguments": "not valid json"}}]}}]},
             )
         return Response(
             200,
-            json={
-                "choices": [
-                    {"message": {"content": json.dumps({"name": "fallback", "value": 64})}}
-                ]
-            },
+            json={"choices": [{"message": {"content": json.dumps({"name": "fallback", "value": 64})}}]},
         )
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            side_effect=side_effect
-        )
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=side_effect)
 
         result = await client.chat_structured(
             messages=[
@@ -699,17 +651,7 @@ async def test_chat_structured_json_fallback_repairs_inquiry_output(mock_setting
         responses = [
             Response(
                 200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "tool_calls": [
-                                    {"function": {"arguments": "not valid json"}}
-                                ]
-                            }
-                        }
-                    ]
-                },
+                json={"choices": [{"message": {"tool_calls": [{"function": {"arguments": "not valid json"}}]}}]},
             ),
             Response(
                 200,
@@ -738,9 +680,7 @@ async def test_chat_structured_json_fallback_repairs_inquiry_output(mock_setting
                 },
             ),
         ]
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            side_effect=responses
-        )
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=responses)
 
         result = await client.chat_structured(
             messages=[{"role": "user", "content": "Generate JSON"}],
@@ -762,11 +702,7 @@ async def test_chat_structured_parse_failure(mock_settings: Settings) -> None:
         respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
             return_value=Response(
                 200,
-                json={
-                    "choices": [
-                        {"message": {"content": "not valid json"}}
-                    ]
-                },
+                json={"choices": [{"message": {"content": "not valid json"}}]},
             )
         )
 
@@ -888,9 +824,7 @@ async def test_embed_unavailable(mock_settings: Settings) -> None:
     client = ModelGatewayClient(mock_settings)
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/embeddings").mock(
-            return_value=Response(503)
-        )
+        respx.post("http://mock-gateway:8080/v1/embeddings").mock(return_value=Response(503))
 
         with pytest.raises(EmbeddingUnavailableError):
             await client.embed(
@@ -1000,9 +934,7 @@ async def test_embed_real_connect_error(mock_settings: Settings) -> None:
     client = ModelGatewayClient(mock_settings)
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/embeddings").mock(
-            side_effect=httpx.ConnectError("connection refused")
-        )
+        respx.post("http://mock-gateway:8080/v1/embeddings").mock(side_effect=httpx.ConnectError("connection refused"))
 
         with pytest.raises(EmbeddingUnavailableError):
             await client.embed(
@@ -1047,9 +979,7 @@ async def test_health_check_chat_unavailable(mock_settings: Settings) -> None:
     client = ModelGatewayClient(mock_settings)
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            return_value=Response(503)
-        )
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(return_value=Response(503))
         respx.post("http://mock-gateway:8080/v1/embeddings").mock(
             return_value=Response(
                 200,
@@ -1075,9 +1005,7 @@ async def test_health_check_embedding_unavailable(mock_settings: Settings) -> No
                 json={"choices": [{"message": {"content": "ok"}}]},
             )
         )
-        respx.post("http://mock-gateway:8080/v1/embeddings").mock(
-            return_value=Response(503)
-        )
+        respx.post("http://mock-gateway:8080/v1/embeddings").mock(return_value=Response(503))
 
         checks = await client.health_check()
 
@@ -1144,9 +1072,7 @@ async def test_chat_retry_on_5xx(mock_settings: Settings) -> None:
         )
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            side_effect=side_effect
-        )
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=side_effect)
 
         result = await client.chat(
             messages=[{"role": "user", "content": "Hello"}],
@@ -1170,9 +1096,7 @@ async def test_chat_no_retry_on_4xx(mock_settings: Settings) -> None:
         return Response(400, json={"error": "bad request"})
 
     with respx.mock:
-        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            side_effect=side_effect
-        )
+        respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=side_effect)
 
         with pytest.raises(ModelGatewayUnavailableError) as exc_info:
             await client.chat(
@@ -1182,6 +1106,7 @@ async def test_chat_no_retry_on_4xx(mock_settings: Settings) -> None:
 
     assert call_count == 1  # 不重试
     assert exc_info.value.retryable is False
+
 
 # --- A2 empty-content-guard test appended ---
 @pytest.mark.asyncio
@@ -1199,9 +1124,7 @@ async def test_chat_structured_empty_content_skips_json_fallback(mock_settings: 
         )
 
     with respx.mock:
-        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
-            side_effect=side_effect
-        )
+        route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(side_effect=side_effect)
         with pytest.raises(ChatStructuredParseError):
             await client.chat_structured(
                 messages=[{"role": "user", "content": "Extract"}],
@@ -1215,4 +1138,3 @@ async def test_chat_structured_empty_content_skips_json_fallback(mock_settings: 
     for payload in call_payloads:
         assert "tools" in payload
         assert "response_format" not in payload
-

@@ -47,12 +47,37 @@ FIXED_SEED = 20260807
 FIXED_SMOKE_SIZE = 20
 FIXED_TEST_SIZE = 200
 FIXED_TOP_K = 8
+RECALL_CUTOFFS = (1, 5, FIXED_TOP_K)
 FIXED_BOOTSTRAP_SAMPLES = 10_000
 SOURCE_TYPES = ["case"]
 RESULT_SCHEMA_VERSION = "1.0"
 RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+QUERY_STYLE_NATURAL_LANGUAGE_V1 = "natural_language_v1"
+QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1 = "structured_fact_key_value_v1"
+_SUPPORTED_QUERY_STYLES = frozenset(
+    {
+        QUERY_STYLE_NATURAL_LANGUAGE_V1,
+        QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    }
+)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_RUNTIME_SOURCE_FILES: dict[str, Path] = {
+    "evaluator": Path(__file__).resolve(),
+    "builder": _PROJECT_ROOT / "scripts" / "build_rag_silver_eval.py",
+    "hard_patient_builder": _PROJECT_ROOT / "scripts" / "build_rag_hard_patient_eval.py",
+    "config": _PROJECT_ROOT / "app" / "core" / "config.py",
+    "gateway": _PROJECT_ROOT / "app" / "core" / "gateway.py",
+    "embedding_gateway": _PROJECT_ROOT / "app" / "core" / "embedding_gateway.py",
+    "reranker_gateway": _PROJECT_ROOT / "app" / "core" / "reranker_gateway.py",
+    "rewrite_gateway": _PROJECT_ROOT / "app" / "core" / "rewrite_gateway.py",
+    "retriever": _PROJECT_ROOT / "app" / "rag" / "retriever.py",
+    "reranker": _PROJECT_ROOT / "app" / "rag" / "reranker.py",
+    "reasoning_retrieval": _PROJECT_ROOT / "app" / "rag" / "reasoning_retrieval.py",
+}
 _RECORD_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_STRUCTURED_FACT_KEY_VALUE_PART_RE = re.compile(
+    r"(?P<fact_key>[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)=(?P<value>[^=；\r\n]+)"
+)
 _SECRET_VALUE_RE = re.compile(
     r"(?i)(bearer\s+)[^\s,]+|(sk-[A-Za-z0-9_\-]+)|((?:password|token|api[_-]?key)\s*[=:]\s*)[^\s,]+"
 )
@@ -81,6 +106,55 @@ _REQUIRED_PREFLIGHT_CHECKS = (
 JsonObject = dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RetrievalProfile:
+    """Explicit full-arm retrieval parameters for a reproducible comparison."""
+
+    name: str
+    vector_top_k: int
+    fulltext_top_k: int
+    reranker_top_k: int
+    fulltext_quota: int
+    fulltext_lexical_enabled: bool
+    reranker_max_chunks_per_source: int = 0
+    dual_query_enabled: bool = False
+
+
+_RETRIEVAL_PROFILES: dict[str, RetrievalProfile] = {
+    "v12-lexical-off": RetrievalProfile("v12-lexical-off", 12, 12, 20, 0, False),
+    "current-v12": RetrievalProfile("current-v12", 12, 12, 20, 0, True),
+    "current-v12-source-diverse": RetrievalProfile(
+        "current-v12-source-diverse", 12, 12, 20, 0, True, reranker_max_chunks_per_source=1
+    ),
+    "current-v12-dual-rrf": RetrievalProfile("current-v12-dual-rrf", 12, 12, 20, 0, True, dual_query_enabled=True),
+    "current-v12-dual-rrf-source-diverse": RetrievalProfile(
+        "current-v12-dual-rrf-source-diverse",
+        12,
+        12,
+        20,
+        0,
+        True,
+        reranker_max_chunks_per_source=1,
+        dual_query_enabled=True,
+    ),
+    "current-v12-expanded20": RetrievalProfile("current-v12-expanded20", 20, 20, 28, 0, True),
+    "current-v12-dual-full": RetrievalProfile("current-v12-dual-full", 12, 12, 48, 0, True, dual_query_enabled=True),
+    # ``reranker_top_k`` is the complete candidate pool, not just the vector
+    # prefix.  Reserve eight lexical-only places *in addition to* the 20
+    # widened vector candidates so the experiment actually tests recall@20.
+    "expanded-v20-f8": RetrievalProfile("expanded-v20-f8", 20, 20, 28, 8, True),
+    "expanded-v32-f12": RetrievalProfile("expanded-v32-f12", 32, 32, 44, 12, True),
+}
+_DEFAULT_RETRIEVAL_PROFILE = "current-v12"
+
+
+def resolve_retrieval_profile(name: str) -> RetrievalProfile:
+    try:
+        return _RETRIEVAL_PROFILES[name]
+    except KeyError as exc:
+        raise EvaluationError(f"unknown retrieval profile: {name}") from exc
+
+
 class EvaluationError(RuntimeError):
     """A fail-closed evaluation contract error."""
 
@@ -99,6 +173,62 @@ class TargetResolutionError(EvaluationError):
 
 class ArmTechnicalFailure(EvaluationError):
     """An arm did not produce a scoreable ranking and must be retried."""
+
+
+def _require_query_style(query_style: Any, *, error_type: type[EvaluationError] = EvaluationError) -> str:
+    if not isinstance(query_style, str) or query_style not in _SUPPORTED_QUERY_STYLES:
+        raise error_type(f"unknown query_style: {query_style!r}")
+    return query_style
+
+
+def query_style_from_manifest(manifest: Mapping[str, Any]) -> str:
+    """Return the frozen input contract, preserving legacy v1's default."""
+    return _require_query_style(
+        manifest.get("query_style", QUERY_STYLE_NATURAL_LANGUAGE_V1),
+        error_type=DatasetError,
+    )
+
+
+def query_style_from_config(config: Mapping[str, Any]) -> str:
+    """Read the mode captured with a run, defaulting only legacy v1 artifacts."""
+    return _require_query_style(config.get("query_style", QUERY_STYLE_NATURAL_LANGUAGE_V1))
+
+
+def query_style_from_result(record: Mapping[str, Any]) -> str:
+    """Read the mode persisted on a result row, defaulting only legacy v1 rows."""
+    return _require_query_style(
+        record.get("query_style", QUERY_STYLE_NATURAL_LANGUAGE_V1), error_type=ResumeIntegrityError
+    )
+
+
+def validate_structured_fact_key_value_query(query: str) -> None:
+    """Fail closed unless a production-style direct fact query is unambiguous."""
+    try:
+        from scripts.build_rag_silver_eval import STRUCTURED_QUERY_CANONICAL_FACT_KEYS
+    except Exception as exc:  # pragma: no cover - a missing shared contract is an operator failure
+        raise DatasetError("structured query canonical fact-key contract is unavailable") from exc
+    canonical_fact_keys = set(STRUCTURED_QUERY_CANONICAL_FACT_KEYS)
+    if not canonical_fact_keys or not all(isinstance(key, str) for key in canonical_fact_keys):
+        raise DatasetError("structured query canonical fact-key contract is invalid")
+    if query != query.strip() or "\n" in query or "\r" in query:
+        raise DatasetError("structured query has leading/trailing whitespace or a line break")
+    parts = query.split("；")
+    if not 2 <= len(parts) <= 8 or any(not part for part in parts):
+        raise DatasetError("structured query must contain two to eight fact_key=value parts")
+    fact_keys: set[str] = set()
+    for part in parts:
+        match = _STRUCTURED_FACT_KEY_VALUE_PART_RE.fullmatch(part)
+        if match is None:
+            raise DatasetError("structured query is not fact_key=value；... format")
+        fact_key = match.group("fact_key")
+        value = match.group("value")
+        if fact_key not in canonical_fact_keys:
+            raise DatasetError("structured query contains an unknown canonical fact_key")
+        if value != value.strip() or not value or ";" in value:
+            raise DatasetError("structured query fact value is empty or padded")
+        if fact_key in fact_keys:
+            raise DatasetError("structured query repeats a fact_key")
+        fact_keys.add(fact_key)
 
 
 def utc_now() -> str:
@@ -372,7 +502,42 @@ class FrozenSplit:
     manifest: JsonObject
 
 
-def _validate_dataset_record(record: Mapping[str, Any], split: str) -> None:
+FROZEN_REWRITE_CACHE_SCHEMA_VERSION = "1.0"
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRewriteCache:
+    """Immutable actual Rewrite outputs shared by every ablation run.
+
+    A cache is deliberately bound to the two frozen split hashes, the model
+    configuration and every original query hash.  It prevents sampling drift
+    in the Rewrite model from being attributed to a retrieval-only ablation.
+    """
+
+    sha256: str
+    model: str
+    temperature: float
+    entries: Mapping[str, Mapping[str, Any]]
+
+    def effective_query_for(self, query_id: str, original_query: str) -> str:
+        entry = self.entries.get(query_id)
+        if entry is None or entry.get("query_sha256") != sha256_text(original_query):
+            raise EvaluationError("frozen rewrite cache entry does not bind to the current query")
+        effective_query = entry.get("effective_query")
+        if not isinstance(effective_query, str) or not effective_query.strip():
+            raise EvaluationError("frozen rewrite cache has an empty effective query")
+        if entry.get("effective_query_sha256") != sha256_text(effective_query):
+            raise EvaluationError("frozen rewrite cache effective query hash is invalid")
+        return effective_query
+
+
+def _validate_dataset_record(
+    record: Mapping[str, Any],
+    split: str,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+) -> None:
+    query_style = _require_query_style(query_style, error_type=DatasetError)
     if record.get("schema_version") != SCHEMA_VERSION:
         raise DatasetError("frozen query schema_version mismatch")
     if record.get("dataset_version") != DATASET_VERSION:
@@ -386,6 +551,8 @@ def _validate_dataset_record(record: Mapping[str, Any], split: str) -> None:
         raise DatasetError("frozen query has no query_id")
     if not isinstance(query, str) or not query:
         raise DatasetError("frozen query has no query")
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        validate_structured_fact_key_value_query(query)
     if not isinstance(target, str) or _RECORD_KEY_RE.fullmatch(target) is None:
         raise DatasetError("frozen query target_record_key must be a SHA-256")
 
@@ -400,6 +567,7 @@ def load_frozen_split(dataset_dir: Path, split: str) -> FrozenSplit:
     manifest = read_json(manifest_path)
     if manifest.get("dataset_version") != DATASET_VERSION or manifest.get("frozen") is not True:
         raise DatasetError("dataset is not frozen rag-silver-v1")
+    query_style = query_style_from_manifest(manifest)
     path = dataset_dir / f"{split}.jsonl"
     actual_sha = sha256_file(path) if path.exists() else ""
     expected_sha = (manifest.get("artifact_sha256") or {}).get(f"{split}.jsonl")
@@ -412,7 +580,7 @@ def load_frozen_split(dataset_dir: Path, split: str) -> FrozenSplit:
     query_ids: set[str] = set()
     targets: set[str] = set()
     for row in records:
-        _validate_dataset_record(row, split)
+        _validate_dataset_record(row, split, query_style=query_style)
         query_id = cast(str, row["query_id"])
         target = cast(str, row["target_record_key"])
         if query_id in query_ids or target in targets:
@@ -425,6 +593,8 @@ def load_frozen_split(dataset_dir: Path, split: str) -> FrozenSplit:
 def validate_dataset_pair(dataset_dir: Path) -> tuple[FrozenSplit, FrozenSplit]:
     smoke = load_frozen_split(dataset_dir, "smoke")
     test = load_frozen_split(dataset_dir, "test")
+    if query_style_from_manifest(smoke.manifest) != query_style_from_manifest(test.manifest):
+        raise DatasetError("smoke/test query_style mismatch")
     smoke_targets = {cast(str, row["target_record_key"]) for row in smoke.records}
     test_targets = {cast(str, row["target_record_key"]) for row in test.records}
     if smoke_targets & test_targets:
@@ -455,13 +625,19 @@ def _verify_frozen_dataset_source(dataset_dir: Path, manifest: Mapping[str, Any]
         raise DatasetError("frozen manifest source paths are malformed")
     prepared_bundle = staging_manifest_path.parent
     try:
-        from scripts.build_rag_silver_eval import verify_frozen_dataset
+        hardening = manifest.get("hardening")
+        if isinstance(hardening, Mapping) and hardening.get("variant") == "rag-hard-patient-v1":
+            from scripts.build_rag_hard_patient_eval import verify_hard_patient_dataset
 
-        problems = verify_frozen_dataset(dataset_dir, prepared_bundle)
+            problems = verify_hard_patient_dataset(dataset_dir, prepared_bundle)
+        else:
+            from scripts.build_rag_silver_eval import verify_frozen_dataset
+
+            problems = verify_frozen_dataset(dataset_dir, prepared_bundle)
     except Exception as exc:
         raise DatasetError("builder frozen-dataset verifier failed") from exc
     if problems:
-        raise DatasetError(f"builder frozen-dataset verifier rejected v1: {problems[0].check}")
+        raise DatasetError(f"builder frozen-dataset verifier rejected dataset: {problems[0].check}")
     if source.get("staging_manifest_sha256") != sha256_file(staging_manifest_path):
         raise DatasetError("staging manifest hash differs from frozen manifest")
     if source.get("prepared_cases_sha256") != sha256_file(prepared_cases_path):
@@ -517,19 +693,180 @@ def copy_dataset_manifest(dataset_dir: Path, run_dir: Path, smoke: FrozenSplit, 
     write_json_atomic(destination, copied)
 
 
-def set_contract_environment(collection: str) -> None:
+def _frozen_rewrite_cache_body(payload: Mapping[str, Any]) -> JsonObject:
+    body = dict(payload)
+    body.pop("cache_sha256", None)
+    return body
+
+
+def load_frozen_rewrite_cache(
+    path: Path,
+    *,
+    smoke: FrozenSplit,
+    test: FrozenSplit,
+    settings: Any,
+) -> FrozenRewriteCache:
+    """Load a cache only when it exactly matches frozen inputs and Rewrite config."""
+    payload = read_json(path)
+    if payload.get("schema_version") != FROZEN_REWRITE_CACHE_SCHEMA_VERSION:
+        raise EvaluationError("frozen rewrite cache schema_version is invalid")
+    observed_sha = payload.get("cache_sha256")
+    expected_sha = sha256_bytes(compact_json_bytes(_frozen_rewrite_cache_body(payload)))
+    if not isinstance(observed_sha, str) or observed_sha != expected_sha:
+        raise EvaluationError("frozen rewrite cache SHA-256 is invalid")
+    dataset = payload.get("dataset")
+    rewrite = payload.get("rewrite")
+    if not isinstance(dataset, Mapping) or not isinstance(rewrite, Mapping):
+        raise EvaluationError("frozen rewrite cache lacks dataset or rewrite contract")
+    if dataset.get("smoke_sha256") != smoke.sha256 or dataset.get("test_sha256") != test.sha256:
+        raise EvaluationError("frozen rewrite cache binds to a different frozen split")
+    if rewrite.get("model") != _actual_rewrite_model(settings):
+        raise EvaluationError("frozen rewrite cache uses a different Rewrite model")
+    try:
+        cache_temperature = float(cast(Any, rewrite.get("temperature")))
+    except (TypeError, ValueError) as exc:
+        raise EvaluationError("frozen rewrite cache has an invalid Rewrite temperature") from exc
+    if not math.isclose(cache_temperature, float(settings.rag_query_rewrite_model_temperature), abs_tol=1e-12):
+        raise EvaluationError("frozen rewrite cache uses a different Rewrite temperature")
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raise EvaluationError("frozen rewrite cache entries must be a list")
+
+    expected_rows = {
+        str(row["query_id"]): (split.split, str(row["query"])) for split in (smoke, test) for row in split.records
+    }
+    entries: dict[str, Mapping[str, Any]] = {}
+    for item in raw_entries:
+        if not isinstance(item, Mapping):
+            raise EvaluationError("frozen rewrite cache contains a non-object entry")
+        query_id = item.get("query_id")
+        if not isinstance(query_id, str) or query_id in entries or query_id not in expected_rows:
+            raise EvaluationError("frozen rewrite cache query identities are invalid")
+        expected_split, original_query = expected_rows[query_id]
+        if item.get("split") != expected_split or item.get("query_sha256") != sha256_text(original_query):
+            raise EvaluationError("frozen rewrite cache entry does not bind to frozen input")
+        effective_query = item.get("effective_query")
+        if not isinstance(effective_query, str) or not effective_query.strip():
+            raise EvaluationError("frozen rewrite cache contains an empty rewrite")
+        if item.get("effective_query_sha256") != sha256_text(effective_query):
+            raise EvaluationError("frozen rewrite cache entry effective hash is invalid")
+        if item.get("gateway_status") != "succeeded":
+            raise EvaluationError("frozen rewrite cache may not replay a failed or fallback rewrite")
+        entries[query_id] = item
+    if set(entries) != set(expected_rows):
+        raise EvaluationError("frozen rewrite cache does not cover every Smoke/Test query")
+    return FrozenRewriteCache(
+        sha256=observed_sha,
+        model=str(rewrite["model"]),
+        temperature=cache_temperature,
+        entries=entries,
+    )
+
+
+async def freeze_rewrites(
+    dataset_dir: Path,
+    output_path: Path,
+    collection: str,
+    *,
+    profile_name: str = _DEFAULT_RETRIEVAL_PROFILE,
+) -> int:
+    """Make one audited Rewrite snapshot for fair, replayable profile ablations."""
+    if output_path.exists():
+        raise EvaluationError("refusing to overwrite an existing frozen rewrite cache")
+    profile = resolve_retrieval_profile(profile_name)
+    if profile.name != _DEFAULT_RETRIEVAL_PROFILE:
+        raise EvaluationError("frozen rewrite cache must use the current-v12 Rewrite contract")
+    smoke, test = validate_dataset_pair(dataset_dir)
+    if query_style_from_manifest(test.manifest) != QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        raise EvaluationError("frozen Rewrite replay is only applicable to natural-language evaluation inputs")
+    settings = load_contract_settings(collection, profile, query_style=QUERY_STYLE_NATURAL_LANGUAGE_V1)
+    from app.core.gateway import ModelGatewayClient
+    from app.core.rewrite_gateway import build_rewrite_gateway_settings
+    from app.rag.reasoning_retrieval import rewrite_syndrome_query
+
+    raw_gateway = ModelGatewayClient(settings=build_rewrite_gateway_settings(settings) or settings)
+    entries: list[JsonObject] = []
+    try:
+        for split in (smoke, test):
+            for row in split.records:
+                event = component_template("not_attempted")
+
+                def event_getter(event: JsonObject = event) -> JsonObject:
+                    return event
+
+                observed_gateway = ObservedGateway(
+                    raw_gateway,
+                    component="rewrite",
+                    event_getter=event_getter,
+                    default_model=_actual_rewrite_model(settings),
+                )
+                original_query = str(row["query"])
+                rewritten = await rewrite_syndrome_query(
+                    [SimpleNamespace(fact_key="present_illness", value=original_query)],
+                    gateway=observed_gateway,
+                    trace_id=f"rag-silver-freeze-{row['query_id']}",
+                )
+                if event.get("status") != "succeeded" or not rewritten.strip():
+                    raise EvaluationError("a frozen Rewrite cache entry did not complete an observed success")
+                entries.append(
+                    {
+                        "split": split.split,
+                        "query_id": str(row["query_id"]),
+                        "query_sha256": sha256_text(original_query),
+                        "effective_query": rewritten,
+                        "effective_query_sha256": sha256_text(rewritten),
+                        "gateway_status": "succeeded",
+                        "gateway_latency_ms": event.get("latency_ms"),
+                    }
+                )
+    finally:
+        closer = getattr(raw_gateway, "aclose", None)
+        if callable(closer):
+            with contextlib.suppress(Exception):
+                await closer()
+    entries.sort(key=lambda item: (str(item["split"]), str(item["query_id"])))
+    payload: JsonObject = {
+        "schema_version": FROZEN_REWRITE_CACHE_SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "dataset": {"smoke_sha256": smoke.sha256, "test_sha256": test.sha256},
+        "rewrite": {
+            "model": _actual_rewrite_model(settings),
+            "temperature": float(settings.rag_query_rewrite_model_temperature),
+        },
+        "entries": entries,
+    }
+    payload["cache_sha256"] = sha256_bytes(compact_json_bytes(payload))
+    write_json_atomic(output_path, payload)
+    print(f"wrote frozen Rewrite cache: {output_path}")
+    return 0
+
+
+def set_contract_environment(
+    collection: str,
+    profile: RetrievalProfile | None = None,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+) -> None:
     """Set the documented full-arm configuration before Settings is first read."""
     if not collection or not re.fullmatch(r"[A-Za-z0-9_\-]+", collection):
         raise EvaluationError("collection must be a non-empty safe collection name")
+    query_style = _require_query_style(query_style)
+    profile = profile or resolve_retrieval_profile(_DEFAULT_RETRIEVAL_PROFILE)
     values = {
         "MILVUS_COLLECTION": collection,
-        "RAG_QUERY_REWRITE_ENABLED": "true",
+        "RAG_QUERY_REWRITE_ENABLED": str(query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1).lower(),
         "RAG_QUERY_REWRITE_MODEL_TEMPERATURE": "0.1",
-        "RAG_TOP_K_VECTOR": "12",
-        "RAG_TOP_K_FULLTEXT": "12",
+        "RAG_TOP_K_VECTOR": str(profile.vector_top_k),
+        "RAG_TOP_K_FULLTEXT": str(profile.fulltext_top_k),
+        "RAG_FULLTEXT_LEXICAL_ENABLED": str(profile.fulltext_lexical_enabled).lower(),
+        "RAG_FULLTEXT_LEXICAL_MAX_TERMS": "12",
+        "RAG_DUAL_QUERY_ENABLED": str(profile.dual_query_enabled).lower(),
+        "RAG_DUAL_QUERY_RRF_K": "60",
         "RAG_RERANKER_ENABLED": "true",
         "RAG_RERANKER_PROVIDER": "cross_encoder",
-        "RAG_RERANKER_TOP_K": "20",
+        "RAG_RERANKER_TOP_K": str(profile.reranker_top_k),
+        "RAG_RERANKER_FULLTEXT_QUOTA": str(profile.fulltext_quota),
+        "RAG_RERANKER_MAX_CHUNKS_PER_SOURCE": str(profile.reranker_max_chunks_per_source),
         "RAG_RERANKER_FINAL_TOP_K": "8",
         "RAG_TOP_N_FINAL": "8",
         # The production cache key is only query text, with no model or
@@ -539,9 +876,16 @@ def set_contract_environment(collection: str) -> None:
     os.environ.update(values)
 
 
-def load_contract_settings(collection: str) -> Any:
+def load_contract_settings(
+    collection: str,
+    profile: RetrievalProfile | None = None,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+) -> Any:
     """Load a fresh global Settings singleton after applying contract overrides."""
-    set_contract_environment(collection)
+    query_style = _require_query_style(query_style)
+    profile = profile or resolve_retrieval_profile(_DEFAULT_RETRIEVAL_PROFILE)
+    set_contract_environment(collection, profile, query_style=query_style)
     from app.core.config import get_settings
     from app.rag.retriever import reset_shared_rag_retriever
 
@@ -550,13 +894,19 @@ def load_contract_settings(collection: str) -> Any:
     settings = get_settings()
     expected: dict[str, Any] = {
         "milvus_collection": collection,
-        "rag_query_rewrite_enabled": True,
+        "rag_query_rewrite_enabled": query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1,
         "rag_query_rewrite_model_temperature": 0.1,
-        "rag_top_k_vector": 12,
-        "rag_top_k_fulltext": 12,
+        "rag_top_k_vector": profile.vector_top_k,
+        "rag_top_k_fulltext": profile.fulltext_top_k,
+        "rag_fulltext_lexical_enabled": profile.fulltext_lexical_enabled,
+        "rag_fulltext_lexical_max_terms": 12,
+        "rag_dual_query_enabled": profile.dual_query_enabled,
+        "rag_dual_query_rrf_k": 60,
         "rag_reranker_enabled": True,
         "rag_reranker_provider": "cross_encoder",
-        "rag_reranker_top_k": 20,
+        "rag_reranker_top_k": profile.reranker_top_k,
+        "rag_reranker_fulltext_quota": profile.fulltext_quota,
+        "rag_reranker_max_chunks_per_source": profile.reranker_max_chunks_per_source,
         "rag_reranker_final_top_k": 8,
         "embedding_cache_ttl_seconds": 0,
     }
@@ -580,8 +930,16 @@ def _actual_reranker_model(settings: Any) -> str:
     return str(getattr(settings, "rag_reranker_model", "") or "jina-reranker-m0")
 
 
-def redacted_config(settings: Any) -> JsonObject:
+def redacted_config(
+    settings: Any,
+    profile: RetrievalProfile | None = None,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+    frozen_rewrite_cache: FrozenRewriteCache | None = None,
+) -> JsonObject:
     """Create the whitelist-only config snapshot used by results and resume keys."""
+    query_style = _require_query_style(query_style)
+    profile = profile or resolve_retrieval_profile(_DEFAULT_RETRIEVAL_PROFILE)
     payload: JsonObject = {
         "schema_version": SCHEMA_VERSION,
         "milvus": {
@@ -596,15 +954,24 @@ def redacted_config(settings: Any) -> JsonObject:
             "reranker": _actual_reranker_model(settings),
         },
         "retrieval": {
+            "profile": profile.name,
             "source_types": SOURCE_TYPES,
             "final_top_k": FIXED_TOP_K,
             "vector_top_k": int(settings.rag_top_k_vector),
             "fulltext_top_k": int(settings.rag_top_k_fulltext),
+            "fulltext_lexical_enabled": bool(getattr(settings, "rag_fulltext_lexical_enabled", True)),
+            "fulltext_lexical_max_terms": int(getattr(settings, "rag_fulltext_lexical_max_terms", 12)),
+            "dual_query_enabled": bool(getattr(settings, "rag_dual_query_enabled", False)),
+            "dual_query_rrf_k": int(getattr(settings, "rag_dual_query_rrf_k", 60)),
+            "candidate_trace": True,
             "vector_weight": 0.65,
             "fulltext_weight": 0.25,
             "source_priority_weight": 0.10,
             "reranker_provider": str(settings.rag_reranker_provider),
+            "reranker_enabled": bool(getattr(settings, "rag_reranker_enabled", False)),
             "reranker_top_k": int(settings.rag_reranker_top_k),
+            "reranker_fulltext_quota": int(getattr(settings, "rag_reranker_fulltext_quota", 0)),
+            "reranker_max_chunks_per_source": int(getattr(settings, "rag_reranker_max_chunks_per_source", 0)),
             "reranker_final_top_k": int(settings.rag_reranker_final_top_k),
             "embedding_cache_ttl_seconds": int(settings.embedding_cache_ttl_seconds),
         },
@@ -626,14 +993,44 @@ def redacted_config(settings: Any) -> JsonObject:
         },
         "secrets_redacted": True,
     }
+    if frozen_rewrite_cache is not None:
+        payload["rewrite"] = {
+            **cast(JsonObject, payload["rewrite"]),
+            "execution_mode": "frozen_replay",
+            "frozen_cache_sha256": frozen_rewrite_cache.sha256,
+            "frozen_cache_entry_count": len(frozen_rewrite_cache.entries),
+        }
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        # This is intentionally an opt-in addition: legacy v1 config payloads
+        # (and therefore their hashes) remain byte-for-byte unchanged.
+        payload["query_style"] = query_style
+        models = cast(JsonObject, payload["models"])
+        models.pop("rewrite", None)
+        payload["rewrite"] = {
+            "enabled": False,
+            "applicable": False,
+            "gateway_call": "not_applicable",
+        }
     config_sha = sha256_bytes(compact_json_bytes(payload))
     payload["captured_at"] = utc_now()
     payload["config_sha256"] = config_sha
     return payload
 
 
-def write_or_validate_config(run_dir: Path, settings: Any) -> JsonObject:
-    snapshot = redacted_config(settings)
+def write_or_validate_config(
+    run_dir: Path,
+    settings: Any,
+    profile: RetrievalProfile | None = None,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+    frozen_rewrite_cache: FrozenRewriteCache | None = None,
+) -> JsonObject:
+    snapshot = redacted_config(
+        settings,
+        profile,
+        query_style=query_style,
+        frozen_rewrite_cache=frozen_rewrite_cache,
+    )
     path = run_dir / "config.redacted.json"
     if path.exists():
         prior = read_json(path)
@@ -658,6 +1055,7 @@ def write_or_update_environment(
     if prior and corpus is None and commands is None:
         return prior
     commit, branch, dirty = _git_environment()
+    runtime_source_sha256 = {name: sha256_file(path) for name, path in _RUNTIME_SOURCE_FILES.items()}
     payload: JsonObject = {
         "captured_at": prior.get("captured_at", utc_now()),
         "git_commit": commit,
@@ -668,6 +1066,7 @@ def write_or_update_environment(
         "project_package_version": "0.1.0",
         "evaluator_sha256": sha256_file(Path(__file__).resolve()),
         "builder_sha256": sha256_file(_PROJECT_ROOT / "scripts" / "build_rag_silver_eval.py"),
+        "runtime_source_sha256": runtime_source_sha256,
         "commands": list(commands) if commands is not None else prior.get("commands", []),
         "corpus": dict(prior.get("corpus", {})),
     }
@@ -689,6 +1088,15 @@ def ensure_frozen_code_identity(run_dir: Path) -> None:
         raise EvaluationError("evaluator source changed after preflight")
     if expected_builder != sha256_file(_PROJECT_ROOT / "scripts" / "build_rag_silver_eval.py"):
         raise EvaluationError("builder source changed after preflight")
+    expected_runtime = environment.get("runtime_source_sha256")
+    if expected_runtime is None:
+        # Legacy v1 artifacts predate runtime dependency identity capture.
+        # Their evaluator/builder checks above remain valid and no new report
+        # is ever written by a tuning run without the stronger map.
+        return
+    current_runtime = {name: sha256_file(path) for name, path in _RUNTIME_SOURCE_FILES.items()}
+    if expected_runtime != current_runtime:
+        raise EvaluationError("runtime retrieval source changed after preflight")
 
 
 # ---------------------------------------------------------------------------
@@ -987,9 +1395,23 @@ class ObservedRAGRetrieverMixin:
     _embedding_model_for_eval: str
     _reranker_model_for_eval: str
     _observed_reranker_gateway: ObservedGateway | None
+    _vector_candidate_hits: list[Any]
+    _fulltext_candidate_hits: list[Any]
+    _vector_candidate_batches: list[list[Any]]
+    _fulltext_candidate_batches: list[list[Any]]
+    _vector_search_call_count: int
+    _vector_search_failure_count: int
+    _fulltext_search_call_count: int
 
     def set_component_records(self, records: JsonObject) -> None:
         self._component_records = records
+        self._vector_candidate_hits = []
+        self._fulltext_candidate_hits = []
+        self._vector_candidate_batches = []
+        self._fulltext_candidate_batches = []
+        self._vector_search_call_count = 0
+        self._vector_search_failure_count = 0
+        self._fulltext_search_call_count = 0
 
     def _evaluation_event(self, component: str) -> JsonObject:
         return cast(JsonObject, self._component_records[component])
@@ -1003,16 +1425,34 @@ class ObservedRAGRetrieverMixin:
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
         event = self._evaluation_event("vector")
-        started = _event_start(event, embedding_model=self._embedding_model_for_eval)
+        self._vector_search_call_count += 1
+        prior_latency = float(event.get("latency_ms") or 0.0)
+        prior_count = int(event.get("candidate_count") or 0)
+        if not event.get("attempted"):
+            started = _event_start(event, embedding_model=self._embedding_model_for_eval)
+        else:
+            event["status"] = "running"
+            started = time.perf_counter()
         try:
             hits = await super()._vector_search(query, sources, top_k=top_k, filters=filters)  # type: ignore[misc]
         except Exception as exc:
-            _event_failure(event, started, exc)
+            self._vector_search_failure_count += 1
+            event["status"] = "fallback"
+            event["latency_ms"] = round(prior_latency + (time.perf_counter() - started) * 1000.0, 3)
+            event["error_type"] = safe_exception_type(exc)
             event["embedding_source"] = "gateway"
             raise
-        _event_success(event, started, len(hits))
+        event["status"] = "succeeded"
+        if self._vector_search_failure_count:
+            # Both query views ran.  A later success must not erase an earlier
+            # vector fallback from component coverage or degradation evidence.
+            event["status"] = "fallback"
+        event["latency_ms"] = round(prior_latency + (time.perf_counter() - started) * 1000.0, 3)
+        event["candidate_count"] = prior_count + len(hits)
         event["embedding_source"] = "gateway"
-        return list(hits)
+        self._vector_candidate_hits = list(hits)
+        self._vector_candidate_batches.append(list(hits))
+        return self._vector_candidate_hits
 
     async def _fulltext_search(
         self,
@@ -1023,14 +1463,90 @@ class ObservedRAGRetrieverMixin:
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
         event = self._evaluation_event("fulltext")
-        started = _event_start(event)
+        self._fulltext_search_call_count += 1
+        prior_latency = float(event.get("latency_ms") or 0.0)
+        prior_count = int(event.get("candidate_count") or 0)
+        if not event.get("attempted"):
+            started = _event_start(event)
+        else:
+            event["status"] = "running"
+            started = time.perf_counter()
         try:
             hits = await super()._fulltext_search(query, sources, top_k=top_k, filters=filters)  # type: ignore[misc]
         except Exception as exc:
-            _event_failure(event, started, exc, status="failed")
+            event["status"] = "failed"
+            event["latency_ms"] = round(prior_latency + (time.perf_counter() - started) * 1000.0, 3)
+            event["error_type"] = safe_exception_type(exc)
             raise
-        _event_success(event, started, len(hits))
-        return list(hits)
+        event["status"] = "succeeded"
+        event["latency_ms"] = round(prior_latency + (time.perf_counter() - started) * 1000.0, 3)
+        event["candidate_count"] = prior_count + len(hits)
+        self._fulltext_candidate_hits = list(hits)
+        self._fulltext_candidate_batches.append(list(hits))
+        return self._fulltext_candidate_hits
+
+    def candidate_trace(self, target_source_id: str) -> JsonObject:
+        """Return numeric candidate-stage evidence without retaining source text or IDs."""
+        from app.rag.retriever import merge_deduplicate, reciprocal_rank_fuse_hits, select_reranker_candidates
+        from app.rag.schemas import FulltextHit, VectorHit
+
+        def rank_for(hits: Sequence[Any]) -> int | None:
+            for rank, hit in enumerate(hits, start=1):
+                if str(getattr(hit, "source_id", "")) == target_source_id:
+                    return rank
+            return None
+
+        settings = cast(Any, self)._settings
+        query_view_count = max(self._vector_search_call_count, self._fulltext_search_call_count)
+        if bool(getattr(settings, "rag_dual_query_enabled", False)) and query_view_count > 1:
+            vector_hits = [
+                hit
+                for hit in reciprocal_rank_fuse_hits(
+                    self._vector_candidate_batches,
+                    score_field="vector_score",
+                    rrf_k=int(getattr(settings, "rag_dual_query_rrf_k", 60)),
+                )
+                if isinstance(hit, VectorHit)
+            ]
+            fulltext_hits = [
+                hit
+                for hit in reciprocal_rank_fuse_hits(
+                    self._fulltext_candidate_batches,
+                    score_field="fulltext_score",
+                    rrf_k=int(getattr(settings, "rag_dual_query_rrf_k", 60)),
+                )
+                if isinstance(hit, FulltextHit)
+            ]
+        else:
+            vector_hits = self._vector_candidate_hits
+            fulltext_hits = self._fulltext_candidate_hits
+        merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources={"case"})
+        reranker_candidates = select_reranker_candidates(
+            merged,
+            fulltext_quota=int(getattr(settings, "rag_reranker_fulltext_quota", 0)),
+            limit=int(getattr(settings, "rag_reranker_top_k", len(merged))),
+            max_chunks_per_source=int(getattr(settings, "rag_reranker_max_chunks_per_source", 0)),
+        )
+        reranker_event = self._evaluation_event("reranker")
+        return {
+            # For dual-view retrieval, candidate-layer diagnostics must reflect
+            # the fused pool, rather than the second leg that happened to run
+            # last.  The single-view values stay byte-for-byte equivalent.
+            "vector_candidate_count": len(vector_hits),
+            "vector_target_rank": rank_for(vector_hits),
+            "fulltext_candidate_count": len(fulltext_hits),
+            "fulltext_target_rank": rank_for(fulltext_hits),
+            "merged_candidate_count": len(merged),
+            "merged_target_rank": rank_for(merged),
+            "reranker_candidate_count": len(reranker_candidates),
+            "reranker_candidate_target_rank": rank_for(reranker_candidates),
+            "reranker_candidate_unique_source_count": len(
+                {(hit.source_type, str(hit.source_id)) for hit in reranker_candidates}
+            ),
+            "query_view_count": query_view_count,
+            "dual_rrf_applied": bool(getattr(settings, "rag_dual_query_enabled", False)) and query_view_count == 2,
+            "reranker_attempted": bool(reranker_event.get("attempted")),
+        }
 
     def _get_reranker_gateway(self) -> Any:
         if self._observed_reranker_gateway is None:
@@ -1073,6 +1589,13 @@ def build_observed_retriever(settings: Any) -> Any:
             self._embedding_model_for_eval = str(settings.embedding_model)
             self._reranker_model_for_eval = _actual_reranker_model(settings)
             self._observed_reranker_gateway = None
+            self._vector_candidate_hits = []
+            self._fulltext_candidate_hits = []
+            self._vector_candidate_batches = []
+            self._fulltext_candidate_batches = []
+            self._vector_search_call_count = 0
+            self._vector_search_failure_count = 0
+            self._fulltext_search_call_count = 0
 
     return ObservedRAGRetriever()
 
@@ -1192,8 +1715,15 @@ def _require_component_shape(component: Any, name: str) -> Mapping[str, Any]:
     return component
 
 
-def validate_component_contract(record: Mapping[str, Any]) -> None:
+def validate_component_contract(
+    record: Mapping[str, Any],
+    *,
+    query_style: str | None = None,
+) -> None:
     """Validate observable component semantics against the scoreable arm rules."""
+    observed_query_style = query_style_from_result(record)
+    if query_style is not None and observed_query_style != _require_query_style(query_style):
+        raise ResumeIntegrityError("result query_style mismatch")
     components = record.get("components")
     if not isinstance(components, Mapping):
         raise ResumeIntegrityError("result components must be an object")
@@ -1208,7 +1738,10 @@ def validate_component_contract(record: Mapping[str, Any]) -> None:
         if any(component.get("status") != "not_applicable" for component in (rewrite, fulltext, reranker)):
             raise ResumeIntegrityError("baseline must not use rewrite, fulltext, or reranker")
     elif arm == "full":
-        if rewrite.get("status") not in {"succeeded", "fallback"} or not rewrite.get("attempted"):
+        if observed_query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            if rewrite.get("status") != "not_applicable" or rewrite.get("attempted"):
+                raise ResumeIntegrityError("structured full must mark rewrite disabled and not applicable")
+        elif rewrite.get("status") not in {"succeeded", "fallback"} or not rewrite.get("attempted"):
             raise ResumeIntegrityError("full rewrite observation is not scoreable")
         if vector.get("status") not in {"succeeded", "fallback"} or not vector.get("attempted"):
             raise ResumeIntegrityError("full vector observation is not scoreable")
@@ -1247,6 +1780,70 @@ def validate_component_contract(record: Mapping[str, Any]) -> None:
         raise ResumeIntegrityError("result degradations do not match component observations")
 
 
+def validate_candidate_trace(record: Mapping[str, Any]) -> None:
+    """Validate optional numeric-only candidate diagnostics when a run records them."""
+    trace = record.get("candidate_trace")
+    if trace is None:
+        return
+    if not isinstance(trace, Mapping):
+        raise ResumeIntegrityError("candidate_trace must be an object")
+    count_names = (
+        "vector_candidate_count",
+        "fulltext_candidate_count",
+        "merged_candidate_count",
+        "reranker_candidate_count",
+    )
+    rank_names = (
+        "vector_target_rank",
+        "fulltext_target_rank",
+        "merged_target_rank",
+        "reranker_candidate_target_rank",
+    )
+    if not isinstance(trace.get("reranker_attempted"), bool):
+        raise ResumeIntegrityError("candidate_trace reranker_attempted must be boolean")
+    for name in count_names:
+        value = trace.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ResumeIntegrityError(f"candidate_trace invalid count: {name}")
+    unique_source_count = trace.get("reranker_candidate_unique_source_count")
+    if unique_source_count is not None and (
+        not isinstance(unique_source_count, int)
+        or isinstance(unique_source_count, bool)
+        or unique_source_count < 0
+        or unique_source_count > trace["reranker_candidate_count"]
+    ):
+        raise ResumeIntegrityError("candidate_trace invalid reranker_candidate_unique_source_count")
+    query_view_count = trace.get("query_view_count")
+    dual_rrf_applied = trace.get("dual_rrf_applied")
+    if query_view_count is not None:
+        if (
+            not isinstance(query_view_count, int)
+            or isinstance(query_view_count, bool)
+            or query_view_count not in {1, 2}
+        ):
+            raise ResumeIntegrityError("candidate_trace invalid query_view_count")
+        if not isinstance(dual_rrf_applied, bool):
+            raise ResumeIntegrityError("candidate_trace dual_rrf_applied must be boolean")
+        if dual_rrf_applied != (query_view_count == 2):
+            raise ResumeIntegrityError("candidate_trace dual_rrf_applied disagrees with query_view_count")
+    elif dual_rrf_applied is not None:
+        raise ResumeIntegrityError("candidate_trace dual_rrf_applied requires query_view_count")
+    for name in rank_names:
+        value = trace.get(name)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            raise ResumeIntegrityError(f"candidate_trace invalid rank: {name}")
+    pairs = (
+        ("vector_target_rank", "vector_candidate_count"),
+        ("fulltext_target_rank", "fulltext_candidate_count"),
+        ("merged_target_rank", "merged_candidate_count"),
+        ("reranker_candidate_target_rank", "reranker_candidate_count"),
+    )
+    for rank_name, count_name in pairs:
+        rank = trace.get(rank_name)
+        if rank is not None and rank > trace[count_name]:
+            raise ResumeIntegrityError(f"candidate_trace rank exceeds count: {rank_name}")
+
+
 def validate_result_record(
     record: Mapping[str, Any],
     *,
@@ -1255,6 +1852,7 @@ def validate_result_record(
     run_id: str | None = None,
     dataset_sha256: str | None = None,
     config_sha256: str | None = None,
+    query_style: str | None = None,
 ) -> None:
     """Validate a successful result row before it may contribute to a metric."""
     if record.get("schema_version") != RESULT_SCHEMA_VERSION:
@@ -1271,6 +1869,9 @@ def validate_result_record(
         raise ResumeIntegrityError("result dataset SHA-256 mismatch")
     if config_sha256 is not None and record.get("config_sha256") != config_sha256:
         raise ResumeIntegrityError("result config SHA-256 mismatch")
+    observed_query_style = query_style_from_result(record)
+    if query_style is not None and observed_query_style != _require_query_style(query_style):
+        raise ResumeIntegrityError("result query_style mismatch")
     if record.get("source_types") != SOURCE_TYPES or record.get("top_k") != FIXED_TOP_K:
         raise ResumeIntegrityError("result retrieval contract mismatch")
     if not isinstance(record.get("query_id"), str) or not record.get("query_id"):
@@ -1281,8 +1882,15 @@ def validate_result_record(
     effective_query = record.get("effective_query")
     if not isinstance(query, str) or record.get("query_sha256") != sha256_text(query):
         raise ResumeIntegrityError("result query_sha256 mismatch")
+    if observed_query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        try:
+            validate_structured_fact_key_value_query(query)
+        except DatasetError as exc:
+            raise ResumeIntegrityError("structured result query is malformed") from exc
     if not isinstance(effective_query, str) or record.get("effective_query_sha256") != sha256_text(effective_query):
         raise ResumeIntegrityError("result effective_query_sha256 mismatch")
+    if observed_query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1 and effective_query != query:
+        raise ResumeIntegrityError("structured full result effective_query must equal direct query")
     results = record.get("results")
     if not isinstance(results, list) or len(results) > FIXED_TOP_K:
         raise ResumeIntegrityError("result ranking is invalid")
@@ -1302,7 +1910,8 @@ def validate_result_record(
     expected_hash = _record_hash(record)
     if record.get("record_sha256") != expected_hash:
         raise ResumeIntegrityError("result record_sha256 mismatch")
-    validate_component_contract(record)
+    validate_component_contract(record, query_style=observed_query_style)
+    validate_candidate_trace(record)
 
 
 def result_path(run_dir: Path, split: str, arm: str) -> Path:
@@ -1328,6 +1937,7 @@ def read_resume_records(
     dataset_sha256: str,
     config_sha256: str,
     run_dir: Path,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
 ) -> dict[str, JsonObject]:
     """Read a checkpoint, recovering only a torn final line (never mid-file)."""
     if not path.exists() or path.stat().st_size == 0:
@@ -1365,6 +1975,7 @@ def read_resume_records(
             run_id=run_dir.name,
             dataset_sha256=dataset_sha256,
             config_sha256=config_sha256,
+            query_style=query_style,
         )
         query_id = str(row["query_id"])
         if query_id in records:
@@ -1394,7 +2005,9 @@ def make_result_record(
     attempt_count: int,
     started_at: str,
     latency_ms: float,
+    candidate_trace: JsonObject | None = None,
 ) -> JsonObject:
+    query_style = query_style_from_manifest(split.manifest)
     rank, hit, reciprocal_rank = score_results(results, target.source_id)
     record: JsonObject = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -1425,6 +2038,10 @@ def make_result_record(
         "hit_at_8": hit,
         "reciprocal_rank": reciprocal_rank,
     }
+    if candidate_trace is not None:
+        record["candidate_trace"] = candidate_trace
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        record["query_style"] = query_style
     record["record_sha256"] = _record_hash(record)
     return record
 
@@ -1434,7 +2051,8 @@ class EvaluationRuntime:
     settings: Any
     baseline: PureVectorAdapter
     full_retriever: Any
-    rewrite_gateway: ObservedGateway
+    rewrite_gateway: ObservedGateway | None
+    frozen_rewrite_cache: FrozenRewriteCache | None
     closeables: list[Any]
 
     async def aclose(self) -> None:
@@ -1449,15 +2067,45 @@ class EvaluationRuntime:
                     await closer()
 
 
-def build_runtime(settings: Any) -> EvaluationRuntime:
+def build_runtime(
+    settings: Any,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+    frozen_rewrite_cache: FrozenRewriteCache | None = None,
+) -> EvaluationRuntime:
     """Build real gateways/retrievers after the global contract is asserted."""
-    from app.core.gateway import ModelGatewayClient
-    from app.core.rewrite_gateway import build_rewrite_gateway_settings
+    query_style = _require_query_style(query_style)
+    if query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        # Preserve the legacy v1 construction/import sequence.
+        from app.core.gateway import ModelGatewayClient
+        from app.core.rewrite_gateway import build_rewrite_gateway_settings
     from app.rag.retriever import RAGRetriever
 
     baseline_retriever = RAGRetriever(settings=settings)
     baseline = PureVectorAdapter(baseline_retriever, embedding_model=str(settings.embedding_model))
     full_retriever = build_observed_retriever(settings)
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        if bool(getattr(settings, "rag_query_rewrite_enabled", True)):
+            raise EvaluationError("structured runtime requires rag_query_rewrite_enabled=false")
+        return EvaluationRuntime(
+            settings=settings,
+            baseline=baseline,
+            full_retriever=full_retriever,
+            rewrite_gateway=None,
+            frozen_rewrite_cache=None,
+            closeables=[getattr(baseline_retriever, "_gateway", None)],
+        )
+
+    if frozen_rewrite_cache is not None:
+        return EvaluationRuntime(
+            settings=settings,
+            baseline=baseline,
+            full_retriever=full_retriever,
+            rewrite_gateway=None,
+            frozen_rewrite_cache=frozen_rewrite_cache,
+            closeables=[getattr(baseline_retriever, "_gateway", None)],
+        )
+
     rewrite_settings = build_rewrite_gateway_settings(settings) or settings
     raw_rewrite_gateway = ModelGatewayClient(settings=rewrite_settings)
     rewrite_event: JsonObject = component_template("not_attempted")
@@ -1474,6 +2122,7 @@ def build_runtime(settings: Any) -> EvaluationRuntime:
         baseline=baseline,
         full_retriever=full_retriever,
         rewrite_gateway=observed_rewrite_gateway,
+        frozen_rewrite_cache=None,
         closeables=[getattr(baseline_retriever, "_gateway", None), raw_rewrite_gateway],
     )
 
@@ -1527,40 +2176,92 @@ async def evaluate_full_query(
     config_sha256: str,
     attempt_count: int,
 ) -> JsonObject:
-    """Run rewrite then the existing full retrieval entry point exactly once."""
-    from app.rag.reasoning_retrieval import rewrite_syndrome_query
-
+    """Run the frozen input contract through the production full retriever."""
+    query_style = query_style_from_manifest(split.manifest)
     original_query = str(query_row["query"])
     started_at = utc_now()
     started = time.perf_counter()
     components = full_component_templates()
     rewrite_event = cast(JsonObject, components["rewrite"])
-    _bind_rewrite_event(runtime.rewrite_gateway, rewrite_event)
-    observation = SimpleNamespace(fact_key="present_illness", value=original_query)
-    try:
-        effective_query = await rewrite_syndrome_query([observation], gateway=runtime.rewrite_gateway)
-        # Settings is asserted enabled and the observation is nonempty, so a
-        # missing gateway call is itself observable rather than inferred.
-        if not rewrite_event.get("attempted"):
-            rewrite_event["status"] = "not_attempted"
-        runtime.full_retriever.set_component_records(components)
-        evidences = await runtime.full_retriever.retrieve(
-            effective_query,
-            ["case"],
-            allow_cross_source=False,
-            top_k=FIXED_TOP_K,
-        )
-    except Exception as exc:
-        # Fulltext failures propagate from production; rewrite/vector/rerank
-        # component fallbacks are handled by production and remain scoreable.
-        fulltext = cast(JsonObject, components["fulltext"])
-        if fulltext.get("status") == "failed":
-            raise ArmTechnicalFailure("full PostgreSQL retrieval failed") from exc
-        if rewrite_event.get("status") == "not_attempted" or rewrite_event.get("status") == "running":
-            _event_failure(rewrite_event, started, exc)
-        raise ArmTechnicalFailure("full retrieval failed before scoreable ranking") from exc
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        if bool(getattr(runtime.settings, "rag_query_rewrite_enabled", True)):
+            raise EvaluationError("structured full arm requires rag_query_rewrite_enabled=false")
+        # The direct production input is already ``fact_key=value；...``.
+        # Do not instantiate, bind, or call a rewrite gateway for this arm.
+        components["rewrite"] = component_template("not_applicable")
+        effective_query = original_query
+        try:
+            runtime.full_retriever.set_component_records(components)
+            evidences = await runtime.full_retriever.retrieve(
+                effective_query,
+                ["case"],
+                allow_cross_source=False,
+                top_k=FIXED_TOP_K,
+            )
+        except Exception as exc:
+            fulltext = cast(JsonObject, components["fulltext"])
+            if fulltext.get("status") == "failed":
+                raise ArmTechnicalFailure("full PostgreSQL retrieval failed") from exc
+            raise ArmTechnicalFailure("full retrieval failed before scoreable ranking") from exc
+    else:
+        # Keep the legacy v1 natural-language arm's call sequence unchanged.
+        from app.rag.reasoning_retrieval import build_syndrome_query, rewrite_syndrome_query
+
+        observation = SimpleNamespace(fact_key="present_illness", value=original_query)
+        intake_key_query = build_syndrome_query([observation])
+        try:
+            frozen_rewrite_cache = getattr(runtime, "frozen_rewrite_cache", None)
+            if frozen_rewrite_cache is not None:
+                if not isinstance(frozen_rewrite_cache, FrozenRewriteCache):
+                    raise EvaluationError("runtime frozen Rewrite cache is invalid")
+                effective_query = frozen_rewrite_cache.effective_query_for(str(query_row["query_id"]), original_query)
+                rewrite_event.update(
+                    {
+                        "status": "succeeded",
+                        "attempted": True,
+                        "model": frozen_rewrite_cache.model,
+                        "latency_ms": 0.0,
+                        "execution_mode": "frozen_replay",
+                        "frozen_cache_sha256": frozen_rewrite_cache.sha256,
+                    }
+                )
+            else:
+                if runtime.rewrite_gateway is None:
+                    raise EvaluationError("natural-language full arm has no rewrite gateway")
+                _bind_rewrite_event(runtime.rewrite_gateway, rewrite_event)
+                effective_query = await rewrite_syndrome_query([observation], gateway=runtime.rewrite_gateway)
+                # Settings is asserted enabled and the observation is nonempty,
+                # so a missing gateway call is observable rather than inferred.
+                if not rewrite_event.get("attempted"):
+                    rewrite_event["status"] = "not_attempted"
+            runtime.full_retriever.set_component_records(components)
+            if bool(getattr(runtime.settings, "rag_dual_query_enabled", False)):
+                evidences = await runtime.full_retriever.retrieve_dual_query(
+                    intake_key_query,
+                    effective_query,
+                    ["case"],
+                    allow_cross_source=False,
+                    top_k=FIXED_TOP_K,
+                )
+            else:
+                evidences = await runtime.full_retriever.retrieve(
+                    effective_query,
+                    ["case"],
+                    allow_cross_source=False,
+                    top_k=FIXED_TOP_K,
+                )
+        except Exception as exc:
+            # Fulltext failures propagate from production; rewrite/vector/rerank
+            # component fallbacks are handled by production and remain scoreable.
+            fulltext = cast(JsonObject, components["fulltext"])
+            if fulltext.get("status") == "failed":
+                raise ArmTechnicalFailure("full PostgreSQL retrieval failed") from exc
+            if rewrite_event.get("status") == "not_attempted" or rewrite_event.get("status") == "running":
+                _event_failure(rewrite_event, started, exc)
+            raise ArmTechnicalFailure("full retrieval failed before scoreable ranking") from exc
     runtime.full_retriever.finalise_reranker_observation(evidences)
     results = project_evidences(evidences)
+    candidate_trace = runtime.full_retriever.candidate_trace(target.source_id)
     return make_result_record(
         run_dir=run_dir,
         split=split,
@@ -1574,6 +2275,7 @@ async def evaluate_full_query(
         attempt_count=attempt_count,
         started_at=started_at,
         latency_ms=(time.perf_counter() - started) * 1000.0,
+        candidate_trace=candidate_trace,
     )
 
 
@@ -1725,6 +2427,94 @@ def _degradation_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return dict(sorted(counter.items()))
 
 
+def _candidate_audit(records: Sequence[Mapping[str, Any]]) -> JsonObject:
+    """Aggregate numeric-only full-arm candidate diagnostics.
+
+    The final top-8 ranking cannot tell whether a miss was absent from recall
+    or present and rejected by the Cross-Encoder.  This aggregate deliberately
+    stores only counts/ranks, never source ids, query texts, or snippets.
+    """
+    traces: list[Mapping[str, Any]] = []
+    traced_records: list[Mapping[str, Any]] = []
+    for record in records:
+        trace = record.get("candidate_trace")
+        if trace is None:
+            continue
+        validate_candidate_trace(record)
+        traces.append(cast(Mapping[str, Any], trace))
+        traced_records.append(record)
+
+    denominator = len(records)
+    trace_count = len(traces)
+    payload: JsonObject = {
+        "trace_records": trace_count,
+        "denominator": denominator,
+        "coverage": trace_count / denominator if denominator else 0.0,
+    }
+    if not traces:
+        return payload
+
+    stage_fields = (
+        ("vector", "vector_candidate_count", "vector_target_rank"),
+        ("fulltext", "fulltext_candidate_count", "fulltext_target_rank"),
+        ("merged", "merged_candidate_count", "merged_target_rank"),
+        ("reranker_pool", "reranker_candidate_count", "reranker_candidate_target_rank"),
+    )
+    stages: JsonObject = {}
+    for stage, count_name, rank_name in stage_fields:
+        counts = sorted(int(trace[count_name]) for trace in traces)
+        middle = trace_count // 2
+        median: float = float(counts[middle])
+        if trace_count % 2 == 0:
+            median = (counts[middle - 1] + counts[middle]) / 2.0
+        target_present = sum(1 for trace in traces if trace[rank_name] is not None)
+        stages[stage] = {
+            "target_present": target_present,
+            "denominator": trace_count,
+            "coverage": target_present / trace_count,
+            "candidate_count": {"min": counts[0], "median": median, "max": counts[-1]},
+        }
+    payload["stages"] = stages
+    unique_source_counts = sorted(
+        int(trace["reranker_candidate_unique_source_count"])
+        for trace in traces
+        if trace.get("reranker_candidate_unique_source_count") is not None
+    )
+    if unique_source_counts:
+        middle = len(unique_source_counts) // 2
+        unique_median: float = float(unique_source_counts[middle])
+        if len(unique_source_counts) % 2 == 0:
+            unique_median = (unique_source_counts[middle - 1] + unique_source_counts[middle]) / 2.0
+        payload["reranker_pool_unique_source_count"] = {
+            "min": unique_source_counts[0],
+            "median": unique_median,
+            "max": unique_source_counts[-1],
+        }
+    query_view_counts = sorted(
+        int(trace["query_view_count"]) for trace in traces if trace.get("query_view_count") is not None
+    )
+    if query_view_counts:
+        middle = len(query_view_counts) // 2
+        view_median: float = float(query_view_counts[middle])
+        if len(query_view_counts) % 2 == 0:
+            view_median = (query_view_counts[middle - 1] + query_view_counts[middle]) / 2.0
+        payload["query_views"] = {
+            "dual_rrf_applied": sum(1 for trace in traces if trace.get("dual_rrf_applied") is True),
+            "denominator": len(query_view_counts),
+            "count": {"min": query_view_counts[0], "median": view_median, "max": query_view_counts[-1]},
+        }
+    reranker_attempted = sum(1 for trace in traces if trace["reranker_attempted"])
+    payload["reranker_attempted"] = reranker_attempted
+    payload["reranker_pool_target_present_final_miss"] = sum(
+        1
+        for record, trace in zip(traced_records, traces, strict=True)
+        if trace["reranker_attempted"]
+        and trace["reranker_candidate_target_rank"] is not None
+        and int(record.get("hit_at_8", 0)) == 0
+    )
+    return payload
+
+
 def compute_metrics(
     baseline_records: Sequence[Mapping[str, Any]],
     full_records: Sequence[Mapping[str, Any]],
@@ -1736,6 +2526,10 @@ def compute_metrics(
     seed: int = FIXED_SEED,
 ) -> JsonObject:
     """Recompute all formal metrics from immutable JSONL records."""
+    query_styles = {query_style_from_result(record) for record in (*baseline_records, *full_records)}
+    if len(query_styles) != 1:
+        raise EvaluationError("baseline/full records do not share one query_style")
+    query_style = next(iter(query_styles))
     baseline_by_id = {str(record.get("query_id")): record for record in baseline_records}
     full_by_id = {str(record.get("query_id")): record for record in full_records}
     if len(baseline_by_id) != len(baseline_records) or len(full_by_id) != len(full_records):
@@ -1745,32 +2539,60 @@ def compute_metrics(
     ordered_ids = sorted(baseline_by_id)
     if not ordered_ids:
         raise EvaluationError("no paired records")
-    baseline_hits: list[float] = []
-    full_hits: list[float] = []
+    baseline_hits_by_cutoff: dict[int, list[float]] = {cutoff: [] for cutoff in RECALL_CUTOFFS}
+    full_hits_by_cutoff: dict[int, list[float]] = {cutoff: [] for cutoff in RECALL_CUTOFFS}
     baseline_rrs: list[float] = []
     full_rrs: list[float] = []
-    paired_hits = {"0_0": 0, "0_1": 0, "1_0": 0, "1_1": 0}
+    paired_hits_by_cutoff: dict[int, dict[str, int]] = {
+        cutoff: {"0_0": 0, "0_1": 0, "1_0": 0, "1_1": 0} for cutoff in RECALL_CUTOFFS
+    }
     for query_id in ordered_ids:
         baseline = baseline_by_id[query_id]
         full = full_by_id[query_id]
-        for record in (baseline, full):
+        scored: dict[str, tuple[int | None, int, float]] = {}
+        for arm, record in (("baseline", baseline), ("full", full)):
             results = cast(list[Mapping[str, Any]], record.get("results", []))
             rank, hit, reciprocal_rank = score_results(results, str(record.get("target_source_id", "")))
             if record.get("first_relevant_rank") != rank or int(record.get("hit_at_8", -1)) != hit:
                 raise EvaluationError("result relevance fields do not recompute")
             if not math.isclose(float(record.get("reciprocal_rank", -1.0)), reciprocal_rank, abs_tol=1e-12):
                 raise EvaluationError("result reciprocal_rank does not recompute")
-        b_hit = int(baseline["hit_at_8"])
-        f_hit = int(full["hit_at_8"])
-        baseline_hits.append(float(b_hit))
-        full_hits.append(float(f_hit))
-        baseline_rrs.append(float(baseline["reciprocal_rank"]))
-        full_rrs.append(float(full["reciprocal_rank"]))
-        paired_hits[f"{b_hit}_{f_hit}"] += 1
-    recall_ci = paired_bootstrap(baseline_hits, full_hits, samples=bootstrap_samples, seed=seed)
+            scored[arm] = (rank, hit, reciprocal_rank)
+        baseline_rank, _baseline_hit_at_8, baseline_rr = scored["baseline"]
+        full_rank, _full_hit_at_8, full_rr = scored["full"]
+        for cutoff in RECALL_CUTOFFS:
+            b_hit = int(baseline_rank is not None and baseline_rank <= cutoff)
+            f_hit = int(full_rank is not None and full_rank <= cutoff)
+            baseline_hits_by_cutoff[cutoff].append(float(b_hit))
+            full_hits_by_cutoff[cutoff].append(float(f_hit))
+            paired_hits_by_cutoff[cutoff][f"{b_hit}_{f_hit}"] += 1
+        baseline_rrs.append(float(baseline_rr))
+        full_rrs.append(float(full_rr))
+    recall_ci_by_cutoff = {
+        cutoff: paired_bootstrap(
+            baseline_hits_by_cutoff[cutoff], full_hits_by_cutoff[cutoff], samples=bootstrap_samples, seed=seed
+        )
+        for cutoff in RECALL_CUTOFFS
+    }
     mrr_ci = paired_bootstrap(baseline_rrs, full_rrs, samples=bootstrap_samples, seed=seed)
     count = len(ordered_ids)
-    return {
+    baseline_arm = {
+        f"target_recall_at_{cutoff}": sum(baseline_hits_by_cutoff[cutoff]) / count for cutoff in RECALL_CUTOFFS
+    }
+    full_arm = {f"target_recall_at_{cutoff}": sum(full_hits_by_cutoff[cutoff]) / count for cutoff in RECALL_CUTOFFS}
+    baseline_arm["mrr"] = sum(baseline_rrs) / count
+    full_arm["mrr"] = sum(full_rrs) / count
+    recall_deltas: JsonObject = {
+        f"target_recall_at_{cutoff}": {
+            "point": sum(
+                full_hits_by_cutoff[cutoff][index] - baseline_hits_by_cutoff[cutoff][index] for index in range(count)
+            )
+            / count,
+            "ci95": {"low": recall_ci_by_cutoff[cutoff][0], "high": recall_ci_by_cutoff[cutoff][1]},
+        }
+        for cutoff in RECALL_CUTOFFS
+    }
+    metrics: JsonObject = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "dataset_version": DATASET_VERSION,
@@ -1779,20 +2601,20 @@ def compute_metrics(
         "n_pairs": count,
         "top_k": FIXED_TOP_K,
         "arms": {
-            "baseline": {"target_recall_at_8": sum(baseline_hits) / count, "mrr": sum(baseline_rrs) / count},
-            "full": {"target_recall_at_8": sum(full_hits) / count, "mrr": sum(full_rrs) / count},
+            "baseline": baseline_arm,
+            "full": full_arm,
         },
         "deltas": {
-            "target_recall_at_8": {
-                "point": sum(full_hits[index] - baseline_hits[index] for index in range(count)) / count,
-                "ci95": {"low": recall_ci[0], "high": recall_ci[1]},
-            },
+            **recall_deltas,
             "mrr": {
                 "point": sum(full_rrs[index] - baseline_rrs[index] for index in range(count)) / count,
                 "ci95": {"low": mrr_ci[0], "high": mrr_ci[1]},
             },
         },
-        "paired_hits": paired_hits,
+        # Retain this legacy @8 field for existing run readers; the structured
+        # object makes the stricter @1/@5 paired diagnostics explicit.
+        "paired_hits": paired_hits_by_cutoff[FIXED_TOP_K],
+        "paired_hits_by_cutoff": {f"at_{cutoff}": paired_hits_by_cutoff[cutoff] for cutoff in RECALL_CUTOFFS},
         "components": {
             "baseline_vector": _component_coverage(baseline_records, "vector"),
             "full_rewrite": _component_coverage(full_records, "rewrite"),
@@ -1811,6 +2633,13 @@ def compute_metrics(
         "artifact_sha256": {},
         "validation": {"status": "INCOMPLETE", "reasons": []},
     }
+    # Keep legacy v1 metric contracts byte-for-byte recomputable.  New tuning
+    # runs opt in by recording candidate traces on the full arm.
+    if any(record.get("candidate_trace") is not None for record in full_records):
+        metrics["candidate_audit"] = _candidate_audit(full_records)
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        metrics["query_style"] = query_style
+    return metrics
 
 
 def _require_metric_equal(observed: Any, expected: Any, label: str, reasons: list[str]) -> None:
@@ -1828,6 +2657,7 @@ def _result_records_for_verify(
     split: str = "test",
     dataset_sha256: str,
     config_sha256: str,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
 ) -> list[JsonObject]:
     records = read_jsonl(path)
     for record in records:
@@ -1838,6 +2668,7 @@ def _result_records_for_verify(
             run_id=path.parent.name,
             dataset_sha256=dataset_sha256,
             config_sha256=config_sha256,
+            query_style=query_style,
         )
     return records
 
@@ -1951,8 +2782,11 @@ def validate_records_bound_to_frozen_split(
     records: Sequence[Mapping[str, Any]],
     frozen_records: Sequence[Mapping[str, Any]],
     target_mapping: Mapping[str, str],
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
 ) -> None:
     """Bind every scoreable result to its immutable query and resolver target."""
+    query_style = _require_query_style(query_style)
     frozen_by_id = {str(row["query_id"]): row for row in frozen_records}
     for record in records:
         query_id = str(record.get("query_id"))
@@ -1963,6 +2797,15 @@ def validate_records_bound_to_frozen_split(
         target_key = str(frozen["target_record_key"])
         if record.get("query") != expected_query or record.get("query_sha256") != sha256_text(expected_query):
             raise EvaluationError("result query is not bound to frozen Test text")
+        if query_style_from_result(record) != query_style:
+            raise EvaluationError("result query_style is not bound to frozen Test")
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            try:
+                validate_structured_fact_key_value_query(expected_query)
+            except DatasetError as exc:
+                raise EvaluationError("frozen structured query is malformed") from exc
+            if record.get("effective_query") != expected_query:
+                raise EvaluationError("structured result did not use the frozen direct query")
         if record.get("target_record_key") != target_key:
             raise EvaluationError("result target_record_key is not bound to frozen Test")
         if record.get("target_source_id") != target_mapping.get(target_key):
@@ -2007,6 +2850,11 @@ def preflight_contract_errors(preflight: Mapping[str, Any]) -> list[str]:
         or _RECORD_KEY_RE.fullmatch(str(frozen.get("test_sha256"))) is None
     ):
         errors.append("preflight frozen_dataset test hash evidence is invalid")
+    try:
+        query_style = _require_query_style(frozen.get("query_style", QUERY_STYLE_NATURAL_LANGUAGE_V1))
+    except EvaluationError:
+        errors.append("preflight frozen_dataset query_style is invalid")
+        query_style = QUERY_STYLE_NATURAL_LANGUAGE_V1
     source = evidence("source_file")
     if not isinstance(source.get("sha256"), str) or _RECORD_KEY_RE.fullmatch(str(source.get("sha256"))) is None:
         errors.append("preflight source_file hash evidence is invalid")
@@ -2018,6 +2866,13 @@ def preflight_contract_errors(preflight: Mapping[str, Any]) -> list[str]:
         or _RECORD_KEY_RE.fullmatch(str(config.get("config_sha256"))) is None
     ):
         errors.append("preflight effective configuration has no config hash evidence")
+    try:
+        configured_query_style = _require_query_style(config.get("query_style", QUERY_STYLE_NATURAL_LANGUAGE_V1))
+    except EvaluationError:
+        errors.append("preflight effective configuration query_style is invalid")
+    else:
+        if configured_query_style != query_style:
+            errors.append("preflight frozen/configuration query_style mismatch")
     postgres = evidence("postgres_connectivity")
     if not all(
         isinstance(postgres.get(key), int) and int(postgres[key]) >= 0
@@ -2028,7 +2883,7 @@ def preflight_contract_errors(preflight: Mapping[str, Any]) -> list[str]:
     if not isinstance(milvus.get("collection"), str) or not isinstance(milvus.get("embedding_dim"), int):
         errors.append("preflight Milvus evidence is invalid")
     gateways = evidence("model_gateways")
-    for name in ("embedding", "rewrite", "reranker"):
+    for name in ("embedding", "reranker"):
         component = gateways.get(name)
         if (
             not isinstance(component, Mapping)
@@ -2036,6 +2891,21 @@ def preflight_contract_errors(preflight: Mapping[str, Any]) -> list[str]:
             or not component.get("model")
         ):
             errors.append(f"preflight gateway evidence is invalid: {name}")
+    rewrite_gateway = gateways.get("rewrite")
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        if (
+            not isinstance(rewrite_gateway, Mapping)
+            or rewrite_gateway.get("status") != "not_applicable"
+            or rewrite_gateway.get("enabled") is not False
+            or (rewrite_gateway.get("model") is not None and rewrite_gateway.get("model") != "")
+        ):
+            errors.append("preflight structured rewrite evidence is not explicitly disabled")
+    elif (
+        not isinstance(rewrite_gateway, Mapping)
+        or not isinstance(rewrite_gateway.get("model"), str)
+        or not rewrite_gateway.get("model")
+    ):
+        errors.append("preflight gateway evidence is invalid: rewrite")
     targets = evidence("frozen_target_resolution")
     target_mapping = targets.get("target_mapping")
     if (
@@ -2166,10 +3036,12 @@ def validate_run(
     """Machine-check the formal must-gates and return PASS/INVALID evidence."""
     reasons: list[str] = []
     metrics: JsonObject | None = None
+    candidate_trace_required = False
     try:
         smoke, test = validate_dataset_pair(dataset_dir)
     except EvaluationError as exc:
         return "INVALID", [f"dataset:{redacted_message(exc)}"], None
+    query_style = query_style_from_manifest(test.manifest)
     expected_sha = test.sha256
     manifest_path = run_dir / "dataset-manifest.json"
     config_path = run_dir / "config.redacted.json"
@@ -2179,12 +3051,40 @@ def validate_run(
         run_manifest = read_json(manifest_path)
         if run_manifest.get("test_jsonl_sha256") != expected_sha:
             reasons.append("run_dataset_hash_mismatch")
+        try:
+            run_query_style = query_style_from_manifest(run_manifest)
+        except EvaluationError:
+            reasons.append("run_dataset_query_style_invalid")
+        else:
+            if run_query_style != query_style:
+                reasons.append("run_dataset_query_style_mismatch")
     if not config_path.exists():
         reasons.append("missing_config_redacted")
         config_sha = ""
     else:
         config = read_json(config_path)
         config_sha = str(config.get("config_sha256", ""))
+        try:
+            config_query_style = query_style_from_config(config)
+        except EvaluationError:
+            reasons.append("config_query_style_invalid")
+        else:
+            if config_query_style != query_style:
+                reasons.append("config_query_style_mismatch")
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            rewrite = config.get("rewrite")
+            models = config.get("models")
+            if (
+                not isinstance(rewrite, Mapping)
+                or not isinstance(models, Mapping)
+                or rewrite.get("enabled") is not False
+                or rewrite.get("applicable") is not False
+                or rewrite.get("gateway_call") != "not_applicable"
+                or (isinstance(models, Mapping) and models.get("rewrite") is not None and models.get("rewrite") != "")
+            ):
+                reasons.append("structured_rewrite_not_explicitly_disabled")
+        retrieval = config.get("retrieval")
+        candidate_trace_required = bool(isinstance(retrieval, Mapping) and retrieval.get("candidate_trace") is True)
         config_body = dict(config)
         config_body.pop("config_sha256", None)
         config_body.pop("captured_at", None)
@@ -2199,10 +3099,18 @@ def validate_run(
     else:
         try:
             baseline_records = _result_records_for_verify(
-                baseline_path, arm="baseline", dataset_sha256=expected_sha, config_sha256=config_sha
+                baseline_path,
+                arm="baseline",
+                dataset_sha256=expected_sha,
+                config_sha256=config_sha,
+                query_style=query_style,
             )
             full_records = _result_records_for_verify(
-                full_path, arm="full", dataset_sha256=expected_sha, config_sha256=config_sha
+                full_path,
+                arm="full",
+                dataset_sha256=expected_sha,
+                config_sha256=config_sha,
+                query_style=query_style,
             )
         except EvaluationError as exc:
             reasons.append(f"result_integrity:{redacted_message(exc)}")
@@ -2219,10 +3127,12 @@ def validate_run(
     if baseline_records and full_records:
         try:
             mapping = preflight_target_mapping(run_dir, test.records)
-            validate_records_bound_to_frozen_split(baseline_records, test.records, mapping)
-            validate_records_bound_to_frozen_split(full_records, test.records, mapping)
+            validate_records_bound_to_frozen_split(baseline_records, test.records, mapping, query_style=query_style)
+            validate_records_bound_to_frozen_split(full_records, test.records, mapping, query_style=query_style)
         except EvaluationError as exc:
             reasons.append(f"frozen_result_binding:{redacted_message(exc)}")
+    if candidate_trace_required and full_records and any("candidate_trace" not in record for record in full_records):
+        reasons.append("candidate_trace_not_complete_for_full_arm")
     if baseline_records and full_records:
         try:
             metrics = compute_metrics(
@@ -2250,6 +3160,7 @@ def validate_run(
                 split="smoke",
                 dataset_sha256=smoke.sha256,
                 config_sha256=config_sha,
+                query_style=query_style,
             )
             smoke_full_records = _result_records_for_verify(
                 smoke_full_path,
@@ -2257,6 +3168,7 @@ def validate_run(
                 split="smoke",
                 dataset_sha256=smoke.sha256,
                 config_sha256=config_sha,
+                query_style=query_style,
             )
             smoke_ids = {str(record["query_id"]) for record in smoke.records}
             if len(smoke_baseline_records) != FIXED_SMOKE_SIZE or len(smoke_full_records) != FIXED_SMOKE_SIZE:
@@ -2266,11 +3178,21 @@ def validate_run(
             if {str(record.get("query_id")) for record in smoke_full_records} != smoke_ids:
                 raise EvaluationError("Smoke full query set does not equal frozen Smoke")
             smoke_mapping = preflight_target_mapping(run_dir, smoke.records)
-            validate_records_bound_to_frozen_split(smoke_baseline_records, smoke.records, smoke_mapping)
-            validate_records_bound_to_frozen_split(smoke_full_records, smoke.records, smoke_mapping)
+            validate_records_bound_to_frozen_split(
+                smoke_baseline_records, smoke.records, smoke_mapping, query_style=query_style
+            )
+            validate_records_bound_to_frozen_split(
+                smoke_full_records, smoke.records, smoke_mapping, query_style=query_style
+            )
         except EvaluationError as exc:
             reasons.append(f"smoke_result_integrity:{redacted_message(exc)}")
             smoke_baseline_records, smoke_full_records = [], []
+    if (
+        candidate_trace_required
+        and smoke_full_records
+        and any("candidate_trace" not in record for record in smoke_full_records)
+    ):
+        reasons.append("candidate_trace_not_complete_for_smoke_full_arm")
     failure_errors, _failure_summary = audit_failure_log(
         run_dir,
         test_dataset_sha256=expected_sha,
@@ -2290,7 +3212,7 @@ def validate_run(
         components = cast(JsonObject, metrics["components"])
         if components["baseline_vector"]["success"] != FIXED_TEST_SIZE:
             reasons.append("baseline_vector_coverage_not_100_percent")
-        if components["full_rewrite"]["coverage"] < 0.95:
+        if query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1 and components["full_rewrite"]["coverage"] < 0.95:
             reasons.append("rewrite_coverage_below_95_percent")
         if components["full_cross_encoder"]["coverage"] < 0.95:
             reasons.append("cross_encoder_coverage_below_95_percent")
@@ -2480,19 +3402,26 @@ async def verify_target_collection_membership(settings: Any, mappings: Mapping[s
     return {"expected_target_chunks": len(expected), "matched_target_chunks": len(observed)}
 
 
-async def _gateway_preflight(settings: Any) -> dict[str, Any]:
+async def _gateway_preflight(
+    settings: Any,
+    *,
+    query_style: str = QUERY_STYLE_NATURAL_LANGUAGE_V1,
+) -> dict[str, Any]:
     """Perform small real requests to each required model capability."""
+    query_style = _require_query_style(query_style)
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1 and bool(
+        getattr(settings, "rag_query_rewrite_enabled", True)
+    ):
+        raise EvaluationError("structured preflight requires rag_query_rewrite_enabled=false")
     from app.core.embedding_gateway import build_embedding_gateway_settings
     from app.core.gateway import ModelGatewayClient
     from app.core.reranker_gateway import build_reranker_gateway_settings
-    from app.core.rewrite_gateway import build_rewrite_gateway_settings
-    from app.rag.reasoning_retrieval import rewrite_syndrome_query
     from app.rag.reranker import cross_encoder_rerank
     from app.rag.schemas import MergedHit
 
     evidence: dict[str, Any] = {}
     embedding_client = ModelGatewayClient(settings=build_embedding_gateway_settings(settings))
-    rewrite_client = ModelGatewayClient(settings=build_rewrite_gateway_settings(settings) or settings)
+    rewrite_client: Any = None
     reranker_client: Any = None
     try:
         vectors = await embedding_client.embed(["评测连通性检查"], trace_id="rag-silver-preflight-embedding")
@@ -2500,21 +3429,29 @@ async def _gateway_preflight(settings: Any) -> dict[str, Any]:
             raise EvaluationError("embedding gateway returned an unexpected vector dimension")
         evidence["embedding"] = {"model": str(settings.embedding_model), "dimension": len(vectors[0])}
 
-        rewrite_event = component_template("not_attempted")
-        observed_rewrite = ObservedGateway(
-            rewrite_client,
-            component="rewrite",
-            event_getter=lambda: rewrite_event,
-            default_model=_actual_rewrite_model(settings),
-        )
-        rewritten = await rewrite_syndrome_query(
-            [SimpleNamespace(fact_key="present_illness", value="近日咳嗽咽痒，夜间较明显，伴少量白痰")],
-            gateway=observed_rewrite,
-            trace_id="rag-silver-preflight-rewrite",
-        )
-        if rewrite_event.get("status") != "succeeded" or not rewritten:
-            raise EvaluationError("rewrite gateway did not complete a successful observed request")
-        evidence["rewrite"] = {"model": _actual_rewrite_model(settings), "status": "succeeded"}
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            # A disabled capability must have no client construction or probe.
+            evidence["rewrite"] = {"status": "not_applicable", "enabled": False}
+        else:
+            from app.core.rewrite_gateway import build_rewrite_gateway_settings
+            from app.rag.reasoning_retrieval import rewrite_syndrome_query
+
+            rewrite_client = ModelGatewayClient(settings=build_rewrite_gateway_settings(settings) or settings)
+            rewrite_event = component_template("not_attempted")
+            observed_rewrite = ObservedGateway(
+                rewrite_client,
+                component="rewrite",
+                event_getter=lambda: rewrite_event,
+                default_model=_actual_rewrite_model(settings),
+            )
+            rewritten = await rewrite_syndrome_query(
+                [SimpleNamespace(fact_key="present_illness", value="近日咳嗽咽痒，夜间较明显，伴少量白痰")],
+                gateway=observed_rewrite,
+                trace_id="rag-silver-preflight-rewrite",
+            )
+            if rewrite_event.get("status") != "succeeded" or not rewritten:
+                raise EvaluationError("rewrite gateway did not complete a successful observed request")
+            evidence["rewrite"] = {"model": _actual_rewrite_model(settings), "status": "succeeded"}
 
         # The production reranker normally receives merged hits from retrieve.
         # A two-item harmless synthetic probe validates the real endpoint and
@@ -2575,8 +3512,12 @@ _QUALITY_GATE_COMMANDS: tuple[tuple[str, list[str]], ...] = (
             "--check",
             "scripts/build_rag_silver_eval.py",
             "scripts/evaluate_rag_silver.py",
+            "scripts/compare_rag_profiles.py",
+            "app/core/config.py",
+            "app/rag/retriever.py",
             "tests/test_build_rag_silver_eval.py",
             "tests/test_evaluate_rag_silver.py",
+            "tests/test_rag_retriever.py",
         ],
     ),
     (
@@ -2588,13 +3529,26 @@ _QUALITY_GATE_COMMANDS: tuple[tuple[str, list[str]], ...] = (
             "check",
             "scripts/build_rag_silver_eval.py",
             "scripts/evaluate_rag_silver.py",
+            "scripts/compare_rag_profiles.py",
+            "app/core/config.py",
+            "app/rag/retriever.py",
             "tests/test_build_rag_silver_eval.py",
             "tests/test_evaluate_rag_silver.py",
+            "tests/test_rag_retriever.py",
         ],
     ),
     (
         "mypy",
-        ["uv", "run", "mypy", "scripts/build_rag_silver_eval.py", "scripts/evaluate_rag_silver.py"],
+        [
+            "uv",
+            "run",
+            "mypy",
+            "scripts/build_rag_silver_eval.py",
+            "scripts/evaluate_rag_silver.py",
+            "scripts/compare_rag_profiles.py",
+            "app/core/config.py",
+            "app/rag/retriever.py",
+        ],
     ),
     (
         "target_tests",
@@ -2604,6 +3558,7 @@ _QUALITY_GATE_COMMANDS: tuple[tuple[str, list[str]], ...] = (
             "pytest",
             "tests/test_build_rag_silver_eval.py",
             "tests/test_evaluate_rag_silver.py",
+            "tests/test_rag_retriever.py",
             "-q",
         ],
     ),
@@ -2634,8 +3589,16 @@ def run_local_quality_gates(run_dir: Path) -> list[JsonObject]:
     return outcomes
 
 
-async def run_preflight(dataset_dir: Path, run_dir: Path, collection: str) -> int:
+async def run_preflight(
+    dataset_dir: Path,
+    run_dir: Path,
+    collection: str,
+    *,
+    profile_name: str = _DEFAULT_RETRIEVAL_PROFILE,
+    rewrite_cache_path: Path | None = None,
+) -> int:
     """Write structured non-mutating readiness evidence for the frozen run."""
+    profile = resolve_retrieval_profile(profile_name)
     ensure_run_directory(run_dir)
     update_state(run_dir, current_phase="preflight", status="running", phase_status="running", collection=collection)
     checks: list[JsonObject] = []
@@ -2651,15 +3614,24 @@ async def run_preflight(dataset_dir: Path, run_dir: Path, collection: str) -> in
     )
     smoke: FrozenSplit | None = None
     test: FrozenSplit | None = None
+    query_style = QUERY_STYLE_NATURAL_LANGUAGE_V1
     try:
         smoke, test = validate_dataset_pair(dataset_dir)
+        query_style = query_style_from_manifest(test.manifest)
         copy_dataset_manifest(dataset_dir, run_dir, smoke, test)
+        frozen_evidence: JsonObject = {
+            "smoke_count": len(smoke.records),
+            "test_count": len(test.records),
+            "test_sha256": test.sha256,
+        }
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            frozen_evidence["query_style"] = query_style
         checks.append(
             _preflight_check(
                 "frozen_dataset",
                 True,
                 "passed",
-                {"smoke_count": len(smoke.records), "test_count": len(test.records), "test_sha256": test.sha256},
+                frozen_evidence,
             )
         )
     except EvaluationError as exc:
@@ -2682,15 +3654,42 @@ async def run_preflight(dataset_dir: Path, run_dir: Path, collection: str) -> in
 
     settings: Any | None = None
     config: JsonObject | None = None
+    frozen_rewrite_cache: FrozenRewriteCache | None = None
     try:
-        settings = load_contract_settings(collection)
-        config = write_or_validate_config(run_dir, settings)
+        settings = load_contract_settings(collection, profile, query_style=query_style)
+        if rewrite_cache_path is not None:
+            if smoke is None or test is None:
+                raise EvaluationError("cannot bind a Rewrite cache before frozen splits validate")
+            if query_style != QUERY_STYLE_NATURAL_LANGUAGE_V1:
+                raise EvaluationError("structured evaluation must not bind a Rewrite cache")
+            frozen_rewrite_cache = load_frozen_rewrite_cache(
+                rewrite_cache_path,
+                smoke=smoke,
+                test=test,
+                settings=settings,
+            )
+        config = write_or_validate_config(
+            run_dir,
+            settings,
+            profile,
+            query_style=query_style,
+            frozen_rewrite_cache=frozen_rewrite_cache,
+        )
+        config_evidence: JsonObject = {
+            "collection": collection,
+            "profile": profile.name,
+            "config_sha256": config["config_sha256"],
+        }
+        if frozen_rewrite_cache is not None:
+            config_evidence["frozen_rewrite_cache_sha256"] = frozen_rewrite_cache.sha256
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            config_evidence["query_style"] = query_style
         checks.append(
             _preflight_check(
                 "effective_contract_configuration",
                 True,
                 "passed",
-                {"collection": collection, "config_sha256": config["config_sha256"]},
+                config_evidence,
             )
         )
     except Exception as exc:
@@ -2712,7 +3711,7 @@ async def run_preflight(dataset_dir: Path, run_dir: Path, collection: str) -> in
         except Exception as exc:
             checks.append(_preflight_check("milvus_collection", True, "failed", error=exc))
         try:
-            gateway_evidence = await _gateway_preflight(settings)
+            gateway_evidence = await _gateway_preflight(settings, query_style=query_style)
             checks.append(_preflight_check("model_gateways", True, "passed", gateway_evidence))
         except Exception as exc:
             checks.append(_preflight_check("model_gateways", True, "failed", error=exc))
@@ -2825,6 +3824,8 @@ async def run_split(
     arms: Sequence[str],
     top_k: int,
     resume: bool,
+    profile_name: str = _DEFAULT_RETRIEVAL_PROFILE,
+    rewrite_cache_path: Path | None = None,
 ) -> int:
     """Execute one frozen split with durable per-arm checkpoints."""
     if split_name not in {"smoke", "test"}:
@@ -2836,10 +3837,28 @@ async def run_split(
     ensure_run_directory(run_dir)
     smoke_split, test_split = validate_dataset_pair(dataset_dir)
     split = smoke_split if split_name == "smoke" else test_split
+    query_style = query_style_from_manifest(split.manifest)
     formal_test_sha = test_split.sha256
     ensure_frozen_code_identity(run_dir)
-    settings = load_contract_settings(collection)
-    config = write_or_validate_config(run_dir, settings)
+    profile = resolve_retrieval_profile(profile_name)
+    settings = load_contract_settings(collection, profile, query_style=query_style)
+    frozen_rewrite_cache: FrozenRewriteCache | None = None
+    if rewrite_cache_path is not None:
+        if query_style != QUERY_STYLE_NATURAL_LANGUAGE_V1:
+            raise EvaluationError("structured evaluation must not bind a Rewrite cache")
+        frozen_rewrite_cache = load_frozen_rewrite_cache(
+            rewrite_cache_path,
+            smoke=smoke_split,
+            test=test_split,
+            settings=settings,
+        )
+    config = write_or_validate_config(
+        run_dir,
+        settings,
+        profile,
+        query_style=query_style,
+        frozen_rewrite_cache=frozen_rewrite_cache,
+    )
     config_sha = str(config["config_sha256"])
     state = ensure_run_directory(run_dir)
     expected_dataset_sha = state.get("dataset_sha256")
@@ -2873,8 +3892,9 @@ async def run_split(
             dataset_sha256=split.sha256,
             config_sha256=config_sha,
             run_dir=run_dir,
+            query_style=query_style,
         )
-    runtime = build_runtime(settings)
+    runtime = build_runtime(settings, query_style=query_style, frozen_rewrite_cache=frozen_rewrite_cache)
     unresolved = 0
     try:
         for row in split.records:
@@ -2927,13 +3947,41 @@ def _format_pp(value: float) -> str:
     return f"{value * 100:+.1f} pp"
 
 
+def _formal_metric_table(arms: Mapping[str, Any], deltas: Mapping[str, Any]) -> str:
+    """Render available Recall cutoffs plus MRR; legacy artifacts may have only @8."""
+    baseline = cast(Mapping[str, Any], arms["baseline"])
+    full = cast(Mapping[str, Any], arms["full"])
+    rows = ["| 指标 | baseline | full | full - baseline | 95% CI |", "|---|---:|---:|---:|---:|"]
+    for cutoff in RECALL_CUTOFFS:
+        key = f"target_recall_at_{cutoff}"
+        delta = deltas.get(key)
+        if key not in baseline or key not in full or not isinstance(delta, Mapping):
+            continue
+        ci = cast(Mapping[str, Any], delta["ci95"])
+        rows.append(
+            f"| Target Recall@{cutoff} | {_format_pct(float(baseline[key]))} | "
+            f"{_format_pct(float(full[key]))} | {_format_pp(float(delta['point']))} | "
+            f"[{_format_pp(float(ci['low']))}, {_format_pp(float(ci['high']))}] |"
+        )
+    mrr = cast(Mapping[str, Any], deltas["mrr"])
+    mrr_ci = cast(Mapping[str, Any], mrr["ci95"])
+    rows.append(
+        f"| MRR | {float(baseline['mrr']):.3f} | {float(full['mrr']):.3f} | {float(mrr['point']):+.3f} | "
+        f"[{float(mrr_ci['low']):+.3f}, {float(mrr_ci['high']):+.3f}] |"
+    )
+    return "\n".join(rows)
+
+
 def _actual_components_for_resume(config: Mapping[str, Any], metrics: Mapping[str, Any]) -> str:
+    query_style = query_style_from_config(config)
     models = cast(Mapping[str, Any], config.get("models", {}))
     components = cast(Mapping[str, Any], metrics.get("components", {}))
     parts = [str(models.get("embedding", "Embedding")), "Milvus/PostgreSQL 混合检索"]
     rewrite = components.get("full_rewrite", {})
     reranker = components.get("full_cross_encoder", {})
-    if isinstance(rewrite, Mapping) and float(rewrite.get("coverage", 0.0)) >= 0.95:
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        parts.insert(0, "fact_key=value 结构化 Query（Rewrite 禁用）")
+    elif isinstance(rewrite, Mapping) and float(rewrite.get("coverage", 0.0)) >= 0.95:
         parts.insert(0, "Query Rewrite")
     if isinstance(reranker, Mapping) and float(reranker.get("coverage", 0.0)) >= 0.95:
         parts.append("Cross-Encoder 重排")
@@ -2956,6 +4004,12 @@ def make_resume_bullet(
     """Choose the conservative resume language directly from raw metrics."""
     metric_sha = sha256_bytes(compact_json_bytes(metrics)) if metrics is not None else ""
     header = f"source_run: {run_id}\nsource_metrics_sha256: {metric_sha}\nacceptance: {acceptance}\n"
+    try:
+        query_style = query_style_from_config(config)
+    except EvaluationError:
+        return header + "selection_rule: R5\n评测输入合同无效，不能用于简历指标。\n"
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        header += "query_style: structured_fact_key_value_v1\nrewrite: disabled_not_applicable\n"
     if acceptance != "PASS" or metrics is None:
         return header + "selection_rule: R5\n实验未完成或未通过验收，不能用于简历指标。\n"
     arms = cast(Mapping[str, Any], metrics["arms"])
@@ -2976,7 +4030,8 @@ def make_resume_bullet(
     rewrite_coverage = float(cast(Mapping[str, Any], components.get("full_rewrite", {})).get("coverage", 0.0))
     reranker_coverage = float(cast(Mapping[str, Any], components.get("full_cross_encoder", {})).get("coverage", 0.0))
     if (
-        is_bge_m3_model(model)
+        query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1
+        and is_bge_m3_model(model)
         and rewrite_coverage >= 0.95
         and reranker_coverage >= 0.95
         and r_point > 0
@@ -3207,13 +4262,7 @@ def _legacy_make_report(
     else:
         arms = cast(Mapping[str, Any], metrics["arms"])
         deltas = cast(Mapping[str, Any], metrics["deltas"])
-        recall = cast(Mapping[str, Any], deltas["target_recall_at_8"])
-        mrr = cast(Mapping[str, Any], deltas["mrr"])
-        metric_table = (
-            "| 指标 | baseline | full | full - baseline | 95% CI |\n|---|---:|---:|---:|---:|\n"
-            f"| Target Recall@8 | {_format_pct(float(arms['baseline']['target_recall_at_8']))} | {_format_pct(float(arms['full']['target_recall_at_8']))} | {_format_pp(float(recall['point']))} | [{_format_pp(float(recall['ci95']['low']))}, {_format_pp(float(recall['ci95']['high']))}] |\n"
-            f"| MRR | {float(arms['baseline']['mrr']):.3f} | {float(arms['full']['mrr']):.3f} | {float(mrr['point']):+.3f} | [{float(mrr['ci95']['low']):+.3f}, {float(mrr['ci95']['high']):+.3f}] |"
-        )
+        metric_table = _formal_metric_table(arms, deltas)
         paired = cast(Mapping[str, Any], metrics["paired_hits"])
         paired_table = (
             "| baseline Hit@8 | full Hit@8 | Query 数 |\n|---:|---:|---:|\n"
@@ -3317,6 +4366,36 @@ def make_report(
     models = cast(Mapping[str, Any], config.get("models", {}))
     milvus = cast(Mapping[str, Any], config.get("milvus", {}))
     corpus = cast(Mapping[str, Any], environment.get("corpus", {}))
+    rewrite_config = cast(Mapping[str, Any], config.get("rewrite", {}))
+    frozen_rewrite_cache_sha = rewrite_config.get("frozen_cache_sha256")
+    frozen_rewrite_replay = rewrite_config.get("execution_mode") == "frozen_replay" and isinstance(
+        frozen_rewrite_cache_sha, str
+    )
+    try:
+        query_style = query_style_from_config(config)
+    except EvaluationError:
+        query_style = "invalid"
+    structured_query_style = query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    query_contract_line = (
+        "- 输入合同：`fact_key=value；…` 结构化事实键；Rewrite 已禁用且不适用（未调用网关）。\n"
+        if structured_query_style
+        else ""
+    )
+    rewrite_model_display = (
+        "disabled / not applicable（未调用 Rewrite gateway）"
+        if structured_query_style
+        else models.get("rewrite", "unknown")
+    )
+    full_arm_contract = (
+        "原始 fact_key=value；… Query（Rewrite 已禁用 / 不适用） -> Milvus + PostgreSQL 混合检索 -> Cross-Encoder -> top 8"
+        if structured_query_style
+        else (
+            f"冻结回放同一 Rewrite（cache={frozen_rewrite_cache_sha}） -> Milvus + PostgreSQL 混合检索 -> "
+            "Cross-Encoder -> top 8"
+            if frozen_rewrite_replay
+            else "Query Rewrite -> Milvus + PostgreSQL 混合检索 -> Cross-Encoder -> top 8"
+        )
+    )
     state = state or {}
     failure_summary = failure_summary or {}
     if validation is None:
@@ -3373,13 +4452,7 @@ def make_report(
     else:
         arms = cast(Mapping[str, Any], formal_metrics["arms"])
         deltas = cast(Mapping[str, Any], formal_metrics["deltas"])
-        recall = cast(Mapping[str, Any], deltas["target_recall_at_8"])
-        mrr = cast(Mapping[str, Any], deltas["mrr"])
-        metric_table = (
-            "| 指标 | baseline | full | full - baseline | 95% CI |\n|---|---:|---:|---:|---:|\n"
-            f"| Target Recall@8 | {_format_pct(float(arms['baseline']['target_recall_at_8']))} | {_format_pct(float(arms['full']['target_recall_at_8']))} | {_format_pp(float(recall['point']))} | [{_format_pp(float(recall['ci95']['low']))}, {_format_pp(float(recall['ci95']['high']))}] |\n"
-            f"| MRR | {float(arms['baseline']['mrr']):.3f} | {float(arms['full']['mrr']):.3f} | {float(mrr['point']):+.3f} | [{float(mrr['ci95']['low']):+.3f}, {float(mrr['ci95']['high']):+.3f}] |"
-        )
+        metric_table = _formal_metric_table(arms, deltas)
         paired = cast(Mapping[str, Any], formal_metrics["paired_hits"])
         paired_table = (
             "| baseline Hit@8 | full Hit@8 | Query 数 |\n|---:|---:|---:|\n"
@@ -3398,6 +4471,9 @@ def make_report(
             ("Cross-Encoder", "full_cross_encoder", "reranker", 0.95),
         ):
             component = cast(Mapping[str, Any], components[key])
+            if structured_query_style and key == "full_rewrite":
+                component_rows.append("| Query Rewrite（禁用 / 不适用） | N/A | N/A | 0 | 未调用 |")
+                continue
             fallback_count = 0
             if fallback_key == "reranker":
                 fallback_count = int(degradations.get("reranker_fallback", 0)) + int(
@@ -3425,6 +4501,66 @@ def make_report(
         formal_data_line = "正式结果：已完成 200 条 Test 完整配对；以下数值由两份正式 JSONL 重算。"
         if acceptance != "PASS":
             formal_data_line += "该数值仅为验收预览，verify 前或 INVALID 状态下均不能用于简历指标。"
+
+    candidate_audit_table = "候选追踪未记录；不能区分初召回遗漏与重排淘汰。"
+    if formal_metrics is not None:
+        candidate_audit = formal_metrics.get("candidate_audit")
+        if isinstance(candidate_audit, Mapping) and int(candidate_audit.get("trace_records", 0) or 0) > 0:
+            stages = candidate_audit.get("stages")
+            if isinstance(stages, Mapping):
+                rows: list[str] = []
+                labels = {
+                    "vector": "向量候选",
+                    "fulltext": "全文候选",
+                    "merged": "去重并集",
+                    "reranker_pool": "Cross-Encoder 候选池",
+                }
+                for key in ("vector", "fulltext", "merged", "reranker_pool"):
+                    stage = stages.get(key)
+                    if not isinstance(stage, Mapping):
+                        continue
+                    counts = stage.get("candidate_count")
+                    if not isinstance(counts, Mapping):
+                        continue
+                    rows.append(
+                        f"| {labels[key]} | {stage.get('target_present', 0)} / {stage.get('denominator', 0)} | "
+                        f"{_format_pct(float(stage.get('coverage', 0.0)))} | "
+                        f"{counts.get('min', 0)} / {counts.get('median', 0)} / {counts.get('max', 0)} |"
+                    )
+                if rows:
+                    source_diversity_line = ""
+                    unique_sources = candidate_audit.get("reranker_pool_unique_source_count")
+                    if isinstance(unique_sources, Mapping):
+                        source_diversity_line = (
+                            "\n\nCross-Encoder 候选池中的不同来源数（min / median / max）："
+                            f"{unique_sources.get('min', 0)} / {unique_sources.get('median', 0)} / "
+                            f"{unique_sources.get('max', 0)}。"
+                        )
+                    query_view_line = ""
+                    query_views = candidate_audit.get("query_views")
+                    if isinstance(query_views, Mapping):
+                        counts = query_views.get("count")
+                        if isinstance(counts, Mapping):
+                            query_view_line = (
+                                "\n\nQuery 视图数（min / median / max）："
+                                f"{counts.get('min', 0)} / {counts.get('median', 0)} / {counts.get('max', 0)}；"
+                                "实际执行双视图 RRF："
+                                f"{query_views.get('dual_rrf_applied', 0)} / {query_views.get('denominator', 0)}。"
+                            )
+                    candidate_audit_table = (
+                        "trace 覆盖："
+                        f"{candidate_audit.get('trace_records', 0)} / {candidate_audit.get('denominator', 0)}；"
+                        "候选数列为 min / median / max。\n\n"
+                        "| 阶段 | target 已进入候选 | 覆盖率 | 候选数 |\n|---|---:|---:|---:|\n"
+                        + "\n".join(rows)
+                        + "\n\n"
+                        "实际调用 Cross-Encoder："
+                        f"{candidate_audit.get('reranker_attempted', 0)} / {candidate_audit.get('trace_records', 0)}。\n\n"
+                        "目标进入 Cross-Encoder 候选池但未进最终 top8："
+                        f"{candidate_audit.get('reranker_pool_target_present_final_miss', 0)} 条。"
+                        + source_diversity_line
+                        + query_view_line
+                    )
 
     arm_failures = int(failure_summary.get("arm_technical_failures", 0) or 0)
     unresolved = int(failure_summary.get("unresolved_arm_technical_failures", 0) or 0)
@@ -3478,7 +4614,7 @@ def make_report(
 - 结论：{acceptance}
 - {formal_data_line}
 - 数据集：rag-silver-v1，test.jsonl SHA-256 = {test_sha}
-- 范围：仅 source_type=case，最终 top_k=8
+{query_contract_line}- 范围：仅 source_type=case，最终 top_k=8
 - 限制：本实验衡量“是否找回产生 Query 的来源医案”，不评价中医辨证、处方或临床结论正确性。{blocked_detail}
 
 ## 可复现性
@@ -3489,7 +4625,8 @@ def make_report(
 | PostgreSQL / prepared 语料快照 | prepared={prepared_evidence.get("prepared_total_entries", corpus.get("prepared_total_entries", 0))}；case={prepared_evidence.get("prepared_case_entries", corpus.get("prepared_case_entries", 0))}；active_case={corpus.get("active_case_rows", 0)}；active_chunks={corpus.get("active_case_chunks", 0)} |
 | Milvus Collection | {milvus.get("collection", "unknown")} |
 | Embedding 模型 / 维度 | {models.get("embedding", "unknown")} / {milvus.get("embedding_dim", "unknown")} |
-| Rewrite 模型 | {models.get("rewrite", "unknown")} |
+| Rewrite 模型 | {rewrite_model_display} |
+| Rewrite 执行 | {f"冻结回放 cache SHA-256={frozen_rewrite_cache_sha}" if frozen_rewrite_replay else "每条 Query 实时调用"} |
 | Reranker 模型 | {models.get("reranker", "unknown")} |
 | 配置哈希 | {config.get("config_sha256", "unknown")} |
 | Bootstrap | 10,000 次配对 Query 级，seed=20260807，95% CI |
@@ -3512,7 +4649,7 @@ def make_report(
 | 组别 | 实际链路 |
 |---|---|
 | baseline | 原始 Query -> {models.get("embedding", "embedding")} -> Milvus 纯向量检索 |
-| full | Query Rewrite -> Milvus + PostgreSQL 混合检索 -> Cross-Encoder -> top 8 |
+| full | {full_arm_contract} |
 
 ## 正式指标
 
@@ -3523,6 +4660,10 @@ Target Recall@8 对单目标数据等价于 Hit@8；MRR 取目标医案来源首
 ## 配对命中变化
 
 {paired_table}
+
+## 候选层诊断
+
+{candidate_audit_table}
 
 ## 组件执行与降级
 
@@ -3556,18 +4697,29 @@ async def run_report(dataset_dir: Path, run_dir: Path, bootstrap_samples: int, s
     config_sha = str(config.get("config_sha256", ""))
     smoke: FrozenSplit | None = None
     test: FrozenSplit | None = None
+    query_style = QUERY_STYLE_NATURAL_LANGUAGE_V1
     with contextlib.suppress(EvaluationError):
         smoke, test = validate_dataset_pair(dataset_dir)
+        if test is not None:
+            query_style = query_style_from_manifest(test.manifest)
     metrics: JsonObject | None = None
     if smoke is not None and test is not None and config_sha:
         baseline_path = result_path(run_dir, "test", "baseline")
         full_path = result_path(run_dir, "test", "full")
         try:
             baseline = _result_records_for_verify(
-                baseline_path, arm="baseline", dataset_sha256=test.sha256, config_sha256=config_sha
+                baseline_path,
+                arm="baseline",
+                dataset_sha256=test.sha256,
+                config_sha256=config_sha,
+                query_style=query_style,
             )
             full = _result_records_for_verify(
-                full_path, arm="full", dataset_sha256=test.sha256, config_sha256=config_sha
+                full_path,
+                arm="full",
+                dataset_sha256=test.sha256,
+                config_sha256=config_sha,
+                query_style=query_style,
             )
             expected_ids = {str(row["query_id"]) for row in test.records}
             if (
@@ -3605,6 +4757,8 @@ async def run_report(dataset_dir: Path, run_dir: Path, bootstrap_samples: int, s
             "config_sha256": config_sha or None,
             "formal_metrics_available": False,
         }
+        if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+            metrics["query_style"] = query_style
     metrics["validation"] = make_validation_payload(staged_status, ["report_recomputation_in_progress"])
     write_json_atomic(run_dir / "metrics.json", metrics)
     machine_acceptance, reasons, recomputed = validate_run(
@@ -3817,19 +4971,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evaluate_rag_silver", description="Run the frozen rag-silver-v1 evaluation")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    freeze = subparsers.add_parser("freeze-rewrites", help="freeze actual Rewrite outputs for fair profile ablations")
+    freeze.add_argument("--dataset-dir", type=Path, required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+    freeze.add_argument("--collection", type=str, required=True)
+    freeze.add_argument("--profile", choices=sorted(_RETRIEVAL_PROFILES), default=_DEFAULT_RETRIEVAL_PROFILE)
+
     preflight = subparsers.add_parser("preflight", help="read-only real service and corpus preflight")
     preflight.add_argument("--dataset-dir", type=Path, required=True)
     preflight.add_argument("--run-dir", type=Path, required=True)
     preflight.add_argument("--collection", type=str, required=True)
+    preflight.add_argument("--profile", choices=sorted(_RETRIEVAL_PROFILES), default=_DEFAULT_RETRIEVAL_PROFILE)
+    preflight.add_argument("--rewrite-cache", type=Path)
 
     run = subparsers.add_parser("run", help="run one frozen split")
     run.add_argument("--dataset-dir", type=Path, required=True)
     run.add_argument("--run-dir", type=Path, required=True)
     run.add_argument("--collection", type=str, required=True)
+    run.add_argument("--profile", choices=sorted(_RETRIEVAL_PROFILES), default=_DEFAULT_RETRIEVAL_PROFILE)
     run.add_argument("--split", choices=("smoke", "test"), required=True)
     run.add_argument("--arms", type=str, required=True)
     run.add_argument("--top-k", type=int, required=True)
     run.add_argument("--resume", action="store_true")
+    run.add_argument("--rewrite-cache", type=Path)
 
     report = subparsers.add_parser("report", help="recompute formal metrics and report")
     report.add_argument("--dataset-dir", type=Path, required=True)
@@ -3844,8 +5008,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    if args.command == "freeze-rewrites":
+        return await freeze_rewrites(args.dataset_dir, args.output, args.collection, profile_name=args.profile)
     if args.command == "preflight":
-        return await run_preflight(args.dataset_dir, args.run_dir, args.collection)
+        return await run_preflight(
+            args.dataset_dir,
+            args.run_dir,
+            args.collection,
+            profile_name=args.profile,
+            rewrite_cache_path=args.rewrite_cache,
+        )
     if args.command == "run":
         return await run_split(
             args.dataset_dir,
@@ -3855,6 +5027,8 @@ async def async_main(args: argparse.Namespace) -> int:
             arms=parse_arms(args.arms),
             top_k=args.top_k,
             resume=bool(args.resume),
+            profile_name=args.profile,
+            rewrite_cache_path=args.rewrite_cache,
         )
     if args.command == "report":
         return await run_report(args.dataset_dir, args.run_dir, args.bootstrap_samples, args.seed)

@@ -20,8 +20,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 from app.core.config import get_settings
 from app.rag.schemas import Evidence
@@ -124,15 +124,65 @@ def _fact_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        # 槽位路径下 value 可能是 {slot_name: text} 的聚合；取所有叶文本。
+        # 普通聚合值只取语义叶子，不把 slot 元数据（来源 ID、完整度、
+        # 缺口提示等）混入检索 Query。
         parts: list[str] = []
-        for v in value.values():
-            if isinstance(v, str) and v:
-                parts.append(v)
+        for key, nested in value.items():
+            if key in {
+                "dimension",
+                "slots",
+                "completeness",
+                "missing_slots",
+                "slot_name",
+                "source_message_id",
+                "confidence",
+            }:
+                continue
+            text = _fact_text(nested)
+            if text:
+                parts.append(text)
         return "，".join(parts)
     if isinstance(value, (list, tuple)):
-        return "，".join(str(v) for v in value if v)
+        return "，".join(text for item in value if (text := _fact_text(item)))
     return str(value)
+
+
+def _slot_query_facts(value: Any) -> list[tuple[str, Any]] | None:
+    """Expand a slot snapshot back to its original fact-key/value pairs.
+
+    The slot rollout intentionally groups active facts by completeness
+    dimension for downstream prompts.  Retrieval must still use the clinical
+    fact keys (for example ``present_illness.chills``), not container values
+    such as ``dimension`` or ``completeness``.  ``None`` means this is not a
+    slot snapshot; an empty list means it is a snapshot with no usable facts.
+    """
+    if not isinstance(value, Mapping) or "slots" not in value:
+        return None
+    slots = value.get("slots")
+    if not isinstance(slots, (list, tuple)):
+        return []
+    facts: list[tuple[str, Any]] = []
+    for slot in slots:
+        if not isinstance(slot, Mapping):
+            continue
+        key = slot.get("slot_name")
+        if isinstance(key, str) and key:
+            facts.append((key, slot.get("value")))
+    return facts
+
+
+def _query_facts(observations: Sequence[Any]) -> list[tuple[str, Any]]:
+    """Return real clinical facts, expanding slot-container observations."""
+    facts: list[tuple[str, Any]] = []
+    for item in observations:
+        key = getattr(item, "fact_key", "")
+        value = getattr(item, "value", None)
+        slot_facts = _slot_query_facts(value)
+        if slot_facts is not None:
+            facts.extend(slot_facts)
+        elif isinstance(key, str) and key:
+            facts.append((key, value))
+    return facts
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +251,8 @@ def _format_observations_for_rewrite(
 ) -> str:
     """把 observations 格式化为 LLM 易于理解的文本。"""
     lines: list[str] = []
-    for item in observations:
-        key = getattr(item, "fact_key", "")
-        value = _fact_text(getattr(item, "value", None))
+    for key, raw_value in _query_facts(observations):
+        value = _fact_text(raw_value)
         if not value:
             continue
         label = _FACT_KEY_LABELS.get(key, key)
@@ -284,9 +333,8 @@ def build_syndrome_query(
     preferred: list[str] = []
     rest: list[str] = []
     seen: set[str] = set()
-    for item in observations:
-        key = getattr(item, "fact_key", "")
-        text = _fact_text(getattr(item, "value", None))
+    for key, raw_value in _query_facts(observations):
+        text = _fact_text(raw_value)
         if not text:
             continue
         if key in seen:
@@ -346,8 +394,9 @@ async def retrieve_syndrome_evidence(
     """
     settings = get_settings()
     k = top_k or settings.rag_syndrome_top_k
+    original_query = build_syndrome_query(observations)
     if query is None:
-        query = build_syndrome_query(observations)
+        query = original_query
     if not query:
         logger.warning("syndrome RAG: 无可检索的观察事实，跳过检索（空证据模式）")
         return []
@@ -358,6 +407,7 @@ async def retrieve_syndrome_evidence(
         top_k=k,
         stage="syndrome",
         logger_extra=logger_extra,
+        original_query=original_query,
     )
 
 
@@ -412,10 +462,7 @@ def build_modification_query(
     # 2. 方剂组成（让检索找到涉及相同药味的加减医案）
     herbs = getattr(base_formula, "composition", None) or ()
     if herbs:
-        herb_text = "、".join(
-            f"{h.herb}{h.dose}{h.unit}" if hasattr(h, "dose") and h.dose else h.herb
-            for h in herbs
-        )
+        herb_text = "、".join(f"{h.herb}{h.dose}{h.unit}" if hasattr(h, "dose") and h.dose else h.herb for h in herbs)
         if herb_text:
             parts.append(f"组成={herb_text}")
 
@@ -474,20 +521,38 @@ async def _retrieve_with_degrade(
     top_k: int,
     stage: str,
     logger_extra: dict[str, Any] | None,
+    original_query: str | None = None,
 ) -> list[Evidence]:
     """执行检索并降级。任何失败（含 RAGUnavailableError）→ 空证据，不 503。"""
     extra = {"query_len": len(query), "stage": stage}
     if logger_extra:
         extra.update(logger_extra)
     try:
-        results = await retriever.retrieve(
-            query=query,
-            primary_sources=primary_sources,
-            allow_cross_source=True,
-            top_k=top_k,
-        )
+        settings = get_settings()
+        dual_query_retrieve = getattr(retriever, "retrieve_dual_query", None)
+        if (
+            bool(getattr(settings, "rag_dual_query_enabled", False))
+            and original_query
+            and original_query != query
+            and callable(dual_query_retrieve)
+        ):
+            results = await dual_query_retrieve(
+                original_query,
+                query,
+                primary_sources,
+                allow_cross_source=True,
+                top_k=top_k,
+            )
+            extra["query_mode"] = "dual_rrf"
+        else:
+            results = await retriever.retrieve(
+                query=query,
+                primary_sources=primary_sources,
+                allow_cross_source=True,
+                top_k=top_k,
+            )
         logger.info("RAG %s 检索完成: query_len=%d hits=%d", stage, len(query), len(results), extra=extra)
-        return results
+        return cast(list[Evidence], results)
     except Exception as exc:  # noqa: BLE001 - 检索失败必须降级而非阻断推理
         logger.warning(
             "RAG %s 检索失败，降级为空证据模式: %s: %s",

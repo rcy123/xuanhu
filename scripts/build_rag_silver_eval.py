@@ -26,9 +26,11 @@ import re
 import sys
 import time
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 # ---------------------------------------------------------------------------
@@ -44,12 +46,77 @@ SYMPTOM_MAX_CHARS = 900
 MIN_SYMPTOM_CHINESE_CHARS = 40
 QUERY_MIN_CHARS = 25
 QUERY_MAX_CHARS = 180
+# ``build_syndrome_query`` defaults to the production RAG query limit.  The
+# structured evaluation style is intentionally bounded by that same limit,
+# rather than by the shorter natural-language rewrite limit above.
+STRUCTURED_QUERY_MAX_CHARS = 600
+STRUCTURED_FACT_MIN_COUNT = 2
+STRUCTURED_FACT_MAX_COUNT = 8
 EXCESSIVE_OVERLAP_JACCARD = 0.60
 NEAR_DUPLICATE_JACCARD = 0.90
 UNCLASSIFIED_STRATUM = "未分类"
 LOW_FREQUENCY_STRATUM = "其他低频类"
 LOW_FREQUENCY_THRESHOLD = 5
 RECORD_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+# Query input contracts.  ``natural_language_v1`` is the legacy/default
+# contract so existing datasets and callers keep their exact behavior.
+QUERY_STYLE_NATURAL_LANGUAGE_V1 = "natural_language_v1"
+QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1 = "structured_fact_key_value_v1"
+DEFAULT_QUERY_STYLE = QUERY_STYLE_NATURAL_LANGUAGE_V1
+SUPPORTED_QUERY_STYLES = frozenset(
+    {
+        QUERY_STYLE_NATURAL_LANGUAGE_V1,
+        QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    }
+)
+STRUCTURED_MODEL_SELECTION_CONTRACT: dict[str, str] = {
+    "source": "explicit_cli",
+    "fallback": "none",
+    "purpose": "structured_fact_extraction",
+}
+
+# This is the production syndrome-query preference set copied as an explicit
+# evaluation contract.  It deliberately excludes diagnosis, syndrome,
+# treatment, formula, medication, and patient-identity fields.  The builder
+# validates values against the answer-stripped symptom span, so an accepted
+# fact is both a canonical query key and symptom-only evidence.
+STRUCTURED_QUERY_CANONICAL_FACT_KEYS: tuple[str, ...] = (
+    "chief_complaint.symptom",
+    "chief_complaint.course",
+    "chief_complaint.category",
+    "present_illness.cough",
+    "present_illness.sputum",
+    "present_illness.rhinorrhea",
+    "present_illness.nasal_congestion",
+    "present_illness.sore_throat",
+    "present_illness.chills",
+    "present_illness.fever",
+    "present_illness.body_ache",
+    "present_illness.chest",
+    "present_illness.abdomen",
+    "present_illness.pain",
+    "present_illness.distension",
+    "present_illness.thirst",
+    "present_illness.appetite",
+    "present_illness.sleep",
+    "present_illness.stool",
+    "present_illness.urine",
+    "ten_questions.cold_heat",
+    "ten_questions.sweat",
+    "ten_questions.head_body",
+    "ten_questions.stool_urine",
+    "ten_questions.diet",
+    "ten_questions.chest_abdomen",
+    "ten_questions.thirst",
+    "ten_questions.sleep",
+    "ten_questions.menses_leukorrhea",
+    "ten_questions.pain",
+    "ten_questions.respiratory",
+    "four_diagnosis.inspection",
+    "four_diagnosis.palpation",
+)
+_STRUCTURED_QUERY_CANONICAL_FACT_KEY_SET = frozenset(STRUCTURED_QUERY_CANONICAL_FACT_KEYS)
 
 # 答案边界标记（按文档顺序；实际取所有标记中最早出现的位置）
 ANSWER_BOUNDARY_MARKERS = [
@@ -75,6 +142,7 @@ _LABEL_LINE_PATTERN = re.compile(r"(?:证\s*型|治\s*法|方\s*剂|处\s*方|�
 CONCLUSION_STYLE_KEYWORDS = ["辨证为", "证属", "治法", "方用", "处方", "方剂", "药用"]
 
 QUERY_PROMPT_VERSION = "rag-silver-query-v1"
+STRUCTURED_QUERY_PROMPT_VERSION = "rag-silver-structured-fact-key-value-v1"
 
 SYSTEM_PROMPT = (
     "你是检索评测 Query 改写器。请把输入的患者症状材料改写为一条自然、独立、\n"
@@ -86,9 +154,26 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT_TEMPLATE = "患者症状材料：\n{symptom_text}"
 
+_STRUCTURED_FACT_KEY_PROMPT_LIST = "\n".join(f"- {key}" for key in STRUCTURED_QUERY_CANONICAL_FACT_KEYS)
+STRUCTURED_QUERY_SYSTEM_PROMPT = (
+    "你是检索评测结构化事实抽取器。请只从输入的患者症状材料中抽取 2 到 8 条可观察的"
+    "临床事实，并为每条事实选择一个允许的 canonical fact_key。\n"
+    "每个 value 必须是患者症状材料中的连续原文片段，只能复制，不得改写、概括、补全或猜测。\n"
+    "不得输出疾病名称、证型、治法、方剂、药物、医案标题、医生结论、患者身份信息或任何材料外内容。\n"
+    "同一 fact_key 只能出现一次；value 不得包含换行、等号或分号。\n"
+    "允许的 canonical fact_key 如下：\n"
+    f"{_STRUCTURED_FACT_KEY_PROMPT_LIST}\n"
+    '输出严格 JSON：{"facts":[{"fact_key":"...","value":"..."}]}，不要输出 query 字段、解释或 Markdown。'
+)
+STRUCTURED_USER_PROMPT_TEMPLATE = USER_PROMPT_TEMPLATE
+
 QUERY_MODEL_TEMPERATURE = 0.1
 QUERY_MODEL_MAX_RETRIES = 2
 QUERY_MODEL_RETRY_BACKOFF_SECONDS = [1.0, 3.0]
+# Structured extraction intentionally has no dependency on the natural-query
+# rewrite settings.  The compact JSON facts schema comfortably fits this
+# standalone limit.
+STRUCTURED_QUERY_MODEL_MAX_TOKENS = 400
 
 JsonObject = dict[str, Any]
 
@@ -464,6 +549,23 @@ def apply_low_frequency_merge(candidates: list[Candidate]) -> None:
             candidate.stratum = LOW_FREQUENCY_STRATUM
 
 
+def sampling_candidates(
+    prepared_cases: list[JsonObject], excluded_target_keys: set[str] | None = None
+) -> tuple[list[Candidate], list[CandidateRejection]]:
+    """Create the exact candidate population used for stratified sampling.
+
+    Exclusion happens before low-frequency strata are merged.  Build and
+    read-only verify share this one operation so an independently frozen
+    confirmation set cannot receive a stratum label that verify recomputes
+    differently after v1/dev targets are excluded.
+    """
+    candidates, rejections = load_structurally_valid_candidates(prepared_cases)
+    excluded = excluded_target_keys or set()
+    candidates = [candidate for candidate in candidates if candidate.record_key not in excluded]
+    apply_low_frequency_merge(candidates)
+    return candidates, rejections
+
+
 def stratum_sort_key(seed: int, record_key: str) -> str:
     """层内排序 key：sha256(f"{seed}|{record_key}")。"""
     return sha256_text(f"{seed}|{record_key}")
@@ -545,8 +647,56 @@ _CODE_FRAGMENT_PATTERN = re.compile(r"[{}<>]|^```")
 _EXPLANATION_MARKERS = ("根据材料", "根据原文", "以下是", "抱歉", "作为", "我认为", "综上")
 
 
-def parse_query_model_response(raw_text: str) -> tuple[str | None, bool]:
-    """解析模型响应为 query 字符串。返回 (query, fence_removed)；解析失败返回 (None, False)。"""
+@dataclass(frozen=True)
+class StructuredQueryFact:
+    """One canonical symptom fact used to reconstruct a production query."""
+
+    fact_key: str
+    value: str
+
+
+def validate_query_style(query_style: str) -> str:
+    """Return a supported style or raise a clear configuration error."""
+    if query_style not in SUPPORTED_QUERY_STYLES:
+        supported = ", ".join(sorted(SUPPORTED_QUERY_STYLES))
+        raise ValueError(f"不支持的 query_style: {query_style!r}（支持：{supported}）")
+    return query_style
+
+
+def query_prompts_for_style(query_style: str) -> tuple[str, str, str]:
+    """Return prompt version, system prompt, and user template for a style."""
+    style = validate_query_style(query_style)
+    if style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        return QUERY_PROMPT_VERSION, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+    return STRUCTURED_QUERY_PROMPT_VERSION, STRUCTURED_QUERY_SYSTEM_PROMPT, STRUCTURED_USER_PROMPT_TEMPLATE
+
+
+def query_style_manifest_contract(query_style: str) -> JsonObject:
+    """Non-sensitive frozen documentation for the model input/output contract."""
+    style = validate_query_style(query_style)
+    if style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        return {
+            "input": "symptom_text_only",
+            "model_output": {"query": "natural_language_string"},
+            "row_query": "model_query_string",
+        }
+    return {
+        "input": "symptom_text_only",
+        "model_output": {
+            "facts": [{"fact_key": "canonical_fact_key", "value": "verbatim_symptom_span"}],
+        },
+        "fact_count": {"min": STRUCTURED_FACT_MIN_COUNT, "max": STRUCTURED_FACT_MAX_COUNT},
+        "canonical_fact_keys": list(STRUCTURED_QUERY_CANONICAL_FACT_KEYS),
+        "value_provenance": "normalized_verbatim_span_of_answer_stripped_symptom_text",
+        "row_query": "production_build_syndrome_query_fact_key_value_string",
+        "query_separator": "；",
+        "production_query_max_chars": STRUCTURED_QUERY_MAX_CHARS,
+        "fact_values_persisted_separately": False,
+    }
+
+
+def _parse_json_response(raw_text: str) -> tuple[JsonObject | None, bool]:
+    """Remove an optional JSON fence and parse one JSON object."""
     text = raw_text.strip()
     fence_removed = False
     match = _FENCE_PATTERN.match(text)
@@ -557,12 +707,103 @@ def parse_query_model_response(raw_text: str) -> tuple[str | None, bool]:
         payload = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return None, fence_removed
-    if not isinstance(payload, dict) or set(payload.keys()) != {"query"}:
+    return (payload if isinstance(payload, dict) else None), fence_removed
+
+
+def parse_query_model_response(raw_text: str) -> tuple[str | None, bool]:
+    """解析模型响应为 query 字符串。返回 (query, fence_removed)；解析失败返回 (None, False)。"""
+    payload, fence_removed = _parse_json_response(raw_text)
+    if payload is None or set(payload.keys()) != {"query"}:
         return None, fence_removed
     query = payload.get("query")
     if not isinstance(query, str):
         return None, fence_removed
     return query, fence_removed
+
+
+def parse_structured_query_model_response(raw_text: str) -> tuple[list[StructuredQueryFact] | None, bool]:
+    """Parse strict ``{\"facts\": [{\"fact_key\", \"value\"}]}`` model output."""
+    payload, fence_removed = _parse_json_response(raw_text)
+    if payload is None or set(payload.keys()) != {"facts"}:
+        return None, fence_removed
+    raw_facts = payload.get("facts")
+    if not isinstance(raw_facts, list):
+        return None, fence_removed
+    facts: list[StructuredQueryFact] = []
+    for raw_fact in raw_facts:
+        if not isinstance(raw_fact, dict) or set(raw_fact.keys()) != {"fact_key", "value"}:
+            return None, fence_removed
+        fact_key = raw_fact.get("fact_key")
+        value = raw_fact.get("value")
+        if not isinstance(fact_key, str) or not isinstance(value, str):
+            return None, fence_removed
+        facts.append(StructuredQueryFact(fact_key=fact_key, value=value))
+    return facts, fence_removed
+
+
+def normalize_for_source_span(text: str) -> str:
+    """Normalize only layout differences before checking a literal source span."""
+    normalized = unicodedata.normalize("NFKC", text)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def check_structured_fact_source_span(value: str, symptom_text: str) -> bool:
+    """Require a non-empty fact value to be a contiguous symptom-text span."""
+    normalized_value = normalize_for_source_span(value)
+    normalized_symptom = normalize_for_source_span(symptom_text)
+    return bool(normalized_value) and normalized_value in normalized_symptom
+
+
+def validate_structured_query_facts(facts: Sequence[StructuredQueryFact], *, symptom_text: str) -> list[str]:
+    """Validate count, canonical keys, safe delimiters, uniqueness, and source provenance."""
+    reasons: list[str] = []
+    if not STRUCTURED_FACT_MIN_COUNT <= len(facts) <= STRUCTURED_FACT_MAX_COUNT:
+        reasons.append("invalid_structured_fact_count")
+    seen_fact_keys: set[str] = set()
+    for fact in facts:
+        if fact.fact_key not in _STRUCTURED_QUERY_CANONICAL_FACT_KEY_SET:
+            reasons.append("invalid_structured_fact_key")
+        if fact.fact_key in seen_fact_keys:
+            reasons.append("duplicate_structured_fact_key")
+        seen_fact_keys.add(fact.fact_key)
+        if not fact.value.strip() or any(token in fact.value for token in ("\n", "\r", "=", ";", "；")):
+            reasons.append("invalid_structured_fact_value")
+        elif not check_structured_fact_source_span(fact.value, symptom_text):
+            reasons.append("structured_fact_value_not_in_source")
+    return list(dict.fromkeys(reasons))
+
+
+def reconstruct_structured_query(facts: Sequence[StructuredQueryFact]) -> str:
+    """Build the exact direct-query shape used by production syndrome retrieval.
+
+    Passing explicit ``max_chars`` makes this independent of deployment
+    settings while retaining the production ordering, de-duplication, and
+    ``fact_key=value；...`` formatter.
+    """
+    from app.rag.reasoning_retrieval import build_syndrome_query
+
+    observations = [SimpleNamespace(fact_key=fact.fact_key, value=fact.value) for fact in facts]
+    return build_syndrome_query(observations, max_chars=STRUCTURED_QUERY_MAX_CHARS)
+
+
+def parse_structured_query_string(query: str) -> list[StructuredQueryFact] | None:
+    """Parse only the canonical serialized direct-query representation."""
+    if not query or "\n" in query or "\r" in query:
+        return None
+    facts: list[StructuredQueryFact] = []
+    for part in query.split("；"):
+        if part.count("=") != 1:
+            return None
+        fact_key, value = part.split("=", 1)
+        if not fact_key or not value:
+            return None
+        facts.append(StructuredQueryFact(fact_key=fact_key, value=value))
+    return facts
+
+
+def check_structured_query_length(query: str) -> bool:
+    """Structured queries must fit the production query limit without truncating a pair."""
+    return 1 <= len(normalize_query_length(query)) <= STRUCTURED_QUERY_MAX_CHARS
 
 
 def check_query_content_sanity(query: str) -> bool:
@@ -620,7 +861,9 @@ class QueryGenerator:
         max_retries: int = QUERY_MODEL_MAX_RETRIES,
         retry_backoff_seconds: list[float] | None = None,
         sleep: Any = None,
+        query_style: str = DEFAULT_QUERY_STYLE,
     ) -> None:
+        self._query_style = validate_query_style(query_style)
         self._gateway = gateway
         self._model = model
         self._temperature = temperature
@@ -631,9 +874,10 @@ class QueryGenerator:
 
     async def generate(self, symptom_text: str, *, trace_id: str) -> QueryGenerationResult:
         """调用 Chat Gateway 生成一次 Query 候选，技术失败按 1s/3s 退避重试最多两次。"""
+        _prompt_version, system_prompt, user_prompt_template = query_prompts_for_style(self._query_style)
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(symptom_text=symptom_text)},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt_template.format(symptom_text=symptom_text)},
         ]
 
         attempt = 0
@@ -708,19 +952,32 @@ def evaluate_query_candidate(
     candidate: Candidate,
     accepted_normalized_queries: list[str],
     accepted_target_keys: set[str],
+    query_style: str = DEFAULT_QUERY_STYLE,
 ) -> list[str]:
-    """对已解析出的 query 字符串执行 §5.1-§5.3 校验，返回命中的拒绝原因（空=通过）。"""
+    """Validate a parsed query under its explicit input-style contract."""
+    style = validate_query_style(query_style)
     reasons: list[str] = []
     if not check_query_content_sanity(query):
         reasons.append("invalid_query_content")
-    if not check_query_length(query):
-        reasons.append("invalid_query_length")
+    if style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        if not check_query_length(query):
+            reasons.append("invalid_query_length")
+        if check_excessive_source_overlap(query, candidate.symptom_text):
+            reasons.append("excessive_source_overlap")
+    else:
+        facts = parse_structured_query_string(query)
+        if facts is None:
+            reasons.append("invalid_structured_query")
+        else:
+            reasons.extend(validate_structured_query_facts(facts, symptom_text=candidate.symptom_text))
+            if not reasons and reconstruct_structured_query(facts) != query:
+                reasons.append("invalid_structured_query")
+        if not check_structured_query_length(query):
+            reasons.append("invalid_structured_query_length")
     if check_answer_leakage(query, candidate.forbidden_terms):
         reasons.append("answer_leakage")
     if check_conclusion_style_leakage(query):
         reasons.append("answer_style_leakage")
-    if check_excessive_source_overlap(query, candidate.symptom_text):
-        reasons.append("excessive_source_overlap")
     if candidate.record_key in accepted_target_keys:
         reasons.append("duplicate_target")
     normalized_query = normalize_query_for_dedup(query)
@@ -728,7 +985,7 @@ def evaluate_query_candidate(
         reasons.append("duplicate_query")
     elif check_near_duplicate(normalized_query, accepted_normalized_queries):
         reasons.append("near_duplicate_query")
-    return reasons
+    return list(dict.fromkeys(reasons))
 
 
 def timestamp_now() -> str:
@@ -742,8 +999,10 @@ async def process_candidate(
     split: str,
     accepted_normalized_queries: list[str],
     accepted_target_keys: set[str],
+    query_style: str = DEFAULT_QUERY_STYLE,
 ) -> AcceptedQuery | RejectedAttempt:
     """对单个候选调用生成模型并跑完 §5 全部门禁，返回接受或拒绝记录。"""
+    style = validate_query_style(query_style)
     trace_id = f"rag-silver-{split}-{candidate.record_key[:12]}"
     gen_result = await generator.generate(candidate.symptom_text, trace_id=trace_id)
     timestamp = timestamp_now()
@@ -761,7 +1020,31 @@ async def process_candidate(
             response_fence_removed=False,
         )
 
-    query, fence_removed = parse_query_model_response(gen_result.raw_response)
+    query: str | None
+    if style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+        query, fence_removed = parse_query_model_response(gen_result.raw_response)
+    else:
+        facts, fence_removed = parse_structured_query_model_response(gen_result.raw_response)
+        if facts is None:
+            query = None
+        else:
+            fact_reasons = validate_structured_query_facts(facts, symptom_text=candidate.symptom_text)
+            if fact_reasons:
+                return RejectedAttempt(
+                    record_key=candidate.record_key,
+                    stratum=candidate.stratum,
+                    primary_reason=fact_reasons[0],
+                    all_reasons=fact_reasons,
+                    # Invalid model facts are intentionally not retained.  This
+                    # avoids persisting untrusted answer-like output in audit
+                    # artifacts while retaining a reason and source hash.
+                    query=None,
+                    symptom_sha256=candidate.source_symptom_sha256,
+                    model_attempts=gen_result.attempt_count,
+                    timestamp=timestamp,
+                    response_fence_removed=fence_removed,
+                )
+            query = reconstruct_structured_query(facts)
     if query is None:
         return RejectedAttempt(
             record_key=candidate.record_key,
@@ -780,6 +1063,7 @@ async def process_candidate(
         candidate=candidate,
         accepted_normalized_queries=accepted_normalized_queries,
         accepted_target_keys=accepted_target_keys,
+        query_style=style,
     )
     if reasons:
         return RejectedAttempt(
@@ -842,11 +1126,13 @@ async def build_split(
     target_size: int,
     accepted_normalized_queries: list[str],
     accepted_target_keys: set[str],
+    query_style: str = DEFAULT_QUERY_STYLE,
 ) -> tuple[SplitResult, dict[str, int]]:
     """按层内顺序生成并校验，耗尽即按剩余层重新做最大余额再分配（doc 02 §6 步骤 4/6）。
 
     返回 (SplitResult, cursors)；cursors 供后续 split 计算"剩余候选"。
     """
+    style = validate_query_style(query_style)
     cursors = dict.fromkeys(grouped, 0)
     remaining_quota = dict(quota)
     accepted: list[AcceptedQuery] = []
@@ -870,6 +1156,7 @@ async def build_split(
                     split=split,
                     accepted_normalized_queries=accepted_normalized_queries,
                     accepted_target_keys=accepted_target_keys,
+                    query_style=style,
                 )
                 if isinstance(result, AcceptedQuery):
                     accepted.append(result)
@@ -1082,6 +1369,8 @@ class BuildConfig:
     test_size: int
     query_model: str
     query_prompt_max_chars: int = SYMPTOM_MAX_CHARS
+    excluded_dataset_dirs: tuple[Path, ...] = ()
+    query_style: str = DEFAULT_QUERY_STYLE
 
 
 def validate_build_config(config: BuildConfig) -> None:
@@ -1092,6 +1381,93 @@ def validate_build_config(config: BuildConfig) -> None:
         raise SystemExit(f"smoke-size 必须为 {FIXED_SMOKE_SIZE}")
     if config.test_size != FIXED_TEST_SIZE:
         raise SystemExit(f"test-size 必须为 {FIXED_TEST_SIZE}")
+    try:
+        validate_query_style(config.query_style)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def load_exclusion_context(
+    dataset_dirs: Sequence[Path],
+) -> tuple[set[str], list[str], list[JsonObject]]:
+    """Load frozen target/query exclusions without retaining source text in manifests.
+
+    Tuning must not choose parameters on a target that later appears in the
+    confirmation split.  Each excluded dataset is hash-bound here, and only
+    target/query hashes and counts are persisted in the new manifest.  A
+    target duplicated *within* one frozen dataset is invalid; an overlap
+    between independently frozen datasets is allowed and excluded as a union.
+    """
+    target_keys: set[str] = set()
+    normalized_queries: list[str] = []
+    seen_dirs: set[Path] = set()
+    descriptors: list[JsonObject] = []
+
+    for raw_dir in dataset_dirs:
+        dataset_dir = raw_dir.resolve()
+        if dataset_dir in seen_dirs:
+            continue
+        seen_dirs.add(dataset_dir)
+        manifest_path = dataset_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise ValueError(f"排除数据集缺少 manifest.json: {dataset_dir}")
+        manifest = read_json_file(manifest_path)
+        if not isinstance(manifest, dict) or manifest.get("frozen") is not True:
+            raise ValueError(f"排除数据集不是冻结数据集: {dataset_dir}")
+        artifacts = manifest.get("artifact_sha256")
+        if not isinstance(artifacts, dict):
+            raise ValueError(f"排除数据集 manifest 缺少 artifact_sha256: {dataset_dir}")
+
+        local_targets: set[str] = set()
+        local_normalized_queries: list[str] = []
+        for name in ("smoke.jsonl", "test.jsonl"):
+            path = dataset_dir / name
+            if not path.exists() or artifacts.get(name) != sha256_file(path):
+                raise ValueError(f"排除数据集 {name} 哈希不匹配: {dataset_dir}")
+            for record in read_jsonl_file(path):
+                target = record.get("target_record_key")
+                query = record.get("query")
+                if not isinstance(target, str) or not RECORD_KEY_PATTERN.fullmatch(target):
+                    raise ValueError(f"排除数据集 target_record_key 无效: {dataset_dir}")
+                if not isinstance(query, str):
+                    raise ValueError(f"排除数据集 query 无效: {dataset_dir}")
+                if target in local_targets:
+                    raise ValueError(f"排除数据集内部 target 重叠: {target}")
+                local_targets.add(target)
+                local_normalized_queries.append(normalize_query_for_dedup(query))
+
+        overlap_with_prior = local_targets & target_keys
+        target_keys.update(local_targets)
+        normalized_queries.extend(local_normalized_queries)
+        descriptor: JsonObject = {
+            "path": str(dataset_dir),
+            "manifest_sha256": sha256_file(manifest_path),
+            "target_count": len(local_targets),
+            "target_keys_sha256": sha256_text("\n".join(sorted(local_targets))),
+            "query_count": len(local_normalized_queries),
+        }
+        # Omit the zero case so manifests created before union support remain
+        # byte-for-byte verifiable.  A real cross-dataset overlap is still
+        # auditable without storing raw target identities.
+        if overlap_with_prior:
+            descriptor["overlap_with_prior_exclusions"] = {
+                "target_count": len(overlap_with_prior),
+                "target_keys_sha256": sha256_text("\n".join(sorted(overlap_with_prior))),
+            }
+        descriptors.append(descriptor)
+    return target_keys, normalized_queries, descriptors
+
+
+def exclusion_union_metadata(target_keys: set[str], normalized_queries: Sequence[str]) -> JsonObject:
+    """Return hash-only audit metadata for the union consumed during sampling."""
+    unique_queries = sorted(set(normalized_queries))
+    return {
+        "target_count": len(target_keys),
+        "target_keys_sha256": sha256_text("\n".join(sorted(target_keys))),
+        "query_count": len(normalized_queries),
+        "unique_normalized_query_count": len(unique_queries),
+        "normalized_queries_sha256": sha256_text("\n".join(unique_queries)),
+    }
 
 
 def check_split_mutual_exclusion(smoke: list[AcceptedQuery], test: list[AcceptedQuery]) -> list[str]:
@@ -1176,12 +1552,33 @@ def build_manifest(
     test_path_sha256: str,
     rejected_path_sha256: str,
     mutual_exclusion_problems: list[str],
+    excluded_frozen_datasets: list[JsonObject] | None = None,
+    excluded_frozen_dataset_union: JsonObject | None = None,
 ) -> JsonObject:
     """按 doc 02 §8 组装冻结 manifest.json。"""
+    query_style = validate_query_style(config.query_style)
+    prompt_version, system_prompt, user_prompt_template = query_prompts_for_style(query_style)
+    excluded_frozen_datasets = excluded_frozen_datasets or []
+    excluded_frozen_dataset_union = excluded_frozen_dataset_union or exclusion_union_metadata(set(), [])
     all_accepted = test_accepted + smoke_accepted
     raw_cases_source = _staging_raw_cases_source(staging_manifest)
     if raw_cases_source is None:
         raise ValueError("已验证的 staging manifest 缺少 cases source 元数据")
+    query_generator: JsonObject = {
+        "prompt_version": prompt_version,
+        "system_prompt_sha256": sha256_text(system_prompt),
+        "user_prompt_template_sha256": sha256_text(user_prompt_template),
+        "input_contract": query_style_manifest_contract(query_style),
+        "model": query_model,
+        "gateway_mode": query_gateway_mode,
+        "temperature": QUERY_MODEL_TEMPERATURE,
+        "max_tokens": query_gateway_max_tokens,
+        "max_retries": QUERY_MODEL_MAX_RETRIES,
+        "retry_backoff_seconds": QUERY_MODEL_RETRY_BACKOFF_SECONDS,
+        "symptom_max_chars": SYMPTOM_MAX_CHARS,
+    }
+    if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        query_generator["model_selection"] = dict(STRUCTURED_MODEL_SELECTION_CONTRACT)
     return {
         "schema_version": SCHEMA_VERSION,
         "dataset_version": DATASET_VERSION,
@@ -1189,6 +1586,10 @@ def build_manifest(
         "git_commit": git_head,
         "git_dirty": git_dirty,
         "seed": config.seed,
+        # Evaluators branch on this field before interpreting ``query``.  Rows
+        # intentionally retain only the raw query string, not model facts or
+        # source/answer fields.
+        "query_style": query_style,
         "sampling_algorithm_version": "rag-silver-v1-stratified-largest-remainder",
         "source": {
             "raw_cases": raw_cases_source,
@@ -1198,18 +1599,7 @@ def build_manifest(
             "prepared_cases_sha256": prepared_cases_sha256,
             "prepared_cases_record_count": prepared_cases_count,
         },
-        "query_generator": {
-            "prompt_version": QUERY_PROMPT_VERSION,
-            "system_prompt_sha256": sha256_text(SYSTEM_PROMPT),
-            "user_prompt_template_sha256": sha256_text(USER_PROMPT_TEMPLATE),
-            "model": query_model,
-            "gateway_mode": query_gateway_mode,
-            "temperature": QUERY_MODEL_TEMPERATURE,
-            "max_tokens": query_gateway_max_tokens,
-            "max_retries": QUERY_MODEL_MAX_RETRIES,
-            "retry_backoff_seconds": QUERY_MODEL_RETRY_BACKOFF_SECONDS,
-            "symptom_max_chars": SYMPTOM_MAX_CHARS,
-        },
+        "query_generator": query_generator,
         "thresholds": {
             "min_symptom_chinese_chars": MIN_SYMPTOM_CHINESE_CHARS,
             "query_min_chars": QUERY_MIN_CHARS,
@@ -1217,6 +1607,9 @@ def build_manifest(
             "excessive_overlap_jaccard": EXCESSIVE_OVERLAP_JACCARD,
             "near_duplicate_jaccard": NEAR_DUPLICATE_JACCARD,
             "low_frequency_threshold": LOW_FREQUENCY_THRESHOLD,
+            "structured_query_max_chars": STRUCTURED_QUERY_MAX_CHARS,
+            "structured_fact_min_count": STRUCTURED_FACT_MIN_COUNT,
+            "structured_fact_max_count": STRUCTURED_FACT_MAX_COUNT,
         },
         "stratum_stats": stratum_stats(structural_counts, test_quota, smoke_quota, all_accepted, all_rejected),
         "rejection_reason_counts": rejection_reason_counts(all_rejected),
@@ -1233,6 +1626,8 @@ def build_manifest(
             "status": "PASS" if not mutual_exclusion_problems else "FAIL",
             "problems": mutual_exclusion_problems,
         },
+        "excluded_frozen_datasets": excluded_frozen_datasets,
+        "excluded_frozen_dataset_union": excluded_frozen_dataset_union,
         "artifact_sha256": {
             "smoke.jsonl": smoke_path_sha256,
             "test.jsonl": test_path_sha256,
@@ -1274,6 +1669,13 @@ _ANSWER_FIELDS_FORBIDDEN_IN_FROZEN_QUERIES = {
     "formula_summary",
     "content",
     "metadata",
+    "facts",
+    "raw_response",
+    "symptom_text",
+    "source_symptom_text",
+    "source_text",
+    "answer",
+    "answers",
 }
 
 
@@ -1310,6 +1712,8 @@ def _verify_split_records(
     candidate_by_key: dict[str, Candidate],
     prepared_keys: set[str],
     problems: list[VerifyProblem],
+    *,
+    query_style: str,
 ) -> None:
     seen_query_ids: set[str] = set()
     seen_targets: set[str] = set()
@@ -1356,15 +1760,29 @@ def _verify_split_records(
             continue
         if not check_query_content_sanity(query):
             problems.append(VerifyProblem(f"{split_name}_query_content", str(query_id)))
-        if not check_query_length(query):
-            problems.append(VerifyProblem(f"{split_name}_query_length", str(query_id)))
+        if query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1:
+            if not check_query_length(query):
+                problems.append(VerifyProblem(f"{split_name}_query_length", str(query_id)))
+        else:
+            facts = parse_structured_query_string(query)
+            if facts is None:
+                problems.append(VerifyProblem(f"{split_name}_structured_query_schema", str(query_id)))
+            else:
+                for reason in validate_structured_query_facts(facts, symptom_text=candidate.symptom_text):
+                    problems.append(VerifyProblem(f"{split_name}_{reason}", str(query_id)))
+                if reconstruct_structured_query(facts) != query:
+                    problems.append(VerifyProblem(f"{split_name}_structured_query_reconstruction", str(query_id)))
+            if not check_structured_query_length(query):
+                problems.append(VerifyProblem(f"{split_name}_structured_query_length", str(query_id)))
         if record.get("query_sha256") != sha256_text(query):
             problems.append(VerifyProblem(f"{split_name}_query_sha256", str(query_id)))
         if check_answer_leakage(query, candidate.forbidden_terms):
             problems.append(VerifyProblem(f"{split_name}_answer_leakage", str(query_id)))
         if check_conclusion_style_leakage(query):
             problems.append(VerifyProblem(f"{split_name}_answer_style_leakage", str(query_id)))
-        if check_excessive_source_overlap(query, candidate.symptom_text):
+        if query_style == QUERY_STYLE_NATURAL_LANGUAGE_V1 and check_excessive_source_overlap(
+            query, candidate.symptom_text
+        ):
             problems.append(VerifyProblem(f"{split_name}_source_overlap", str(query_id)))
 
         normalized_query = normalize_query_for_dedup(query)
@@ -1405,6 +1823,36 @@ def verify_frozen_dataset(dataset_dir: Path, prepared_bundle: Path) -> list[Veri
         problems.append(VerifyProblem("frozen_flag", "manifest.frozen 不为 true"))
     if manifest.get("seed") != FIXED_SEED:
         problems.append(VerifyProblem("seed", f"manifest.seed != {FIXED_SEED}"))
+    raw_query_style = manifest.get("query_style", DEFAULT_QUERY_STYLE)
+    if not isinstance(raw_query_style, str):
+        problems.append(VerifyProblem("query_style", "manifest.query_style 必须是字符串"))
+        query_style = DEFAULT_QUERY_STYLE
+    else:
+        try:
+            query_style = validate_query_style(raw_query_style)
+        except ValueError:
+            problems.append(VerifyProblem("query_style", f"不支持: {raw_query_style}"))
+            query_style = DEFAULT_QUERY_STYLE
+    # v1 manifests predate explicit styles and are intentionally interpreted
+    # as natural-language inputs.  New manifests must carry the matching
+    # non-sensitive input contract so a structured row is never misread.
+    if "query_style" in manifest:
+        generator_contract = manifest.get("query_generator")
+        if not isinstance(generator_contract, dict):
+            problems.append(VerifyProblem("query_generator_schema", "manifest.query_generator 必须是对象"))
+        else:
+            expected_prompt_version, _system_prompt, _user_template = query_prompts_for_style(query_style)
+            if generator_contract.get("prompt_version") != expected_prompt_version:
+                problems.append(VerifyProblem("query_generator_prompt_version", query_style))
+            if generator_contract.get("input_contract") != query_style_manifest_contract(query_style):
+                problems.append(VerifyProblem("query_style_contract", query_style))
+            if query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+                if generator_contract.get("model_selection") != STRUCTURED_MODEL_SELECTION_CONTRACT:
+                    problems.append(VerifyProblem("structured_model_selection", "必须为 explicit_cli / no-fallback"))
+                if generator_contract.get("gateway_mode") != "default_model_gateway":
+                    problems.append(VerifyProblem("structured_gateway_mode", "必须使用 default_model_gateway"))
+                if not isinstance(generator_contract.get("model"), str) or not generator_contract["model"].strip():
+                    problems.append(VerifyProblem("structured_query_model", "必须记录非空显式模型"))
 
     smoke_path = dataset_dir / "smoke.jsonl"
     test_path = dataset_dir / "test.jsonl"
@@ -1435,6 +1883,54 @@ def verify_frozen_dataset(dataset_dir: Path, prepared_bundle: Path) -> list[Veri
     test_targets = {r.get("target_record_key") for r in test_records}
     if smoke_targets & test_targets:
         problems.append(VerifyProblem("split_target_exclusion", "smoke/test 共享 target_record_key"))
+
+    excluded_target_keys: set[str] = set()
+    exclusion_context = manifest.get("excluded_frozen_datasets", [])
+    if not isinstance(exclusion_context, list) or not all(isinstance(item, dict) for item in exclusion_context):
+        problems.append(VerifyProblem("excluded_frozen_datasets_schema", "必须是对象数组"))
+    elif exclusion_context:
+        paths: list[Path] = []
+        for item in exclusion_context:
+            path_value = item.get("path")
+            if not isinstance(path_value, str) or not path_value:
+                problems.append(VerifyProblem("excluded_frozen_datasets_path", "缺少 path"))
+                continue
+            paths.append(Path(path_value))
+        if len(paths) == len(exclusion_context):
+            try:
+                excluded_targets, excluded_queries, observed_context = load_exclusion_context(paths)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                problems.append(VerifyProblem("excluded_frozen_datasets_integrity", type(exc).__name__))
+            else:
+                excluded_target_keys = excluded_targets
+                if observed_context != exclusion_context:
+                    problems.append(
+                        VerifyProblem("excluded_frozen_datasets_hash", "外部数据集上下文与 manifest 不一致")
+                    )
+                observed_union = exclusion_union_metadata(excluded_targets, excluded_queries)
+                if (
+                    "excluded_frozen_dataset_union" in manifest
+                    and manifest.get("excluded_frozen_dataset_union") != observed_union
+                ):
+                    problems.append(
+                        VerifyProblem("excluded_frozen_dataset_union", "外部数据集并集摘要与 manifest 不一致")
+                    )
+                current_targets = {str(target) for target in smoke_targets | test_targets if isinstance(target, str)}
+                shared_targets = current_targets & excluded_targets
+                if shared_targets:
+                    problems.append(VerifyProblem("excluded_target_overlap", str(len(shared_targets))))
+                current_queries = [
+                    normalize_query_for_dedup(str(record["query"]))
+                    for record in smoke_records + test_records
+                    if isinstance(record.get("query"), str)
+                ]
+                near_duplicates = sum(1 for query in current_queries if check_near_duplicate(query, excluded_queries))
+                if near_duplicates:
+                    problems.append(VerifyProblem("excluded_query_near_duplicate", str(near_duplicates)))
+    elif "excluded_frozen_dataset_union" in manifest and manifest.get(
+        "excluded_frozen_dataset_union"
+    ) != exclusion_union_metadata(set(), []):
+        problems.append(VerifyProblem("excluded_frozen_dataset_union", "空排除集摘要与 manifest 不一致"))
 
     staging_manifest_path = prepared_bundle / "manifest.json"
     prepared_cases_path = prepared_bundle / "prepared" / "cases.json"
@@ -1475,8 +1971,7 @@ def verify_frozen_dataset(dataset_dir: Path, prepared_bundle: Path) -> list[Veri
     if staging_problem is not None:
         problems.append(VerifyProblem("staging_snapshot", staging_problem))
 
-    candidates, _ = load_structurally_valid_candidates(prepared_cases)
-    apply_low_frequency_merge(candidates)
+    candidates, _ = sampling_candidates(prepared_cases, excluded_target_keys)
     candidate_by_key = {candidate.record_key: candidate for candidate in candidates}
     prepared_keys: set[str] = set()
     for record in prepared_cases:
@@ -1488,8 +1983,8 @@ def verify_frozen_dataset(dataset_dir: Path, prepared_bundle: Path) -> list[Veri
         record_key = metadata.get("record_key")
         if isinstance(record_key, str):
             prepared_keys.add(record_key)
-    _verify_split_records("smoke", smoke_records, candidate_by_key, prepared_keys, problems)
-    _verify_split_records("test", test_records, candidate_by_key, prepared_keys, problems)
+    _verify_split_records("smoke", smoke_records, candidate_by_key, prepared_keys, problems, query_style=query_style)
+    _verify_split_records("test", test_records, candidate_by_key, prepared_keys, problems, query_style=query_style)
 
     smoke_normalized = {
         normalize_query_for_dedup(record["query"]) for record in smoke_records if isinstance(record.get("query"), str)
@@ -1562,43 +2057,77 @@ async def run_build(config: BuildConfig) -> int:
         print(f"staging 快照校验失败: {staging_problem}", file=sys.stderr)
         return 1
 
-    candidates, _structural_rejections = load_structurally_valid_candidates(prepared_cases)
-    apply_low_frequency_merge(candidates)
+    try:
+        excluded_target_keys, excluded_normalized_queries, excluded_frozen_datasets = load_exclusion_context(
+            config.excluded_dataset_dirs
+        )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"排除数据集校验失败: {exc}", file=sys.stderr)
+        return 1
+
+    candidates, _structural_rejections = sampling_candidates(prepared_cases, excluded_target_keys)
     grouped = group_by_stratum(candidates, config.seed)
     structural_counts = structural_counts_by_stratum(grouped)
 
     from app.core.config import get_settings
     from app.core.gateway import ModelGatewayClient
-    from app.core.rewrite_gateway import build_rewrite_gateway_settings
 
     settings = get_settings()
-    configured_query_model = settings.rag_query_rewrite_model or settings.chat_model
-    if config.query_model and config.query_model != configured_query_model:
-        print("--query-model 必须与当前有效的 rewrite 模型一致", file=sys.stderr)
-        return 1
-    if settings.rag_query_rewrite_model_temperature != QUERY_MODEL_TEMPERATURE:
-        print(
-            f"rag_query_rewrite_model_temperature 必须为 {QUERY_MODEL_TEMPERATURE}（rag-silver-v1 固定合同）",
-            file=sys.stderr,
-        )
-        return 1
+    if config.query_style == QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1:
+        # Structured facts are a distinct experiment input, not a fallback
+        # consumer of the natural-language rewrite model.  Require the caller
+        # to name the configured chat model explicitly and use its normal
+        # gateway; this prevents implicit natural-query model selection.
+        query_model = config.query_model.strip()
+        if not query_model:
+            print(
+                "structured_fact_key_value_v1 必须显式提供 --query-model（当前 chat_model）",
+                file=sys.stderr,
+            )
+            return 1
+        if query_model != settings.chat_model:
+            print(
+                "structured_fact_key_value_v1 的 --query-model 必须与当前 chat_model 一致",
+                file=sys.stderr,
+            )
+            return 1
+        gateway = ModelGatewayClient(settings=settings)
+        query_gateway_max_tokens = STRUCTURED_QUERY_MODEL_MAX_TOKENS
+        query_gateway_mode = "default_model_gateway"
+    else:
+        # Preserve the legacy natural-language rewrite selection and gateway
+        # behavior unchanged for existing v1/v2 builds.
+        from app.core.rewrite_gateway import build_rewrite_gateway_settings
 
-    rewrite_gateway_settings = build_rewrite_gateway_settings(settings)
-    gateway = ModelGatewayClient(settings=rewrite_gateway_settings or settings)
-    query_model = configured_query_model
-    query_gateway_mode = (
-        "dedicated_rewrite_gateway" if rewrite_gateway_settings is not None else "default_model_gateway"
-    )
+        configured_query_model = settings.rag_query_rewrite_model or settings.chat_model
+        if config.query_model and config.query_model != configured_query_model:
+            print("--query-model 必须与当前有效的 rewrite 模型一致", file=sys.stderr)
+            return 1
+        if settings.rag_query_rewrite_model_temperature != QUERY_MODEL_TEMPERATURE:
+            print(
+                f"rag_query_rewrite_model_temperature 必须为 {QUERY_MODEL_TEMPERATURE}（rag-silver-v1 固定合同）",
+                file=sys.stderr,
+            )
+            return 1
+
+        rewrite_gateway_settings = build_rewrite_gateway_settings(settings)
+        gateway = ModelGatewayClient(settings=rewrite_gateway_settings or settings)
+        query_model = configured_query_model
+        query_gateway_max_tokens = settings.rag_query_rewrite_model_max_tokens
+        query_gateway_mode = (
+            "dedicated_rewrite_gateway" if rewrite_gateway_settings is not None else "default_model_gateway"
+        )
     generator = QueryGenerator(
         gateway,
         model=query_model,
         temperature=QUERY_MODEL_TEMPERATURE,
-        max_tokens=settings.rag_query_rewrite_model_max_tokens,
+        max_tokens=query_gateway_max_tokens,
+        query_style=config.query_style,
     )
 
     test_quota = largest_remainder_allocation(structural_counts, config.test_size)
-    accepted_normalized_queries: list[str] = []
-    accepted_target_keys: set[str] = set()
+    accepted_normalized_queries = list(excluded_normalized_queries)
+    accepted_target_keys = set(excluded_target_keys)
 
     test_result, test_cursors = await build_split(
         grouped,
@@ -1608,6 +2137,7 @@ async def run_build(config: BuildConfig) -> int:
         target_size=config.test_size,
         accepted_normalized_queries=accepted_normalized_queries,
         accepted_target_keys=accepted_target_keys,
+        query_style=config.query_style,
     )
 
     remaining_grouped = remaining_candidates_after(grouped, test_cursors)
@@ -1622,6 +2152,7 @@ async def run_build(config: BuildConfig) -> int:
         target_size=config.smoke_size,
         accepted_normalized_queries=accepted_normalized_queries,
         accepted_target_keys=accepted_target_keys,
+        query_style=config.query_style,
     )
 
     if len(test_result.accepted) != config.test_size:
@@ -1660,7 +2191,7 @@ async def run_build(config: BuildConfig) -> int:
         git_dirty=git_dirty,
         generated_at=timestamp_now(),
         query_model=query_model,
-        query_gateway_max_tokens=settings.rag_query_rewrite_model_max_tokens,
+        query_gateway_max_tokens=query_gateway_max_tokens,
         query_gateway_mode=query_gateway_mode,
         structural_counts=structural_counts,
         test_quota=test_quota,
@@ -1674,6 +2205,8 @@ async def run_build(config: BuildConfig) -> int:
         test_path_sha256=sha256_file(test_path),
         rejected_path_sha256=sha256_file(rejected_path),
         mutual_exclusion_problems=mutual_exclusion_problems,
+        excluded_frozen_datasets=excluded_frozen_datasets,
+        excluded_frozen_dataset_union=exclusion_union_metadata(excluded_target_keys, excluded_normalized_queries),
     )
     write_json_atomic(config.output_dir / "manifest.json", manifest)
 
@@ -1697,6 +2230,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--smoke-size", type=int, required=True)
     build_parser.add_argument("--test-size", type=int, required=True)
     build_parser.add_argument("--query-model", type=str, default="")
+    build_parser.add_argument(
+        "--query-style",
+        choices=sorted(SUPPORTED_QUERY_STYLES),
+        default=DEFAULT_QUERY_STYLE,
+        help="评测输入形态；默认保留既有自然语言 Query 合同",
+    )
+    build_parser.add_argument(
+        "--exclude-dataset-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="排除一个已冻结数据集的 Smoke/Test target 与近重复 Query；可重复指定",
+    )
 
     verify_parser = subparsers.add_parser("verify", help="只读复算已冻结数据集")
     verify_parser.add_argument("--dataset-dir", type=Path, required=True)
@@ -1717,6 +2263,8 @@ async def _main(argv: list[str] | None = None) -> int:
             smoke_size=args.smoke_size,
             test_size=args.test_size,
             query_model=args.query_model,
+            excluded_dataset_dirs=tuple(args.exclude_dataset_dir),
+            query_style=args.query_style,
         )
         return await run_build(config)
 

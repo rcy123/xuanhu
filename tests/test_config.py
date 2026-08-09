@@ -103,6 +103,9 @@ def test_load_with_defaults(monkeypatch) -> None:
     assert settings.model_gateway_max_retries == 2
     assert settings.model_gateway_route_profile == "default"
     assert settings.rag_top_k_vector == 12
+    assert settings.rag_dual_query_enabled is False
+    assert settings.rag_dual_query_rrf_k == 60
+    assert settings.rag_reranker_max_chunks_per_source == 0
     assert settings.agent_max_retries == 2
     assert settings.event_dedupe_ttl_seconds == 86_400
 
