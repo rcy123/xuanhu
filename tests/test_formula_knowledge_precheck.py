@@ -200,7 +200,7 @@ def test_safety_violations_in_candidate_extracts_blocking_suggestions(monkeypatc
         def __init__(self, _db):
             pass
 
-        async def evaluate(self, formula, patient_info):
+        async def evaluate(self, formula, patient_info, observe_metric=True):
             return _FakeSafetyResult()
 
     # _safety_violations_in_candidate 在函数内 `from app.safety.engine import SafetyRuleEngine`，

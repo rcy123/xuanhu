@@ -27,6 +27,8 @@ import {
   terminateSession,
   updateRecord,
   exportRecord,
+  getCommandStatus,
+  isAsyncCommandAccepted,
   TransportErrorCode,
 } from '@/api/mod'
 import { __setBaseUrlResolver } from '@/api/mod'
@@ -438,6 +440,234 @@ describe('requestWithRetry', () => {
     // 1 次初始 + 2 次重试 = 3
     expect(fn).toHaveBeenCalledTimes(3)
   }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// R6-B 异步命令（respondAsync / getCommandStatus）
+// ---------------------------------------------------------------------------
+
+describe('R6-B respondAsync 偏好头', () => {
+  it('respondAsync=true 时注入 Prefer: respond-async', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        status: 202,
+        body: {
+          code: 'SUCCESS',
+          data: {
+            command_id: 'cmd-1',
+            operation: 'intake.message',
+            status: 'queued',
+            replayed: false,
+            attempt_count: 0,
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+
+    await request('consult/sessions/s/advance', {
+      method: 'POST',
+      ctx: { respondAsync: true },
+    })
+
+    const headers = fn.mock.calls[0][1].headers as Record<string, string>
+    expect(headers['Prefer']).toBe('respond-async')
+  })
+
+  it('原始 request 未设置 respondAsync 时不注入 Prefer 头', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({ body: { code: 'SUCCESS', data: {}, trace_id: 't' } }),
+    )
+    // 缺省 ctx 与显式 respondAsync=false 都不该带上 Prefer 头。
+    // （仅指 header 层面；R7 后端就绪时仍可能返回 202，由守卫判别。）
+    await request('consult/sessions/s/advance', { method: 'POST' })
+    await request('consult/sessions/s/advance', {
+      method: 'POST',
+      ctx: { respondAsync: false },
+    })
+    for (const call of fn.mock.calls) {
+      const headers = call[1].headers as Record<string, string>
+      expect(headers['Prefer']).toBeUndefined()
+    }
+  })
+})
+
+describe('getCommandStatus', () => {
+  it('对 sessionId/commandId 做 URL 编码并返回有界状态', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: {
+          code: 'SUCCESS',
+          data: {
+            command_id: 'cmd/1',
+            operation: 'session.advance',
+            status: 'succeeded',
+            attempt_count: 1,
+            result: { http_status: 200 },
+            error: null,
+            timestamps: { created_at: '2026-08-01T00:00:00Z' },
+            links: { self: '/self', session: '/s', stream: '/stream' },
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+
+    const data = await getCommandStatus('sess/1', 'cmd/1')
+
+    const url = fn.mock.calls[0][0] as string
+    expect(url).toContain(
+      `sessions/${encodeURIComponent('sess/1')}/commands/${encodeURIComponent('cmd/1')}`,
+    )
+    // 原始（未编码）的斜杠值不得出现在请求路径中。
+    expect(url).not.toContain('sessions/sess/1/commands/cmd/1')
+
+    expect(data).toMatchObject({ command_id: 'cmd/1', status: 'succeeded', attempt_count: 1 })
+    expect(data.operation).toBe('session.advance')
+    expect(data.result).toEqual({ http_status: 200 })
+  })
+
+  it('getCommandStatus 缺省 ctx 不携带写操作头', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        body: {
+          code: 'SUCCESS',
+          data: {
+            command_id: 'cmd',
+            operation: 'prescription.review',
+            status: 'failed',
+            attempt_count: 2,
+            result: null,
+            error: { code: 'SESSION_NOT_FOUND' },
+            timestamps: {},
+            links: { self: '/self', session: '/s', stream: '/stream' },
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+    const data = await getCommandStatus('s', 'cmd')
+    const headers = fn.mock.calls[0][1].headers as Record<string, string>
+    expect(headers['Prefer']).toBeUndefined()
+    expect(headers['X-Idempotency-Key']).toBeUndefined()
+    expect(data).toMatchObject({ status: 'failed', error: { code: 'SESSION_NOT_FOUND' } })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// R7 默认异步 + 判别守卫
+// ---------------------------------------------------------------------------
+
+describe('R7 默认异步（Prefer: respond-async）', () => {
+  it('submitMessage/advanceSession/reviewPrescription 缺省即请求异步', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({ body: { code: 'SUCCESS', data: { ok: true }, trace_id: 't' } }),
+    )
+
+    await submitMessage('s', { content: 'hi', role: 'doctor' })
+    await advanceSession('s')
+    await reviewPrescription('s', { action: 'confirm' })
+
+    expect(fn).toHaveBeenCalledTimes(3)
+    for (const call of fn.mock.calls) {
+      const headers = call[1].headers as Record<string, string>
+      // R7：三处写操作显式请求 `Prefer: respond-async`（RFC 7240，非自定义隐藏头）。
+      expect(headers['Prefer']).toBe('respond-async')
+    }
+  })
+
+  it('respondAsync=false 仅省略兼容偏好头（不强制同步）', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({ body: { code: 'SUCCESS', data: { ok: true }, trace_id: 't' } }),
+    )
+
+    await submitMessage('s', { content: 'hi', role: 'doctor' }, { respondAsync: false })
+    await advanceSession('s', {}, { respondAsync: false })
+    await reviewPrescription('s', { action: 'confirm' }, { respondAsync: false })
+
+    for (const call of fn.mock.calls) {
+      const headers = call[1].headers as Record<string, string>
+      expect(headers['Prefer']).toBeUndefined()
+    }
+    // 注意：这只是「不发送兼容偏好头」。R7 后端就绪时默认仍返回 HTTP 202，
+    // 前端必须用 isAsyncCommandAccepted 判别实际结果；真正的同步回退是部署方
+    // 设置 XUANHU_ASYNC_COMMAND_ENABLED=false。
+  })
+
+  it('缺省异步仍注入幂等键，供后端以同一 key 去重已接受的命令', async () => {
+    const fn = mockFetch(() =>
+      mockResponse({
+        status: 202,
+        body: {
+          code: 'SUCCESS',
+          data: {
+            command_id: 'cmd-1',
+            operation: 'intake.message',
+            status: 'queued',
+            replayed: false,
+            attempt_count: 0,
+            links: { self: '/self', session: '/s', stream: '/stream' },
+          },
+          trace_id: 't',
+        },
+      }),
+    )
+
+    const result = await submitMessage('s', { content: 'hi', role: 'doctor' })
+
+    const headers = fn.mock.calls[0][1].headers as Record<string, string>
+    expect(headers['X-Idempotency-Key']).toBeTruthy()
+    // 202 envelope 应被判别守卫收窄，而非当作业务结果消费。
+    expect(isAsyncCommandAccepted(result)).toBe(true)
+  })
+})
+
+describe('isAsyncCommandAccepted 判别守卫', () => {
+  const acceptedEnvelope = {
+    command_id: 'cmd-1',
+    operation: 'intake.message',
+    status: 'queued',
+    replayed: false,
+    attempt_count: 0,
+    links: { self: '/self', session: '/s', stream: '/stream' },
+  }
+
+  it('对 202 命令 envelope 返回 true', () => {
+    expect(isAsyncCommandAccepted(acceptedEnvelope)).toBe(true)
+  })
+
+  it('对同步业务结果返回 false，绝不误判为已接受命令', () => {
+    const syncMessage = {
+      message_id: 'm',
+      session_id: 's',
+      role: 'agent',
+      stage: 'inquiry',
+      content: 'reply',
+      current_stage: 'inquiry',
+      state_version: 1,
+      created_at: 'x',
+    }
+    const syncAdvance = { session_id: 's', current_stage: 'review', state_version: 2 }
+    expect(isAsyncCommandAccepted(syncMessage)).toBe(false)
+    expect(isAsyncCommandAccepted(syncAdvance)).toBe(false)
+  })
+
+  it('缺字段/类型不符/null 均返回 false', () => {
+    expect(isAsyncCommandAccepted(null)).toBe(false)
+    expect(isAsyncCommandAccepted(undefined)).toBe(false)
+    expect(isAsyncCommandAccepted('queued')).toBe(false)
+    expect(isAsyncCommandAccepted({ command_id: 'x' })).toBe(false)
+    expect(isAsyncCommandAccepted({ ...acceptedEnvelope, status: 'running' })).toBe(false)
+    expect(isAsyncCommandAccepted({ ...acceptedEnvelope, links: undefined })).toBe(false)
+  })
+
+  it('按返回值类型收窄：202 envelope 与同步结果二者取其结构判别', () => {
+    // 模拟 submitMessage 可能返回的两种形态，二者经守卫收窄后互斥。
+    const results: unknown[] = [acceptedEnvelope, { message_id: 'm', session_id: 's' }]
+    const accepted = results.filter((r) => isAsyncCommandAccepted(r))
+    expect(accepted).toHaveLength(1)
+    expect(accepted[0]).toMatchObject({ command_id: 'cmd-1' })
+  })
 })
 
 // ---------------------------------------------------------------------------

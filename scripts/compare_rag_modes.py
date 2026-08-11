@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """no-RAG vs RAG 端到端对比（存量会话聚合，无需重跑后端）。
 
 数据源：artifact_revisions(status='current') 的 syndrome_draft/formula_draft payload。
@@ -27,10 +26,11 @@ import json
 import selectors
 import statistics
 import sys
+from io import TextIOWrapper
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -50,7 +50,7 @@ def _mode(policy_version: str) -> str:
     return "rag" if RAG_POLICY_MARKER in policy_version else "no-rag"
 
 
-def _conf(text_value) -> float | None:
+def _conf(text_value: Any) -> float | None:
     try:
         return float(text_value)
     except (TypeError, ValueError):
@@ -114,7 +114,7 @@ def _aggregate_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-async def _load_payloads(db) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+async def _load_payloads(db: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """按 stage 读取全部 current payload，返回 (no_rag, rag) 两桶。"""
     buckets: dict[str, list[dict[str, Any]]] = {"no-rag": [], "rag": []}
     for stage in STAGES:
@@ -136,7 +136,7 @@ async def _load_payloads(db) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
     return buckets["no-rag"], buckets["rag"]
 
 
-async def _count_agent_evidences(db, no_rag: list[dict], rag: list[dict]) -> dict[str, int]:
+async def _count_agent_evidences(db: Any, no_rag: list[dict[str, Any]], rag: list[dict[str, Any]]) -> dict[str, int]:
     """按 policy 统计 agent_evidences 落库行数（通过 run_spec.run_id ↔ agent_run_id 关联）。"""
     rag_run_ids = {(p.get("run_spec") or {}).get("run_id") for p in rag}
     no_rag_run_ids = {(p.get("run_spec") or {}).get("run_id") for p in no_rag}
@@ -152,7 +152,7 @@ async def _count_agent_evidences(db, no_rag: list[dict], rag: list[dict]) -> dic
     }
 
 
-def _render_markdown(no_rag_agg: dict, rag_agg: dict, by_stage: dict, evidences: dict) -> str:
+def _render_markdown(no_rag_agg: dict[str, Any], rag_agg: dict[str, Any], by_stage: dict[str, Any], evidences: dict[str, Any]) -> str:
     lines = [
         "# no-RAG vs RAG 端到端对比",
         "",
@@ -197,7 +197,7 @@ def _render_markdown(no_rag_agg: dict, rag_agg: dict, by_stage: dict, evidences:
     return "\n".join(lines)
 
 
-def _print_console(no_rag_agg: dict, rag_agg: dict, by_stage: dict, evidences: dict) -> None:
+def _print_console(no_rag_agg: dict[str, Any], rag_agg: dict[str, Any], by_stage: dict[str, Any], evidences: dict[str, Any]) -> None:
     print(f"no-RAG payload {no_rag_agg['count']} vs RAG payload {rag_agg['count']}")
     for label, agg in (("no-RAG", no_rag_agg), ("RAG", rag_agg)):
         print(f"  [{label}] confidence {agg['confidence']} | 引用率 {agg['evidence_citation_rate']} "
@@ -216,7 +216,7 @@ async def _main(argv: list[str] | None = None) -> int:
         no_rag, rag = await _load_payloads(db)
         evidences = await _count_agent_evidences(db, no_rag, rag)
 
-    by_stage: dict[str, dict[str, dict]] = {"no-rag": {}, "rag": {}}
+    by_stage: dict[str, dict[str, dict[str, Any]]] = {"no-rag": {}, "rag": {}}
     for bucket, items in (("no-rag", no_rag), ("rag", rag)):
         for stage in STAGES:
             staged = [p for p in items if p.get("kind") == stage]

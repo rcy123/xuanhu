@@ -18,6 +18,9 @@ from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.async_command_admission import (
+    try_rollout_async_admission,
+)
 from app.agent_runtime.lifecycle import allow_request_local_runtime_fallback
 from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
 from app.core.exceptions import (
@@ -97,6 +100,25 @@ async def create_message(
         ),
     )
     trace_id = context.trace_id
+    # R7 rollout: prefer the durable async 202 path when the R6 substrate is
+    # enabled/ready/registered; otherwise fall through to the synchronous path
+    # (exact R1-R5 semantics). This is the single centralized rollout decision;
+    # admission does bounded validation/session/enqueue only — no model or graph
+    # execution in the request task.
+    accepted = await try_rollout_async_admission(
+        request,
+        request.app.state,
+        session_id=session_id,
+        operation="intake.message",
+        idempotency_key=context.idempotency_key,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+    )
+    if accepted is not None:
+        return accepted
     service = MessageService(
         db,
         shared_langgraph_runtime=(runtime_state.runtime if runtime_state is not None else None),

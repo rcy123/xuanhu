@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -24,19 +25,33 @@ from app.safety.datasets import (
     is_toxic_or_strong_herb,
 )
 from app.safety.engine import (
+    _MAX_HERB_CONTRAINDICATION_ENTRIES,
+    _MAX_PATIENT_CONDITION_ITEMS,
+    _MAX_PATIENT_MEDICATION_ITEMS,
     SafetyRuleEngine,
+    _bounded_normalized_conditions,
+    _bounded_normalized_medications,
     _check_allergy,
     _check_combination_incompatibilities,
     _check_dose_limits,
     _check_eighteen_incompatibilities,
+    _check_herb_contraindications,
+    _check_medication_interaction_coverage,
     _check_nineteen_fears,
     _check_pregnancy,
     _check_unknown_herbs,
+    _contraindication_entry_condition,
     _convert_all_doses,
     _convert_dose,
     _deduplicate,
     _determine_passed,
+    _has_non_whitespace_medication,
+    _herb_contraindication_conditions,
+    _herb_contraindications_overflow,
+    _medications_overflow,
+    _normalize_bounded_text,
     _normalize_composition,
+    _patient_conditions_overflow,
     _sort_issues,
 )
 from app.safety.normalizer import HerbNormalizer
@@ -68,6 +83,7 @@ class _FakeHerb:
     max_dose: float | None
     pregnancy_contraindication: str = "none"
     incompatibilities: list[dict[str, str]] | None = None
+    contraindications: list[Any] | None = None
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -79,6 +95,7 @@ def _make_herb(
     max_dose: float | None = None,
     pregnancy: str = "none",
     incompatibilities: list[dict[str, str]] | None = None,
+    contraindications: list[Any] | None = None,
 ) -> _FakeHerb:
     return _FakeHerb(
         name=name,
@@ -86,6 +103,7 @@ def _make_herb(
         max_dose=max_dose,
         pregnancy_contraindication=pregnancy,
         incompatibilities=incompatibilities,
+        contraindications=contraindications,
     )
 
 
@@ -1059,6 +1077,506 @@ class TestSafetyRuleResultSchema:
 
 
 # ---------------------------------------------------------------------------
+# 14. R4-A 有界归一化纯函数
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedNormalization:
+    def test_nfkc_casefold_whitespace_collapse(self):
+        # 全角字母/全角空格经 NFKC 折叠；空白折叠；casefold。
+        assert _normalize_bounded_text("ＨＹＰＥＲ　ＴＥＮＳＩＯＮ") == "hyper tension"
+        assert _normalize_bounded_text("　高血压　") == "高血压"
+        assert _normalize_bounded_text("高　血 压") == "高 血 压"
+
+    def test_non_string_returns_none(self):
+        assert _normalize_bounded_text(None) is None
+        assert _normalize_bounded_text(123) is None
+        assert _normalize_bounded_text(True) is None
+
+    def test_empty_or_whitespace_returns_none(self):
+        assert _normalize_bounded_text("") is None
+        assert _normalize_bounded_text("   ") is None
+        assert _normalize_bounded_text("　　") is None
+
+    def test_overlong_returns_none(self):
+        assert _normalize_bounded_text("x" * 600) is None
+
+    def test_bounded_conditions_dedup_and_normalize(self):
+        assert _bounded_normalized_conditions(["A", " A ", "b"], ["B"]) == frozenset({"a", "b"})
+
+    def test_bounded_medications_dedup(self):
+        assert _bounded_normalized_medications(["A", " a ", "", "   "]) == ("a",)
+
+    def test_contraindication_entry_condition(self):
+        assert _contraindication_entry_condition(" 高 血压 ") == "高 血压"
+        assert _contraindication_entry_condition({"condition": "高血压"}) == "高血压"
+        assert _contraindication_entry_condition({"name": "高血压"}) == "高血压"
+        assert _contraindication_entry_condition({"other": "高血压"}) is None
+        assert _contraindication_entry_condition({"condition": 123}) is None
+        assert _contraindication_entry_condition({"condition": "   "}) is None
+        assert _contraindication_entry_condition(None) is None
+
+    def test_herb_contraindication_conditions(self):
+        entries = ["高血压 ", {"condition": "高血压"}, {"name": "失眠"}, {"bad": "x"}, 123]
+        assert _herb_contraindication_conditions(entries) == ("高血压", "失眠")
+        assert _herb_contraindication_conditions("not-a-list") == ()
+        assert _herb_contraindication_conditions(None) == ()
+
+    def test_overflow_helpers_bound_counts(self):
+        """R4-B：各溢出判定只统计原始条目数，不依赖内容或顺序。"""
+        assert _patient_conditions_overflow([None] * (_MAX_PATIENT_CONDITION_ITEMS + 1), []) is True
+        assert _patient_conditions_overflow([None] * _MAX_PATIENT_CONDITION_ITEMS, []) is False
+        assert _patient_conditions_overflow([], [None] * _MAX_PATIENT_CONDITION_ITEMS) is False
+        assert _patient_conditions_overflow([None] * 100, [None] * 101) is True
+        assert _medications_overflow([None] * (_MAX_PATIENT_MEDICATION_ITEMS + 1)) is True
+        assert _medications_overflow([None] * _MAX_PATIENT_MEDICATION_ITEMS) is False
+        assert _herb_contraindications_overflow([None] * (_MAX_HERB_CONTRAINDICATION_ENTRIES + 1)) is True
+        assert _herb_contraindications_overflow([None] * _MAX_HERB_CONTRAINDICATION_ENTRIES) is False
+        assert _herb_contraindications_overflow("not-a-list") is False
+        assert _herb_contraindications_overflow(None) is False
+
+    def test_non_whitespace_medication_presence_bounded(self):
+        """R4-B：用药存在性判定先做长度检查，超长条目 fail-closed 视为存在。"""
+        assert _has_non_whitespace_medication("阿司匹林") is True
+        assert _has_non_whitespace_medication("  阿司匹林  ") is True
+        assert _has_non_whitespace_medication("   ") is False
+        assert _has_non_whitespace_medication("") is False
+        assert _has_non_whitespace_medication("x" * 600) is True
+        assert _has_non_whitespace_medication(123) is False
+        assert _has_non_whitespace_medication(None) is False
+
+
+# ---------------------------------------------------------------------------
+# 15. R4-A 药材禁忌精确匹配
+# ---------------------------------------------------------------------------
+
+
+class TestHerbContraindications:
+    def test_exact_match_blocker(self):
+        herb = _make_herb("党参", contraindications=["阴虚燥渴者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["阴虚燥渴者慎用"])
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.HERB_CONTRAINDICATION
+        assert issues[0].severity == Severity.BLOCKER
+        assert issues[0].herbs == ["党参"]
+        assert issues[0].rule_source == "Herb.contraindications"
+
+    def test_unicode_case_whitespace_normalization(self):
+        herb = _make_herb("麻黄", contraindications=["表实邪盛"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        # 首尾全角空白经 NFKC + strip 后与「表实邪盛」精确相等。
+        patient = PatientInfo(major_conditions=["　表实邪盛　"])
+        issues = _check_herb_contraindications(["麻黄"], patient, herbs, normalizer)
+        assert len(issues) == 1
+
+        herb2 = _make_herb("麻黄2", contraindications=["表 实 邪 盛"])
+        herbs2 = {herb2.name: herb2}
+        normalizer2 = _build_normalizer(list(herbs2.values()))
+        # 内部空白折叠 + 全角空白 NFKC：与「表 实 邪 盛」精确相等。
+        patient2 = PatientInfo(major_conditions=["表　实  邪 盛"])
+        issues2 = _check_herb_contraindications(["麻黄2"], patient2, herbs2, normalizer2)
+        assert len(issues2) == 1
+
+    def test_casefold_match(self):
+        herb = _make_herb("草", contraindications=["HYPERTENSION"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["hypertension"])
+        issues = _check_herb_contraindications(["草"], patient, herbs, normalizer)
+        assert len(issues) == 1
+
+    def test_alias_normalized_formula_herb_matches(self):
+        herb = _make_herb("甘草", aliases=["国老"], contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["实证者慎用"])
+        issues = _check_herb_contraindications(["国老"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].herbs == ["甘草"]
+
+    def test_no_substring_match(self):
+        herb = _make_herb("党参", contraindications=["高血压患者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["高血压"])
+        assert _check_herb_contraindications(["党参"], patient, herbs, normalizer) == []
+
+    def test_malformed_dict_entries_ignored(self):
+        herb = _make_herb(
+            "党参",
+            contraindications=[{"other": "高血压"}, {"condition": 123}, {"name": "   "}],
+        )
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["高血压"])
+        assert _check_herb_contraindications(["党参"], patient, herbs, normalizer) == []
+
+    def test_malformed_list_ignored(self):
+        herb = _make_herb("党参", contraindications="not-a-list")
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["高血压"])
+        assert _check_herb_contraindications(["党参"], patient, herbs, normalizer) == []
+
+    def test_overlong_entries_ignored(self):
+        long_text = "x" * 600
+        herb = _make_herb("党参", contraindications=[long_text])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=[long_text])
+        assert _check_herb_contraindications(["党参"], patient, herbs, normalizer) == []
+
+    def test_strict_dict_entry_accepted(self):
+        herb = _make_herb("党参", contraindications=[{"condition": "高血压", "level": "high"}])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["高血压"])
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert "高血压" in issues[0].suggestion
+
+    def test_multiple_herb_hits(self):
+        dangshen = _make_herb("党参", contraindications=["实证者慎用"])
+        huangqi = _make_herb("黄芪", contraindications=["表实邪盛者慎用"])
+        herbs = {dangshen.name: dangshen, huangqi.name: huangqi}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["实证者慎用", "表实邪盛者慎用"])
+        issues = _check_herb_contraindications(["党参", "黄芪"], patient, herbs, normalizer)
+        assert len(issues) == 2
+        assert {i.herbs[0] for i in issues} == {"党参", "黄芪"}
+
+    def test_same_herb_multiple_conditions_one_issue(self):
+        herb = _make_herb("党参", contraindications=["实证者慎用", "阴虚者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["实证者慎用", "阴虚者慎用"])
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert "实证者慎用" in issues[0].suggestion
+        assert "阴虚者慎用" in issues[0].suggestion
+
+    def test_order_invariance(self):
+        def build(cond_order, entry_order):
+            herb = _make_herb("党参", contraindications=entry_order)
+            herbs = {herb.name: herb}
+            normalizer = _build_normalizer(list(herbs.values()))
+            patient = PatientInfo(major_conditions=cond_order)
+            return _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+
+        entries_a = ["实证者慎用", "阴虚者慎用"]
+        entries_b = ["阴虚者慎用", "实证者慎用"]
+        conds_a = ["实证者慎用", "阴虚者慎用"]
+        conds_b = ["阴虚者慎用", "实证者慎用"]
+        assert build(conds_a, entries_a) == build(conds_b, entries_b)
+
+    def test_duplicate_herb_only_checked_once(self):
+        herb = _make_herb("党参", contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["实证者慎用"])
+        issues = _check_herb_contraindications(["党参", "党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+
+    def test_empty_patient_conditions_no_issue(self):
+        herb = _make_herb("党参", contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        assert _check_herb_contraindications(["党参"], PatientInfo(), herbs, normalizer) == []
+
+    def test_herb_contraindication_blocker_blocks_pass(self):
+        issue = SafetyIssue(
+            type=SafetyIssueType.HERB_CONTRAINDICATION,
+            severity=Severity.BLOCKER,
+            herbs=["党参"],
+            rule_source="Herb.contraindications",
+            suggestion="test",
+        )
+        assert _determine_passed([issue]) is False
+
+    def test_conditions_overflow_emits_exactly_one_patient_context_coverage(self):
+        """R4-B：患者条件超上限 → 恰好一条 HIGH fail-closed 覆盖率门禁，不评估截断子集。"""
+        herb = _make_herb("党参", contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        # 匹配条件被埋在 200 之后——旧实现会截断前 200 条而漏检。
+        conditions = [f"无关条件{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS)]
+        conditions.append("实证者慎用")
+        patient = PatientInfo(major_conditions=conditions)
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.type == SafetyIssueType.PATIENT_CONTEXT_COVERAGE
+        assert issue.severity == Severity.HIGH
+        assert issue.herbs == []
+        assert issue.rule_source == "patient_context_coverage"
+        # 固定文本不泄漏任何条件名
+        assert "实证者慎用" not in issue.suggestion
+        assert "无关条件" not in issue.suggestion
+
+    def test_conditions_overflow_reorder_invariant(self):
+        """R4-B：同一组超上限条件的不同顺序产出完全一致的 issue。"""
+        def build(conds: list[str]) -> list[SafetyIssue]:
+            herb = _make_herb("党参", contraindications=["实证者慎用"])
+            herbs = {herb.name: herb}
+            normalizer = _build_normalizer(list(herbs.values()))
+            return _check_herb_contraindications(
+                ["党参"], PatientInfo(major_conditions=conds), herbs, normalizer
+            )
+
+        base = [f"无关条件{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS)]
+        base.append("实证者慎用")
+        assert build(base) == build(list(reversed(base)))
+        assert len(build(base)) == 1
+
+    def test_conditions_overflow_overrides_all_herb_matches(self):
+        """R4-B：即使存在精确命中候选，条件超上限时也仅发射覆盖率门禁。"""
+        herb = _make_herb("党参", contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        conditions = ["实证者慎用"] + [f"无关条件{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS)]
+        patient = PatientInfo(major_conditions=conditions)
+        issues = _check_herb_contraindications(["党参", "党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.PATIENT_CONTEXT_COVERAGE
+
+    def test_conditions_at_cap_still_evaluates_exact_match(self):
+        """R4-B：恰好在上限内的条件集保持原有精确匹配语义（BLOCKER）。"""
+        herb = _make_herb("党参", contraindications=["实证者慎用"])
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        conditions = [f"无关条件{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS - 1)]
+        conditions.append("实证者慎用")
+        patient = PatientInfo(major_conditions=conditions)
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.HERB_CONTRAINDICATION
+        assert issues[0].severity == Severity.BLOCKER
+        assert "实证者慎用" in issues[0].suggestion
+
+    def test_conditions_overflow_exactly_one_not_per_herb(self):
+        """R4-B：多味药时条件超上限也只发射一条 PATIENT_CONTEXT_COVERAGE。"""
+        ds = _make_herb("党参", contraindications=["实证者慎用"])
+        hq = _make_herb("黄芪", contraindications=["表实邪盛者慎用"])
+        herbs = {ds.name: ds, hq.name: hq}
+        normalizer = _build_normalizer(list(herbs.values()))
+        conditions = [f"无关条件{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS)]
+        conditions.append("实证者慎用")
+        patient = PatientInfo(major_conditions=conditions)
+        issues = _check_herb_contraindications(["党参", "黄芪"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.PATIENT_CONTEXT_COVERAGE
+
+    def test_herb_contraindications_overflow_fails_closed(self):
+        """R4-B：单味药禁忌条目超上限 → 固定 HIGH 覆盖率门禁，替代截断后精确匹配。"""
+        entries = [f"无关条目{i}" for i in range(_MAX_HERB_CONTRAINDICATION_ENTRIES)]
+        entries.insert(0, "匹配条件")  # 1 + 200 = 201 → 超上限
+        herb = _make_herb("党参", contraindications=entries)
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["匹配条件"])
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.type == SafetyIssueType.HERB_CONTRAINDICATION_COVERAGE
+        assert issue.severity == Severity.HIGH
+        assert issue.herbs == ["党参"]
+        assert issue.rule_source == "herb_contraindication_coverage"
+        # 不泄漏任何原始禁忌条目
+        assert "匹配条件" not in issue.suggestion
+        assert "无关条目" not in issue.suggestion
+
+    def test_herb_contraindications_overflow_exactly_one_per_herb(self):
+        """R4-B：同一味药在处方中重复出现只产生一条覆盖率门禁。"""
+        entries = [f"无关条目{i}" for i in range(_MAX_HERB_CONTRAINDICATION_ENTRIES + 1)]
+        herb = _make_herb("党参", contraindications=entries)
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["匹配条件"])
+        issues = _check_herb_contraindications(["党参", "党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.HERB_CONTRAINDICATION_COVERAGE
+
+    def test_herb_contraindications_overflow_reorder_invariant(self):
+        """R4-B：两味药均超上限时，处方顺序不影响最终确定性排序结果。"""
+        def build(herb_order: list[str]) -> list[SafetyIssue]:
+            a = _make_herb(
+                "herb-a",
+                contraindications=[f"无关条目{i}" for i in range(_MAX_HERB_CONTRAINDICATION_ENTRIES + 1)],
+            )
+            b = _make_herb(
+                "herb-b",
+                contraindications=[f"其他条目{i}" for i in range(_MAX_HERB_CONTRAINDICATION_ENTRIES + 1)],
+            )
+            herbs = {a.name: a, b.name: b}
+            normalizer = _build_normalizer(list(herbs.values()))
+            patient = PatientInfo(major_conditions=["任意条件"])
+            raw = _check_herb_contraindications(herb_order, patient, herbs, normalizer)
+            return _sort_issues(raw)
+
+        forward = build(["herb-a", "herb-b"])
+        reverse = build(["herb-b", "herb-a"])
+        assert forward == reverse
+        assert [i.type for i in forward] == [SafetyIssueType.HERB_CONTRAINDICATION_COVERAGE] * 2
+        assert [i.herbs for i in forward] == [["herb-a"], ["herb-b"]]
+
+    def test_herb_contraindications_at_cap_exact_match_unchanged(self):
+        """R4-B：恰好在上限内的禁忌条目保持原有精确匹配语义。"""
+        entries = [f"无关条目{i}" for i in range(_MAX_HERB_CONTRAINDICATION_ENTRIES - 1)]
+        entries.insert(0, "匹配条件")  # 1 + 199 = 200 → 恰好在上限内
+        herb = _make_herb("党参", contraindications=entries)
+        herbs = {herb.name: herb}
+        normalizer = _build_normalizer(list(herbs.values()))
+        patient = PatientInfo(major_conditions=["匹配条件"])
+        issues = _check_herb_contraindications(["党参"], patient, herbs, normalizer)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.HERB_CONTRAINDICATION
+        assert issues[0].severity == Severity.BLOCKER
+        assert "匹配条件" in issues[0].suggestion
+
+
+# ---------------------------------------------------------------------------
+# 16. R4-A 用药相互作用覆盖率门禁
+# ---------------------------------------------------------------------------
+
+
+class TestMedicationInteractionCoverage:
+    def test_non_empty_medications_emits_exactly_one_high(self):
+        patient = PatientInfo(current_medications=["阿司匹林", " 阿司匹林 ", "硝苯地平"])
+        issues = _check_medication_interaction_coverage(patient)
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+        assert issues[0].severity == Severity.HIGH
+        assert issues[0].herbs == []
+        assert issues[0].rule_source == "medication_interaction_coverage"
+
+    def test_no_medication_names_in_issue(self):
+        patient = PatientInfo(current_medications=["阿司匹林"])
+        issues = _check_medication_interaction_coverage(patient)
+        assert "阿司匹林" not in issues[0].rule_source
+        assert "阿司匹林" not in issues[0].suggestion
+
+    def test_empty_medications_no_issue(self):
+        assert _check_medication_interaction_coverage(PatientInfo(current_medications=[])) == []
+
+    def test_whitespace_only_medications_no_issue(self):
+        assert _check_medication_interaction_coverage(PatientInfo(current_medications=["   ", "　"])) == []
+
+    def test_overlong_medication_emits_coverage_issue(self):
+        """R4-B：超长（非空白）条目也必须触发覆盖率门禁（fail-closed）。"""
+        issues = _check_medication_interaction_coverage(PatientInfo(current_medications=["x" * 600]))
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+        assert issues[0].severity == Severity.HIGH
+
+    def test_overlong_first_entry_does_not_hide_later_medication(self):
+        """R4-B：超长首条目不得遮蔽后续合法用药。"""
+        issues = _check_medication_interaction_coverage(
+            PatientInfo(current_medications=["x" * 600, "阿司匹林"])
+        )
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+
+    def test_medications_over_cap_emits_exactly_one_high(self):
+        """R4-B：条目数超过上限 → 恰好一条 HIGH 覆盖率门禁，不泄漏药名。"""
+        meds = [f"X7Y9-{i}" for i in range(_MAX_PATIENT_MEDICATION_ITEMS + 1)]
+        issues = _check_medication_interaction_coverage(PatientInfo(current_medications=meds))
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+        assert issues[0].severity == Severity.HIGH
+        assert "X7Y9" not in issues[0].suggestion
+        assert "X7Y9" not in issues[0].rule_source
+
+    def test_medications_over_cap_reorder_invariant(self):
+        """R4-B：超上限列表的任何顺序产出完全一致的 issue。"""
+        forward = [f"X7Y9-{i}" for i in range(_MAX_PATIENT_MEDICATION_ITEMS + 1)]
+        reverse = list(reversed(forward))
+        assert _check_medication_interaction_coverage(PatientInfo(current_medications=forward)) == \
+            _check_medication_interaction_coverage(PatientInfo(current_medications=reverse))
+        assert len(_check_medication_interaction_coverage(PatientInfo(current_medications=forward))) == 1
+
+    def test_medications_at_cap_with_valid_entry_emits_issue(self):
+        """R4-B：恰好在上限内且含合法用药时仍触发覆盖率门禁。"""
+        meds = [f"X7Y9-{i}" for i in range(_MAX_PATIENT_MEDICATION_ITEMS - 1)]
+        meds.append("阿司匹林")
+        issues = _check_medication_interaction_coverage(PatientInfo(current_medications=meds))
+        assert len(issues) == 1
+        assert issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+
+    def test_medication_coverage_high_blocks_pass(self):
+        patient = PatientInfo(current_medications=["阿司匹林"])
+        issues = _check_medication_interaction_coverage(patient)
+        assert _determine_passed(issues) is False
+
+
+# ---------------------------------------------------------------------------
+# 17. R4-A 规则接入 execution_order 与版本
+# ---------------------------------------------------------------------------
+
+
+class TestEngineNewRulesWiring:
+    @pytest.mark.asyncio
+    async def test_new_rules_in_execution_order_and_version(self):
+        db = _CapturingDb([])
+        engine = SafetyRuleEngine(db)  # type: ignore[arg-type]
+        formula = _make_formula("test", [HerbDose(herb="党参", dose=10, unit="g")])
+        patient = PatientInfo(current_medications=["阿司匹林"])
+        result = await engine.evaluate(formula, patient)
+        assert result.rule_version == SAFETY_RULE_VERSION
+        assert result.rule_version == "v1.2.0"
+        order = result.execution_order
+        assert "herb_contraindication" in order
+        assert "medication_interaction_coverage" in order
+        assert order.index("allergy") < order.index("herb_contraindication")
+        assert order.index("herb_contraindication") < order.index("medication_interaction_coverage")
+        assert order.index("medication_interaction_coverage") < order.index("deduplicate")
+        assert result.passed is False
+        assert any(
+            i.type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE for i in result.issues
+        )
+
+    @pytest.mark.asyncio
+    async def test_patient_context_overflow_wired_through_evaluate(self):
+        """R4-B：患者条件超上限在完整 evaluate() 路径中产出 fail-closed 覆盖率门禁。"""
+        db = _CapturingDb([])
+        engine = SafetyRuleEngine(db)  # type: ignore[arg-type]
+        formula = _make_formula("test", [HerbDose(herb="党参", dose=10, unit="g")])
+        conditions = [f"c{i}" for i in range(_MAX_PATIENT_CONDITION_ITEMS)]
+        conditions.append("匹配条件")
+        patient = PatientInfo(major_conditions=conditions)
+        result = await engine.evaluate(formula, patient)
+        coverage = [
+            i for i in result.issues if i.type == SafetyIssueType.PATIENT_CONTEXT_COVERAGE
+        ]
+        assert len(coverage) == 1
+        assert coverage[0].severity == Severity.HIGH
+        assert coverage[0].herbs == []
+        assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_medication_overflow_wired_through_evaluate(self):
+        """R4-B：用药条目超上限在完整 evaluate() 路径中产出覆盖率门禁。"""
+        db = _CapturingDb([])
+        engine = SafetyRuleEngine(db)  # type: ignore[arg-type]
+        formula = _make_formula("test", [HerbDose(herb="党参", dose=10, unit="g")])
+        meds = [f"X7Y9-{i}" for i in range(_MAX_PATIENT_MEDICATION_ITEMS + 1)]
+        patient = PatientInfo(current_medications=meds)
+        result = await engine.evaluate(formula, patient)
+        coverage = [
+            i for i in result.issues
+            if i.type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+        ]
+        assert len(coverage) == 1
+        assert coverage[0].severity == Severity.HIGH
+        assert result.passed is False
+        assert "X7Y9" not in coverage[0].suggestion
+        assert "X7Y9" not in coverage[0].rule_source
+
+
+# ---------------------------------------------------------------------------
 # 13. Engine 集成测试（需 PostgreSQL）
 # ---------------------------------------------------------------------------
 
@@ -1327,4 +1845,125 @@ class TestSafetyRuleEngineIntegration:
             assert run.rule_version == SAFETY_RULE_VERSION
             assert run.passed is True
         finally:
+            await self._cleanup_db(db)
+
+    async def test_medication_coverage_persisted_fail_closed(self, db: AsyncSession):
+        """R4-B：安全处方 + 用药 → passed=False，唯一 MEDICATION_INTERACTION_COVERAGE HIGH，
+        safety_rule_runs 持久化 rule_version 当前值且 passed=False，issue 文本不含用药 sentinel。"""
+        await self._setup_db(db)
+        try:
+            from sqlalchemy import select
+
+            from app.models.safety import SafetyRuleRun
+            from app.safety.engine import SafetyRuleEngine
+
+            engine = SafetyRuleEngine(db)
+            med_sentinel = "X7Y9-R4B-MEDICATION-SENTINEL"
+            formula = FormulaResult(
+                name="四君子汤",
+                composition=[
+                    HerbDose(herb="党参", dose=12, unit="g"),
+                    HerbDose(herb="白术", dose=10, unit="g"),
+                ],
+                rationale="健脾益气",
+            )
+            patient = PatientInfo(
+                pregnancy_status=PregnancyStatus.NO,
+                current_medications=[med_sentinel],
+            )
+            sid = str(self._test_session.id)
+            result = await engine.check(
+                formula=formula,
+                patient_info=patient,
+                session_id=sid,
+                trace_id="test-trace-r4b-meds",
+            )
+            assert result.passed is False
+            assert len(result.issues) == 1
+            assert result.issues[0].type == SafetyIssueType.MEDICATION_INTERACTION_COVERAGE
+            assert result.issues[0].severity == Severity.HIGH
+            assert med_sentinel not in result.issues[0].rule_source
+            assert med_sentinel not in result.issues[0].suggestion
+
+            await db.commit()
+            run = (
+                await db.execute(
+                    select(SafetyRuleRun).where(
+                        SafetyRuleRun.session_id == uuid.UUID(sid)
+                    )
+                )
+            ).scalar_one_or_none()
+            assert run is not None
+            assert run.rule_version == SAFETY_RULE_VERSION
+            assert run.passed is False
+            persisted_text = json.dumps(run.issues, ensure_ascii=False)
+            assert med_sentinel not in persisted_text
+        finally:
+            await self._cleanup_db(db)
+
+    async def test_herb_contraindication_blocker_persisted(self, db: AsyncSession):
+        """R4-B：唯一集成药精确禁忌命中 + 匹配 major_condition → HERB_CONTRAINDICATION BLOCKER，
+        safety_rule_runs 持久化 rule_version 当前值且 passed=False；清理创建的所有行。"""
+        await self._setup_db(db)
+        unique_name = f"r4b_int_herb_{uuid.uuid4().hex[:8]}"
+        unique_condition = f"r4b_int_cond_{uuid.uuid4().hex[:8]}"
+        try:
+            from sqlalchemy import select
+
+            from app.models.knowledge import Herb
+            from app.models.safety import SafetyRuleRun
+            from app.safety.engine import SafetyRuleEngine
+
+            db.add(
+                Herb(
+                    name=unique_name,
+                    aliases=[],
+                    max_dose=30.0,
+                    pregnancy_contraindication="none",
+                    contraindications=[unique_condition],
+                    doc_text="R4-B integration test herb",
+                )
+            )
+            await db.commit()
+
+            engine = SafetyRuleEngine(db)
+            formula = FormulaResult(
+                name="r4b_int_formula",
+                composition=[HerbDose(herb=unique_name, dose=3, unit="g")],
+                rationale="R4-B integration test",
+            )
+            patient = PatientInfo(
+                pregnancy_status=PregnancyStatus.NO,
+                major_conditions=[unique_condition],
+            )
+            sid = str(self._test_session.id)
+            result = await engine.check(
+                formula=formula,
+                patient_info=patient,
+                session_id=sid,
+                trace_id="test-trace-r4b-herb",
+            )
+            assert result.passed is False
+            blockers = [
+                i for i in result.issues
+                if i.type == SafetyIssueType.HERB_CONTRAINDICATION
+            ]
+            assert len(blockers) == 1
+            assert blockers[0].severity == Severity.BLOCKER
+            assert blockers[0].herbs == [unique_name]
+            assert blockers[0].rule_source == "Herb.contraindications"
+
+            await db.commit()
+            run = (
+                await db.execute(
+                    select(SafetyRuleRun).where(
+                        SafetyRuleRun.session_id == uuid.UUID(sid)
+                    )
+                )
+            ).scalar_one_or_none()
+            assert run is not None
+            assert run.rule_version == SAFETY_RULE_VERSION
+            assert run.passed is False
+        finally:
+            await db.execute(text("DELETE FROM herbs WHERE name = :name"), {"name": unique_name})
             await self._cleanup_db(db)

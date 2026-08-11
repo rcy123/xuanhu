@@ -187,6 +187,7 @@ uv run python scripts/prewarm_embedding_cache.py --stats
 - **权威快照缓存** — 推理 Agent 的权威快照在 commit 时缓存，写入时失效，DB 往返减少 60–70%
 - **三级 Embedding 缓存** — 实体 → 模板 → 运行时三级预热（Redis），~60% 命中率，~4ms 取回
 - **两阶段开方** — 基础方选择（多方案、医师选定）→ 个性化加减方（加减方），临床过程透明分离
+- **租约守护的持久命令** — 持久异步命令 worker 与 HTTP 幂等执行器都在共享的单调租约守护（`app/services/lease_guard.py`）下运行 handler。只有能持续续租，handler 才能继续写入；一旦 owner token/状态丢失或本地截止时间耗尽，过期 handler 会被取消/排空，执行器安全失败（`HTTP_COMMAND_RECOVERY_REQUIRED`），绝不结算过期的临床写入。运维人员通过异步 worker 的环境设置（env/config）调整其租约/心跳时序（生产默认：心跳 20s / 租约 60s）。HTTP 执行器的租约/心跳时序在生产环境固定（20s / 90s），其构造参数仅作内部/测试注入，不是运维配置面。
 
 ---
 
@@ -413,6 +414,7 @@ xuanhu/
 | [性能：Milvus 与状态缓存](docs/03_agent性能优化/阶段优化记录-OP3Milvus异步化与状态缓存-2026-08-06.md) | OP3 优化：Milvus 异步、共享检索器、权威缓存 |
 | [性能：三 Agent 管线](docs/03_agent性能优化/06-辨证开方加减方Agent逻辑优化方案.md) | 辨证→开方→加减方三 Agent 管线设计 |
 | [性能：实施评估报告](docs/03_agent性能优化/06-实施评估报告-2026-08-06.md) | 优化后评估、before/after 对比表、验收报告 |
+| [异步命令（R6/R7）](docs/async-command.md) | 持久化 202 异步路径：底层设施、Worker、状态 API、R7 默认异步接入与 Handler |
 
 ---
 

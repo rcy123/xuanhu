@@ -993,7 +993,9 @@ async def test_advance_returns_committed_syndrome_when_formula_stage_fails(
 
     assert response["current_stage"] == "syndrome"
     assert response["from_stage"] == "inquiry"
-    assert response["state_version"] == 2
+    # Advance from inquiry bumps state_version 1->2 while moving to the
+    # syndrome stage; the durable syndrome artifact commit then bumps 2->3.
+    assert response["state_version"] == 3
     assert response["artifact_refs"][0]["kind"] == "syndrome_draft"
 
     async with factory() as db:
@@ -1348,8 +1350,18 @@ async def test_syndrome_verifier_failure_routes_to_manual_required_without_artif
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    invalid_syndrome = _syndrome_completed(fact_ids).model_copy(update={"confidence": 0.95})
-    gateway = _ReasoningFakeGateway([invalid_syndrome])
+    from app.schemas.completeness import InquiryDimension
+
+    # DECISION_CONTENT_INVALID: a COMPLETED syndrome must have empty
+    # missing_inputs. Inject one to force a real (content-based) verifier
+    # failure, independent of confidence capping.  DECISION_CONTENT_INVALID
+    # is a retryable (transient model quality) failure, so the graph retries
+    # up to _REASONING_MAX_RETRIES (2) times before routing to manual_required;
+    # queue the same invalid output for every attempt.
+    invalid_syndrome = _syndrome_completed(fact_ids).model_copy(
+        update={"missing_inputs": (InquiryDimension.TEN_SLEEP,)}
+    )
+    gateway = _ReasoningFakeGateway([invalid_syndrome] * 3)
     _install_gateway(monkeypatch, gateway)
 
     async with factory() as db:
@@ -1364,7 +1376,7 @@ async def test_syndrome_verifier_failure_routes_to_manual_required_without_artif
         )
 
     assert response["current_stage"] == "blocked"
-    assert gateway.calls == [SyndromeDraft]
+    assert gateway.calls == [SyndromeDraft, SyndromeDraft, SyndromeDraft]
     async with factory() as db:
         artifact_count = await db.scalar(
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "syndrome_draft")
@@ -1445,7 +1457,12 @@ async def test_formula_verifier_failure_routes_to_manual_required_without_formul
 ) -> None:
     _, factory = store
     session_id, _, fact_ids = await _ready_session(factory)
-    invalid_modification = _modification_completed(fact_ids).model_copy(update={"confidence": 0.95})
+    # MODIFICATION_BASIS_MISSING: drop the modification's basis to force a
+    # real (content-based) formula verifier failure, independent of
+    # confidence capping.
+    completed_modification = _modification_completed(fact_ids)
+    orphaned_mod = completed_modification.modifications[0].model_copy(update={"basis": None})
+    invalid_modification = completed_modification.model_copy(update={"modifications": (orphaned_mod,)})
     gateway = _ReasoningFakeGateway([_syndrome_completed(fact_ids), _base_formula_completed(fact_ids), invalid_modification])
     _install_gateway(monkeypatch, gateway)
 

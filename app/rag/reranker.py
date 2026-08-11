@@ -227,7 +227,7 @@ async def _call_reranker_api(
                 scores.append(max(0.0, min(1.0, float(score))))
             if len(scores) == len(documents):
                 return scores
-        elif isinstance(results[0], (int, float)):
+        elif isinstance(results[0], int | float):
             scores = [max(0.0, min(1.0, float(s))) for s in results]
             if len(scores) == len(documents):
                 return scores
@@ -284,7 +284,7 @@ async def cross_encoder_rerank(
         return rerank(merged_hits, top_k=top_k)
 
     # 按新分数重排
-    scored = list(zip(merged_hits, scores))
+    scored = list(zip(merged_hits, scores, strict=False))
     scored.sort(key=lambda x: x[1], reverse=True)
 
     evidence_model = model or get_settings().rag_reranker_model or "cross-encoder"
@@ -373,7 +373,7 @@ async def llm_rerank(
         return rerank(merged_hits, top_k=top_k)
 
     # 按新分数重排
-    scored = list(zip(merged_hits, scores))
+    scored = list(zip(merged_hits, scores, strict=False))
     scored.sort(key=lambda x: x[1], reverse=True)
 
     evidence_model = llm_model

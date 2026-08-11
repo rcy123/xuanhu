@@ -183,6 +183,7 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 - **Authority Snapshot Caching** — reasoning agent authority snapshots cached at commit with invalidation on write, reducing DB round-trips by 60–70%
 - **Three-Tier Embedding Cache** — entity → template → runtime warming via Redis, achieving ~60% hit rate and ~4ms retrieval
 - **Two-Stage Formula Drafting** — base formula selection (multi-alternative, practitioner-chosen) → personalized modification (加减方), separated for clinical transparency
+- **Lease-fenced Durable Commands** — both the durable async-command worker and the HTTP idempotency executor run handlers under a shared monotonic lease guard (`app/services/lease_guard.py`). A handler may only keep writing while it can renew its lease; if the owner token/status is lost or the local deadline is exhausted, the stale handler is cancelled/drained and the executor fails closed (`HTTP_COMMAND_RECOVERY_REQUIRED`) instead of settling a stale clinical write. Operators tune the async worker's lease/heartbeat timing through its environment settings (production defaults: heartbeat 20s / lease 60s). The HTTP executor's lease/heartbeat timing is fixed in production (20s / 90s); its constructor kwargs are an internal/test injection seam, not an operator configuration surface.
 
 ---
 
@@ -407,6 +408,7 @@ xuanhu/
 | [Perf: Milvus & State Cache](docs/03_agent性能优化/阶段优化记录-OP3Milvus异步化与状态缓存-2026-08-06.md) | OP3 optimization: Milvus async, shared retriever, authority cache |
 | [Perf: 三Agent Pipeline](docs/03_agent性能优化/06-辨证开方加减方Agent逻辑优化方案.md) | Three-agent reasoning pipeline design: Syndrome → Formula → Modification |
 | [Perf: Implementation Report](docs/03_agent性能优化/06-实施评估报告-2026-08-06.md) | Post-optimization evaluation, before/after tables, acceptance report |
+| [Async Commands (R6/R7)](docs/async-command.md) | Durable 202 async path: substrate, worker, status API, R7 default async admission & handlers |
 
 ---
 

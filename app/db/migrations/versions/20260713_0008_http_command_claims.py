@@ -7,6 +7,8 @@ Create Date: 2026-07-13
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
@@ -30,8 +32,8 @@ def upgrade() -> None:
         sa.Column("owner_token", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("http_status", sa.Integer(), nullable=True),
-        sa.Column("response_payload", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-        sa.Column("error_payload", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("response_payload", cast(Any, postgresql.JSONB)(astext_type=sa.Text()), nullable=True),
+        sa.Column("error_payload", cast(Any, postgresql.JSONB)(astext_type=sa.Text()), nullable=True),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),

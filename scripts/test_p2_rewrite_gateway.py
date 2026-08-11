@@ -1,10 +1,15 @@
 """Test P2 rewrite gateway end-to-end with Qwen3.5-2B-free @ dmxapi."""
-import asyncio, sys, time
+import asyncio
+import sys
+import time
+from io import TextIOWrapper
+from typing import cast
+from uuid import UUID
 
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding='utf-8', errors='replace')
 
 
-async def main():
+async def main() -> None:
     print('=== P2 Query Rewrite Gateway End-to-End Test ===')
     print()
 
@@ -35,53 +40,54 @@ async def main():
     gw = ModelGatewayClient(settings=rs)
 
     # ---- Simulate observations ----
+    from app.schemas.domain import ObservationStatus
     from app.schemas.syndrome import SyndromeObservationContext
 
     observations = [
         SyndromeObservationContext(
-            observation_id='550e8400-e29b-41d4-a716-446655440001',
-            session_id='550e8400-e29b-41d4-a716-446655440000',
+            observation_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440001'),
+            session_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440000'),
             state_version=1,
             fact_key='chief_complaint.symptom',
             value='受凉后咳嗽三天',
             normalized_value=None,
-            status='active',
+            status=ObservationStatus.ACTIVE,
         ),
         SyndromeObservationContext(
-            observation_id='550e8400-e29b-41d4-a716-446655440002',
-            session_id='550e8400-e29b-41d4-a716-446655440000',
+            observation_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440002'),
+            session_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440000'),
             state_version=1,
             fact_key='present_illness.cough',
             value='咳嗽',
             normalized_value=None,
-            status='active',
+            status=ObservationStatus.ACTIVE,
         ),
         SyndromeObservationContext(
-            observation_id='550e8400-e29b-41d4-a716-446655440003',
-            session_id='550e8400-e29b-41d4-a716-446655440000',
+            observation_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440003'),
+            session_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440000'),
             state_version=1,
             fact_key='present_illness.sputum',
             value='痰白稀',
             normalized_value=None,
-            status='active',
+            status=ObservationStatus.ACTIVE,
         ),
         SyndromeObservationContext(
-            observation_id='550e8400-e29b-41d4-a716-446655440004',
-            session_id='550e8400-e29b-41d4-a716-446655440000',
+            observation_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440004'),
+            session_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440000'),
             state_version=1,
             fact_key='present_illness.chills',
             value='怕冷明显',
             normalized_value=None,
-            status='active',
+            status=ObservationStatus.ACTIVE,
         ),
         SyndromeObservationContext(
-            observation_id='550e8400-e29b-41d4-a716-446655440005',
-            session_id='550e8400-e29b-41d4-a716-446655440000',
+            observation_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440005'),
+            session_id=cast(UUID, '550e8400-e29b-41d4-a716-446655440000'),
             state_version=1,
             fact_key='present_illness.rhinorrhea',
             value='流清涕',
             normalized_value=None,
-            status='active',
+            status=ObservationStatus.ACTIVE,
         ),
     ]
 
@@ -93,7 +99,7 @@ async def main():
     print(f'  Rewrite model: {s.rag_query_rewrite_model}')
     print()
 
-    from app.rag.reasoning_retrieval import rewrite_syndrome_query, build_syndrome_query
+    from app.rag.reasoning_retrieval import build_syndrome_query, rewrite_syndrome_query
 
     orig_query = build_syndrome_query(observations)
     print(f'  Original query ({len(orig_query)} chars):')
@@ -114,9 +120,9 @@ async def main():
         print(f'    {rewritten}')
         print()
         if rewritten != orig_query:
-            print(f'  Verdict: REWRITE SUCCESS — output differs from key=value input')
+            print('  Verdict: REWRITE SUCCESS — output differs from key=value input')
         else:
-            print(f'  Verdict: NO CHANGE — output same as input')
+            print('  Verdict: NO CHANGE — output same as input')
     except Exception as e:
         latency = (time.perf_counter() - start) * 1000
         print(f'  Latency: {latency:.0f}ms')

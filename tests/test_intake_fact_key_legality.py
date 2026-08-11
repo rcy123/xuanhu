@@ -11,13 +11,10 @@ RETRACT 清脏。
 
 from __future__ import annotations
 
-from uuid import UUID, uuid4, uuid5
-from uuid import NAMESPACE_URL
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from app.agent_runtime.intake_fact_key_legality import (
     LEGAL_FACT_KEYS,
-    NormalizedObservation,
-    RejectedObservation,
     filter_legal_observations,
     normalized_observations_to_payload,
     rejected_observations_to_payload,

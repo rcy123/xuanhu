@@ -453,7 +453,7 @@ def _has_forbidden_authority_field(raw: Any) -> bool:
         if set(raw) & _FORBIDDEN_AUTHORITY_FIELDS:
             return True
         return any(_has_forbidden_authority_field(value) for value in raw.values())
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         return any(_has_forbidden_authority_field(value) for value in raw)
     return False
 
@@ -480,10 +480,10 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 for name in allowed
             )
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)

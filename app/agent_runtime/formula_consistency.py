@@ -17,7 +17,7 @@ from collections.abc import Iterable, Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -240,7 +240,10 @@ def apply_modifications_to_base(
     ).base_formula
     if canonical_base is None:
         raise _ConsistencyFailure(FormulaConsistencyFailureCode.SCHEMA_INVALID)
-    return _apply_modifications(canonical_base, modifications)
+    return cast(
+        FormulaComposition,
+        _apply_modifications(cast(CanonicalFormula, canonical_base), modifications),
+    )
 
 
 def verify_formula_consistency(
@@ -567,7 +570,7 @@ def _decimal_text(value: Decimal) -> str:
 
 
 def _verify_evidence_contract(
-    output: FormulaDraft | None,
+    output: FormulaDraft,
     *,
     policy_version: str | None,
     evidence_ids: frozenset[str],
@@ -683,7 +686,7 @@ def _contains_forbidden_key(value: object) -> bool:
             str(key).casefold() in _FORBIDDEN_AUTHORITY_KEYS or _contains_forbidden_key(item)
             for key, item in value.items()
         )
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, list | tuple | set | frozenset):
         return any(_contains_forbidden_key(item) for item in value)
     return False
 
@@ -699,7 +702,7 @@ def _has_hidden_or_extra_fields(value: object) -> bool:
     ) or any(
         _has_hidden_or_extra_fields(item)
         for item in vars(value).values()
-        if isinstance(item, (tuple, list))
+        if isinstance(item, tuple | list)
         for item in item
         if isinstance(item, BaseModel)
     )

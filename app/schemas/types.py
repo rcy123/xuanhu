@@ -89,6 +89,16 @@ class SafetyIssueType(StrEnum):
     ALLERGY = "allergy"
     COMBINATION = "combination"
     CAUTION = "caution"
+    # R4-A：患者条件与药材 contraindications 精确匹配（BLOCKER）。
+    HERB_CONTRAINDICATION = "herb_contraindication"
+    # R4-A：患者用药存在但知识库无权威相互作用数据时的覆盖率门禁（HIGH）。
+    MEDICATION_INTERACTION_COVERAGE = "medication_interaction_coverage"
+    # R4-B：患者条件（major + special）合并条目数超过有界上限时，无法完整审核
+    # 药材禁忌的 fail-closed 覆盖率门禁（HIGH，固定文本，不含条件名）。
+    PATIENT_CONTEXT_COVERAGE = "patient_context_coverage"
+    # R4-B：单味药 contraindications 条目数超过有界上限时，无法确认是否存在禁忌
+    # 命中的 fail-closed 覆盖率门禁（HIGH，固定文本，不含原始禁忌条目）。
+    HERB_CONTRAINDICATION_COVERAGE = "herb_contraindication_coverage"
 
 
 class RollbackTarget(StrEnum):

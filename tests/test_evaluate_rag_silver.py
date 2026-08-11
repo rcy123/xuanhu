@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -403,9 +404,32 @@ def test_resume_r1_requires_bge_m3_even_with_positive_confidence_intervals() -> 
 
 
 def test_contract_environment_disables_unprovenanced_embedding_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("EMBEDDING_CACHE_TTL_SECONDS", raising=False)
-    evaluator.set_contract_environment("xuanhu_knowledge_v4")
-    assert __import__("os").environ["EMBEDDING_CACHE_TTL_SECONDS"] == "0"
+    contract_keys = {
+        "MILVUS_COLLECTION",
+        "RAG_QUERY_REWRITE_ENABLED",
+        "RAG_QUERY_REWRITE_MODEL_TEMPERATURE",
+        "RAG_TOP_K_VECTOR",
+        "RAG_TOP_K_FULLTEXT",
+        "RAG_RERANKER_ENABLED",
+        "RAG_RERANKER_PROVIDER",
+        "RAG_RERANKER_TOP_K",
+        "RAG_RERANKER_FINAL_TOP_K",
+        "RAG_TOP_N_FINAL",
+        "EMBEDDING_CACHE_TTL_SECONDS",
+    }
+    original = {key: os.environ.get(key) for key in contract_keys}
+    missing = {key for key in contract_keys if key not in os.environ}
+    with monkeypatch.context() as env_patch:
+        for key in contract_keys:
+            env_patch.setenv(key, os.environ.get(key, "__pytest_contract_env_placeholder__"))
+        evaluator.set_contract_environment("xuanhu_knowledge_v4")
+        assert os.environ["EMBEDDING_CACHE_TTL_SECONDS"] == "0"
+        assert os.environ["RAG_QUERY_REWRITE_ENABLED"] == "true"
+    for key in contract_keys:
+        if key in missing:
+            assert key not in os.environ
+        else:
+            assert os.environ[key] == original[key]
 
 
 def _preflight_for_report() -> dict[str, Any]:

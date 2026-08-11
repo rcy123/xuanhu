@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import (
     DomainDelta,
     DomainReducerError,
@@ -15,6 +16,7 @@ from app.agent_runtime.reducer import (
     ReducerErrorCode,
     domain_delta_digest,
     reduce_domain_state,
+    validate_domain_delta,
 )
 from app.agent_runtime.specs import AgentSpec, ModelPolicy, RunArtifact, RunSpec
 from app.agent_runtime.verifiers import (
@@ -517,3 +519,344 @@ def test_artifact_revision_supersedes_current_and_explicit_invalidation_is_idemp
     replay_delta = make_delta(state=invalidated, run_id=uuid4(), invalidations=(artifact_id,))
     replayed = reduce_domain_state(invalidated, replay_delta, authorized(replay_delta, invalidated))
     assert replayed == invalidated
+
+
+def _fixed_uuid(suffix: int) -> UUID:
+    return UUID(f"00000000-0000-0000-0000-{suffix:012d}")
+
+
+_REDUCER_BASE_TS = datetime(2026, 8, 10, 8, 0, 0, tzinfo=UTC)
+
+
+def fixed_observation(
+    *,
+    obs_id: UUID,
+    session_id: UUID,
+    source_id: UUID,
+    fact_key: str = "chief_complaint",
+    value: object = "headache",
+    normalized_value: object = None,
+    status: ObservationStatus = ObservationStatus.ACTIVE,
+    target_id: UUID | None = None,
+    created_at: datetime = _REDUCER_BASE_TS,
+) -> ObservationSchema:
+    return ObservationSchema(
+        observation_id=obs_id,
+        session_id=session_id,
+        fact_key=fact_key,
+        value=value,
+        normalized_value=normalized_value,
+        source_message_id=source_id,
+        status=status,
+        supersedes_observation_id=target_id,
+        created_at=created_at,
+    )
+
+
+def test_duplicate_add_across_source_and_id_is_true_noop() -> None:
+    """R2-B1: ADD 同一 canonical fact_key + 同一有效值 → 无论 observation_id/
+    source/confidence/created_at 如何变化, 恒为真 no-op: 不 bump state_version,
+    不使 CURRENT artifact 失效。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(obs_id=_fixed_uuid(20), session_id=session_id, source_id=source1, value="headache")
+    artifact = artifact_revision(
+        session_id=session_id,
+        run_id=run_id,
+        artifact_id=_fixed_uuid(30),
+        revision=1,
+        input_version=1,
+    )
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,), artifacts=(artifact,))
+
+    duplicate = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        value="headache",
+        created_at=_REDUCER_BASE_TS + timedelta(hours=1),
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(duplicate,), sources=(source2,))
+    replayed = reduce_domain_state(state, delta, authorized(delta, state, sources=frozenset({source2})))
+
+    assert replayed == state
+    assert replayed.state_version == 1
+    assert replayed.observations == state.observations
+    assert replayed.artifacts[0].status is ArtifactStatus.CURRENT
+
+
+def test_normalized_equivalent_add_is_noop() -> None:
+    """R2-B1: 有效值 = normalized_value(若有)否则 value; 归一化等价的两条 ADD 恒 no-op。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(
+        obs_id=_fixed_uuid(20),
+        session_id=session_id,
+        source_id=source1,
+        fact_key="present_illness.chills",
+        value="头 痛",
+        normalized_value="头痛",
+    )
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    equivalent = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="present_illness.chills",
+        value="头痛",
+        normalized_value="头痛",
+        created_at=_REDUCER_BASE_TS + timedelta(hours=1),
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(equivalent,), sources=(source2,))
+    replayed = reduce_domain_state(state, delta, authorized(delta, state, sources=frozenset({source2})))
+
+    assert replayed == state
+    assert replayed.state_version == 1
+
+
+def test_different_effective_value_add_conflicts() -> None:
+    """R2-B1: ADD 同一 key/不同有效值 → 确定性拒绝 OBSERVATION_SOURCE_CONFLICT。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(obs_id=_fixed_uuid(20), session_id=session_id, source_id=source1, value="headache")
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    conflict = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        value="migraine",
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(conflict,), sources=(source2,))
+    report = verified(delta, state, sources=frozenset({source2}))
+
+    assert report.failure_code is VerificationFailureCode.OBSERVATION_SOURCE_CONFLICT
+    assert report.requires_human is True
+
+
+def test_same_value_correct_is_true_noop() -> None:
+    """R2-B1: CORRECT 到与当前链头相同的有效值 → 无论新 id/source 如何恒 no-op。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(
+        obs_id=_fixed_uuid(20),
+        session_id=session_id,
+        source_id=source1,
+        fact_key="onset.duration",
+        value="3 days",
+    )
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    same_value = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="onset.duration",
+        value="3 days",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(same_value,), sources=(source2,))
+    replayed = reduce_domain_state(state, delta, authorized(delta, state, sources=frozenset({source2})))
+
+    assert replayed == state
+    assert replayed.state_version == 1
+    assert replayed.observations == (first,)
+
+
+def test_different_value_correct_changes_once_and_exposes_only_successor() -> None:
+    """R2-B1: CORRECT 到不同值 → 恰好追加一条后继, 当前投影只暴露后继一条真值;
+    重放同事件(新 id 同 provenance)恒 no-op。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(
+        obs_id=_fixed_uuid(20),
+        session_id=session_id,
+        source_id=source1,
+        fact_key="onset.duration",
+        value="3 days",
+    )
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    correction = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="onset.duration",
+        value="5 days",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(correction,), sources=(source2,))
+    corrected = reduce_domain_state(state, delta, authorized(delta, state, sources=frozenset({source2})))
+
+    assert corrected.state_version == 2
+    assert corrected.observations == (first, correction)
+    current = project_current_observations(corrected.observations)
+    assert current == (correction,)
+    assert current[0].value == "5 days"
+
+    replay = correction.model_copy(update={"observation_id": _fixed_uuid(22)})
+    replay_delta = make_delta(state=corrected, run_id=run_id, observations=(replay,), sources=(source2,))
+    replayed = reduce_domain_state(
+        corrected,
+        replay_delta,
+        authorized(replay_delta, corrected, sources=frozenset({source2})),
+    )
+    assert replayed == corrected
+
+
+def test_retract_changes_once_and_exposes_no_current_truth() -> None:
+    """R2-B1: RETRACT 到精确链头 → 追加墓碑, 该链不再有当前真值。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+    first = fixed_observation(obs_id=_fixed_uuid(20), session_id=session_id, source_id=source1, value="headache")
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    tombstone = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        value=None,
+        status=ObservationStatus.RETRACTED,
+        target_id=_fixed_uuid(20),
+    )
+    delta = make_delta(state=state, run_id=run_id, observations=(tombstone,), sources=(source2,))
+    retracted = reduce_domain_state(state, delta, authorized(delta, state, sources=frozenset({source2})))
+
+    assert retracted.state_version == 2
+    assert retracted.observations == (first, tombstone)
+    assert project_current_observations(retracted.observations) == ()
+
+
+def test_correct_rejects_stale_target_and_wrong_fact_key_and_missing_target() -> None:
+    """R2-B1: CORRECT 必须命中精确当前链头; stale 目标/错误 fact_key/不存在目标
+    分别确定性拒绝 OBSERVATION_TARGET_NOT_CURRENT / _FACT_KEY_MISMATCH / _NOT_FOUND。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2 = _fixed_uuid(10), _fixed_uuid(11)
+
+    first = fixed_observation(
+        obs_id=_fixed_uuid(20),
+        session_id=session_id,
+        source_id=source1,
+        fact_key="onset.duration",
+        value="3 days",
+    )
+    successor = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="onset.duration",
+        value="5 days",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    superseded_state = DomainState(session_id=session_id, state_version=1, observations=(first, successor))
+
+    stale = fixed_observation(
+        obs_id=_fixed_uuid(22),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="onset.duration",
+        value="7 days",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    with pytest.raises(DomainReducerError) as not_current:
+        validate_domain_delta(
+            superseded_state,
+            make_delta(state=superseded_state, run_id=run_id, observations=(stale,), sources=(source2,)),
+        )
+    assert not_current.value.code is ReducerErrorCode.OBSERVATION_TARGET_NOT_CURRENT
+
+    plain_state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+    wrong_key = fixed_observation(
+        obs_id=_fixed_uuid(23),
+        session_id=session_id,
+        source_id=source2,
+        fact_key="onset.onset",
+        value="7 days",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    with pytest.raises(DomainReducerError) as key_mismatch:
+        validate_domain_delta(
+            plain_state,
+            make_delta(state=plain_state, run_id=run_id, observations=(wrong_key,), sources=(source2,)),
+        )
+    assert key_mismatch.value.code is ReducerErrorCode.OBSERVATION_FACT_KEY_MISMATCH
+
+    missing_target = stale.model_copy(update={"supersedes_observation_id": _fixed_uuid(999)})
+    with pytest.raises(DomainReducerError) as not_found:
+        validate_domain_delta(
+            plain_state,
+            make_delta(state=plain_state, run_id=run_id, observations=(missing_target,), sources=(source2,)),
+        )
+    assert not_found.value.code is ReducerErrorCode.OBSERVATION_TARGET_NOT_FOUND
+
+
+def test_two_operations_in_one_delta_cannot_create_two_current_truths() -> None:
+    """R2-B1: 单个 delta 内 ADD(不同值)+ CORRECT(不同值)同 canonical key,
+    无论操作顺序如何都拒绝——不得出现两条当前真值。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2, source3 = _fixed_uuid(10), _fixed_uuid(11), _fixed_uuid(12)
+    first = fixed_observation(obs_id=_fixed_uuid(20), session_id=session_id, source_id=source1, value="headache")
+    state = DomainState(session_id=session_id, state_version=1, observations=(first,))
+
+    add_op = fixed_observation(
+        obs_id=_fixed_uuid(21),
+        session_id=session_id,
+        source_id=source2,
+        value="back pain",
+    )
+    correct_op = fixed_observation(
+        obs_id=_fixed_uuid(22),
+        session_id=session_id,
+        source_id=source3,
+        value="migraine",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+
+    add_first = make_delta(
+        state=state,
+        run_id=run_id,
+        observations=(add_op, correct_op),
+        sources=(source2, source3),
+    )
+    add_first_report = verified(add_first, state, sources=frozenset({source2, source3}))
+    assert add_first_report.failure_code is VerificationFailureCode.OBSERVATION_SOURCE_CONFLICT
+
+    correct_first = make_delta(
+        state=state,
+        run_id=run_id,
+        observations=(correct_op, add_op),
+        sources=(source2, source3),
+    )
+    correct_first_report = verified(correct_first, state, sources=frozenset({source2, source3}))
+    assert correct_first_report.failure_code is VerificationFailureCode.OBSERVATION_SOURCE_CONFLICT
+
+
+def test_correct_to_one_of_duplicate_heads_rejects_two_truths() -> None:
+    """R2-B1: 目标链头外已存在另一条同 key 当前真值时, 换值 CORRECT 不得再造一条。"""
+    session_id, run_id = _fixed_uuid(1), _fixed_uuid(2)
+    source1, source2, source3 = _fixed_uuid(10), _fixed_uuid(11), _fixed_uuid(12)
+    first = fixed_observation(obs_id=_fixed_uuid(20), session_id=session_id, source_id=source1, value="headache")
+    dup_head = fixed_observation(obs_id=_fixed_uuid(21), session_id=session_id, source_id=source2, value="headache")
+    state = DomainState(session_id=session_id, state_version=1, observations=(first, dup_head))
+
+    correction = fixed_observation(
+        obs_id=_fixed_uuid(22),
+        session_id=session_id,
+        source_id=source3,
+        value="migraine",
+        status=ObservationStatus.CORRECTED,
+        target_id=_fixed_uuid(20),
+    )
+    with pytest.raises(DomainReducerError) as two_truths:
+        validate_domain_delta(
+            state,
+            make_delta(state=state, run_id=run_id, observations=(correction,), sources=(source3,)),
+        )
+    assert two_truths.value.code is ReducerErrorCode.OBSERVATION_SOURCE_CONFLICT

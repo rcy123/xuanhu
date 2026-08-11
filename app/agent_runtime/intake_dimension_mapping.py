@@ -36,9 +36,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, NamedTuple, cast
+from uuid import NAMESPACE_URL, UUID, uuid5
 
+from app.agent_runtime.observation_projection import project_current_observations
 from app.schemas.completeness import InquiryDimension
 
 #: 各完整体维度 → 该维度临床语义下所有可命中的 fact_key（canonical + 派生）。
@@ -403,58 +407,242 @@ def dimension_slot_satisfied(
     return slot_count >= threshold
 
 
+#: R2-A 每维槽位硬上限——与 ``DimensionSlotSnapshot.slots.max_length=16`` 对齐。
+MAX_SLOTS_PER_DIMENSION_HARD_CAP: int = 16
+#: R2-A 全局槽位硬上限——图状态可承载的槽位投影总量有限,取有限全局硬上限。
+MAX_TOTAL_SLOTS_HARD_CAP: int = 64
+
+_EPOCH_UTC: datetime = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _validate_cap(value: object, *, name: str, hard_max: int) -> int:
+    """R2-A: 校验每维/全局槽位上限是「真正整数」且不超过硬上限。
+
+    bool 是 int 子类,必须显式拒绝;非 int(如 float)同样拒绝。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    if value > hard_max:
+        raise ValueError(f"{name} must not exceed the hard cap {hard_max}, got {value}")
+    return value
+
+
+def _observation_id_of(fact: Any) -> str:
+    observation_id = getattr(fact, "observation_id", None)
+    return "" if observation_id is None else str(observation_id)
+
+
+def _normalized_created_at(fact: Any) -> datetime:
+    created_at = getattr(fact, "created_at", None)
+    if created_at is None:
+        return _EPOCH_UTC
+    created_ts = cast(datetime, created_at)
+    if created_ts.tzinfo is None:
+        return created_ts.replace(tzinfo=UTC)
+    return created_ts
+
+
+def _slot_value_of(fact: Any) -> Any:
+    normalized = getattr(fact, "normalized_value", None)
+    if normalized is not None:
+        return normalized
+    return getattr(fact, "value", None)
+
+
+def _confidence_of(fact: Any) -> float:
+    confidence = getattr(fact, "confidence", None)
+    return 0.9 if confidence is None else cast(float, confidence)
+
+
+def _is_json_safe(value: Any) -> bool:
+    """R2-A: 严格 JSON 校验——``json.dumps(..., allow_nan=False)`` + ``json.loads`` 往返。
+
+    拒绝 NaN/Infinity(TypeError/ValueError)与非可序列化类型(集合/UUID/datetime 等)。
+    """
+    try:
+        payload = json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    try:
+        json.loads(payload)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _canonical_dimension_for(fact_key: str, dims: tuple[InquiryDimension, ...]) -> InquiryDimension | None:
+    """R2-A: 键只经 ``DIMENSION_KEYSETS``(单一真源)归属;多键集命中取枚举值最小维度(确定)。"""
+    for dimension in dims:
+        if fact_key in DIMENSION_KEYSETS.get(dimension, ()):
+            return dimension
+    return None
+
+
+def _slot_id_for(dimension: InquiryDimension, fact_key: str) -> str:
+    """R2-A: 确定性稳定槽位标识——uuid5(NAMESPACE_URL, canonical 维度 + fact_key)。
+
+    不依赖输入顺序/时间戳/置信度/模型文本;纠正同一 canonical 槽位的值(新 observation、
+    同 fact_key)时保持不变的字符串。
+    """
+    return str(uuid5(NAMESPACE_URL, f"xuanhu:slot:{dimension.value}:{fact_key}"))
+
+
+class _SlotItem(NamedTuple):
+    dimension: InquiryDimension
+    fact_key: str
+    fact: Any
+    slot_id: str
+    preserved: bool
+
+
+def _pick_winner(candidates: list[Any], preserved_ids: frozenset[str]) -> Any:
+    """R2-A: 同一 canonical 槽位(slot_id)去重赢家。
+
+    若请求保留的 observation_id 在该槽位重复候选(当前链头)内,则优先;
+    否则确定性赢家 = newest valid created_at,随后稳定 observation_id 平局决胜。
+    """
+    preserved = [fact for fact in candidates if _observation_id_of(fact) in preserved_ids]
+    pool = preserved if preserved else candidates
+    return max(pool, key=lambda fact: (_normalized_created_at(fact), _observation_id_of(fact)))
+
+
 def derive_dimension_slots(
     active_facts: tuple[Any, ...],
     *,
     dimensions: frozenset[InquiryDimension],
     max_slots_per_dimension: int = 8,
+    max_total_slots: int = 32,
+    preserve_observation_ids: frozenset[UUID | str] = frozenset(),
 ) -> tuple[dict[str, Any], ...]:
-    """2b: 从已验证 observations 派生粗槽位快照(JSON-safe dict,可入 Graph State)。
+    """R2-A: 从已验证 observations 派生粗槽位快照(JSON-safe dict,可入 Graph State)。
 
-    设计(决策 12「改容器不改判定」+ 2.5a 灰度):
-    - 不做模型契约变更——槽位对象由确定性代码从 E1/D1 已验证的 observations
-      按 ``DIMENSION_KEYSETS`` 归属派生,落库单元仍是裸键(过渡期,E1/D1 保留);
-    - 每个维度一个快照:slots = 该维度 keyset 内已采到的 (fact_key, value) 语义项,
-      completeness 按粗槽位阈值判定(complete / partial),missing_slots 列阈值缺口;
-    - 灰度关闭时 covered 判定仍认键(现状);开启时认槽位齐(阶段 2c 接入),
-      两个口径的判定阈值同源(``MATURITY_KEY_THRESHOLDS``),迁移不改变判定结果。
+    ``active_facts`` 接受完整 append-only 观测历史(任意顺序);R2-B1 起**当前语义事实**由
+    :func:`~app.agent_runtime.observation_projection.project_current_observations` 在函数内部
+    权威投影为链头后再派生:
+    - CORRECTED 链头是当前真值,参与派生;其被取代的 ACTIVE 根被排除;
+    - RETRACTED 链头被排除(整链无当前真值);
+    - 其余权威投影契约(2a/2b 决策 12「改容器不改判定」+ 2.5a 灰度)不变:
+    - 键只经 ``DIMENSION_KEYSETS`` 归属(canonical 真源),越界键不派生、不计数;
+    - 非 JSON 值(``json.dumps(..., allow_nan=False)`` + ``json.loads`` 往返)拒绝并计入
+      ``sanitized_count``;
+    - 同一 canonical 槽位去重取确定性赢家(newest created_at + 稳定 observation_id 平局);
+      ``preserve_observation_ids`` 内的有效候选可为赢家(显式纠正目标不被丢弃);
+    - 稳定 ``slot_id = uuid5(NAMESPACE_URL, dimension + fact_key)``,值/observation 变化不变;
+    - 维度按枚举值排序、槽位按 canonical fact_key/slot_id 排序,与输入顺序无关;
+    - 每维/全局 cap 确定性截断:有效保留 ID 优先于普通候选,但最终槽位仍按 canonical 序序列化;
+      全局选择恒保持在每维 cap 内;保留候选单维/全局超 cap 时取 canonical-first 子集。
+      无效保留 ID(已被取代/不存在/越维)被忽略;
+    - ``slot_count`` = 发射数;``candidate_count`` = 去重+清洗后候选数(cap 前);
+      ``sanitized_count`` = 非 JSON 值拒绝数;``truncated`` = slot_count < candidate_count;
+    - 每个派生快照恒填充 ``projection_version`` / ``per_dimension_cap`` / ``global_cap``;
+    - completeness 由**完整去重候选数**判定(非发射数)——观测性 cap 不改变医学完整性判定。
     """
+
+    per_dim_cap = _validate_cap(
+        max_slots_per_dimension, name="max_slots_per_dimension", hard_max=MAX_SLOTS_PER_DIMENSION_HARD_CAP
+    )
+    global_cap = _validate_cap(max_total_slots, name="max_total_slots", hard_max=MAX_TOTAL_SLOTS_HARD_CAP)
+    preserved_ids = frozenset(str(pid) for pid in preserve_observation_ids)
+    dims = tuple(sorted(dimensions, key=lambda dimension: dimension.value))
 
     from app.schemas.intake import DimensionSlotSnapshot, DimensionSlotValue, SlotCompleteness
 
-    by_dimension: dict[InquiryDimension, list[Any]] = {d: [] for d in dimensions}
-    for fact in active_facts:
-        key = getattr(fact, "fact_key", None)
-        if not isinstance(key, str):
+    raw_by_dimension: dict[InquiryDimension, list[Any]] = {dimension: [] for dimension in dims}
+    for fact in project_current_observations(active_facts):
+        fact_key = getattr(fact, "fact_key", None)
+        if not isinstance(fact_key, str):
             continue
-        for dimension in dimensions:
-            if key in DIMENSION_KEYSETS.get(dimension, ()):
-                by_dimension[dimension].append(fact)
-                break
+        dimension = _canonical_dimension_for(fact_key, dims)
+        if dimension is None:
+            continue
+        raw_by_dimension[dimension].append(fact)
+
+    meta: dict[InquiryDimension, tuple[int, int]] = {}
+    all_selected: list[_SlotItem] = []
+
+    for dimension in dims:
+        raw = raw_by_dimension[dimension]
+        sanitized_count = 0
+        valid: list[Any] = []
+        for fact in raw:
+            if _is_json_safe(_slot_value_of(fact)):
+                valid.append(fact)
+            else:
+                sanitized_count += 1
+
+        by_fact_key: dict[str, list[Any]] = {}
+        for fact in valid:
+            by_fact_key.setdefault(fact.fact_key, []).append(fact)
+
+        items: list[_SlotItem] = []
+        for fact_key, candidates in by_fact_key.items():
+            winner = _pick_winner(candidates, preserved_ids)
+            items.append(
+                _SlotItem(
+                    dimension=dimension,
+                    fact_key=fact_key,
+                    fact=winner,
+                    slot_id=_slot_id_for(dimension, fact_key),
+                    preserved=_observation_id_of(winner) in preserved_ids,
+                )
+            )
+        items.sort(key=lambda item: (item.fact_key, item.slot_id))
+        candidate_count = len(items)
+        meta[dimension] = (candidate_count, sanitized_count)
+
+        preserved_items = [item for item in items if item.preserved]
+        ordinary_items = [item for item in items if not item.preserved]
+        kept = preserved_items[:per_dim_cap]
+        kept.extend(ordinary_items[: per_dim_cap - len(kept)])
+        all_selected.extend(kept)
+
+    def _global_sort_key(item: _SlotItem) -> tuple[str, str, str]:
+        return (item.dimension.value, item.fact_key, item.slot_id)
+
+    preserved_selected = sorted([item for item in all_selected if item.preserved], key=_global_sort_key)
+    ordinary_selected = sorted([item for item in all_selected if not item.preserved], key=_global_sort_key)
+    kept_global = preserved_selected[:global_cap]
+    kept_global.extend(ordinary_selected[: global_cap - len(kept_global)])
+
+    final_by_dimension: dict[InquiryDimension, list[_SlotItem]] = {}
+    for item in kept_global:
+        final_by_dimension.setdefault(item.dimension, []).append(item)
 
     snapshots: list[dict[str, Any]] = []
-    for dimension in sorted(dimensions, key=lambda item: item.value):
-        facts = by_dimension[dimension][:max_slots_per_dimension]
-        slot_count = len(facts)
-        satisfied = dimension_slot_satisfied(dimension, slot_count)
+    for dimension in dims:
+        candidate_count, sanitized_count = meta[dimension]
+        selected = final_by_dimension.get(dimension, [])
+        selected.sort(key=lambda item: (item.fact_key, item.slot_id))
+        slot_count = len(selected)
+        # completeness 用完整去重候选数(非发射数):观测性 cap 不改变医学完整性判定。
+        satisfied = dimension_slot_satisfied(dimension, candidate_count)
         threshold = slot_threshold_for(dimension)
-        missing = ()
-        if not satisfied and slot_count < threshold:
-            missing = (f"还需采集 {threshold - slot_count} 项该维度语义",)
+        missing: tuple[str, ...] = ()
+        if not satisfied and candidate_count < threshold:
+            missing = (f"还需采集 {threshold - candidate_count} 项该维度语义",)
         snapshots.append(
             DimensionSlotSnapshot(
                 dimension=dimension.value,
                 slots=tuple(
                     DimensionSlotValue(
-                        slot_name=fact.fact_key,
-                        value=(fact.normalized_value if fact.normalized_value is not None else fact.value),
-                        source_message_id=fact.source_message_id,
-                        confidence=fact.confidence if fact.confidence is not None else 0.9,
+                        slot_id=item.slot_id,
+                        slot_name=item.fact_key,
+                        value=_slot_value_of(item.fact),
+                        source_message_id=getattr(item.fact, "source_message_id", None),
+                        confidence=_confidence_of(item.fact),
                     )
-                    for fact in facts
+                    for item in selected
                 ),
                 completeness=(SlotCompleteness.COMPLETE if satisfied else SlotCompleteness.PARTIAL),
                 missing_slots=missing,
+                slot_count=slot_count,
+                candidate_count=candidate_count,
+                sanitized_count=sanitized_count,
+                truncated=slot_count < candidate_count,
+                per_dimension_cap=per_dim_cap,
+                global_cap=global_cap,
             ).model_dump(mode="json")
         )
     return tuple(snapshots)
@@ -473,19 +661,19 @@ def derive_slot_context_rows(
     灰度开启时下游辨证/开方 prompt 看到规整的维度槽位对象,而非裸 fact_key
     列表(问题 22)。行结构对齐 SyndromeObservationContext 可映射形状:
     - fact_key = 维度枚举值(程序定义,无漂移键)
-    - value = 槽位快照(JSON-safe:dimension/slots/completeness/missing_slots)
+    - value = 槽位快照(JSON-safe:dimension/slots/completeness/missing_slots,
+      并携带 R2-A 投影版本/计数/cap 元数据)
     - 无槽位(空提取)的维度不产行;observation_id 用稳定 uuid5(session_id, dimension)。
+
+    R2-B1: 当前语义事实(链头,含 CORRECTED 后继、排除被取代根与 RETRACTED 头)由
+    ``derive_dimension_slots`` 内部权威投影,此处不再预过滤;派生走有界默认 cap
+    (每维 8 / 全局 32),value 保留投影版本与计数元数据。
 
     适配说明(review nit):入参 observations 为 DomainState 的 ObservationSchema
     (有 value/normalized_value/source_message_id/confidence);若从 completeness
     snapshot 传入 CompletenessObservationFact 需先做字段适配。
     """
-    from uuid import NAMESPACE_URL, uuid5
-
-    from app.schemas.domain import ObservationStatus
-
-    active = tuple(item for item in observations if getattr(item, "status", None) is ObservationStatus.ACTIVE)
-    snapshots = derive_dimension_slots(active, dimensions=dimensions)
+    snapshots = derive_dimension_slots(observations, dimensions=dimensions)
     rows: list[dict[str, Any]] = []
     for snapshot in snapshots:
         if not snapshot.get("slots"):

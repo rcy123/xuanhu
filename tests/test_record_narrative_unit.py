@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.agent import (
     FormulaResult,
     HerbDose,
@@ -14,6 +13,7 @@ from app.schemas.agent import (
     SafetyRuleResult,
     Severity,
 )
+from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.services.langgraph_record import _clinical_record_fields, _render_record_text
 
 

@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.schemas.domain import GateDecision, GateResultSchema
-from app.schemas.intake import CandidateSeverity, RedFlagCategory
+from app.schemas.intake import CandidateSeverity, RedFlagCandidate, RedFlagCategory
 from app.schemas.triage import (
     TRIAGE_GATE_NAME,
     TRIAGE_POLICY_VERSION,
@@ -297,10 +297,10 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 for name in allowed
             )
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)

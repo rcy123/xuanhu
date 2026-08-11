@@ -29,6 +29,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -44,6 +45,7 @@ from app.agent_runtime.formula_verifier import (
     verify_formula_artifact,
 )
 from app.agent_runtime.graph import build_main_graph
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import DomainState
 from app.agent_runtime.repository import ReasoningAuthoritySnapshot
 from app.agent_runtime.runner import GraphRunner
@@ -358,11 +360,7 @@ def _input(
         observations=obs,
         safety_profile=safety_profile or _ready_safety(sid),
     )
-    superseded_ids = {
-        item.supersedes_observation_id
-        for item in obs
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    }
+    current = project_current_observations(obs)
     context = context_observations or tuple(
         SyndromeObservationContext(
             observation_id=item.observation_id,
@@ -373,8 +371,7 @@ def _input(
             normalized_value=item.normalized_value,
             status=ObservationStatus.ACTIVE,
         )
-        for item in obs
-        if item.status is ObservationStatus.ACTIVE and item.observation_id not in superseded_ids
+        for item in current
     )
     draft = syndrome_draft or _syndrome_draft()
     # Rebuild syndrome draft with actual fact IDs if not provided
@@ -556,8 +553,7 @@ async def _execute(
                 normalized_value=item.normalized_value,
                 status=ObservationStatus.ACTIVE,
             )
-            for item in input_payload.domain_state.observations
-            if item.status is ObservationStatus.ACTIVE
+            for item in project_current_observations(input_payload.domain_state.observations)
         )
         syndrome_input = SyndromeDraftInput(
             session_id=input_payload.session_id,
@@ -967,6 +963,196 @@ def test_unknown_inactive_superseded_and_cross_session_fact_ids_are_rejected() -
         syndrome_run_spec=syn_run,
     )
     assert cross_report.failure_code is FormulaVerificationFailureCode.FACT_LINK_INVALID
+
+
+# 命中身份证正则以「6 位前缀 + 11 位分隔数字 + 1 位数字」布局的确定性 UUID 字面量
+# （``00104524-0456-4789-99`` 在身份证正则可构成合法匹配）。它是 flake 回归的确定性锚点。
+_COLLIDING_SOURCE_MESSAGE_ID = uuid.UUID("00104524-0456-4789-99ff-276f0aa4a030")
+_COLLIDING_UUID = str(_COLLIDING_SOURCE_MESSAGE_ID)
+_COLLIDING_PHONE = "13800138000"
+_COLLIDING_ID_CARD = "110101199003078517"
+
+
+def test_slot_source_message_id_uuid_exemption_is_key_scoped_deterministic() -> None:
+    """Deterministic regression for the UUID/PII privacy-gate flake (Formula).
+
+    与 L4-1 同口径：构造权威槽位快照，其 ``source_message_id`` 正是那个会命中身份证正则的
+    UUID。通过 :func:`verify_formula_artifact` 的真实 context 入口端到端校验必须通过（不是只
+    断言私有 helper）；同一真实 verifier 路径下手机号 / 身份证号必须各自 CONTEXT_PRIVACY_
+    INVALID；同一个 UUID 字面量出现在任意业务 value/note 下不得获得豁免（key-aware 范围）。
+    """
+    sid = uuid.uuid4()
+    observations = tuple(
+        obs.model_copy(update={"source_message_id": _COLLIDING_SOURCE_MESSAGE_ID}) for obs in _ready_observations(sid)
+    )
+    payload = _input(session_id=sid, observations=observations)
+
+    from app.agent_runtime.completeness_policy import COMPLETENESS_DIMENSION_RULES
+    from app.agent_runtime.intake_dimension_mapping import derive_slot_context_rows
+
+    rows = derive_slot_context_rows(
+        payload.domain_state.observations,
+        dimensions=frozenset(COMPLETENESS_DIMENSION_RULES),
+        state_version=payload.state_version,
+        session_id=payload.session_id,
+    )
+    assert rows, "slot projection must produce rows for the ready observations"
+    # 断言槽位快照确实携带了那个命中身份证正则的确定性 source_message_id。
+    assert any(
+        slot.get("source_message_id") == _COLLIDING_UUID for row in rows for slot in row["value"].get("slots", ())
+    )
+    projected_context = tuple(
+        SyndromeObservationContext(
+            observation_id=UUID(item["observation_id"]),
+            session_id=payload.session_id,
+            state_version=item["state_version"],
+            fact_key=item["fact_key"],
+            value=item["value"],
+            normalized_value=None,
+            status=ObservationStatus.ACTIVE,
+        )
+        for item in rows
+    )
+    # 用投影 context 的合成槽位 id 重建 syndrome_draft（引用与 context 一致），
+    # 并让输入携带同一投影 context —— formula verifier 消费的正是这个 context 入口。
+    all_ids = tuple(item.observation_id for item in projected_context)
+    first = projected_context[0].observation_id
+    projected_draft = SyndromeDraft(
+        decision=SyndromeDraftDecision.COMPLETED,
+        syndrome="风寒头痛证",
+        syndrome_basis=(SyndromeFactClaim(claim="头痛与怕冷支持风寒", fact_ids=all_ids),),
+        differential=(SyndromeFactClaim(claim="未见明显热象", fact_ids=(first,)),),
+        treatment_principle="疏风散寒止痛",
+        confidence=0.6,
+        evidence_mode=SYNDROME_EVIDENCE_MODE,
+        claim_evidence_links=(),
+        missing_inputs=(),
+        review_required=True,
+    )
+    projected_payload = payload.model_copy(
+        update={"context_observations": projected_context, "syndrome_draft": projected_draft}
+    )
+    run = _run(session_id=projected_payload.session_id, state_version=projected_payload.state_version)
+    spec = build_formula_agent_spec(model="fake-model")
+    syn_run = _syndrome_run_spec(projected_payload.session_id, projected_payload.state_version)
+    syn_artifact = _syndrome_artifact(projected_draft, syn_run)
+
+    # 端到端：权威槽位快照的 source_message_id 是该 UUID → 校验必须通过。
+    ok_report = verify_formula_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(_completed_formula(projected_payload), run),
+        input_payload=projected_payload,
+        gate_authority=_gate_authority(projected_payload),
+        syndrome_artifact=syn_artifact,
+        syndrome_run_spec=syn_run,
+    )
+    assert ok_report.passed, ok_report.failure_code
+
+    # 同一真实 verifier 路径：手机号 / 身份证号泄漏进槽位 value → 必须隐私拦截。
+    for leaked_value in (_COLLIDING_PHONE, _COLLIDING_ID_CARD):
+        leaked = projected_context[0].model_copy(update={"value": {"note": leaked_value}})
+        leaked_payload = projected_payload.model_copy(update={"context_observations": (leaked, *projected_context[1:])})
+        leaked_report = verify_formula_artifact(
+            agent_spec=spec,
+            run_spec=run,
+            artifact=_artifact(_completed_formula(leaked_payload), run),
+            input_payload=leaked_payload,
+            gate_authority=_gate_authority(leaked_payload),
+            syndrome_artifact=syn_artifact,
+            syndrome_run_spec=syn_run,
+        )
+        assert leaked_report.failure_code is FormulaVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+
+    # 关键负向（key-aware 范围）：同一个 UUID 字面量在任意业务 value/note 下不得豁免。
+    uuid_leak = projected_context[0].model_copy(update={"value": {"note": _COLLIDING_UUID}})
+    uuid_payload = projected_payload.model_copy(update={"context_observations": (uuid_leak, *projected_context[1:])})
+    uuid_report = verify_formula_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(_completed_formula(uuid_payload), run),
+        input_payload=uuid_payload,
+        gate_authority=_gate_authority(uuid_payload),
+        syndrome_artifact=syn_artifact,
+        syndrome_run_spec=syn_run,
+    )
+    assert uuid_report.failure_code is FormulaVerificationFailureCode.CONTEXT_PRIVACY_INVALID
+
+
+def test_context_projection_includes_corrected_head_excludes_root_and_retracted() -> None:
+    """R2-B1：formula plain 路径上下文必须包含 CORRECTED 后继，剔除被取代根与 RETRACTED 头。"""
+    from app.agents.formula_draft import _context_from_domain_state
+
+    sid = uuid.uuid4()
+    old = _observation(sid, "ten_questions.sleep", "normal")
+    corrected = _observation(
+        sid,
+        "ten_questions.sleep",
+        "insomnia",
+        status=ObservationStatus.CORRECTED,
+        supersedes=old.observation_id,
+    )
+    retracted_root = _observation(sid, "present_illness.change", "worse")
+    retracted = _observation(
+        sid,
+        "present_illness.change",
+        "none",
+        status=ObservationStatus.RETRACTED,
+        supersedes=retracted_root.observation_id,
+    )
+    state = DomainState(
+        session_id=sid,
+        state_version=3,
+        observations=(old, corrected, retracted_root, retracted),
+        safety_profile=_ready_safety(sid),
+    )
+    context = _context_from_domain_state(state)
+    by_id = {item.observation_id: item for item in context}
+    assert corrected.observation_id in by_id, "CORRECTED 后继必须是当前语义事实并出现在上下文中"
+    assert old.observation_id not in by_id, "被取代根不得出现在上下文中"
+    assert retracted.observation_id not in by_id, "RETRACTED 头不得出现在上下文中"
+    row = by_id[corrected.observation_id]
+    assert row.fact_key == corrected.fact_key
+    assert row.value == corrected.value
+    assert row.normalized_value == corrected.normalized_value
+    assert row.status is ObservationStatus.ACTIVE
+
+
+def test_corrected_head_fact_link_is_accepted() -> None:
+    """R2-B1：CORRECTED 后继未被再取代/撤回时是当前语义事实，方剂 basis 引用其 id 必须通过。"""
+    spec = build_formula_agent_spec(model="fake-model")
+    sid = uuid.uuid4()
+    old = _observation(sid, "symptom.corrected", "old")
+    corrected = _observation(
+        sid,
+        "symptom.corrected",
+        "new",
+        status=ObservationStatus.CORRECTED,
+        supersedes=old.observation_id,
+    )
+    payload = _input(session_id=sid, observations=(*_ready_observations(sid), old, corrected))
+    run = _run(session_id=payload.session_id, state_version=payload.state_version)
+    syn_run = _syndrome_run_spec(payload.session_id, payload.state_version)
+    syn_artifact = _syndrome_artifact(payload.syndrome_draft, syn_run)
+    linked = _completed_formula(payload).model_copy(
+        update={
+            "base_formula": _completed_formula(payload).base_formula.model_copy(
+                update={
+                    "basis": (FormulaFactClaim(claim="current", fact_ids=(corrected.observation_id,)),),
+                }
+            )
+        }
+    )
+    ok_report = verify_formula_artifact(
+        agent_spec=spec,
+        run_spec=run,
+        artifact=_artifact(linked, run),
+        input_payload=payload,
+        gate_authority=_gate_authority(payload),
+        syndrome_artifact=syn_artifact,
+        syndrome_run_spec=syn_run,
+    )
+    assert ok_report.passed, ok_report.failure_code
 
 
 # ---------------------------------------------------------------------------

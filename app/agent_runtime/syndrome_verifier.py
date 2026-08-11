@@ -11,10 +11,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.agent_runtime.observation_projection import project_current_observations
+from app.agent_runtime.reducer import DomainState
 from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
 from app.core.config import agent_model_timeout_seconds
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
-from app.agent_runtime.reducer import DomainState
 from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
 from app.schemas.syndrome import (
     SYNDROME_DRAFT_SCHEMA_VERSION,
@@ -388,10 +389,14 @@ def _context_matches_authority(
     if set(active_by_id) == set(context_by_id):
         for item in context_observations:
             source = active_by_id.get(item.observation_id)
+            # ``active_by_id`` is the projected current set, so the source is a
+            # current semantic fact whether it is an ACTIVE root or a CORRECTED
+            # successor.  The supplied context row must still carry the ACTIVE
+            # semantic-view status, and the corrected successor's value is the
+            # only value a faithful context may carry.
             if (
                 source is None
                 or source.session_id != session_id
-                or source.status is not ObservationStatus.ACTIVE
                 or item.status != ObservationStatus.ACTIVE
                 or item.state_version != state_version
                 or item.fact_key != source.fact_key
@@ -417,7 +422,13 @@ def _context_matches_authority(
 
 
 def _verify_fact_links(output: SyndromeDraft, input_payload: SyndromeDraftInput) -> SyndromeVerificationFailureCode | None:
-    active_ids = {item.observation_id for item in input_payload.context_observations}
+    # R2-B1: current fact identity comes from the shared projection (CORRECTED
+    # heads are valid links; superseded roots and RETRACTED heads are not).
+    current_ids = {item.observation_id for item in project_current_observations(input_payload.domain_state.observations)}
+    # The slot-projected context (3a) carries synthetic deterministic ids that
+    # are also authoritative derivations of the domain state.
+    context_ids = {item.observation_id for item in input_payload.context_observations}
+    active_ids = current_ids | context_ids
     all_claims = (*output.syndrome_basis, *output.differential)
     if any(not claim.fact_ids or any(fact_id not in active_ids for fact_id in claim.fact_ids) for claim in all_claims):
         return SyndromeVerificationFailureCode.FACT_LINK_INVALID
@@ -510,16 +521,9 @@ def _verify_authority(output: SyndromeDraft) -> SyndromeVerificationFailureCode 
 
 
 def _active_observations(observations: Iterable[ObservationSchema]) -> tuple[ObservationSchema, ...]:
-    superseded = frozenset(
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        item
-        for item in observations
-        if item.status is ObservationStatus.ACTIVE and item.observation_id not in superseded
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _same_gate(left: GateResultSchema, right: GateResultSchema) -> bool:
@@ -615,6 +619,31 @@ _PII_PATTERNS = (
     re.compile(r"(?<!\d)1[3-9](?:[\s-]?\d){9}(?!\d)"),
     re.compile(r"(?<!\d)\d{6}(?:[\s-]?\d){11}[\s-]?[\dXx](?!\d)"),
 )
+# 完整 UUID 字面量。UUID(observation_id / source_message_id / slot_id / session_id)
+# 是系统生成的程序化标识符，不是患者身份数据。其十六进制数字 + 连字符布局会被
+# _PII_PATTERNS 的身份证正则误判（见 _is_uuid_string 注释），必须先排除。
+_UUID_HEX = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _is_uuid_string(value: str) -> bool:
+    """Return True when the whole string is a canonical UUID literal.
+
+    This is a pure shape test: whether the exemption actually applies is decided
+    by :func:`_scan_identity`, which only exempts a UUID string when it sits under
+    a machine-metadata id key (see :data:`_MACHINE_ID_KEYS`).  A UUID string in an
+    arbitrary business value is still fed to the PII patterns.
+
+    The ID-card pattern ``\\d{6}(?:[\\s-]?\\d){11}[\\s-]?[\\dXx]`` treats dash
+    separators as legal within the "18-digit ID" and can therefore match the
+    hex layout of a random UUID — e.g. ``00104524-0456-4789-99ff-…`` matches as
+    ``00104524-0456-4789-99`` (6-digit prefix + 12 dash-separated digits).  Whether
+    a given context collides depends on the random ``uuid4()`` embedded in the slot
+    snapshot (``source_message_id``), so the privacy gate turned flaky.
+    """
+
+    return _UUID_HEX.fullmatch(value) is not None
 
 
 def _valid_clinical_text(value: str | None) -> bool:
@@ -629,20 +658,40 @@ def _valid_clinical_text(value: str | None) -> bool:
 # _is_identity_key 误判（"slot_name" 含 "name" 后缀）。其 value 仍照常递归检查。
 _SLOT_PROJECTION_SCHEMA_KEYS = frozenset({"slot_name", "dimension", "completeness", "missing_slots"})
 
+# 机器元数据标识符键：这些键名由程序定义，其取值是系统生成的规范化 UUID
+# （observation_id / session_id / source_message_id / slot_id），不是患者身份数据。
+# 值模式豁免只允许发生在这些明确键下、且整串是规范 UUID 时。其他任意业务值 / note
+# 里出现的 UUID 字符串必须照常过 PII 正则，不得被 UUID 规则自动豁免。
+_MACHINE_ID_KEYS = frozenset({"observation_id", "session_id", "source_message_id", "slot_id"})
+
 
 def _contains_identity_key_or_value(value: Any) -> bool:
+    return _scan_identity(value, parent_key=None)
+
+
+def _scan_identity(value: Any, parent_key: str | None) -> bool:
+    """Recursively scan for identity keys / PII-bearing values, key-aware.
+
+    ``parent_key`` is the dictionary key the current node was reached under.  It
+    narrows the UUID exemption: only a canonical UUID string under a machine-id
+    metadata key (:data:`_MACHINE_ID_KEYS`) is skipped.  Identity-name keys
+    (``name`` / ``phone`` / ``id_card`` …) always reject; a UUID literal in an
+    arbitrary business value/note is still matched against the PII patterns.
+    """
     if isinstance(value, BaseModel):
-        return _contains_identity_key_or_value(value.model_dump(mode="python"))
+        return _scan_identity(value.model_dump(mode="python"), parent_key)
     if isinstance(value, dict):
-        if any(
-            _is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS
-            for key in value
-        ):
+        if any(_is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS for key in value):
             return True
-        return any(_contains_identity_key_or_value(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_identity_key_or_value(item) for item in value)
+        return any(_scan_identity(item, str(key)) for key, item in value.items())
+    if isinstance(value, list | tuple):
+        return any(_scan_identity(item, parent_key) for item in value)
     if isinstance(value, str):
+        # 整串是规范 UUID 且位于机器元数据 id 键下时才跳过值模式（程序化标识符，
+        # 非 PII；否则随机 source_message_id 会被身份证正则误判 → 同一条上下文随机
+        # CONTEXT_PRIVACY_INVALID，flaky）。任意业务值 / note 里的 UUID 字符串不豁免。
+        if parent_key in _MACHINE_ID_KEYS and _is_uuid_string(value):
+            return False
         return any(pattern.search(value) for pattern in _PII_PATTERNS)
     return False
 
@@ -679,7 +728,7 @@ def _contains_key(raw: Any, forbidden: frozenset[str]) -> bool:
         if {str(key).lower() for key in raw} & forbidden:
             return True
         return any(_contains_key(value, forbidden) for value in raw.values())
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         return any(_contains_key(value, forbidden) for value in raw)
     return False
 
@@ -700,13 +749,13 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 return True
             return any(_has_undeclared_fields(raw.get(name), getattr(canonical, name)) for name in allowed)
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)
 
 
 def _check(name: str, code: SyndromeVerificationFailureCode | None) -> SyndromeCheckResult:

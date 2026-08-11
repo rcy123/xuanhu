@@ -15,7 +15,7 @@ RECORD_NARRATIVE_OUTPUT_SCHEMA_VERSION: Literal["record-narrative-output.v1"] = 
 RECORD_NARRATIVE_AGENT_NAME = "record_narrative"
 RECORD_NARRATIVE_AGENT_VERSION = "record-narrative-agent.v1"
 RECORD_NARRATIVE_PROMPT_VERSION = "record_narrative_v1.jinja2"
-RECORD_NARRATIVE_POLICY_VERSION = "record-narrative-policy.v1"
+RECORD_NARRATIVE_POLICY_VERSION: Literal["record-narrative-policy.v1"] = "record-narrative-policy.v1"
 RECORD_NARRATIVE_CONTEXT_TOKEN_LIMIT = 3_200
 
 

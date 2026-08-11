@@ -87,7 +87,7 @@ def _json_ready(value: object) -> object:
         return value.model_dump(mode="json")
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_ready(item) for item in value]
     if isinstance(value, bytes):
         return value.hex()
@@ -652,7 +652,7 @@ def _model_graph_is_exact(value: object) -> bool:
         return type(value) is list and all(
             _model_graph_is_exact(item) for item in value
         )
-    if isinstance(value, (set, frozenset)):
+    if isinstance(value, set | frozenset):
         return type(value) in {set, frozenset} and all(
             _model_graph_is_exact(item) for item in value
         )
@@ -686,11 +686,11 @@ def _model_graphs_match(left: object, right: object) -> bool:
                 for field_name in fields
             )
         )
-    if isinstance(left, (tuple, list)) or isinstance(right, (tuple, list)):
+    if isinstance(left, tuple | list) or isinstance(right, tuple | list):
         return (
             type(left) is type(right)
-            and isinstance(left, (tuple, list))
-            and isinstance(right, (tuple, list))
+            and isinstance(left, tuple | list)
+            and isinstance(right, tuple | list)
             and len(left) == len(right)
             and all(
                 _model_graphs_match(left_item, right_item)

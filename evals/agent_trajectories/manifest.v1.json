@@ -1,0 +1,307 @@
+{
+  "digest": "3d21b5b6d8d27280c93645f11a49043aa58a86a65716e948bd4afbd1d2ed4db9",
+  "manifest_id": "suite.agent_trajectories.v1",
+  "schema_version": "agent-trajectory-eval.v1",
+  "trajectories": [
+    {
+      "digest": "0f5f43cdd40a853402a86fee4fb97d7b1f2345a6470f4e3b2a87f19185b826a2",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "multi_turn_intake",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "clarify",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "clarification",
+          "safety_escalated": false,
+          "state_version": 0,
+          "step_id": "step.intake.clarify.1"
+        },
+        {
+          "action": "extract",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 2,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.intake.extract.1"
+        },
+        {
+          "action": "extract",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 3,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 2,
+          "step_id": "step.intake.extract.2"
+        },
+        {
+          "action": "respond",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 3,
+          "replay_ref": null,
+          "route": "terminal",
+          "safety_escalated": false,
+          "state_version": 3,
+          "step_id": "step.intake.terminal.1"
+        }
+      ],
+      "trajectory_id": "traj.multi_turn_intake"
+    },
+    {
+      "digest": "4657ccee494ba80356fc56c03c3e1ef6a0cdc1bb6bd46d7da921b72eb5f37980",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "correction_retraction",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "observe",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 0,
+          "step_id": "step.correction.observe.1"
+        },
+        {
+          "action": "extract",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.correction.extract.1"
+        },
+        {
+          "action": "observe",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 2,
+          "step_id": "step.correction.observe.2"
+        },
+        {
+          "action": "project",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "projection",
+          "safety_escalated": false,
+          "state_version": 3,
+          "step_id": "step.correction.project.1"
+        }
+      ],
+      "trajectory_id": "traj.correction_retraction"
+    },
+    {
+      "digest": "d5393c44f82ab215576efd165e1f3a98a311bd0f72727c7e3ab48842b3778da3",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "ambiguous_safety_negation",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "reason",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 0,
+          "replay_ref": null,
+          "route": "safety",
+          "safety_escalated": false,
+          "state_version": 0,
+          "step_id": "step.ambiguity.reason.1"
+        },
+        {
+          "action": "clarify",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "clarification",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.ambiguity.clarify.1"
+        },
+        {
+          "action": "extract",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 2,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 2,
+          "step_id": "step.ambiguity.extract.1"
+        }
+      ],
+      "trajectory_id": "traj.ambiguous_safety_negation"
+    },
+    {
+      "digest": "4742f89036a309253836c624bbd0fc0e4e1238d510657ee152a2425b89bc7ae1",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "red_flag_escalation",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "extract",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 0,
+          "step_id": "step.red_flag.extract.1"
+        },
+        {
+          "action": "escalate",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "red_flag",
+          "safety_escalated": true,
+          "state_version": 1,
+          "step_id": "step.red_flag.escalate.1"
+        }
+      ],
+      "trajectory_id": "traj.red_flag_escalation"
+    },
+    {
+      "digest": "ffc2eac3abd16baf42d3fd452a2dde564638d3661f8057d851257747d47e55b8",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "idempotent_replay",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "respond",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 0,
+          "replay_ref": "replay.ref.1",
+          "route": "replay",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.replay.first"
+        },
+        {
+          "action": "respond",
+          "checkpoint_ref": null,
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 0,
+          "replay_ref": "replay.ref.1",
+          "route": "replay",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.replay.second"
+        }
+      ],
+      "trajectory_id": "traj.idempotent_replay"
+    },
+    {
+      "digest": "6df2dc7f16691dffaf74bc7f05b2d91b9c936dcb5618eac79683cf2231a23e54",
+      "expected_invariants": {
+        "bounded_question_count": true,
+        "missed_safety_escalation": false,
+        "phi_safe_projection": true,
+        "protocol_valid": true,
+        "replay_equality": true,
+        "route_state_consistency": true
+      },
+      "scenario": "checkpoint_resume",
+      "schema_version": "agent-trajectory-eval.v1",
+      "steps": [
+        {
+          "action": "respond",
+          "checkpoint_ref": "ckpt.ref.1",
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 1,
+          "replay_ref": null,
+          "route": "intake",
+          "safety_escalated": false,
+          "state_version": 0,
+          "step_id": "step.checkpoint.save.1"
+        },
+        {
+          "action": "resume",
+          "checkpoint_ref": "ckpt.ref.1",
+          "projection_safe": true,
+          "protocol_valid": true,
+          "question_count": 2,
+          "replay_ref": "replay.ref.1",
+          "route": "resume",
+          "safety_escalated": false,
+          "state_version": 1,
+          "step_id": "step.checkpoint.resume.1"
+        }
+      ],
+      "trajectory_id": "traj.checkpoint_resume"
+    }
+  ]
+}

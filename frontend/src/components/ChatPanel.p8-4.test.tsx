@@ -4,11 +4,13 @@
  * 测试医师确认三路径、病历集成。不测完整 E2E（P8-5）。
  */
 
+import type { ComponentProps } from 'react'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react'
 import { ChatPanel } from './ChatPanel'
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
+import type { UseCommandReconciliationResult } from '@/hooks/useCommandReconciliation'
 import * as api from '@/api/index'
 import * as sse from '@/api/sse'
 import { ApiRequestError } from '@/api/errors'
@@ -67,9 +69,34 @@ function makeMessagesHook(overrides: Partial<UseMessagesResult> = {}): UseMessag
     loadMessages: vi.fn().mockResolvedValue(null),
     submit: vi.fn().mockResolvedValue(true),
     retryPending: vi.fn().mockResolvedValue(true),
+    settleMessage: vi.fn(),
     clear: vi.fn(),
     ...overrides,
   }
+}
+
+function makeCommandReconciler(): UseCommandReconciliationResult {
+  return {
+    outstanding: [],
+    hasOutstanding: false,
+    attention: [],
+    hasAttention: false,
+    isOutstandingFor: vi.fn().mockReturnValue(false),
+    registerAccepted: vi.fn(),
+    handleCommandEvent: vi.fn(),
+    reconcileAll: vi.fn().mockResolvedValue(undefined),
+    retryStatus: vi.fn().mockResolvedValue(undefined),
+    getEntry: vi.fn(),
+    setHandlers: vi.fn(),
+    clear: vi.fn(),
+  }
+}
+
+const commandReconciler = makeCommandReconciler()
+
+// ChatPanel 现在要求 commandReconciler prop；P8-4 用例不测 R7，统一注入空 mock。
+function TestChatPanel(props: Omit<ComponentProps<typeof ChatPanel>, 'commandReconciler'>) {
+  return <ChatPanel {...props} commandReconciler={commandReconciler} />
 }
 
 describe('ChatPanel P8-4 集成', () => {
@@ -116,7 +143,7 @@ describe('ChatPanel P8-4 集成', () => {
     })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ detail })}
         messagesHook={makeMessagesHook({ messages: [] })}
@@ -142,7 +169,7 @@ describe('ChatPanel P8-4 集成', () => {
     const detailHook = makeDetailHook({ detail })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={detailHook}
         messagesHook={makeMessagesHook()}
@@ -161,7 +188,7 @@ describe('ChatPanel P8-4 集成', () => {
     })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ detail })}
         messagesHook={makeMessagesHook()}
@@ -191,7 +218,7 @@ describe('ChatPanel P8-4 集成', () => {
       },
     })
     const { container } = render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ detail })}
         messagesHook={makeMessagesHook()}
@@ -218,7 +245,7 @@ describe('ChatPanel P8-4 集成', () => {
     const detailHook = makeDetailHook({ detail })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={detailHook}
         messagesHook={makeMessagesHook()}
@@ -257,7 +284,7 @@ describe('ChatPanel P8-4 集成', () => {
     })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ detail })}
         messagesHook={makeMessagesHook()}
@@ -273,7 +300,8 @@ describe('ChatPanel P8-4 集成', () => {
       expect(reviewSpy).toHaveBeenCalledWith(
         's1',
         { action: 'request_more_info', feedback: '请补充舌象和脉象' },
-        { stateVersion: 5 },
+        // R7: 医师确认操作现在携带 idempotencyKey（幂等保留），断言 stateVersion 即可。
+        expect.objectContaining({ stateVersion: 5 }),
       )
     })
     reviewSpy.mockRestore()
@@ -288,7 +316,7 @@ describe('ChatPanel P8-4 集成', () => {
     const detailHook = makeDetailHook({ detail })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={detailHook}
         messagesHook={makeMessagesHook()}
@@ -321,7 +349,7 @@ describe('ChatPanel P8-4 集成', () => {
     const detailHook = makeDetailHook({ detail })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={detailHook}
         messagesHook={makeMessagesHook()}
@@ -355,7 +383,7 @@ describe('ChatPanel P8-4 集成', () => {
     })
 
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ detail })}
         messagesHook={makeMessagesHook()}
@@ -375,7 +403,7 @@ describe('ChatPanel P8-4 集成', () => {
       retryable: true,
     })
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook()}
         messagesHook={makeMessagesHook({
@@ -400,7 +428,7 @@ describe('ChatPanel P8-4 集成', () => {
     const staleDetail = makeDetail({ session_id: 's1' })
     const submit = vi.fn().mockResolvedValue(true)
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s2"
         detailHook={makeDetailHook({ sessionId: 's2', detail: staleDetail })}
         messagesHook={makeMessagesHook({ submit })}
@@ -424,7 +452,7 @@ describe('ChatPanel P8-4 集成', () => {
     const refreshDetail = vi.fn().mockResolvedValue(makeDetail({ state_version: 2 }))
     const loadMessages = vi.fn().mockResolvedValue([])
     render(
-      <ChatPanel
+      <TestChatPanel
         sessionId="s1"
         detailHook={makeDetailHook({ refreshDetail })}
         messagesHook={makeMessagesHook({ loadMessages })}

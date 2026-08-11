@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """真实问诊医案汇入知识库（薄封装 import_knowledge 的 cases 逻辑）。
 
 与 import_knowledge --type cases 的区别：独立 knowledge_source
@@ -15,9 +14,11 @@ import asyncio
 import json
 import selectors
 import sys
+from io import TextIOWrapper
 from pathlib import Path
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -26,11 +27,9 @@ load_dotenv()
 from sqlalchemy import select  # noqa: E402
 
 from app.db.session import get_session_factory  # noqa: E402
-from app.models.knowledge import KnowledgeSource, TheoryCase  # noqa: E402
+from app.models.knowledge import TheoryCase  # noqa: E402
 from scripts.import_knowledge import (  # noqa: E402
     SAMPLE_LICENSE,
-    SAMPLE_SOURCE_NAME,
-    SAMPLE_SOURCE_VERSION,
     KnowledgeImporter,
     build_theory_case_doc_text,
     validate_theory_case,
@@ -40,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GENERATED_SOURCE_TITLE = "悬壶真实问诊医案集 v1"
 
 
-async def _import(session_factory, cases_path: Path) -> None:
+async def _import(session_factory: Any, cases_path: Path) -> None:
     data = json.loads(cases_path.read_text(encoding="utf-8"))
     print(f"待导入医案: {len(data)} 条")
 

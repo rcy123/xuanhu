@@ -6,6 +6,6 @@
 
 from __future__ import annotations
 
-SAFETY_RULE_VERSION = "v1.0.0"
+SAFETY_RULE_VERSION = "v1.2.0"
 
 __all__ = ["SAFETY_RULE_VERSION"]

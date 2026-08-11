@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """RAG 参数网格调优：top_k × 重排权重 → IR 指标对比 + 推荐参数。
 
 网格：
@@ -21,10 +20,11 @@ import asyncio
 import json
 import selectors
 import sys
+from io import TextIOWrapper
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -69,7 +69,7 @@ class _WeightedRetriever:
         top_k: int = 8,
         filters: dict[str, Any] | None = None,
     ) -> list[Any]:
-        from app.rag.retriever import VALID_SOURCE_TYPES
+        from app.rag.schemas import VALID_SOURCE_TYPES
 
         settings = self._retriever._settings
         vector_top_k = getattr(settings, "rag_top_k_vector", 12)
@@ -77,7 +77,7 @@ class _WeightedRetriever:
         search_sources = (
             list(VALID_SOURCE_TYPES) if allow_cross_source else list(primary_sources)
         )
-        return await self._retriever.hybrid_search(
+        return cast(list[Any], await self._retriever.hybrid_search(
             query=query,
             sources=search_sources,
             primary_sources=set(primary_sources),
@@ -87,12 +87,12 @@ class _WeightedRetriever:
             fulltext_top_k=fulltext_top_k,
             top_k=top_k,
             filters=filters,
-        )
+        ))
 
 
 def _combine_score(report: Any) -> float:
     """推荐评分：pass 为主、recall 次之、MRR/NDCG 修正。"""
-    return (
+    return float(
         0.40 * report.pass_rate
         + 0.25 * report.avg_recall_at_k
         + 0.20 * report.avg_mrr

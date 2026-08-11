@@ -507,7 +507,8 @@ class OutboxMessage(BaseModel):
     event_id: UUID
     event_type: str
     session_id: UUID
-    graph_run_id: UUID
+    # Nullable for async_command.* rows, which are not graph runs.
+    graph_run_id: UUID | None
     state_version: int = Field(ge=1)
     trace_id: str
     payload: dict[str, object]
@@ -1451,22 +1452,22 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         # ---- batch 3: load existing SafetyFactAssertion rows ----
         existing_assertions: dict[UUID, SafetyFactAssertion] = {}
         if assertion_ids:
-            for row in (
+            for assertion_row in (
                 await session.scalars(
                     select(SafetyFactAssertion).where(SafetyFactAssertion.id.in_(assertion_ids))
                 )
             ).all():
-                existing_assertions[row.id] = row
+                existing_assertions[assertion_row.id] = assertion_row
 
         # ---- batch 4: load existing AuditEvent rows ----
         existing_audits: dict[UUID, AuditEvent] = {}
         if audit_ids:
-            for row in (
+            for audit_row in (
                 await session.scalars(
                     select(AuditEvent).where(AuditEvent.id.in_(audit_ids))
                 )
             ).all():
-                existing_audits[row.id] = row
+                existing_audits[audit_row.id] = audit_row
 
         for item in safety_fact_assertions:
             source = source_messages.get(item.source_message_id)
@@ -1621,12 +1622,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
         existing_audit_map: dict[UUID, AuditEvent] = {}
         if event_ids:
-            for row in (
+            for existing_audit_row in (
                 await session.scalars(
                     select(AuditEvent).where(AuditEvent.id.in_(event_ids))
                 )
             ).all():
-                existing_audit_map[row.id] = row
+                existing_audit_map[existing_audit_row.id] = existing_audit_row
 
         for audit_item in audit_events:
             existing_audit = existing_audit_map.get(audit_item.event_id)
@@ -1650,21 +1651,23 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         review_ids_pending = {item.review_id for item in doctor_reviews}
         existing_review_map: dict[UUID, DoctorReview] = {}
         if review_ids_pending:
-            for row in (
+            for review_row in (
                 await session.scalars(
                     select(DoctorReview).where(DoctorReview.id.in_(review_ids_pending))
                 )
             ).all():
-                existing_review_map[row.id] = row
+                existing_review_map[review_row.id] = review_row
 
         for review_item in doctor_reviews:
-            if review_item.safety_rule_run_id not in safety_ids:
-                if review_item.safety_rule_run_id not in existing_safety_map:
-                    # 不在本次批次内 → 单独查并缓存
-                    safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
-                    if safety_exists is None or safety_exists.session_id != delta.session_id:
-                        raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
-                    existing_safety_map[review_item.safety_rule_run_id] = safety_exists
+            if (
+                review_item.safety_rule_run_id not in safety_ids
+                and review_item.safety_rule_run_id not in existing_safety_map
+            ):
+                # 不在本次批次内 → 单独查并缓存
+                safety_exists = await session.get(SafetyRuleRun, review_item.safety_rule_run_id)
+                if safety_exists is None or safety_exists.session_id != delta.session_id:
+                    raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
+                existing_safety_map[review_item.safety_rule_run_id] = safety_exists
             existing_review = existing_review_map.get(review_item.review_id)
             review_values: dict[str, object] = {
                 "session_id": review_item.session_id,
@@ -1688,21 +1691,21 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         record_ids_pending = {item.record_id for item in medical_records}
         existing_record_map: dict[UUID, MedicalRecord] = {}
         if record_ids_pending:
-            for row in (
+            for record_row in (
                 await session.scalars(
                     select(MedicalRecord).where(MedicalRecord.id.in_(record_ids_pending))
                 )
             ).all():
-                existing_record_map[row.id] = row
+                existing_record_map[record_row.id] = record_row
         # 预加载 medical_records 中引用的 DoctorReview（用于校验）
         review_ref_ids = {item.doctor_review_id for item in medical_records} - review_ids_pending
         if review_ref_ids:
-            for row in (
+            for review_ref_row in (
                 await session.scalars(
                     select(DoctorReview).where(DoctorReview.id.in_(review_ref_ids))
                 )
             ).all():
-                existing_review_map[row.id] = row
+                existing_review_map[review_ref_row.id] = review_ref_row
 
         for record_item in medical_records:
             review = existing_review_map.get(record_item.doctor_review_id)
@@ -1747,12 +1750,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
         existing_run_map: dict[UUID, AgentRun] = {}
         if run_ids_pending:
-            for row in (
+            for run_row in (
                 await session.scalars(
                     select(AgentRun).where(AgentRun.id.in_(run_ids_pending))
                 )
             ).all():
-                existing_run_map[row.id] = row
+                existing_run_map[run_row.id] = run_row
 
         for run_item in agent_runs:
             existing_run = existing_run_map.get(run_item.run_id)
@@ -1790,12 +1793,12 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
             raise RepositoryError(RepositoryErrorCode.UNSAFE_METADATA)
         existing_evidence_map: dict[UUID, AgentEvidence] = {}
         if evidence_row_ids:
-            for row in (
+            for evidence_row in (
                 await session.scalars(
                     select(AgentEvidence).where(AgentEvidence.id.in_(evidence_row_ids))
                 )
             ).all():
-                existing_evidence_map[row.id] = row
+                existing_evidence_map[evidence_row.id] = evidence_row
 
         for evidence_item in agent_evidences:
             existing_evidence = existing_evidence_map.get(evidence_item.evidence_row_id)

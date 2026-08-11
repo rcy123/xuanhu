@@ -23,7 +23,6 @@ async def test_intake_retry_success_records_success_run_id(
 
     captured: dict[str, object] = {}
     first_run_id = uuid.uuid4()
-    retry_run_id = uuid.uuid4()
     calls: list[uuid.UUID] = []
 
     def fake_run_spec_run_id(run_spec: object) -> uuid.UUID:
@@ -49,40 +48,6 @@ async def test_intake_retry_success_records_success_run_id(
     async def fake_save_intermediate(claim_id: object, patch: dict[str, object], *, step: str) -> None:
         captured.update(patch)
 
-    async def first_failure(*, runtime: object, run_spec: object, input_payload: object):
-        calls.append(fake_run_spec_run_id(run_spec))
-        return IntakeExecutionResult(
-            status=IntakeExecutionStatus.FAILED,
-            failure_code=FakeFailure(),
-        )
-
-    async def second_success(*, runtime: object, run_spec: object, input_payload: object):
-        calls.append(fake_run_spec_run_id(run_spec))
-        from app.agent_runtime.intake_verifier import (
-            IntakeCheckResult,
-            IntakeCheckStatus,
-            IntakeVerificationReport,
-            IntakeVerifierName,
-        )
-
-        return IntakeExecutionResult(
-            status=IntakeExecutionStatus.SUCCEEDED,
-            output=IntakeExtractionOutput(decision="extracted", observations=()),
-            verification=IntakeVerificationReport(
-                passed=True,
-                checks=(
-                    IntakeCheckResult(
-                        verifier=IntakeVerifierName.SCHEMA,
-                        status=IntakeCheckStatus.PASSED,
-                        failure_code=None,
-                    ),
-                ),
-                failure_code=None,
-                subject_digest="0" * 64,
-            ),
-        )
-
-    monkeypatch.setattr(intake_module, "execute_intake_extraction", first_failure)
     monkeypatch.setattr(intake_module, "_save_intermediate", fake_save_intermediate)
 
     # 打桩前置依赖: precheck clear、无 bound 输出、无缓存。

@@ -247,10 +247,19 @@ class _RecoveryCheckpointState(_CheckpointControlModel):
     pending_interrupt: _CheckpointInterruptRef | None
     budget: _CheckpointBudget
     last_error: _CheckpointLastError | None
-    # 澄清通道（intake 子图）与 extract 决策：旧 checkpoint 不含这两个字段，
+    # 澄清通道（intake 子图）与 extract 决策：旧 checkpoint 不含这些字段，
     # 必须为可选并带默认值，保证 backward-compatible。
     clarify_requested: bool = False
     intake_decision: str = ""
+    # L3-6 澄清：extract 节点跳过澄清路由 / 问诊结束信号
+    intake_skip_clarification: bool = False
+    intake_end_requested: bool = False
+    # 1b fix: 四诊回复绑定的 fallback 标记
+    intake_four_diagnosis_bound: bool = False
+    # R1: 跨轮次 interrupt/resume 追问轮次计数器（仅 ref）
+    intake_loop_count: int = 0
+    # R1: resume 时携带的新 answer claim 引用（仅 UUID 字符串）
+    intake_resume_claim_ref: str = ""
 
     @field_validator("session_id", "run_id", mode="before")
     @classmethod
@@ -1231,10 +1240,11 @@ async def _replay_failed_intake_message(
         # The begin() commit expired every loaded ORM attribute; re-fetch the
         # replay claim and patient message so _execute_after_claim sees loaded
         # instances (async sessions cannot lazy-load expired attributes).
-        replay_claim = await db.get(IntakeCommandClaim, replay_id)
+        refetched_claim = await db.get(IntakeCommandClaim, replay_id)
         patient_message = await db.get(ConsultMessage, message_id)
-        if replay_claim is None or patient_message is None:
+        if refetched_claim is None or patient_message is None:
             return None
+        replay_claim = refetched_claim
         state = default_state(
             session_id=str(session_id),
             command=XuanhuCommand.MESSAGE.value,

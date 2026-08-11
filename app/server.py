@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal, cast
+
 import uvicorn
 
 from app.core.config import get_settings
@@ -17,7 +19,7 @@ def main() -> None:
         "app.main:app",
         host=settings.api_host,
         port=settings.api_port,
-        loop=UVICORN_LOOP_FACTORY,
+        loop=cast(Literal["none", "auto", "asyncio", "uvloop"], UVICORN_LOOP_FACTORY),
     )
 
 

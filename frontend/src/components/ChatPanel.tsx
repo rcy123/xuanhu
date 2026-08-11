@@ -20,6 +20,9 @@ import {
 import type { UseSessionDetailResult } from '@/hooks/useSessionDetail'
 import type { UseMessagesResult } from '@/hooks/useMessages'
 import { useSessionStream } from '@/hooks/useSessionStream'
+import type { UseCommandReconciliationResult, CommandReconciliationEntry } from '@/hooks/useCommandReconciliation'
+import { COMMAND_STATUS_UNAVAILABLE } from '@/hooks/useCommandReconciliation'
+import { isAsyncCommandAccepted } from '@/types/api'
 import type { Formula, FormulaOverride, SafetyIssue, RecordResponse, RecordUpdateRequest, BaseFormulaAlternative } from '@/types/api'
 import { StepBar } from './StepBar'
 import { MessageList } from './MessageList'
@@ -48,9 +51,11 @@ interface ChatPanelProps {
   sessionId: string | null
   detailHook: UseSessionDetailResult
   messagesHook: UseMessagesResult
+  /** R7：异步命令终态对账器（由 App 创建，消息命令已登记；本组件注册终态处理器）。 */
+  commandReconciler: UseCommandReconciliationResult
 }
 
-export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProps) {
+export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconciler }: ChatPanelProps) {
   const [pendingReviewFormula, setPendingReviewFormula] = useState<Formula | null>(null)
   const [blockedIssues, setBlockedIssues] = useState<SafetyIssue[] | null>(null)
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null)
@@ -84,7 +89,9 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   // 选中会话变化时加载消息历史；离开时清空
   // 同时清空 SSE 衍生的本地状态（pendingReviewFormula/blockedIssues/rollbackTarget）
+  // R7：切换会话 / 离开时清空未决异步命令对账，避免上一个会话的命令污染当前 UI。
   useEffect(() => {
+    commandReconciler.clear()
     if (!sessionId) {
       clear()
       setPendingReviewFormula(null)
@@ -103,7 +110,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     setContextOpen(false)
     setPendingSafetyCount(null)
     void loadMessages(sessionId)
-  }, [sessionId, loadMessages, clear])
+  }, [sessionId, loadMessages, clear, commandReconciler])
 
   // SSE 回调：onStageChanged — 阶段变化时刷新会话详情（GET 为权威）
   const handleStageChanged = useCallback(
@@ -130,12 +137,14 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     [loadMessages, refreshDetail, sessionId],
   )
 
-  // SSE 回调：onResync — 流断裂后全量同步
+  // SSE 回调：onResync — 流断裂后全量同步；同时对所有未决异步命令做一次对账
+  // （重连/断流后不能依赖 SSE 唤醒，需以 GET status 追平终态）。
   const handleResync = useCallback(
     (_reason: string) => {
       void refreshDetail()
+      void commandReconciler.reconcileAll()
     },
-    [refreshDetail],
+    [refreshDetail, commandReconciler],
   )
 
   // SSE 回调：onReviewRequired — 使用 modified_formula 设置待确认处方
@@ -199,16 +208,25 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const handleSelectAlternative = useCallback(
     async (index: number) => {
       if (!sessionId || !detail) return
+      const idemKey = generateIdempotencyKey()
       setSelectedAlternativeIndex(index)
       setAlternativeSubmitting(true)
       setAlternativeError(null)
+      let acceptedCommand = false
       try {
-        await advanceSession(
+        const result = await advanceSession(
           sessionId,
           { alternative_index: index },
-          { idempotencyKey: generateIdempotencyKey(), stateVersion: detail.state_version },
+          { idempotencyKey: idemKey, stateVersion: detail.state_version },
         )
-        // 选择后立即刷新：后端会走 resume 路径，完成后推进到 safety/review
+        if (isAsyncCommandAccepted(result)) {
+          // R7: 202 仅表示已接受，登记对账；不乐观刷新，终态由 reconciler 处理
+          // （成功刷新读模型；失败展示有界错误）。期间保持 submitting 禁用按钮。
+          acceptedCommand = true
+          commandReconciler.registerAccepted(result, sessionId, idemKey)
+          return
+        }
+        // 同步成功：选择后立即刷新，后端会走 resume 路径，完成后推进到 safety/review
         setBaseFormulaAlternatives(null)
         setSelectedAlternativeIndex(null)
         await refreshDetail()
@@ -218,13 +236,14 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
         setAlternativeError(apiErr?.message ?? '方案选择失败，请重试')
         setSelectedAlternativeIndex(null)
       } finally {
-        setAlternativeSubmitting(false)
+        // 已接受（202）时保留 submitting 直到终态，避免把已接受命令当新命令重发。
+        if (!acceptedCommand) setAlternativeSubmitting(false)
       }
     },
-    [sessionId, detail, refreshDetail, loadMessages],
+    [sessionId, detail, refreshDetail, loadMessages, commandReconciler],
   )
 
-  const handleHoverAlternative = useCallback((index: number | null) => {
+  const handleHoverAlternative = useCallback((_index: number | null) => {
     // 预留 hover 交互（如高亮对应药味对比）
   }, [])
 
@@ -241,6 +260,8 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
     onSessionBlocked: handleSessionBlocked,
     onSessionTerminated: handleSessionTerminated,
     onPollingRefresh: handlePollingRefresh,
+    // R7：command.* SSE 仅作唤醒信号；权威状态以 GET status + 读模型为准。
+    onCommandEvent: commandReconciler.handleCommandEvent,
   })
 
   // 推导当前运行的 agent 名称（取第一个 status==='running' 的条目）
@@ -308,6 +329,81 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const [requestMoreInfoModalOpen, setRequestMoreInfoModalOpen] = useState(false)
   const [modifyReviewError, setModifyReviewError] = useState<ApiRequestError | null>(null)
 
+  // ---------- R7 异步命令终态处理 ----------
+  // succeeded：以 GET 权威读模型刷新；failed：展示有界（PHI 安全）错误。
+  const handleCommandSucceeded = useCallback(async (entry: CommandReconciliationEntry) => {
+    if (entry.operation === 'intake.message') {
+      messagesHook.settleMessage(entry.commandId, true)
+      if (sessionId) await loadMessages(sessionId)
+      await refreshDetail()
+    } else if (entry.operation === 'session.advance') {
+      setBaseFormulaAlternatives(null)
+      setSelectedAlternativeIndex(null)
+      setAlternativeSubmitting(false)
+      await refreshDetail()
+      if (sessionId) await loadMessages(sessionId)
+    } else if (entry.operation === 'prescription.review') {
+      setModifyModalOpen(false)
+      setRejectModalOpen(false)
+      setRequestMoreInfoModalOpen(false)
+      setReviewSubmitting(false)
+      await refreshDetail()
+      if (sessionId) await loadMessages(sessionId)
+    }
+  }, [messagesHook, sessionId, loadMessages, refreshDetail])
+
+  const handleCommandFailed = useCallback((entry: CommandReconciliationEntry) => {
+    const bounded = entry.errorCode ?? null
+    if (entry.operation === 'intake.message') {
+      messagesHook.settleMessage(entry.commandId, false, bounded ?? undefined)
+    } else if (entry.operation === 'session.advance') {
+      setAlternativeSubmitting(false)
+      setSelectedAlternativeIndex(null)
+      setAlternativeError(bounded ?? '推进失败，请稍后重试')
+    } else if (entry.operation === 'prescription.review') {
+      setModifyModalOpen(false)
+      setRejectModalOpen(false)
+      setRequestMoreInfoModalOpen(false)
+      setReviewSubmitting(false)
+      setReviewError(new ApiRequestError({
+        code: bounded ?? 'COMMAND_FAILED',
+        userMessage: bounded ? `复核处理失败（${bounded}）` : '复核处理失败',
+        status: 409,
+        retryable: false,
+      }))
+    }
+  }, [messagesHook])
+
+  // R7 attention：对账预算耗尽、状态暂不可得。释放 spinner/loading 语义并只暴露
+  // 固定的 PHI 安全本地码（COMMAND_STATUS_UNAVAILABLE），绝不伪造命令失败，也不
+  // 允许把它当作新逻辑命令重发。消息命令的 pending 保留（不确定态，可重试同一幂等键）。
+  const handleCommandAttention = useCallback((entry: CommandReconciliationEntry) => {
+    if (entry.operation === 'session.advance') {
+      setAlternativeSubmitting(false)
+      setAlternativeError(
+        '命令状态暂不可得，请稍后重试（' + COMMAND_STATUS_UNAVAILABLE + '）',
+      )
+    } else if (entry.operation === 'prescription.review') {
+      setReviewSubmitting(false)
+      setReviewError(new ApiRequestError({
+        code: COMMAND_STATUS_UNAVAILABLE,
+        userMessage: '命令状态暂不可得，请稍后重试',
+        status: 0,
+        retryable: true,
+      }))
+    }
+    // intake.message：保留 pendingSubmission（不确定态），由消息输入栏的重试
+    // （同一幂等键，非新逻辑命令）或 resync 触发 recheck 恢复。
+  }, [])
+
+  useEffect(() => {
+    commandReconciler.setHandlers(
+      handleCommandSucceeded,
+      handleCommandFailed,
+      handleCommandAttention,
+    )
+  }, [commandReconciler, handleCommandSucceeded, handleCommandFailed, handleCommandAttention])
+
   // 病历
   const [record, setRecord] = useState<RecordResponse | null>(null)
   const [recordGenerationRequested, setRecordGenerationRequested] = useState(false)
@@ -352,22 +448,32 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   const handleConfirm = useCallback(() => {
     if (!sessionId || !detail || detail.session_id !== sessionId) return
+    const idemKey = generateIdempotencyKey()
     setReviewSubmitting(true)
     setReviewError(null)
+    let acceptedCommand = false
     reviewPrescription(
       sessionId,
       { action: 'confirm' },
-      { stateVersion: detail.state_version },
+      { stateVersion: detail.state_version, idempotencyKey: idemKey },
     )
-      .then(() => {
-        setReviewSubmitting(false)
+      .then((result) => {
+        if (isAsyncCommandAccepted(result)) {
+          // R7: 202 仅表示已接受，登记对账；终态由 reconciler 处理。
+          acceptedCommand = true
+          commandReconciler.registerAccepted(result, sessionId, idemKey)
+          return
+        }
         void refreshDetail()
       })
       .catch((err: unknown) => {
-        setReviewSubmitting(false)
         if (err instanceof ApiRequestError) setReviewError(err)
       })
-  }, [sessionId, detail, refreshDetail])
+      .finally(() => {
+        // 已接受时保留 submitting（禁用按钮）直到终态，避免重复提交同一逻辑命令。
+        if (!acceptedCommand) setReviewSubmitting(false)
+      })
+  }, [sessionId, detail, refreshDetail, commandReconciler])
 
   const handleModify = useCallback(() => {
     setModifyModalOpen(true)
@@ -377,8 +483,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
   const handleModifySubmit = useCallback(
     (override: FormulaOverride, feedback?: string) => {
       if (!sessionId || !detail || detail.session_id !== sessionId) return
+      const idemKey = generateIdempotencyKey()
       setReviewSubmitting(true)
       setModifyReviewError(null)
+      let acceptedCommand = false
       reviewPrescription(
         sessionId,
         {
@@ -386,15 +494,20 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
           formula_override: override,
           feedback: feedback || undefined,
         },
-        { stateVersion: detail.state_version },
+        { stateVersion: detail.state_version, idempotencyKey: idemKey },
       )
-        .then(() => {
-          setReviewSubmitting(false)
+        .then((result) => {
+          if (isAsyncCommandAccepted(result)) {
+            // R7: 已接受，登记对账并关闭弹窗；终态刷新由 reconciler 负责。
+            acceptedCommand = true
+            commandReconciler.registerAccepted(result, sessionId, idemKey)
+            setModifyModalOpen(false)
+            return
+          }
           setModifyModalOpen(false)
           void refreshDetail()
         })
         .catch((err: unknown) => {
-          setReviewSubmitting(false)
           if (err instanceof ApiRequestError) {
             // 二次安全审核失败：在 Modal 内展示 issues，不关闭弹窗
             if (err.code === 'SAFETY_REVIEW_BLOCKED') {
@@ -405,8 +518,11 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
             }
           }
         })
+        .finally(() => {
+          if (!acceptedCommand) setReviewSubmitting(false)
+        })
     },
-    [sessionId, detail, refreshDetail],
+    [sessionId, detail, refreshDetail, commandReconciler],
   )
 
   const handleReject = useCallback(() => {
@@ -420,52 +536,74 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
 
   const handleRequestMoreInfoSubmit = useCallback((feedback: string) => {
     if (!sessionId || !detail || detail.session_id !== sessionId) return
+    const idemKey = generateIdempotencyKey()
     setReviewSubmitting(true)
     setReviewError(null)
+    let acceptedCommand = false
     reviewPrescription(
       sessionId,
       { action: 'request_more_info', feedback },
-      { stateVersion: detail.state_version },
+      { stateVersion: detail.state_version, idempotencyKey: idemKey },
     )
-      .then(() => {
-        setReviewSubmitting(false)
+      .then((result) => {
+        if (isAsyncCommandAccepted(result)) {
+          // R7: 已接受，登记对账并关闭弹窗；终态刷新由 reconciler 负责。
+          acceptedCommand = true
+          commandReconciler.registerAccepted(result, sessionId, idemKey)
+          setRequestMoreInfoModalOpen(false)
+          return
+        }
         setRequestMoreInfoModalOpen(false)
         void refreshDetail()
       })
       .catch((err: unknown) => {
-        setReviewSubmitting(false)
         if (err instanceof ApiRequestError) setReviewError(err)
       })
-  }, [sessionId, detail, refreshDetail])
+      .finally(() => {
+        if (!acceptedCommand) setReviewSubmitting(false)
+      })
+  }, [sessionId, detail, refreshDetail, commandReconciler])
 
   const handleRejectSubmit = useCallback(
     (feedback: string) => {
       if (!sessionId || !detail || detail.session_id !== sessionId) return
+      const idemKey = generateIdempotencyKey()
       setReviewSubmitting(true)
       setReviewError(null)
+      let acceptedCommand = false
       reviewPrescription(
         sessionId,
         { action: 'reject', feedback: feedback || undefined },
-        { stateVersion: detail.state_version },
+        { stateVersion: detail.state_version, idempotencyKey: idemKey },
       )
-        .then(() => {
-          setReviewSubmitting(false)
+        .then((result) => {
+          if (isAsyncCommandAccepted(result)) {
+            // R7: 已接受，登记对账并关闭弹窗；终态刷新由 reconciler 负责。
+            acceptedCommand = true
+            commandReconciler.registerAccepted(result, sessionId, idemKey)
+            setRejectModalOpen(false)
+            return
+          }
           setRejectModalOpen(false)
           void refreshDetail()
         })
         .catch((err: unknown) => {
-          setReviewSubmitting(false)
           if (err instanceof ApiRequestError) setReviewError(err)
           setRejectModalOpen(false)
         })
+        .finally(() => {
+          if (!acceptedCommand) setReviewSubmitting(false)
+        })
     },
-    [sessionId, detail, refreshDetail],
+    [sessionId, detail, refreshDetail, commandReconciler],
   )
 
   const handleReviewRetry = useCallback(() => {
     setReviewError(null)
     void refreshDetail()
-  }, [refreshDetail])
+    // R7：attention 命令（状态暂不可得）手动重查，不发起新 POST。
+    void commandReconciler.reconcileAll()
+  }, [refreshDetail, commandReconciler])
 
   const handleRecordGenerationStart = useCallback(() => {
     setRecordGenerationRequested(true)
@@ -693,8 +831,17 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
             {alternativeError ? (
               <div className="xh-inline-feedback">
                 <ErrorBanner
-                  error={new ApiRequestError(alternativeError, 500, 'ALTERNATIVE_SELECTION_FAILED')}
-                  onRetry={() => setAlternativeError(null)}
+                  error={new ApiRequestError({
+                    code: 'ALTERNATIVE_SELECTION_FAILED',
+                    userMessage: alternativeError,
+                    status: 500,
+                    retryable: false,
+                  })}
+                  onRetry={() => {
+                    setAlternativeError(null)
+                    // R7：attention 命令（状态暂不可得）手动重查，不发起新 POST。
+                    void commandReconciler.reconcileAll()
+                  }}
                 />
               </div>
             ) : null}
@@ -802,6 +949,11 @@ export function ChatPanel({ sessionId, detailHook, messagesHook }: ChatPanelProp
                     await refreshDetail()
                     if (sessionId) await loadMessages(sessionId)
                   }}
+                  // R7: 已接受（202）的推进命令登记对账，pending 期间禁用按钮。
+                  onCommandAccepted={(accepted, idemKey) => {
+                    if (sessionId) commandReconciler.registerAccepted(accepted, sessionId, idemKey)
+                  }}
+                  pending={commandReconciler.isOutstandingFor('session.advance')}
                 />
               ) : null}
               {detail ? (

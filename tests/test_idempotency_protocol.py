@@ -60,6 +60,30 @@ def _install_passthrough_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_http_executor_rejects_invalid_renew_attempt_budget() -> None:
+    from app.services.http_idempotency import HttpCommandExecutor
+
+    with pytest.raises(ValueError):
+        HttpCommandExecutor(None, session_factory=object(), renew_attempt_seconds=0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        HttpCommandExecutor(None, session_factory=object(), heartbeat_seconds=2, lease_seconds=1)  # type: ignore[arg-type]
+
+
+def test_http_executor_decouples_renew_attempt_budget_from_heartbeat() -> None:
+    from app.services.http_idempotency import HttpCommandExecutor
+
+    explicit = HttpCommandExecutor(
+        None,  # type: ignore[arg-type]
+        session_factory=object(),
+        renew_attempt_seconds=1.5,
+    )
+    assert explicit._renew_attempt_seconds == 1.5
+
+    # Default: the per-attempt budget follows the heartbeat (unchanged behaviour).
+    defaulted = HttpCommandExecutor(None, session_factory=object())  # type: ignore[arg-type]
+    assert defaulted._renew_attempt_seconds is None
+
+
 @pytest.mark.parametrize(
     "value",
     [

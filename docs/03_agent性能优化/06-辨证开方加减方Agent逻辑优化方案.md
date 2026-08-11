@@ -805,7 +805,7 @@ final_score = vector_weight * vector_score       # 0.65 * 向量相似度
 
 reranker:
     RERANKER_GATEWAY_BASE_URL=https://www.dmxapi.cn/v1
-    RERANKER_GATEWAY_API_KEY=sk-nddHCp7Tf8JlhsohBPFR3zJ5PVGfLw0HKdLNuiXckFNObHDk
+    RERANKER_GATEWAY_API_KEY=${RERANKER_GATEWAY_API_KEY}   # 从环境 / .env 注入，勿在代码或文档中硬编码
     RERANKER_MODEL=jina-reranker-m0
 
 ### 5.2 设计

@@ -90,8 +90,8 @@ def _build_legal_fact_keys() -> frozenset[str]:
         legal.update(rule.fact_keys)
     for fact_key, _dimension in COMPLETENESS_AUXILIARY_FACT_DIMENSIONS:
         legal.add(fact_key)
-    for rule in COMPLETENESS_CONFLICT_RULES:
-        legal.update(rule.fact_keys)
+    for conflict_rule in COMPLETENESS_CONFLICT_RULES:
+        legal.update(conflict_rule.fact_keys)
     for keyset in DIMENSION_KEYSETS.values():
         legal.update(keyset)
     legal.update(_SAFETY_DIMENSION_FACT_KEYS)

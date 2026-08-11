@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -24,12 +25,34 @@ from app.core.exceptions import (
     ChatStructuredParseError,
     EmbeddingDimensionMismatchError,
     EmbeddingUnavailableError,
+    ModelGatewayError,
     ModelGatewayTimeoutError,
     ModelGatewayUnavailableError,
 )
-from app.core.metrics import measure
+from app.core.metrics import (
+    measure,
+    observe_gateway_request,
+    observe_gateway_structured_fallback,
+)
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger("xuanhu.gateway")
+
+
+def _observe_never_raise(fn: Callable[..., None], *args: Any) -> None:
+    """Invoke an observation callable, swallowing any failure.
+
+    Observation is best-effort and must never alter gateway business behavior
+    or mask the original return/exception.  This is the defensive boundary at
+    the production call site: even a broken/metrics-layer raise must not leak
+    into the gateway path.  ``BaseException`` (incl. cancellation) is not
+    swallowed.
+    """
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001 - metrics must never leak into the call path
+        logger.warning("gateway metric observation failed")
 
 # Hosts whose thinking-mode models reject a forced ``tool_choice`` (HTTP 400)
 # and must therefore use the ``response_format=json_object`` transport with
@@ -126,6 +149,41 @@ class ModelGatewayClient:
     def client(self) -> httpx.AsyncClient:
         """返回底层 httpx 客户端（供 embedding gateway 复用）。"""
         return self._client
+
+    @staticmethod
+    async def _record_gateway_outcome(
+        operation: str,
+        awaitable: Coroutine[Any, Any, _T],
+    ) -> _T:
+        """Await a gateway call and record exactly one bounded outcome.
+
+        The outcome is recorded on every return and every gateway raise, but
+        the original exception is always re-raised — metrics never mask or
+        replace it.  One increment per top-level call keeps the counter
+        coherent and non-double-counted.  ``operation`` is fail-closed to a
+        fixed bucket by :func:`observe_gateway_request` if it is not on the
+        declared allowlist.
+        """
+        try:
+            result = await awaitable
+        except ChatOutputTruncatedError:
+            _observe_never_raise(observe_gateway_request, operation, "truncated")
+            raise
+        except ChatStructuredParseError:
+            _observe_never_raise(observe_gateway_request, operation, "parse_failed")
+            raise
+        except ModelGatewayError:
+            _observe_never_raise(observe_gateway_request, operation, "error")
+            raise
+        except Exception:
+            # Any other ordinary Exception — unexpected response decoding, an
+            # unforeseen runtime failure — is still a terminal gateway error.
+            # Record it and re-raise the exact original exception.  BaseException
+            # (incl. asyncio.CancelledError) is intentionally not caught.
+            _observe_never_raise(observe_gateway_request, operation, "error")
+            raise
+        _observe_never_raise(observe_gateway_request, operation, "success")
+        return result
 
     @staticmethod
     def _resolve_structured_mode(settings: Any) -> str:
@@ -333,6 +391,31 @@ class ModelGatewayClient:
         session_id: str | None = None,
         agent_name: str | None = None,
     ) -> str:
+        """普通对话补全（记录一次 bounded gateway outcome）。"""
+        return await self._record_gateway_outcome(
+            "chat",
+            self._chat(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=trace_id,
+                session_id=session_id,
+                agent_name=agent_name,
+            ),
+        )
+
+    async def _chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+        trace_id: str,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> str:
         """普通对话补全。
 
         Args:
@@ -360,16 +443,9 @@ class ModelGatewayClient:
             **self._build_payload_overrides(trace_id, session_id, agent_name),
         }
 
-        logger.info(
-            "chat 请求: model=%s, trace_id=%s, agent=%s",
-            model_name,
-            trace_id,
-            agent_name,
-        )
+        logger.info("chat 请求")
 
-        host = self._base_url
-        route = self._route_profile or "default"
-        async with measure("gateway.chat", labels={"host": host, "route_profile": route}):
+        async with measure("gateway.chat"):
             response = await self._request_with_retry(
                 method="POST",
                 path="/chat/completions",
@@ -381,16 +457,14 @@ class ModelGatewayClient:
             content: str = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             logger.warning(
-                "chat 响应结构异常: model=%s, trace_id=%s, error=%s",
-                model_name,
-                trace_id,
+                "chat 响应结构异常: error=%s",
                 type(exc).__name__,
             )
             raise ModelGatewayUnavailableError(
                 "模型网关返回结构异常的响应",
                 retryable=False,
             ) from exc
-        logger.info("chat 完成: model=%s, trace_id=%s", model_name, trace_id)
+        logger.info("chat 完成")
         return content
 
     async def chat_structured(
@@ -407,17 +481,20 @@ class ModelGatewayClient:
         max_requests: int | None = None,
     ) -> BaseModel:
         """Return only the validated output for backwards-compatible callers."""
-        result = await self._chat_structured_impl(
-            messages,
-            output_schema,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            trace_id=trace_id,
-            session_id=session_id,
-            agent_name=agent_name,
-            max_requests=max_requests,
-            capture_observation=False,
+        result = await self._record_gateway_outcome(
+            "chat_structured",
+            self._chat_structured_impl(
+                messages,
+                output_schema,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=trace_id,
+                session_id=session_id,
+                agent_name=agent_name,
+                max_requests=max_requests,
+                capture_observation=False,
+            ),
         )
         if isinstance(result, StructuredChatResponse):  # pragma: no cover - invariant guard
             return result.output
@@ -437,17 +514,20 @@ class ModelGatewayClient:
         max_requests: int | None = None,
     ) -> StructuredChatResponse:
         """Return validated output with actual-model and token observations."""
-        result = await self._chat_structured_impl(
-            messages,
-            output_schema,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            trace_id=trace_id,
-            session_id=session_id,
-            agent_name=agent_name,
-            max_requests=max_requests,
-            capture_observation=True,
+        result = await self._record_gateway_outcome(
+            "chat_structured",
+            self._chat_structured_impl(
+                messages,
+                output_schema,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=trace_id,
+                session_id=session_id,
+                agent_name=agent_name,
+                max_requests=max_requests,
+                capture_observation=True,
+            ),
         )
         if isinstance(result, StructuredChatResponse):
             return result
@@ -558,10 +638,7 @@ class ModelGatewayClient:
                 }
 
             logger.info(
-                "chat_structured 请求: model=%s, schema=%s, trace_id=%s, attempt=%d/%d",
-                model_name,
-                output_schema.__name__,
-                trace_id,
+                "chat_structured 请求: attempt=%d/%d",
                 attempt + 1,
                 max_attempts,
             )
@@ -593,12 +670,7 @@ class ModelGatewayClient:
                         args_json,
                         output_schema,
                     )
-                    logger.info(
-                        "chat_structured 完成: model=%s, schema=%s, trace_id=%s",
-                        model_name,
-                        output_schema.__name__,
-                        trace_id,
-                    )
+                    logger.info("chat_structured 完成")
                     return self._observed_result(result, data) if capture_observation else result
 
                 # 如果没有 tool_calls，尝试从 content 解析 JSON
@@ -609,12 +681,7 @@ class ModelGatewayClient:
                         content_json,
                         output_schema,
                     )
-                    logger.info(
-                        "chat_structured 完成(content 解析): model=%s, schema=%s, trace_id=%s",
-                        model_name,
-                        output_schema.__name__,
-                        trace_id,
-                    )
+                    logger.info("chat_structured 完成(content 解析)")
                     return self._observed_result(result, data) if capture_observation else result
 
                 if finish_reason == "length":
@@ -626,9 +693,7 @@ class ModelGatewayClient:
                     raise ChatOutputTruncatedError() from exc
                 last_parse_error = f"结构化输出解析失败: {type(exc).__name__}"
                 logger.warning(
-                    "chat_structured 解析失败: schema=%s, trace_id=%s, attempt=%d/%d, error=%s",
-                    output_schema.__name__,
-                    trace_id,
+                    "chat_structured 解析失败: attempt=%d/%d, error=%s",
                     attempt + 1,
                     max_attempts,
                     type(exc).__name__,
@@ -650,21 +715,32 @@ class ModelGatewayClient:
                 # 空内容：推理模型常态，不浪费 fallback 请求，直接进入下一次 retry（若有预算）。
                 continue
 
-            fallback_result = await self._chat_structured_json_fallback(
-                messages=messages,
-                output_schema=output_schema,
-                model_name=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                trace_id=trace_id,
-                session_id=session_id,
-                agent_name=agent_name,
-                attempt=attempt + 1,
-                max_attempts=max_attempts,
-                capture_observation=capture_observation,
-            )
+            _observe_never_raise(observe_gateway_structured_fallback, "attempted")
+            try:
+                fallback_result = await self._chat_structured_json_fallback(
+                    messages=messages,
+                    output_schema=output_schema,
+                    model_name=model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    capture_observation=capture_observation,
+                )
+            except Exception:
+                # Every attempted fallback must end in exactly one success or
+                # failure.  A transport/timeout/unavailable/unexpected response
+                # exception is a fallback failure: record it, then re-raise the
+                # exact original exception unchanged.
+                _observe_never_raise(observe_gateway_structured_fallback, "failure")
+                raise
             if fallback_result is not None:
+                _observe_never_raise(observe_gateway_structured_fallback, "success")
                 return fallback_result
+            _observe_never_raise(observe_gateway_structured_fallback, "failure")
         # 所有重试耗尽
         raise ChatStructuredParseError(
             last_parse_error or "结构化输出解析失败（重试耗尽）",
@@ -738,10 +814,7 @@ class ModelGatewayClient:
         }
 
         logger.info(
-            "chat_structured JSON fallback request: model=%s, schema=%s, trace_id=%s, attempt=%d/%d",
-            model_name,
-            output_schema.__name__,
-            trace_id,
+            "chat_structured JSON fallback request: attempt=%d/%d",
             attempt,
             max_attempts,
         )
@@ -759,18 +832,11 @@ class ModelGatewayClient:
                 self._loads_json_object(content),
                 output_schema,
             )
-            logger.info(
-                "chat_structured JSON fallback completed: model=%s, schema=%s, trace_id=%s",
-                model_name,
-                output_schema.__name__,
-                trace_id,
-            )
+            logger.info("chat_structured JSON fallback completed")
             return self._observed_result(result, data) if capture_observation else result
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValidationError):
             logger.warning(
-                "chat_structured JSON fallback parse failed: schema=%s, trace_id=%s, attempt=%d/%d",
-                output_schema.__name__,
-                trace_id,
+                "chat_structured JSON fallback parse failed: attempt=%d/%d",
                 attempt,
                 max_attempts,
             )
@@ -924,6 +990,23 @@ class ModelGatewayClient:
             EmbeddingDimensionMismatchError: 维度不一致。
             ModelGatewayTimeoutError: 请求超时。
         """
+        return await self._record_gateway_outcome(
+            "embed",
+            self._embed(
+                texts,
+                model=model,
+                trace_id=trace_id,
+            ),
+        )
+
+    async def _embed(
+        self,
+        texts: list[str],
+        *,
+        model: str | None = None,
+        trace_id: str | None = None,
+    ) -> list[list[float]]:
+        """批量文本向量化实现（由 ``embed`` 包裹以记录 bounded outcome）。"""
         model_name = model or self._embedding_model
         payload: dict[str, Any] = {
             "model": model_name,
@@ -931,12 +1014,7 @@ class ModelGatewayClient:
             **self._build_payload_overrides(trace_id or "embed-no-trace"),
         }
 
-        logger.info(
-            "embed 请求: model=%s, count=%d, trace_id=%s",
-            model_name,
-            len(texts),
-            trace_id,
-        )
+        logger.info("embed 请求: count=%d", len(texts))
 
         try:
             async with measure("gateway.embed"):
@@ -955,9 +1033,7 @@ class ModelGatewayClient:
             embeddings: list[list[float]] = [item["embedding"] for item in data["data"]]
         except (KeyError, IndexError, TypeError) as exc:
             logger.warning(
-                "embed 响应结构异常: model=%s, trace_id=%s, error=%s",
-                model_name,
-                trace_id,
+                "embed 响应结构异常: error=%s",
                 type(exc).__name__,
             )
             raise EmbeddingUnavailableError(
@@ -973,12 +1049,7 @@ class ModelGatewayClient:
                     actual=len(emb),
                 )
 
-        logger.info(
-            "embed 完成: model=%s, count=%d, trace_id=%s",
-            model_name,
-            len(embeddings),
-            trace_id,
-        )
+        logger.info("embed 完成: count=%d", len(embeddings))
         return embeddings
 
     async def health_check(self) -> dict[str, str]:

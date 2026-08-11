@@ -28,9 +28,10 @@ import asyncio
 import json
 import sys
 import time
-from typing import Any
+from io import TextIOWrapper
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding='utf-8', errors='replace')
 
 
 # ---------------------------------------------------------------------------

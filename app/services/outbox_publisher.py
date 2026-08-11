@@ -18,6 +18,10 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from app.agent_runtime.async_command import (
+    ASYNC_COMMAND_ERROR_CODES,
+    ASYNC_COMMAND_OPERATIONS,
+)
 from app.agent_runtime.repository import (
     OutboxErrorCode,
     OutboxHealth,
@@ -73,6 +77,8 @@ def _common(message: OutboxMessage) -> dict[str, object]:
 
 
 def _agent_event(message: OutboxMessage, event_type: SupportedEventType, name: str) -> MappedSessionEvent:
+    if message.graph_run_id is None:
+        raise OutboxMappingError("agent event requires a graph_run_id")
     return MappedSessionEvent(
         event_type,
         {
@@ -81,6 +87,54 @@ def _agent_event(message: OutboxMessage, event_type: SupportedEventType, name: s
             "agent_run_id": str(message.graph_run_id),
         },
     )
+
+
+# Exact version -> (expected command status, client event type).
+_ASYNC_COMMAND_EVENT_VERSIONS: dict[str, tuple[str, str]] = {
+    "async_command.queued.v1": ("queued", "command.queued"),
+    "async_command.running.v1": ("running", "command.running"),
+    "async_command.succeeded.v1": ("succeeded", "command.succeeded"),
+    "async_command.failed.v1": ("failed", "command.failed"),
+}
+
+
+def _command_event(message: OutboxMessage, version: str) -> MappedSessionEvent:
+    """Map an async-command lifecycle row from its fixed allowlist.
+
+    Never copies arbitrary payload fields: only the bounded identifiers,
+    operation/status, attempt, and (for failures) the sanitized error code are
+    projected. Private request payload, result payload, exception text and
+    digests never appear here.
+    """
+    expected_status, event_type = _ASYNC_COMMAND_EVENT_VERSIONS[version]
+    payload = message.payload
+    command_id = _string(payload, "command_id")
+    operation = _string(payload, "operation")
+    status = _string(payload, "status")
+    attempt = payload.get("attempt")
+    if not command_id or not operation or status != expected_status:
+        raise OutboxMappingError(f"{version} has an invalid command contract")
+    if operation not in ASYNC_COMMAND_OPERATIONS:
+        # A corrupt/unknown operation must never be broadcast: fail closed.
+        raise OutboxMappingError(f"{version} has an operation outside the allowlist")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0:
+        raise OutboxMappingError(f"{version} has an invalid attempt count")
+    out: dict[str, object] = {
+        "command_id": command_id,
+        "operation": operation,
+        "status": status,
+        "attempt": attempt,
+    }
+    if version == "async_command.failed.v1":
+        error_code = _string(payload, "error_code")
+        if error_code is None:
+            raise OutboxMappingError("async_command.failed.v1 requires a sanitized error_code")
+        if error_code not in ASYNC_COMMAND_ERROR_CODES:
+            raise OutboxMappingError(
+                "async_command.failed.v1 error_code is outside the fixed allowlist"
+            )
+        out["error_code"] = error_code
+    return MappedSessionEvent(cast(SupportedEventType, event_type), out)
 
 
 def map_outbox_event(message: OutboxMessage) -> tuple[MappedSessionEvent, ...]:
@@ -262,6 +316,9 @@ def map_outbox_event(message: OutboxMessage) -> tuple[MappedSessionEvent, ...]:
     if message.event_type == "domain.state_committed.v1":
         return (_agent_event(message, "agent.finished", "domain_commit"),)
 
+    if message.event_type in _ASYNC_COMMAND_EVENT_VERSIONS:
+        return (_command_event(message, message.event_type),)
+
     raise OutboxMappingError(f"unsupported internal event type: {message.event_type}")
 
 
@@ -387,10 +444,10 @@ class OutboxPublisher:
 
     @staticmethod
     def _error_code(exc: Exception) -> OutboxErrorCode:
-        if isinstance(exc, (asyncio.TimeoutError, RedisTimeoutError)):
+        if isinstance(exc, asyncio.TimeoutError | RedisTimeoutError):
             return OutboxErrorCode.PUBLISH_TIMEOUT
-        if isinstance(exc, (RedisConnectionError, RedisError, ConnectionError)):
+        if isinstance(exc, RedisConnectionError | RedisError | ConnectionError):
             return OutboxErrorCode.PUBLISH_UNAVAILABLE
-        if isinstance(exc, (OutboxMappingError, ValueError)):
+        if isinstance(exc, OutboxMappingError | ValueError):
             return OutboxErrorCode.PUBLISH_REJECTED
         return OutboxErrorCode.PUBLISH_UNKNOWN

@@ -10,10 +10,18 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
-import { ErrorCode } from '@/types/api'
+import { ErrorCode, isAsyncCommandAccepted } from '@/types/api'
 import { listMessages, submitMessageWithRetry } from '@/api/index'
-import type { MessageItem } from '@/types/api'
+import type { AsyncCommandAccepted, MessageItem } from '@/types/api'
 import { generateIdempotencyKey } from '@/utils/id'
+
+/**
+ * R7 选项：收到已接受（HTTP 202）消息命令时回调。上层据此登记对账并保留
+ * 幂等键——已接受的命令绝不能被当作新逻辑命令重发。
+ */
+export interface UseMessagesOptions {
+  onCommandAccepted?: (accepted: AsyncCommandAccepted, idempotencyKey: string) => void
+}
 
 /**
  * One logical doctor reply.  Keep this object intact until the server has
@@ -59,6 +67,25 @@ function ambiguousSubmissionError(cause: unknown): ApiRequestError {
   })
 }
 
+/**
+ * 内部提交执行结果判别（executeSubmission 使用）：
+ * - 'accepted'：HTTP 202，命令已登记对账（onCommandAccepted 已触发）。不是完成，
+ *   内部保留 pending 与幂等键，绝不做乐观刷新/关闭 UI 为完成态；终态由
+ *   settleMessage 处理。
+ * - 'completed'：同步成功完成。
+ * - 'failed'：同步失败（submitError 已设置；上层可展示错误）。
+ *
+ * 注意：公共 submit / retryPending 对外保持历史 boolean 契约——'accepted' 与
+ * 'completed' 都映射为 true（202 表示 HTTP 提交已被接受），'failed'/中止为 false。
+ * 上层据 pendingSubmission 是否保留来区分「已接受待终态」与「已同步完成」。
+ */
+export type SubmissionOutcome = 'accepted' | 'completed' | 'failed'
+
+/** 把内部执行结果映射回历史 boolean 契约（true=提交被接受或同步完成）。 */
+function outcomeToBoolean(outcome: SubmissionOutcome | false): boolean {
+  return outcome === 'accepted' || outcome === 'completed'
+}
+
 export interface UseMessagesResult {
   messages: MessageItem[]
   loading: boolean
@@ -68,7 +95,12 @@ export interface UseMessagesResult {
   pendingSubmission: PendingMessageSubmission | null
   lastFailedContent: string | null
   loadMessages: (sessionId: string) => Promise<MessageItem[] | null>
-  /** 提交问诊消息。stateVersion 为当前会话版本号；onRefreshDetail 用于版本冲突后拉新版本。 */
+  /**
+   * 提交问诊消息。stateVersion 为当前会话版本号；onRefreshDetail 用于版本冲突后拉新版本。
+   * 返回历史 boolean 契约：true 表示 HTTP 提交已被接受（同步完成或已返回 202 登记对账），
+   * false 表示同步失败/中止。202 场景下 pendingSubmission 仍保留且已通过 onCommandAccepted
+   * 登记对账——上层不得据此视为业务完成，终态由 settleMessage/对账回调推进。
+   */
   submit: (
     sessionId: string,
     content: string,
@@ -81,10 +113,15 @@ export interface UseMessagesResult {
     sessionId: string,
     onRefreshDetail: () => Promise<number | undefined>,
   ) => Promise<boolean>
+  /**
+   * R7：对账到终态后由上层调用，清除该已接受消息命令的 pending 状态。
+   * ok=true 视为成功（权威读模型已由上层刷新）；ok=false 展示有界错误。
+   */
+  settleMessage: (commandId: string, ok: boolean, errorCode?: string) => void
   clear: () => void
 }
 
-export function useMessages(): UseMessagesResult {
+export function useMessages(options?: UseMessagesOptions): UseMessagesResult {
   const [messages, setMessages] = useState<MessageItem[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ApiRequestError | null>(null)
@@ -94,11 +131,15 @@ export function useMessages(): UseMessagesResult {
   const [lastFailedContent, setLastFailedContent] = useState<string | null>(null)
   const pendingSubmissionRef = useRef<PendingMessageSubmission | null>(null)
   const pendingSessionIdRef = useRef<string | null>(null)
+  /** R7：记录当前 pending 是否对应一个已接受（202）命令，终态对账时据此清空。 */
+  const pendingAcceptedCommandIdRef = useRef<string | null>(null)
   const activeSessionIdRef = useRef<string | null>(null)
   const sessionGenerationRef = useRef(0)
   const loadGenerationRef = useRef(0)
   const hasMessagesRef = useRef(false)
   const mounted = useRef(true)
+  const optionsRef = useRef<UseMessagesOptions | undefined>(options)
+  optionsRef.current = options
 
   useEffect(() => {
     mounted.current = true
@@ -160,6 +201,7 @@ export function useMessages(): UseMessagesResult {
     setSubmitError(null)
     pendingSubmissionRef.current = null
     pendingSessionIdRef.current = null
+    pendingAcceptedCommandIdRef.current = null
     setPendingSubmission(null)
     setLastFailedContent(null)
   }, [])
@@ -168,8 +210,8 @@ export function useMessages(): UseMessagesResult {
     async (
       sessionId: string,
       submission: PendingMessageSubmission,
-    ): Promise<boolean> => {
-      await submitMessageWithRetry(
+    ): Promise<AsyncCommandAccepted | boolean> => {
+      const result = await submitMessageWithRetry(
         sessionId,
         {
           content: submission.content,
@@ -183,6 +225,9 @@ export function useMessages(): UseMessagesResult {
           idempotencyKey: submission.idempotencyKey,
         },
       )
+      // R7: 202 envelope 表示「已接受为持久命令」，不是已完成业务结果。
+      if (isAsyncCommandAccepted(result)) return result
+      // 同步成功：返回业务结果（此处仅关心非 accepted，等价 true）。
       return true
     },
     [],
@@ -194,7 +239,7 @@ export function useMessages(): UseMessagesResult {
       submission: PendingMessageSubmission,
       onRefreshDetail: () => Promise<number | undefined>,
       sessionGeneration: number,
-    ): Promise<boolean> => {
+    ): Promise<SubmissionOutcome | false> => {
       const isCurrentSession = () => (
         mounted.current
         && activeSessionIdRef.current === sessionId
@@ -205,9 +250,17 @@ export function useMessages(): UseMessagesResult {
       setSubmitting(true)
       setSubmitError(null)
       try {
-        await doSubmit(sessionId, submission)
+        const result = await doSubmit(sessionId, submission)
         if (!isCurrentSession()) return false
-        // 成功后刷新消息历史
+        if (isAsyncCommandAccepted(result)) {
+          // R7: 202 仅表示已接受，非完成。保留 pendingSubmission 阻止把已接受
+          // 的命令当新逻辑命令重发；登记对账，终态由 settleMessage 清空并由
+          // 上层以权威读模型刷新。绝不在此时做乐观刷新。
+          pendingAcceptedCommandIdRef.current = result.command_id
+          optionsRef.current?.onCommandAccepted?.(result, submission.idempotencyKey)
+          return 'accepted'
+        }
+        // 同步成功：刷新消息历史
         await loadMessages(sessionId)
         if (!isCurrentSession()) return false
         if (
@@ -216,10 +269,11 @@ export function useMessages(): UseMessagesResult {
         ) {
           pendingSubmissionRef.current = null
           pendingSessionIdRef.current = null
+          pendingAcceptedCommandIdRef.current = null
           setPendingSubmission(null)
           setLastFailedContent(null)
         }
-        return true
+        return 'completed'
       } catch (err) {
         if (!isCurrentSession()) return false
         if (!(err instanceof ApiRequestError)) {
@@ -293,8 +347,17 @@ export function useMessages(): UseMessagesResult {
           pendingSubmissionRef.current = rebasedSubmission
           setPendingSubmission(rebasedSubmission)
           try {
-            await doSubmit(sessionId, rebasedSubmission)
+            const rebasedResult = await doSubmit(sessionId, rebasedSubmission)
             if (!isCurrentSession()) return false
+            if (isAsyncCommandAccepted(rebasedResult)) {
+              // R7: rebased 提交同样返回 202 → 与首次 202 完全一致地登记对账，
+              // 保留 rebased 的幂等键与 pending，不做乐观刷新/清除；终态由
+              // settleMessage（上层对账回调）处理。绝不能把 202 当同步成功。
+              pendingAcceptedCommandIdRef.current = rebasedResult.command_id
+              optionsRef.current?.onCommandAccepted?.(rebasedResult, rebasedSubmission.idempotencyKey)
+              return 'accepted'
+            }
+            // 同步成功：刷新消息历史
             await loadMessages(sessionId)
             if (!isCurrentSession()) return false
             if (
@@ -303,10 +366,11 @@ export function useMessages(): UseMessagesResult {
             ) {
               pendingSubmissionRef.current = null
               pendingSessionIdRef.current = null
+              pendingAcceptedCommandIdRef.current = null
               setPendingSubmission(null)
               setLastFailedContent(null)
             }
-            return true
+            return 'completed'
           } catch (err2) {
             if (isCurrentSession()) {
               setLastFailedContent(rebasedSubmission.content)
@@ -379,7 +443,7 @@ export function useMessages(): UseMessagesResult {
         submission,
         onRefreshDetail,
         sessionGenerationRef.current,
-      )
+      ).then(outcomeToBoolean)
     },
     [executeSubmission],
   )
@@ -400,10 +464,28 @@ export function useMessages(): UseMessagesResult {
         submission,
         onRefreshDetail,
         sessionGenerationRef.current,
-      )
+      ).then(outcomeToBoolean)
     },
     [executeSubmission],
   )
+
+  // R7: 已接受消息命令对账到终态后，由上层调用以清除 pending 并展示有界结果。
+  const settleMessage = useCallback((commandId: string, ok: boolean, errorCode?: string) => {
+    if (pendingAcceptedCommandIdRef.current !== commandId) return
+    if (!ok) {
+      setLastFailedContent(pendingSubmissionRef.current?.content ?? null)
+      setSubmitError(new ApiRequestError({
+        code: errorCode ?? 'COMMAND_FAILED',
+        userMessage: errorCode ? `命令处理失败（${errorCode}）` : '命令处理失败',
+        status: 409,
+        retryable: false,
+      }))
+    }
+    pendingSubmissionRef.current = null
+    pendingSessionIdRef.current = null
+    pendingAcceptedCommandIdRef.current = null
+    setPendingSubmission(null)
+  }, [])
 
   return {
     messages,
@@ -416,6 +498,7 @@ export function useMessages(): UseMessagesResult {
     loadMessages,
     submit,
     retryPending,
+    settleMessage,
     clear,
   }
 }

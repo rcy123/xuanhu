@@ -8,6 +8,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.agent_runtime.intake_dimension_mapping import (
+    derived_coverage_for_fact_keys,
+    dimension_acquired_key_count,
+    slot_threshold_for,
+)
+from app.agent_runtime.observation_projection import project_current_observations
 from app.schemas.completeness import (
     COMPLETENESS_GATE_NAME,
     COMPLETENESS_POLICY_VERSION,
@@ -28,12 +34,7 @@ from app.schemas.completeness import (
     InquiryDimension,
     StagnationReasonCode,
 )
-from app.agent_runtime.intake_dimension_mapping import (
-    derived_coverage_for_fact_keys,
-    dimension_acquired_key_count,
-    slot_threshold_for,
-)
-from app.schemas.domain import CollectionStatus, GateDecision, GateResultSchema, ObservationStatus
+from app.schemas.domain import CollectionStatus, GateDecision, GateResultSchema
 from app.schemas.triage import TRIAGE_GATE_NAME, TRIAGE_POLICY_VERSION, TriageDisposition
 
 
@@ -458,21 +459,9 @@ def completeness_to_gate_result_schema(
 def _current_facts(
     observations: tuple[CompletenessObservationFact, ...],
 ) -> tuple[CompletenessObservationFact, ...]:
-    superseded_ids = frozenset(
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        sorted(
-            (
-                item
-                for item in observations
-                if item.observation_id not in superseded_ids and item.status is not ObservationStatus.RETRACTED
-            ),
-            key=lambda item: (item.fact_key, _value_key(item), str(item.observation_id)),
-        )
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) come from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _facts_by_dimension(
@@ -576,9 +565,9 @@ def _covered_dimensions(
         covered = set()
         for dimension in COMPLETENESS_DIMENSION_RULES:
             canonical_keys = COMPLETENESS_DIMENSION_RULES[dimension].fact_keys
-            if any(key in active_fact_keys for key in canonical_keys):
-                covered.add(dimension)
-            elif dimension_acquired_key_count(dimension, active_fact_keys) >= slot_threshold_for(dimension):
+            if any(key in active_fact_keys for key in canonical_keys) or (
+                dimension_acquired_key_count(dimension, active_fact_keys) >= slot_threshold_for(dimension)
+            ):
                 covered.add(dimension)
     else:
         covered = {dimension for dimension, facts in facts_by_dimension if facts}
@@ -919,10 +908,10 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 for name in allowed
             )
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)

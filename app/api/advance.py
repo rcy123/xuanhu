@@ -14,6 +14,7 @@ review 阶段必须挂起等待医师确认，不得自动推进。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -27,8 +28,9 @@ from sqlalchemy import func, select
 from sqlalchemy import null as sql_null
 from sqlalchemy.ext.asyncio import AsyncSession
 
-_logger = logging.getLogger("xuanhu.api.advance")
-
+from app.agent_runtime.async_command_admission import (
+    try_rollout_async_admission,
+)
 from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import NODE_REASONING_SUBGRAPH_V1, XuanhuCommand
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
@@ -70,6 +72,8 @@ from app.schemas.common import success_response
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
 from app.services.http_idempotency import HttpCommandExecutor, session_http_scope
 from app.services.session_lock import SessionLock
+
+_logger = logging.getLogger("xuanhu.api.advance")
 
 router = APIRouter(prefix="/api/v1/consult", tags=["advance"])
 
@@ -192,9 +196,10 @@ async def _resolve_committed_advance_stage(
             )
         if claim.status == "completed" and isinstance(claim.response_payload, dict):
             return dict(claim.response_payload)
-        if claim.status == "failed":
-            pass
-        elif claim.status == "running" and (allow_running or await _claim_graph_is_terminal(db, claim.run_id)):
+        if claim.status == "failed" or (
+            claim.status == "running"
+            and (allow_running or await _claim_graph_is_terminal(db, claim.run_id))
+        ):
             pass
         else:
             return None
@@ -601,7 +606,10 @@ async def _run_langgraph_advance(
     sid = uuid.UUID(session_id)
     command_key = _advance_command_key(idempotency_key)
     payload_digest = _advance_payload_digest(force)
-    _require_normal_recovery(session)
+    # 先解析已落盘的幂等结果：图可能在 domain commit 之后、claim 关闭之前崩溃。
+    # 此时 session 可能已被置 recovery_status=manual_required，但 durable outcome
+    # 已提交（可幂等修复），不应被恢复门槛拦下；真正 stuck（无落盘结果）的会话
+    # 仍会命中下方的 _require_normal_recovery，fail-closed 语义不变。
     durable = await _repair_durable_advance_claim(
         session_id=sid,
         command_key=command_key,
@@ -609,6 +617,7 @@ async def _run_langgraph_advance(
     )
     if durable is not None:
         return durable
+    _require_normal_recovery(session)
     run_id: uuid.UUID | None = None
     lock = SessionLock(db, session_id, trace_id)
     try:
@@ -704,17 +713,14 @@ async def _run_langgraph_advance(
             gate_id: uuid.UUID | None = None
             gate_state_version: int | None = None
             if locked.current_stage == "inquiry":
-                # 2.8 版本错位修复（REAL-SESSION b801423b / 7f0b21ae）：
-                # 恢复/回退路径（recover、reasoning needs_more_info 回退）会递增
-                # state_version 但不重新生成 completeness gate，精确匹配
-                # input_state_version == state_version 会误报"信息不充分"。
-                # 这些路径不改变已采集事实，取最新一条 gate 判定是安全的。
+                # 仅接受当前 state version 的 gate，除非有显式持久化的 carry-forward 来源。
                 result = await db.execute(
                     select(GateResult)
                     .where(
                         GateResult.session_id == locked.id,
                         GateResult.gate_name == COMPLETENESS_GATE_NAME,
                         GateResult.policy_version == COMPLETENESS_POLICY_VERSION,
+                        GateResult.input_state_version == locked.state_version,
                     )
                     .order_by(GateResult.created_at.desc(), GateResult.id.desc())
                     .limit(1)
@@ -927,7 +933,7 @@ async def _run_langgraph_advance(
             session_id,
             command_key,
         )
-        try:
+        with contextlib.suppress(BaseException):
             await _mark_advance_failed(
                 db,
                 run_id=run_id,
@@ -935,8 +941,6 @@ async def _run_langgraph_advance(
                 command_key=command_key,
                 error_code="REASONING_GRAPH_CANCELLED",
             )
-        except BaseException:
-            pass
         raise
     return await _completed_advance_response(
         db,
@@ -957,6 +961,80 @@ def _require_langgraph_runtime(
             "shared LangGraph runtime is unavailable",
             retryable=True,
         )
+
+
+async def run_langgraph_advance_flow(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    state_version: int | None,
+    trace_id: str,
+    force: bool,
+    idempotency_key: str,
+    alternative_index: int | None,
+    shared_runtime: SharedLangGraphRuntime | None,
+    allow_request_local_runtime: bool,
+) -> dict[str, Any]:
+    """Execute the full LangGraph advance flow for one logical request.
+
+    This is the single shared business implementation used by both the
+    synchronous POST route and the R6-B async ``session.advance`` worker handler
+    so sync/async always share semantics. It reproduces the exact legacy check,
+    durable-claim repair, and the safety auto-reopen loop of the sync path.
+
+    The caller is responsible for the fresh/request database session. The flow
+    commits internally via ``_run_langgraph_advance``'s ``db.begin()`` blocks;
+    on return ``db`` is not in a transaction.
+    """
+    session = await _load_session_for_advance(db, session_id)
+    if getattr(session, "agent_runtime", "langgraph") != "langgraph":
+        # 3d: legacy 路径已下线——历史 legacy session 仅兼容读,不再推进。
+        raise AgentTriggerFailedError(
+            detail=f"session_id={session_id} legacy runtime has been decommissioned; session is read-only",
+            agent_error_code="LEGACY_RUNTIME_DECOMMISSIONED",
+            retryable=False,
+        )
+
+    # 自动重开方（REAL-SESSION cb5fe635 复盘）：安全审核失败时，prepare_review_interrupt
+    # 会把会话重置回 syndrome + 写拦截原因 + 失效方子，并返回 reopened_for_safety 标记。
+    # 此处在一个 worker job（或一个 HTTP 请求）内循环：下一轮以 syndrome 进入 ADVANCE
+    # （reasoning 重开方），重开方后再次安全审核……直到通过（review）或尝试耗尽（blocked）。
+    # 幂等：首轮用调用方 key（保留乐观并发契约）；后续轮用 fresh internal key 派生
+    # 新 IntakeCommandClaim，避免命中幂等重放路径返回旧响应。
+    from app.services.langgraph_review import MAX_SAFETY_REOPEN_ATTEMPTS
+
+    last_response: dict[str, Any] | None = None
+    for attempt in range(MAX_SAFETY_REOPEN_ATTEMPTS + 1):
+        internal_key = (
+            idempotency_key
+            if attempt == 0
+            else f"{idempotency_key}:safety-reopen:{attempt}"
+        )
+        response = await _run_langgraph_advance(
+            db,
+            session,
+            session_id=session_id,
+            # 首轮校验调用方 state_version（乐观并发）；后续轮会话 state_version 已递增，
+            # 传 None 跳过陈旧校验，让内部重新加载最新 session。
+            state_version=state_version if attempt == 0 else None,
+            trace_id=trace_id,
+            force=force,
+            idempotency_key=internal_key,
+            alternative_index=alternative_index if attempt == 0 else None,
+            shared_runtime=shared_runtime,
+            allow_request_local_runtime=allow_request_local_runtime,
+        )
+        last_response = response
+        # 自动重开：会话已重置回 syndrome（等下一轮 reasoning 重开方），继续循环。
+        if response.get("reopened_for_safety"):
+            continue
+        # reasoning 刚提交方子到 safety，等下一轮 REVIEW 安全审核，继续循环。
+        if response.get("current_stage") == "safety":
+            continue
+        # review（通过）或 blocked（尝试耗尽）→ 终态，返回。
+        return response
+    assert last_response is not None
+    return last_response
 
 
 @router.post("/sessions/{session_id}/advance")
@@ -990,9 +1068,26 @@ async def advance_session(
 
     preflight_session = await _load_session_for_advance(db, session_id)
     preflight_session_id = uuid.UUID(session_id)
+    # R7 rollout: prefer the durable async 202 path when the R6 substrate is
+    # enabled/ready/registered; otherwise fall through to the synchronous path
+    # (exact R1-R5 semantics). Single centralized rollout decision; admission
+    # does bounded session/enqueue only — no model or graph execution inline.
+    accepted = await try_rollout_async_admission(
+        request,
+        request.app.state,
+        session_id=session_id,
+        operation="session.advance",
+        idempotency_key=context.idempotency_key,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+    )
+    if accepted is not None:
+        return accepted
     durable_preflight: dict[str, Any] | None = None
     if getattr(preflight_session, "agent_runtime", "legacy") == "langgraph":
-        _require_normal_recovery(preflight_session)
         preflight_command_key = _advance_command_key(context.idempotency_key)
         preflight_payload_digest = _advance_payload_digest(body.force)
         durable_preflight = await _repair_durable_advance_claim(
@@ -1000,61 +1095,29 @@ async def advance_session(
             command_key=preflight_command_key,
             payload_digest=preflight_payload_digest,
         )
-        # Do not persist a retryable runtime-startup failure as the terminal
-        # outcome for this HTTP idempotency key.
+        # A durable terminal outcome for this exact idempotency key proves the
+        # graph already committed and can be replayed without recovery.  Only an
+        # advance with no durable outcome must pass the recovery gate.
         if durable_preflight is None:
+            _require_normal_recovery(preflight_session)
+            # Do not persist a retryable runtime-startup failure as the terminal
+            # outcome for this HTTP idempotency key.
             _require_langgraph_runtime(shared_runtime, test_runtime_fallback)
 
     async def run_advance() -> dict[str, Any]:
-        session = await _load_session_for_advance(db, session_id)
-        if getattr(session, "agent_runtime", "langgraph") != "langgraph":
-            # 3d: legacy 路径已下线——历史 legacy session 仅兼容读,不再推进。
-            raise AgentTriggerFailedError(
-                detail=f"session_id={session_id} legacy runtime has been decommissioned; session is read-only",
-                agent_error_code="LEGACY_RUNTIME_DECOMMISSIONED",
-                retryable=False,
-            )
-
-        # 自动重开方（REAL-SESSION cb5fe635 复盘）：安全审核失败时，prepare_review_interrupt
-        # 会把会话重置回 syndrome + 写拦截原因 + 失效方子，并返回 reopened_for_safety 标记。
-        # 此处在一个 HTTP 请求内循环：下一轮以 syndrome 进入 ADVANCE（reasoning 重开方），
-        # 重开方后再次安全审核……直到通过（review）或尝试耗尽（blocked）。
-        # 幂等：首轮用 HTTP key（保留乐观并发契约）；后续轮用 fresh internal key 派生
-        # 新 IntakeCommandClaim，避免命中幂等重放路径返回旧响应。
-        from app.services.langgraph_review import MAX_SAFETY_REOPEN_ATTEMPTS
-
-        last_response: dict[str, Any] | None = None
-        for attempt in range(MAX_SAFETY_REOPEN_ATTEMPTS + 1):
-            internal_key = (
-                context.idempotency_key
-                if attempt == 0
-                else f"{context.idempotency_key}:safety-reopen:{attempt}"
-            )
-            response = await _run_langgraph_advance(
-                db,
-                session,
-                session_id=session_id,
-                # 首轮校验 HTTP header（乐观并发）；后续轮会话 state_version 已递增，
-                # 传 None 跳过陈旧 header 校验，让内部重新加载最新 session。
-                state_version=state_version if attempt == 0 else None,
-                trace_id=trace_id,
-                force=body.force,
-                idempotency_key=internal_key,
-                alternative_index=body.alternative_index if attempt == 0 else None,
-                shared_runtime=shared_runtime,
-                allow_request_local_runtime=test_runtime_fallback,
-            )
-            last_response = response
-            # 自动重开：会话已重置回 syndrome（等下一轮 reasoning 重开方），继续循环。
-            if response.get("reopened_for_safety"):
-                continue
-            # reasoning 刚提交方子到 safety，等下一轮 REVIEW 安全审核，继续循环。
-            if response.get("current_stage") == "safety":
-                continue
-            # review（通过）或 blocked（尝试耗尽）→ 终态，返回。
-            return response
-        assert last_response is not None
-        return last_response
+        # Delegate to the shared flow so the synchronous POST and the R6-B async
+        # worker handler execute identical business semantics.
+        return await run_langgraph_advance_flow(
+            db,
+            session_id=session_id,
+            state_version=state_version,
+            trace_id=trace_id,
+            force=body.force,
+            idempotency_key=context.idempotency_key,
+            alternative_index=body.alternative_index,
+            shared_runtime=shared_runtime,
+            allow_request_local_runtime=test_runtime_fallback,
+        )
 
     scope = session_http_scope(session_id)
 

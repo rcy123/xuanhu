@@ -1,18 +1,23 @@
 """Reranker Cross-Encoder real-backend evaluation (standalone)."""
-import asyncio, sys, time, json
+import asyncio
+import json
+import sys
+import time
+from io import TextIOWrapper
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding='utf-8', errors='replace')
 
 
-async def main():
+async def main() -> None:
     print('=== Reranker Cross-Encoder Real-Backend Evaluation ===')
     print()
 
     from app.core.config import get_settings
     from app.core.gateway import ModelGatewayClient
     from app.core.reranker_gateway import build_reranker_gateway_settings
-    from app.rag.retriever import RAGRetriever
     from app.rag.reranker import cross_encoder_rerank, rerank
+    from app.rag.retriever import RAGRetriever
     from app.rag.schemas import MergedHit
 
     s = get_settings()
@@ -30,13 +35,13 @@ async def main():
         ('脾胃虚弱穴位', '足三里用于脾胃虚弱时的定位和主治是什么？'),
     ]
 
-    results = []
+    results: list[dict[str, Any]] = []
     for label, query in test_queries:
         print(f"--- [{label}] ---")
         print(f"Query: {query[:100]}...")
 
         candidates = await retriever.hybrid_search(
-            query=query, sources=('formula', 'herb', 'case', 'theory'), top_k=12,
+            query=query, sources=['formula', 'herb', 'case', 'theory'], top_k=12,
         )
         if not candidates:
             print('  No candidates')
@@ -46,7 +51,7 @@ async def main():
         merged = []
         for ev in candidates:
             hit = MergedHit(
-                source_type=ev.source_type, source_id=ev.source_id, chunk_id=ev.chunk_id,
+                source_type=ev.source_type, source_id=ev.source_id, chunk_id=cast(str, ev.chunk_id),
                 title=ev.title, content_snippet=ev.content_snippet,
                 vector_score=ev.metadata.get('vector_score', 0.7),
                 fulltext_score=ev.metadata.get('fulltext_score', 0.5),
@@ -60,7 +65,7 @@ async def main():
         mvp_latency = (time.perf_counter() - mvp_start) * 1000
         mvp_titles = [e.title for e in mvp_evidence]
         mvp_scores = [e.score for e in mvp_evidence]
-        mvp_short = [(t[:50], round(s, 3)) for t, s in zip(mvp_titles, mvp_scores)]
+        mvp_short = [(t[:50], round(s, 3)) for t, s in zip(mvp_titles, mvp_scores, strict=False)]
         print(f"  MVP ({mvp_latency:.0f}ms): {mvp_short}")
 
         # ---- Cross-Encoder ----
@@ -75,7 +80,7 @@ async def main():
             ce_titles = [e.title for e in ce_evidence]
             ce_scores = [e.score for e in ce_evidence]
             provider = ce_evidence[0].metadata.get('reranker_provider', '?') if ce_evidence else '?'
-            ce_short = [(t[:50], round(s, 3)) for t, s in zip(ce_titles, ce_scores)]
+            ce_short = [(t[:50], round(s, 3)) for t, s in zip(ce_titles, ce_scores, strict=False)]
             print(f"  CE ({ce_latency:.0f}ms, {provider}): {ce_short}")
         except Exception as e:
             print(f"  CE FAILED: {e}")
@@ -116,7 +121,7 @@ async def main():
 
     with open('scripts/op3_eval_reranker.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\nSaved to scripts/op3_eval_reranker.json")
+    print("\nSaved to scripts/op3_eval_reranker.json")
 
 
 if __name__ == '__main__':

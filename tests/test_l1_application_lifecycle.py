@@ -70,6 +70,17 @@ class _FakeCompiledGraph:
         finally:
             self.active -= 1
 
+    async def aget_state(
+        self,
+        config: dict[str, Any],
+        *,
+        subgraphs: bool = False,
+    ) -> Any:
+        # Contract matching the production CompiledStateGraph.aget_state call
+        # in ``_start_or_resume_intake``: return a snapshot with no pending
+        # tasks so the intake graph is invoked for the first time.
+        return SimpleNamespace(tasks=[], values={}, subgraph_states={})
+
 
 def _runtime(
     saver: object | None = None,
@@ -280,6 +291,8 @@ async def test_fastapi_lifespan_shares_runtime_and_closes_on_failure(
         database_url="postgresql://must-not-be-logged",
         outbox_publisher_enabled=False,
         outbox_publisher_shutdown_grace_seconds=1.0,
+        async_command_enabled=False,
+        async_command_shutdown_grace_seconds=1.0,
         safe_dump=lambda: {"database_url": "***"},
     )
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)
@@ -323,6 +336,8 @@ async def test_fastapi_lifespan_startup_failure_is_degraded_and_sanitized(
         database_url=secret,
         outbox_publisher_enabled=False,
         outbox_publisher_shutdown_grace_seconds=1.0,
+        async_command_enabled=False,
+        async_command_shutdown_grace_seconds=1.0,
         safe_dump=lambda: {"database_url": "***"},
     )
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)

@@ -68,7 +68,8 @@ async def two_stage_store(two_stage_db: str):
             text(
                 "TRUNCATE domain_command_commits, outbox_events, gate_results, graph_run_steps, "
                 "artifact_revision_payloads, artifact_revisions, graph_runs, safety_rule_runs, "
-                "safety_profiles, observations, consult_messages, consult_sessions CASCADE"
+                "safety_profiles, observations, consult_messages, consult_sessions, "
+                "herbs, dosage_units CASCADE"
             )
         )
     reasoning_module._SYNDROME_RESULT_CACHE.clear()
@@ -121,7 +122,7 @@ def _syndrome(fact_ids: tuple[uuid.UUID, ...]) -> SyndromeDraft:
         differential=(),
         treatment_principle="辛温解表",
         confidence=0.45,
-        evidence_mode="rag_retrieved",
+        evidence_mode="model_knowledge_only",
         claim_evidence_links=(),
         missing_inputs=(),
         review_required=True,
@@ -144,7 +145,7 @@ def _base(fact_ids: tuple[uuid.UUID, ...]) -> BaseFormulaDraft:
         ),
         rationale="解表散寒",
         confidence=0.45,
-        evidence_mode="rag_retrieved",
+        evidence_mode="model_knowledge_only",
     )
 
 
@@ -161,7 +162,7 @@ def _modification(fact_ids: tuple[uuid.UUID, ...]) -> ModificationDraft:
             ),
         ),
         confidence=0.45,
-        evidence_mode="rag_retrieved",
+        evidence_mode="model_knowledge_only",
     )
 
 

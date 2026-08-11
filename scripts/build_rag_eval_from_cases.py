@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """从真实问诊医案生成 RAG 评估查询集。
 
 每条医案 → query（主诉 + 关键症状）；expected_topics = [证型, 方名, 治法]；
@@ -18,16 +17,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from io import TextIOWrapper
 from pathlib import Path
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = ROOT / "data" / "generated_cases" / "cases.json"
 OUTPUT_PATH = ROOT / "data" / "rag_eval_queries_cases.json"
 
 # 语料中刻意未生成的低频/空缺场景 → negative case（禁止命中）
-NEGATIVE_SCENARIOS: list[dict] = [
+NEGATIVE_SCENARIOS: list[dict[str, Any]] = [
     {
         "category": "negative-缺证场景",
         "query": "热毒炽盛，壮热烦渴，咽喉肿痛溃烂，应参考什么证型与治法？",
@@ -43,7 +44,7 @@ NEGATIVE_SCENARIOS: list[dict] = [
 ]
 
 
-def _chief_text(case: dict) -> str:
+def _chief_text(case: dict[str, Any]) -> str:
     """从 content 提取主诉句（首段「主诉：…」）。"""
     content = case.get("content") or ""
     for line in content.splitlines():
@@ -52,7 +53,7 @@ def _chief_text(case: dict) -> str:
     return content[:80]
 
 
-def _build_query(case: dict) -> str:
+def _build_query(case: dict[str, Any]) -> str:
     chief = _chief_text(case)
     # query = 主诉句 + 现病史要点
     content = case.get("content") or ""
@@ -64,8 +65,8 @@ def _build_query(case: dict) -> str:
     return f"{chief}；{present}" if present else chief
 
 
-def build_eval_queries(cases: list[dict]) -> list[dict]:
-    queries: list[dict] = []
+def build_eval_queries(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    queries: list[dict[str, Any]] = []
     for case in cases:
         syndrome = case.get("syndrome") or ""
         formula_name = (case.get("formula_summary") or "").split("：")[0]

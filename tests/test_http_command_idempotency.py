@@ -42,6 +42,24 @@ _PATIENT_REF_PREFIX = "P1-02-IDEMP-"
 _PUBLIC_CLAIM_DIGESTS: set[str] = set()
 _PROCESS_WORKER_CONFIG_ENV = "XUANHU_IDEMPOTENCY_PROCESS_CONFIG"
 
+# The R8-B guard timing is tunable through these env vars so an operator can run
+# the transient-renew test against any lease/heartbeat/renew-attempt budget
+# without editing the module. Defaults decouple the per-attempt renew budget
+# (generous) from the tight heartbeat so a real DB renewal is never cancelled as
+# a sub-heartbeat timeout.
+_GUARD_LEASE_ENV = "XUANHU_TEST_HTTP_GUARD_LEASE_SECONDS"
+_GUARD_HEARTBEAT_ENV = "XUANHU_TEST_HTTP_GUARD_HEARTBEAT_SECONDS"
+_GUARD_RENEW_ATTEMPT_ENV = "XUANHU_TEST_HTTP_GUARD_RENEW_ATTEMPT_SECONDS"
+
+
+def _guard_timing() -> dict[str, float]:
+    """Return the R8-B guard timing from env (with decoupled, generous defaults)."""
+    return {
+        "lease_seconds": float(os.environ.get(_GUARD_LEASE_ENV, "2")),
+        "heartbeat_seconds": float(os.environ.get(_GUARD_HEARTBEAT_ENV, "0.1")),
+        "renew_attempt_seconds": float(os.environ.get(_GUARD_RENEW_ATTEMPT_ENV, "1.0")),
+    }
+
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def factory() -> async_sessionmaker[AsyncSession]:
@@ -58,11 +76,7 @@ async def cleanup(factory: async_sessionmaker[AsyncSession]) -> None:
                 | (HttpCommandClaim.idempotency_key_digest.in_(_PUBLIC_CLAIM_DIGESTS))
             )
         )
-        await db.execute(
-            delete(ConsultSession).where(
-                ConsultSession.patient_ref.like(f"{_PATIENT_REF_PREFIX}%")
-            )
-        )
+        await db.execute(delete(ConsultSession).where(ConsultSession.patient_ref.like(f"{_PATIENT_REF_PREFIX}%")))
 
 
 async def _execute(
@@ -153,12 +167,11 @@ async def test_same_key_concurrent_workers_execute_one_side_effect_and_replay(
     assert {first.replayed, second.replayed} == {False, True}
     assert calls == 1
     async with factory() as db:
-        assert await db.scalar(
-            select(func.count()).select_from(ConsultSession).where(ConsultSession.id == session_id)
-        ) == 1
-        claim = await db.scalar(
-            select(HttpCommandClaim).where(HttpCommandClaim.operation == operation)
+        assert (
+            await db.scalar(select(func.count()).select_from(ConsultSession).where(ConsultSession.id == session_id))
+            == 1
         )
+        claim = await db.scalar(select(HttpCommandClaim).where(HttpCommandClaim.operation == operation))
     assert claim is not None
     assert claim.status == "completed"
     assert claim.idempotency_mode == "public"
@@ -232,8 +245,7 @@ def _run_process_pair(
         for process in processes:
             stdout, stderr = process.communicate(timeout=60)
             assert process.returncode == 0, (
-                f"idempotency worker failed with code {process.returncode}; "
-                f"stdout={stdout!r}; stderr={stderr!r}"
+                f"idempotency worker failed with code {process.returncode}; stdout={stdout!r}; stderr={stderr!r}"
             )
             parsed = json.loads(stdout)
             assert isinstance(parsed, dict)
@@ -282,9 +294,7 @@ async def test_same_public_key_in_two_os_processes_commits_once_and_replays(
     assert outputs[0]["data"]["session_id"] == str(session_id)
     assert outputs[0]["data"]["effect_token"] == effect_token
     assert outputs[0]["data"]["executed_by_pid"] in worker_pids
-    assert sum(
-        output["worker_pid"] == output["data"]["executed_by_pid"] for output in outputs
-    ) == 1
+    assert sum(output["worker_pid"] == output["data"]["executed_by_pid"] for output in outputs) == 1
 
     key_digest = hashlib.sha256(public_key.encode()).hexdigest()
     async with factory() as db:
@@ -526,13 +536,16 @@ async def test_non_idempotent_commands_share_scope_lock_but_later_random_key_run
     assert not first_context.is_idempotent
     assert not overlap_context.is_idempotent
     assert not later_context.is_idempotent
-    assert len(
-        {
-            first_context.idempotency_key,
-            overlap_context.idempotency_key,
-            later_context.idempotency_key,
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                first_context.idempotency_key,
+                overlap_context.idempotency_key,
+                later_context.idempotency_key,
+            }
+        )
+        == 3
+    )
 
     async def first_handler(db: AsyncSession) -> dict[str, Any]:
         nonlocal active_handlers, max_active_handlers
@@ -655,9 +668,7 @@ async def test_create_session_api_same_key_different_trace_creates_once(
     assert first.json()["trace_id"] != second.json()["trace_id"]
     async with factory() as db:
         session_count = await db.scalar(
-            select(func.count())
-            .select_from(ConsultSession)
-            .where(ConsultSession.patient_ref == patient_ref)
+            select(func.count()).select_from(ConsultSession).where(ConsultSession.patient_ref == patient_ref)
         )
         claim_count = await db.scalar(
             select(func.count())
@@ -669,3 +680,141 @@ async def test_create_session_api_same_key_different_trace_creates_once(
         )
     assert session_count == 1
     assert claim_count == 1
+
+
+# ---------------------------------------------------------------------------
+# R8-B: ownership-loss convergence under the shared lease guard
+# ---------------------------------------------------------------------------
+
+
+async def test_owner_loss_while_handler_blocked_fails_closed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A stale HTTP owner must stop at its next guard observation.
+
+    The handler blocks (a clinical write in progress). A second owner takes over
+    the claim (flips the owner token). The guard observes the loss on its next
+    renewal, cancels the blocked handler, and the executor fails closed with the
+    PHI-safe ``HTTP_COMMAND_RECOVERY_REQUIRED`` error — the stale handler never
+    runs its uncommitted side effect and never completes the claim.
+    """
+    operation = f"{_OPERATION_PREFIX}owner-loss"
+    scope = f"session:{uuid.uuid4()}"
+    entered = asyncio.Event()
+    stale_side_effect = asyncio.Event()
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        entered.set()
+        await asyncio.Event().wait()  # only cancellation ends this block
+        stale_side_effect.set()  # reached only if the stale owner kept running
+        return {"must_not": "commit"}
+
+    async with factory() as db:
+        executor = HttpCommandExecutor(
+            db,
+            session_factory=factory,
+            lease_seconds=1,
+            heartbeat_seconds=0.1,
+        )
+        task = asyncio.create_task(
+            executor.execute(
+                operation=operation,
+                scope_key=scope,
+                concurrency_scope=scope,
+                idempotency_key="owner-loss-key",
+                is_idempotent=True,
+                request_payload={"body": {}},
+                success_status=200,
+                success_message="ok",
+                handler=lambda: handler(db),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        # A second owner takes over the claim (owner-token loss).
+        async with factory() as takeover_db, takeover_db.begin():
+            claim = await takeover_db.scalar(select(HttpCommandClaim).where(HttpCommandClaim.operation == operation))
+            assert claim is not None
+            claim.owner_token = uuid.uuid4()
+
+        with pytest.raises(HttpCommandRecoveryRequiredError) as captured:
+            await asyncio.wait_for(task, timeout=10)
+        assert captured.value.code == "HTTP_COMMAND_RECOVERY_REQUIRED"
+        # The stale handler never reached its clinical side effect.
+        assert not stale_side_effect.is_set()
+
+        async with factory() as check_db:
+            claim = await check_db.scalar(select(HttpCommandClaim).where(HttpCommandClaim.operation == operation))
+        assert claim is not None
+        assert claim.status != "completed"  # no stale completion
+        # The takeover token is intact; the claim was not repurposed by the stale owner.
+        assert claim.status == "running"
+
+
+async def test_transient_renew_failure_recovers_and_completes(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A transient renewal failure is retried by the real guard, not fatal.
+
+    The first ``renew`` raises (a transient DB hiccup); the shared guard retries
+    while the local deadline remains, the handler finishes, and the claim
+    completes normally. Only the renewal source is injected to fail once; the
+    LeaseGuard itself is the real production implementation.
+
+    The watchdog heartbeat is intentionally tight (0.1s) so it fires several
+    times while the handler runs, while ``renew_attempt_seconds`` is decoupled
+    to a generous budget so each real DB renewal transaction (tens of ms on the
+    test cluster) can complete instead of being cancelled as a timeout. This
+    makes the test assert exactly the claimed property — one transient failure is
+    retried and recovered — rather than tripping over renews slower than the
+    heartbeat. The three timings are overridable through ``XUANHU_TEST_HTTP_GUARD_*``
+    env vars (see :func:`_guard_timing`).
+    """
+    operation = f"{_OPERATION_PREFIX}renew-recovery"
+    scope = f"session:{uuid.uuid4()}"
+    entered = asyncio.Event()
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        del db
+        entered.set()
+        # Outlive the injected preflight failure + backoff and several real
+        # watchdog renewals, so completion happens under continued ownership.
+        await asyncio.sleep(0.4)
+        return {"recovered": True}
+
+    async with factory() as db:
+        executor = HttpCommandExecutor(
+            db,
+            session_factory=factory,
+            **_guard_timing(),
+        )
+        real_renew = executor._renew
+        first = {"fired": False}
+
+        async def failing_renew(owner: Any) -> bool:
+            if not first["fired"]:
+                first["fired"] = True
+                raise RuntimeError("transient renew failure")
+            return await real_renew(owner)
+
+        executor._renew = failing_renew  # type: ignore[assignment]
+
+        result = await executor.execute(
+            operation=operation,
+            scope_key=scope,
+            concurrency_scope=scope,
+            idempotency_key="renew-recovery-key",
+            is_idempotent=True,
+            request_payload={"body": {}},
+            success_status=200,
+            success_message="ok",
+            handler=lambda: handler(db),
+        )
+
+    assert result.data == {"recovered": True}
+    assert not result.replayed
+    async with factory() as check_db:
+        claim = await check_db.scalar(select(HttpCommandClaim).where(HttpCommandClaim.operation == operation))
+    assert claim is not None
+    assert claim.status == "completed"
+    assert claim.response_payload == {"data": {"recovered": True}, "message": "ok"}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
 from app.agent_runtime.formula_consistency import (
     FormulaConsistencyFailureCode,

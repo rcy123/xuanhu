@@ -609,15 +609,33 @@ async def test_recovery_required_blocks_record_advance_without_mutation() -> Non
         ) == 0
 
 
-async def test_langgraph_record_never_calls_legacy_supervisor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_langgraph_record_never_calls_legacy_supervisor() -> None:
     session_id, state_version, _herb_name = await _confirmed_record_stage()
 
-    async def reject_legacy_path(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("Legacy Supervisor.advance must not serve LangGraph Record")
+    # 3d 统一后端：legacy Supervisor.advance 入口已从 app.api.advance 彻底下线，
+    # LangGraph 是唯一会话路径。断言该符号已不存在（而非 monkeypatch 一个并不存在
+    # 的路径做 vacuous 校验），并证明 record advance 通过 LangGraph 流程落盘为 done。
+    import app.api.advance as advance_module
 
-    monkeypatch.setattr("app.api.advance.Supervisor.advance", reject_legacy_path)
+    assert not hasattr(advance_module, "Supervisor")
+
     status_code, body = await _post_record_advance(session_id, state_version)
     assert status_code == 200, body
     assert body["data"]["current_stage"] == "done"
+    assert body["data"]["from_stage"] == "record"
+
+    factory = get_session_factory()
+    async with factory() as db:
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        assert session.agent_runtime == "langgraph"
+        assert session.status == "done"
+        assert await db.scalar(
+            select(func.count())
+            .select_from(ArtifactRevision)
+            .where(
+                ArtifactRevision.session_id == session_id,
+                ArtifactRevision.artifact_type == MEDICAL_RECORD_ARTIFACT_TYPE,
+                ArtifactRevision.status == "current",
+            )
+        ) == 1

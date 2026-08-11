@@ -1,11 +1,27 @@
-"""Quick reranker connectivity test."""
-import requests, json
+"""Quick reranker connectivity test (secrets read from env only)."""
+import json
+import os
+import sys
+from typing import Any
 
-BASE = 'https://www.dmxapi.cn/v1'
-KEY = 'sk-nddHCp7Tf8JlhsohBPFR3zJ5PVGfLw0HKdLNuiXckFNObHDk'
+import requests
 
-payload = {
-    'model': 'jina-reranker-m0',
+KEY_ENV = 'RERANKER_GATEWAY_API_KEY'
+BASE_ENV = 'RERANKER_GATEWAY_BASE_URL'
+MODEL_ENV = 'RAG_RERANKER_MODEL'
+
+KEY = os.environ.get(KEY_ENV, '').strip()
+if not KEY:
+    sys.exit(
+        f'{KEY_ENV} 未设置：请从环境（或 .env）提供 reranker 网关 API 密钥后再运行。'
+    )
+
+# 网关地址与模型名按既定配置口径读取；未设置时给出默认值，但不涉及密钥。
+BASE = os.environ.get(BASE_ENV, '').strip() or 'https://www.dmxapi.cn/v1'
+MODEL = os.environ.get(MODEL_ENV, '').strip() or 'jina-reranker-m0'
+
+payload: dict[str, Any] = {
+    'model': MODEL,
     'query': '患者咳嗽痰白稀，恶寒发热，麻黄汤证',
     'documents': [
         '麻黄汤治疗风寒感冒，发汗解表，宣肺平喘',

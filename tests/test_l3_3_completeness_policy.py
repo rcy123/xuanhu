@@ -365,6 +365,39 @@ def test_corrected_retracted_and_superseded_old_facts_do_not_count_as_current_co
     assert InquiryDimension.TEN_SLEEP in result.missing_required
 
 
+def test_only_the_outermost_correction_head_counts_as_current_coverage() -> None:
+    """R2-B1：链头语义——被再修正的中间 CORRECTED 不是当前事实，最外层修正才覆盖维度。
+
+    旧 completeness 本地游走只排除 RETRACTED 与被取代根，被再修正的 CORRECTED
+    仍被计入 → 同维度出现两个当前值 → 误报冲突。共享投影只把链头计为当前，
+    因此最外层修正独自覆盖维度且不产生冲突。
+    """
+    course_root = fact("chief_complaint.course", "one_day", observation_id=uuid4())
+    course_fix1 = fact(
+        "chief_complaint.course",
+        "two_days",
+        status=ObservationStatus.CORRECTED,
+        supersedes=course_root.observation_id,
+        observation_id=uuid4(),
+    )
+    course_fix2 = fact(
+        "chief_complaint.course",
+        "three_days",
+        status=ObservationStatus.CORRECTED,
+        supersedes=course_fix1.observation_id,
+        observation_id=uuid4(),
+    )
+    facts = tuple(item for item in complete_general_facts() if item.fact_key != "chief_complaint.course")
+
+    result = evaluate_completeness_policy(
+        policy_input(*facts, course_root, course_fix1, course_fix2)
+    )
+
+    assert result.disposition is CompletenessDisposition.READY
+    assert InquiryDimension.BASIC_COURSE in result.covered_dimensions
+    assert not result.conflicting_dimensions
+
+
 def test_conflicting_current_facts_are_conflict_and_failed() -> None:
     facts = complete_general_facts() + (fact("ten_questions.sleep", "poor"),)
 

@@ -34,12 +34,39 @@ _TEST_DOCTOR_ID = "doctor_p3_test"
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
 async def _cleanup_test_sessions() -> None:
-    """模块结束时清理本模块创建的会话及关联审计事件。"""
+    """模块结束时清理本模块创建的会话及关联审计事件。
+
+    模块 setup 阶段先落一条 durable ``runtime.switched`` 审计，模拟一次真实的
+    langgraph 发布：统一后端要求配置默认运行时(AGENT_RUNTIME_VERSION=langgraph)
+    与最近一次 switch 审计一致，之后新会话才允许消费该默认运行时。
+    """
     from app.core.config import get_settings
     from app.db.session import get_session_factory, reset_session_factory
+    from app.services.runtime_switch_audit import (
+        PostgresRuntimeSwitchAuditRepository,
+        RuntimeSwitchAuditService,
+        RuntimeSwitchRecord,
+    )
 
     get_settings.cache_clear()
     await reset_session_factory()
+
+    factory = get_session_factory()
+    async with factory() as session:
+        service = RuntimeSwitchAuditService(PostgresRuntimeSwitchAuditRepository(session))
+        if (await service.status("langgraph")).status != "ok":
+            await service.record_switch(
+                RuntimeSwitchRecord(
+                    from_runtime="legacy",
+                    to_runtime="langgraph",
+                    operator="test-operator",
+                    reason="integration tests authorize the langgraph default runtime",
+                    deployment_id="sessions-api-test-deploy-0001",
+                    timestamp=datetime.now(UTC),
+                ),
+                configured_runtime="langgraph",
+            )
+            await session.commit()
 
     yield
 
@@ -177,7 +204,8 @@ async def test_create_session_success(client: AsyncClient, db: AsyncSession) -> 
     data = body["data"]
     assert data["current_stage"] == "inquiry"
     assert data["status"] == "active"
-    assert data["agent_runtime"] == "legacy"
+    # 统一后端：langgraph 是唯一新会话运行时。
+    assert data["agent_runtime"] == "langgraph"
     assert data["patient_info"]["patient_ref"] == f"{_TEST_PATIENT_REF_PREFIX}TEST001"
 
     # 数据库验证
@@ -200,8 +228,7 @@ async def test_create_session_writes_audit_event(
             "gender": "unknown",
         },
         "chief_complaint": "audit test",
-            "agent_runtime": "langgraph",
-    }
+                }
     data = await _create_session(client, payload, headers={"X-Doctor-Id": "doctor_p3"})
     session_id = data["session_id"]
 
@@ -234,10 +261,8 @@ async def test_create_langgraph_session_seeds_identity_free_domain_state(
     data = await _create_session(
         client,
         {
-            "agent_runtime": "langgraph",
-            "chief_complaint": "反复头痛",
-            "agent_runtime": "langgraph",
-            "patient_info": {
+                        "chief_complaint": "反复头痛",
+                        "patient_info": {
                 "name": identity_name,
                 "patient_ref": identity_ref,
                 "age": 36,
@@ -298,10 +323,8 @@ async def test_create_langgraph_session_persists_first_question_without_extra_us
     data = await _create_session(
         client,
         {
-            "agent_runtime": "langgraph",
-            "chief_complaint": "感冒三天",
-            "agent_runtime": "langgraph",
-            "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}AUTO-FIRST"},
+                        "chief_complaint": "感冒三天",
+                        "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}AUTO-FIRST"},
         },
     )
     sid = uuid.UUID(data["session_id"])
@@ -373,10 +396,8 @@ async def test_create_langgraph_session_red_flag_chief_complaint_blocks_immediat
     data = await _create_session(
         client,
         {
-            "agent_runtime": "langgraph",
-            "chief_complaint": "突然胸痛并且呼吸困难",
-            "agent_runtime": "langgraph",
-            "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}SEED-RED-FLAG"},
+                        "chief_complaint": "突然胸痛并且呼吸困难",
+                        "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}SEED-RED-FLAG"},
         },
     )
     assert data["current_stage"] == "blocked"
@@ -396,16 +417,23 @@ async def test_create_langgraph_session_red_flag_chief_complaint_blocks_immediat
 async def test_create_langgraph_session_fails_closed_when_public_rollout_is_disabled(
     client: AsyncClient,
     db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.core.config import get_settings
+
     patient_ref = f"{_TEST_PATIENT_REF_PREFIX}LANGGRAPH-PUBLIC-DISABLED"
-    response = await client.post(
-        "/api/v1/consult/sessions",
-        json={
-            "agent_runtime": "langgraph",
-            "patient_info": {"patient_ref": patient_ref},
-        },
-        headers={"X-Request-Id": "trace-langgraph-public-disabled"},
-    )
+    monkeypatch.setenv("XUANHU_LANGGRAPH_PUBLIC_ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        response = await client.post(
+            "/api/v1/consult/sessions",
+            json={
+                                "patient_info": {"patient_ref": patient_ref},
+            },
+            headers={"X-Request-Id": "trace-langgraph-public-disabled"},
+        )
+    finally:
+        get_settings.cache_clear()
 
     assert response.status_code == 403
     assert response.json() == {
@@ -477,16 +505,14 @@ async def test_list_sessions_pagination_and_sort(client: AsyncClient, db: AsyncS
         {
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}PAGE001"},
             "chief_complaint": "first",
-            "agent_runtime": "langgraph",
-        },
+                    },
     )
     s2 = await _create_session(
         client,
         {
             "patient_info": {"patient_ref": f"{_TEST_PATIENT_REF_PREFIX}PAGE002"},
             "chief_complaint": "second",
-            "agent_runtime": "langgraph",
-        },
+                    },
     )
 
     response = await client.get("/api/v1/consult/sessions?page=1&page_size=1&sort=created_at:desc")
@@ -501,7 +527,8 @@ async def test_list_sessions_pagination_and_sort(client: AsyncClient, db: AsyncS
 
     # 默认排序为 created_at:desc，第一条应为最新创建的 s2
     assert data["items"][0]["session_id"] == s2["session_id"]
-    assert data["items"][0]["agent_runtime"] == "legacy"
+    # 统一后端：langgraph 是唯一新会话运行时。
+    assert data["items"][0]["agent_runtime"] == "langgraph"
 
 
 async def test_list_sessions_status_filter(client: AsyncClient, db: AsyncSession) -> None:
@@ -578,8 +605,7 @@ async def test_get_session_detail_success(client: AsyncClient, db: AsyncSession)
             "age": 30,
         },
         "chief_complaint": "detail test",
-            "agent_runtime": "langgraph",
-    }
+                }
     created = await _create_session(client, payload)
 
     response = await client.get(f"/api/v1/consult/sessions/{created['session_id']}")
@@ -591,8 +617,11 @@ async def test_get_session_detail_success(client: AsyncClient, db: AsyncSession)
     assert data["current_stage"] == "inquiry"
     assert data["status"] == "active"
     assert data["patient_info"]["patient_ref"] == f"{_TEST_PATIENT_REF_PREFIX}DETAIL001"
-    # P3-1 未实现字段应为 null 或空结构
-    assert data["sufficiency_report"] is None
+    # 统一后端：inquiry 阶段 completeness/triage 门禁已投影出充分性报告。
+    sufficiency = data["sufficiency_report"]
+    assert isinstance(sufficiency, dict)
+    assert {"covered", "missing", "sufficient"} <= set(sufficiency)
+    # 尚无证候/方剂/安全审核/病历产物，应保持 null。
     assert data["syndrome_result"] is None
     assert data["safety_review"] is None
     assert data["medical_record"] is None

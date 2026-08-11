@@ -7,6 +7,8 @@ Create Date: 2026-07-12
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
@@ -26,7 +28,7 @@ def upgrade() -> None:
         sa.Column("revision", sa.Integer(), nullable=False),
         sa.Column("payload_schema_version", sa.String(length=64), nullable=False),
         sa.Column("content_digest", sa.String(length=64), nullable=False),
-        sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("payload", cast(Any, postgresql.JSONB)(astext_type=sa.Text()), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.CheckConstraint("revision >= 1", name="chk_artifact_revision_payloads_revision"),

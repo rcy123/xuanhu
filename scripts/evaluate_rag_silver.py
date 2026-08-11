@@ -1098,7 +1098,7 @@ def _safe_metadata(metadata: Any) -> JsonObject:
     result: JsonObject = {}
     for key in allowed:
         value = metadata.get(key)
-        if value is not None and isinstance(value, (str, int, float, bool)):
+        if value is not None and isinstance(value, str | int | float | bool):
             result[key] = value
     return result
 
@@ -1297,7 +1297,7 @@ def validate_result_record(
     if record.get("first_relevant_rank") != rank or record.get("hit_at_8") != hit:
         raise ResumeIntegrityError("stored result relevance fields mismatch")
     stored_rr = record.get("reciprocal_rank")
-    if not isinstance(stored_rr, (float, int)) or not math.isclose(float(stored_rr), reciprocal_rank, abs_tol=1e-12):
+    if not isinstance(stored_rr, float | int) or not math.isclose(float(stored_rr), reciprocal_rank, abs_tol=1e-12):
         raise ResumeIntegrityError("stored result reciprocal_rank mismatch")
     expected_hash = _record_hash(record)
     if record.get("record_sha256") != expected_hash:
@@ -1814,7 +1814,7 @@ def compute_metrics(
 
 
 def _require_metric_equal(observed: Any, expected: Any, label: str, reasons: list[str]) -> None:
-    if isinstance(observed, (float, int)) and isinstance(expected, (float, int)):
+    if isinstance(observed, float | int) and isinstance(expected, float | int):
         if not math.isclose(float(observed), float(expected), abs_tol=1e-12):
             reasons.append(label)
     elif observed != expected:

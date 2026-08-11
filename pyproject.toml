@@ -95,6 +95,10 @@ module = [
     "fastapi.*",
     "httpx.*",
     "pymilvus.*",
+    "requests",
+    "playwright",
+    "playwright.*",
+    "pypinyin",
 ]
 ignore_missing_imports = true
 

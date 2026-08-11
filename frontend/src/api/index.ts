@@ -9,20 +9,21 @@ import { request, requestWithRetry } from './client'
 import type { RequestContext } from './client'
 import { generateIdempotencyKey } from '@/utils/id'
 import type {
-  AdvanceData,
+  AdvanceMutationResult,
   AdvanceRequest,
+  AsyncCommandStatus,
   CursorData,
-  MessageCreateData,
   MessageCreateRequest,
   MessageItem,
   MessageListParams,
+  MessageSubmitResult,
   PageData,
   RecordResponse,
   RecordUpdateRequest,
   RecordUpdateResponse,
   RecoveryData,
   RecoveryRequest,
-  ReviewData,
+  ReviewMutationResult,
   ReviewRequest,
   SafetyAssertionDecisionRequest,
   SafetyAssertionStatus,
@@ -98,14 +99,19 @@ export function terminateSession(
  *
  * 写操作：建议携带 ctx.stateVersion；后端可能返回 409 SESSION_BUSY /
  * INVALID_STATE_VERSION，由调用方决定重试。本封装提供 retry 版本。
+ *
+ * R7：缺省即请求异步（`Prefer: respond-async`）。后端就绪时返回 HTTP 202
+ * 命令 envelope（`AsyncCommandAccepted`，用 `isAsyncCommandAccepted` 收窄），
+ * 未就绪时回退同步返回 `MessageCreateData`。调用方不得把 202 当作已完成业务。
+ * `respondAsync=false` 仅省略偏好头，不强制同步（见 RequestContext.respondAsync）。
  */
 export function submitMessage(
   sessionId: string,
   body: MessageCreateRequest,
   ctx?: RequestContext,
-): Promise<MessageCreateData> {
-  const writeContext = withIdempotencyKey(ctx)
-  return request<MessageCreateData>(
+): Promise<MessageSubmitResult> {
+  const writeContext = withR7AsyncDefault(withIdempotencyKey(ctx))
+  return request<MessageSubmitResult>(
     `consult/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
@@ -119,15 +125,17 @@ export function submitMessage(
  * 提交消息（带自动重试，处理 SESSION_BUSY 等不确定失败）。
  * INVALID_STATE_VERSION 是确定失败，由 useMessages 校验回复绑定后新建命令。
  * 默认重试 3 次，间隔 1.5s。
+ *
+ * R7：默认请求异步；202 是成功的接受（非错误），不会触发重试。
  */
 export function submitMessageWithRetry(
   sessionId: string,
   body: MessageCreateRequest,
   ctx?: RequestContext,
   maxRetries = 3,
-): Promise<MessageCreateData> {
-  const writeContext = withIdempotencyKey(ctx)
-  return requestWithRetry<MessageCreateData>(
+): Promise<MessageSubmitResult> {
+  const writeContext = withR7AsyncDefault(withIdempotencyKey(ctx))
+  return requestWithRetry<MessageSubmitResult>(
     `consult/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
@@ -245,14 +253,17 @@ export function recoverSession(
  * 注意（UI §3.3 / P7-1）：confirm/modify 成功后当前只进入
  * current_stage=record/status=active，不会在该响应里返回病历。
  * 病历完成态需通过 session.done SSE 或 GET /sessions/{id} 确认。
+ *
+ * R7：默认请求异步；后端就绪时返回 202 命令 envelope，未就绪时回退同步
+ * `ReviewData`。202 仅表示已接受，须经命令状态 + 权威读模型确认结果。
  */
 export function reviewPrescription(
   sessionId: string,
   body: ReviewRequest,
   ctx?: RequestContext,
-): Promise<ReviewData> {
-  const writeContext = withIdempotencyKey(ctx)
-  return request<ReviewData>(
+): Promise<ReviewMutationResult> {
+  const writeContext = withR7AsyncDefault(withIdempotencyKey(ctx))
+  return request<ReviewMutationResult>(
     `consult/sessions/${encodeURIComponent(sessionId)}/review`,
     {
       method: 'POST',
@@ -350,14 +361,17 @@ export function exportRecord(
  * 问诊完备性充分后调用，依次执行辨证→开方→加减→安全审核。
  * 安全审核通过后挂起等待医师确认（不进病历生成）。
  * review 阶段不可调用，需先提交医师确认。
+ *
+ * R7：默认请求异步；后端就绪时返回 202 命令 envelope，未就绪时回退同步
+ * `AdvanceData`。202 仅表示已接受，须经命令状态 + 权威读模型确认结果。
  */
 export function advanceSession(
   sessionId: string,
   body: AdvanceRequest = {},
   ctx?: RequestContext,
-): Promise<AdvanceData> {
-  const writeContext = withIdempotencyKey(ctx)
-  return request<AdvanceData>(
+): Promise<AdvanceMutationResult> {
+  const writeContext = withR7AsyncDefault(withIdempotencyKey(ctx))
+  return request<AdvanceMutationResult>(
     `consult/sessions/${encodeURIComponent(sessionId)}/advance`,
     {
       method: 'POST',
@@ -367,10 +381,43 @@ export function advanceSession(
   )
 }
 
+/**
+ * GET /consult/sessions/{id}/commands/{commandId} —— 查询 R6-B 异步命令公共状态。
+ * 返回的字段全部有界且 PHI 安全（仅状态/attempt/结果 HTTP 码/固定错误码/链接）。
+ * SSE 的 command.* 事件是唤醒信号；此处为权威状态源。
+ */
+export function getCommandStatus(
+  sessionId: string,
+  commandId: string,
+  ctx?: RequestContext,
+): Promise<AsyncCommandStatus> {
+  return request<AsyncCommandStatus>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(commandId)}`,
+    {
+      method: 'GET',
+      ctx,
+    },
+  )
+}
+
 function withIdempotencyKey(ctx?: RequestContext): RequestContext {
   return {
     ...ctx,
     idempotencyKey: ctx?.idempotencyKey ?? generateIdempotencyKey(),
+  }
+}
+
+/**
+ * R7 默认异步：三处写操作缺省请求 `Prefer: respond-async`（RFC 7240 标准头）。
+ * 显式传 `ctx.respondAsync = false` 仅省略该兼容偏好头，**不强制同步**——
+ * R7 后端就绪时即使不带该头也默认返回 HTTP 202；真正的同步回退是部署方
+ * 设置 `XUANHU_ASYNC_COMMAND_ENABLED=false`。前端以 `isAsyncCommandAccepted`
+ * 判别实际返回结果，不依赖该头是否发送。
+ */
+function withR7AsyncDefault(ctx: RequestContext): RequestContext {
+  return {
+    ...ctx,
+    respondAsync: ctx.respondAsync ?? true,
   }
 }
 

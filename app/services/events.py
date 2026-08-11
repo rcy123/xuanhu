@@ -292,7 +292,7 @@ class EventService:
                 encoded_payload,
             ),
         )
-        if not isinstance(result, (list, tuple)) or len(result) != 2:
+        if not isinstance(result, list | tuple) or len(result) != 2:
             raise RuntimeError("unexpected Redis append-once result")
         return EventAppendResult(
             event_id=str(result[0]),
@@ -320,7 +320,7 @@ class EventService:
             return [], True
 
         rows = await redis.xread({key: start_id}, count=count)
-        return self._decode_xread(rows), False
+        return self._decode_xread(cast(list[tuple[str, list[tuple[str, dict[str, str]]]]], rows)), False
 
     async def wait_for_events(
         self,
@@ -334,7 +334,7 @@ class EventService:
         redis = await self._get_redis()
         key = session_event_stream_key(session_id)
         rows = await redis.xread({key: last_event_id}, count=count, block=block_ms)
-        return self._decode_xread(rows)
+        return self._decode_xread(cast(list[tuple[str, list[tuple[str, dict[str, str]]]]], rows))
 
     async def iter_sse(
         self,

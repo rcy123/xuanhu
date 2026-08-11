@@ -8,11 +8,11 @@ import inspect
 import json
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
+from app.core.config import get_settings
 from app.core.exceptions import (
     ChatOutputTruncatedError,
     ChatStructuredParseError,
@@ -21,7 +21,6 @@ from app.core.exceptions import (
     ModelRunAuditIntegrityError,
     ModelRunAuditUnavailableError,
 )
-from app.core.config import get_settings
 from app.core.gateway import ModelGatewayClient, StructuredChatResponse
 
 from .context import (
@@ -38,6 +37,8 @@ from .specs import (
     model_input_digest,
     model_output_digest,
 )
+
+
 class RuntimeErrorBase(Exception):
     """A sanitized failure whose code is stable and safe to record."""
 
@@ -380,7 +381,7 @@ class AgentRuntime:
             return output, observation, None
         except asyncio.CancelledError:
             raise
-        except TimeoutError as exc:
+        except TimeoutError:
             # asyncio.wait_for 的 TimeoutError 原则上是「外层 RunSpec/ModelPolicy 截止」，
             # 应与网关侧 60s 真超时区分开。但当本层 timeout 正是 ModelPolicy.timeout_seconds
             # 时（runtime 在 run() 主循环里取的就是 min(policy, remaining)），这是「单次

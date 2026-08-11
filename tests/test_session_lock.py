@@ -21,8 +21,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import SessionBusyError
-from app.core.redis import reset_redis
-from app.services.session_lock import SessionLock, _advisory_lock_id
+from app.core.redis import get_redis, reset_redis
+from app.services.session_lock import SessionLock, _advisory_lock_id, _redis_key
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -234,11 +234,65 @@ async def test_release_without_acquire_safe(db: AsyncSession) -> None:
 
 
 async def test_redis_or_pg_lock_succeeds(db: AsyncSession) -> None:
-    """锁获取成功（优先 Redis，不可用时降级 PG）。"""
+    """锁获取成功（PG 权威；Redis 不可用时纯 PG 也成功）。"""
     session_id = f"test-lock-backend-{uuid.uuid4()}"
 
     lock = SessionLock(db, session_id, "trace-backend")
     await lock.acquire()
-    # 无论哪种实现，获取都应成功
-    assert lock._lock_type in ("redis", "pg_advisory")
+    assert lock._lock_type == "pg_advisory"
     await lock.release()
+
+
+async def test_forced_redis_unavailable_fallback_still_excludes(db: AsyncSession) -> None:
+    """强制 Redis 不可用（纯 PG）→ 同会话互斥仍然成立。"""
+    session_id = f"test-lock-redisdown-{uuid.uuid4()}"
+
+    async def _redis_down():
+        raise RuntimeError("redis forced down for test")
+
+    lock1 = SessionLock(db, session_id, "trace-a", _redis_getter=_redis_down)
+    await lock1.acquire()
+    assert lock1._lock_type == "pg_advisory"
+
+    factory = _new_session_factory()
+    async with factory() as session2:
+        lock2 = SessionLock(session2, session_id, "trace-b", _redis_getter=_redis_down)
+        with pytest.raises(SessionBusyError) as exc_info:
+            await lock2.acquire()
+        assert exc_info.value.code == "SESSION_BUSY"
+
+    await lock1.release()
+    # 释放后可重新获取
+    lock3 = SessionLock(db, session_id, "trace-c", _redis_getter=_redis_down)
+    await lock3.acquire()
+    await lock3.release()
+
+
+async def test_redis_ttl_expiry_while_holder_inside_cannot_reenter(db: AsyncSession) -> None:
+    """Redis 守卫过期（模拟 TTL 到期）时，持锁者仍在临界区 → 不得让新 SessionLock 进入。
+
+    PG 权威锁由专属连接持有；即便 Redis key 已过期（新写者可重新抢占守卫），
+    只要 PG 锁未被释放，第二个 SessionLock 必须 SESSION_BUSY。
+    """
+    session_id = f"test-lock-ttl-{uuid.uuid4()}"
+    lock1 = SessionLock(db, session_id, "trace-a")
+    await lock1.acquire()
+    assert lock1._lock_type == "pg_advisory"
+
+    # 若 Redis 可用且守卫已持，模拟 TTL 到期（清掉守卫 key）
+    try:
+        redis = await get_redis()
+    except Exception:  # noqa: BLE001 - Redis 缺失时退化为纯 PG 验证
+        redis = None
+    if redis is not None and lock1._redis_guard_held:
+        await redis.delete(_redis_key(session_id))
+
+    # lock1 仍处于临界区时，lock2 尝试进入（Redis 守卫已过期可重新抢占）
+    factory = _new_session_factory()
+    async with factory() as session2:
+        lock2 = SessionLock(session2, session_id, "trace-b")
+        with pytest.raises(SessionBusyError) as exc_info:
+            await lock2.acquire()
+        assert exc_info.value.code == "SESSION_BUSY"
+
+    await lock1.release()

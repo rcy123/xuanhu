@@ -1,0 +1,102 @@
+groups:
+  - name: xuanhu-r5-model-drift
+    interval: 30s
+    rules:
+      # Structured-output terminal failure rate.  "Terminal" = parse_failed or
+      # truncated (finish_reason=length).  Each of these is one top-level
+      # chat_structured call that did not produce a usable structured output.
+      # The minimum-volume guard (>=10 structured calls in 10m) keeps the ratio
+      # from firing on a handful of low-traffic samples.
+      - alert: XuanhuStructuredTerminalFailureRateHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_gateway_requests_total{
+              operation="chat_structured", outcome=~"parse_failed|truncated"}[5m]))
+            /
+            sum(increase(xuanhu_gateway_requests_total{
+              operation="chat_structured"}[5m]))
+          ) > 0.05
+          and sum(increase(xuanhu_gateway_requests_total{
+            operation="chat_structured"}[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: gateway
+        annotations:
+          summary: Xuanhu structured-output terminal failure rate is high
+          description: More than 5% of chat_structured calls failed to produce usable structured output (parse or truncation) over five minutes.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-terminal-failure
+
+      # Structured-output JSON fallback attempt rate relative to structured
+      # calls, measured as *fallback attempts per structured call*.  A retrying
+      # caller falls back on each attempt, so the attempted numerator can
+      # exceed the number of top-level structured calls (ratio > 1.0); this
+      # alert is therefore not a percent of calls.  A rising ratio means the
+      # primary tool-call transport is drifting toward malformed output and the
+      # JSON fallback is being leaned on.
+      - alert: XuanhuStructuredFallbackRateHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_gateway_structured_fallback_total{
+              outcome="attempted"}[5m]))
+            /
+            sum(increase(xuanhu_gateway_requests_total{
+              operation="chat_structured"}[5m]))
+          ) > 0.2
+          and sum(increase(xuanhu_gateway_requests_total{
+            operation="chat_structured"}[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: gateway
+        annotations:
+          summary: Xuanhu structured-output JSON fallback rate is high
+          description: More than 0.2 structured-output JSON fallback attempts per chat_structured call over five minutes, indicating model format drift in the primary tool-call path.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-fallback-rate
+
+      # Structured-output JSON fallback failure rate.  The fallback itself is
+      # failing to produce valid JSON more than half the time it is attempted.
+      - alert: XuanhuStructuredFallbackFailureRateHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_gateway_structured_fallback_total{
+              outcome="failure"}[5m]))
+            /
+            sum(increase(xuanhu_gateway_structured_fallback_total{
+              outcome="attempted"}[5m]))
+          ) > 0.5
+          and sum(increase(xuanhu_gateway_structured_fallback_total{
+            outcome="attempted"}[10m])) >= 5
+        for: 5m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: gateway
+        annotations:
+          summary: Xuanhu structured-output JSON fallback failure rate is high
+          description: More than half of structured-output JSON fallback attempts failed over five minutes, so recovery from malformed primary output is no longer working.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-fallback-failure
+
+      # Safety block-rate drift.  The authoritative safety engine should block a
+      # small minority of decisions; a sustained majority-blocked window signals
+      # a systemic regression (data/rule bug that fail-closes everything).  The
+      # >=10 decisions-per-window guard prevents firing on a handful of samples.
+      - alert: XuanhuSafetyBlockRateDrift
+        expr: >-
+          (
+            sum(increase(xuanhu_safety_checks_total{outcome="blocked"}[5m]))
+            /
+            sum(increase(xuanhu_safety_checks_total[5m]))
+          ) > 0.5
+          and sum(increase(xuanhu_safety_checks_total[5m])) >= 10
+        for: 5m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: safety
+        annotations:
+          summary: Xuanhu safety block rate drifted above majority over five minutes
+          description: More than half of authoritative safety decisions blocked over five minutes, indicating a possible fail-closed regression in the safety rule engine.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#safety-block-rate-drift

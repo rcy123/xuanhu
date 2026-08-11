@@ -269,7 +269,7 @@ def _trusted_artifact(
     if artifact.artifact_type == _SYNDROME_ARTIFACT_TYPE:
         expected_schema = _SYNDROME_PAYLOAD_SCHEMA_VERSION
         gate_name = _SYNDROME_GATE_NAME
-        gate_policies = _SYNDROME_GATE_POLICIES
+        gate_policies: tuple[str, ...] = _SYNDROME_GATE_POLICIES
         output_type: type[SyndromeDraft] | type[FormulaDraft] = SyndromeDraft
     else:
         expected_schema = _FORMULA_PAYLOAD_SCHEMA_VERSION

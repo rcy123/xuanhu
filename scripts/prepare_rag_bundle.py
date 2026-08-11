@@ -388,7 +388,7 @@ def _prepare_dosage_units(source: LoadedSource) -> KindResult:
 
         if normalized_type in {"standard", "fixed"}:
             to_grams = record.get("to_grams")
-            if isinstance(to_grams, bool) or not isinstance(to_grams, (int, float)) or to_grams <= 0:
+            if isinstance(to_grams, bool) or not isinstance(to_grams, int | float) or to_grams <= 0:
                 reasons.append("invalid_positive_to_grams")
 
         if reasons:
@@ -464,9 +464,9 @@ def _prepare_herbs(source: LoadedSource) -> KindResult:
             reasons.append("duplicate_name_conflict")
 
         max_dose = record.get("max_dose")
-        if isinstance(max_dose, bool) or (max_dose is not None and not isinstance(max_dose, (int, float))):
+        if isinstance(max_dose, bool) or (max_dose is not None and not isinstance(max_dose, int | float)):
             reasons.append("invalid_max_dose_type")
-        elif isinstance(max_dose, (int, float)) and not isinstance(max_dose, bool):
+        elif isinstance(max_dose, int | float) and not isinstance(max_dose, bool):
             if max_dose < 0:
                 reasons.append("negative_max_dose")
             elif max_dose == 0:

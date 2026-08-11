@@ -7,6 +7,7 @@ State and interrupt/resume values carry references only.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from app.agent_runtime.commands import NODE_BLOCKED_TERMINAL, NODE_REVIEW_PLACEH
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.formula_consistency import FORMULA_CONSISTENCY_POLICY_VERSION
 from app.agent_runtime.graph import build_main_graph
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import DomainDelta, DomainState
 from app.agent_runtime.repository import (
     ArtifactPayloadRecord,
@@ -68,7 +70,7 @@ from app.schemas.domain import (
 from app.schemas.formula import FormulaDraft, FormulaDraftDecision
 from app.schemas.review import FormulaOverride, ReviewRequest, ReviewResponse
 from app.schemas.session import PatientInfo
-from app.schemas.types import Gender, PregnancyStatus
+from app.schemas.types import Gender, PregnancyStatus, Severity
 
 FORMULA_ARTIFACT_TYPE = "formula_draft"
 REVIEWED_FORMULA_ARTIFACT_TYPE = "reviewed_formula"
@@ -136,7 +138,7 @@ async def _safety_attempt_count(
     except Exception:  # noqa: BLE001 - 计数失败保守按 0（自动重开，safety 硬门禁兜底）
         return 0
     count = 0
-    for artifact, payload in rows:
+    for _artifact, payload in rows:
         if payload is None or not isinstance(payload.payload, dict):
             continue
         formula_ref = payload.payload.get("formula_ref")
@@ -381,6 +383,38 @@ async def _load_formula_authority(
     return FormulaAuthority(draft, _formula_result_from_draft(draft))
 
 
+def _observation_value(fact: Any) -> Any:
+    """观察事实的有效值：normalized_value 优先，且区分 ``0``/空字符串与缺省。"""
+    normalized = getattr(fact, "normalized_value", None)
+    if normalized is not None:
+        return normalized
+    return getattr(fact, "value", None)
+
+
+def _parse_patient_age(raw: Any) -> int | None:
+    """解析 observation 中的年龄，非法/越界一律返回 ``None`` 且不抛异常。
+
+    - bool 一律拒绝（bool 是 int 子类，``int(True) == 1`` 会产生虚假年龄）；
+    - 接受 int（含 0）或可转 int 的字符串；
+    - 超出 ``PatientInfo.age`` 合法范围 [0, 130] 的年龄忽略。
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        candidate = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            candidate = int(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    return candidate if 0 <= candidate <= 130 else None
+
+
 def _patient_info_from_domain(
     profile: SafetyProfileSchema,
     observations: tuple[Any, ...] = (),
@@ -388,22 +422,27 @@ def _patient_info_from_domain(
     # 2026-08：PatientInfo 补充 domain observations 里的性别/年龄（patient.sex /
     # patient.age）。安全引擎的妊娠/剂量检查依赖它们——缺省时妊娠未知警告在男性
     # 患者上误报（真实会话 f6a5ffb7 复盘）。
+    #
+    # R4-A：性别/年龄只从 project_current_observations 投影出的**当前语义链头**
+    # 读取——被 CORRECTED/RETRACTED 取代的根不是当前真值，输入顺序也不决定赢家。
+    # 同一组当前事实在任何历史顺序下都投影出同一 PatientInfo；校正值胜出，撤回值
+    # 消失为 UNKNOWN/None。投影顺序稳定（(session_id, fact_key, observation_id)），
+    # 同一 fact_key 存在多个当前链头时后者确定性胜出。函数不修改 observations/profile。
     gender = Gender.UNKNOWN
     age: int | None = None
-    for item in observations:
+    for item in project_current_observations(observations):
         key = getattr(item, "fact_key", None)
         if key == "patient.sex":
-            raw = getattr(item, "normalized_value", None) or getattr(item, "value", None)
-            try:
-                gender = Gender(str(raw))
-            except (TypeError, ValueError):
-                pass
-        elif key == "patient.age" and age is None:
-            raw = getattr(item, "normalized_value", None) or getattr(item, "value", None)
-            try:
-                age = int(raw)
-            except (TypeError, ValueError, OverflowError):
-                pass
+            raw = _observation_value(item)
+            if isinstance(raw, str):
+                sex_text = raw.strip().lower()
+                if sex_text:
+                    with contextlib.suppress(ValueError):
+                        gender = Gender(sex_text)
+        elif key == "patient.age":
+            parsed = _parse_patient_age(_observation_value(item))
+            if parsed is not None:
+                age = parsed
     pregnancy = (
         PregnancyStatus.PREGNANT
         if profile.pregnancy_value is PregnancyValue.PREGNANT
@@ -917,7 +956,9 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
     )
     factory = get_session_factory()
     async with factory() as safety_db:
-        result = await SafetyRuleEngine(safety_db).evaluate(formula.formula, patient_info)
+        result = await SafetyRuleEngine(safety_db).evaluate(
+            formula.formula, patient_info, observe_metric=True
+        )
 
     safety_id = _stable_id(session_id, SAFETY_ARTIFACT_TYPE)
     latest = await repository.get_artifact_payload(
@@ -952,7 +993,15 @@ async def prepare_review_interrupt(state: XuanhuGraphState) -> dict[str, Any]:
         session_id,
         formula.record.revision,
     ) + 1
-    reopened_for_safety = (not result.passed) and safety_attempt < MAX_SAFETY_REOPEN_ATTEMPTS
+    # 3.1 自动重开方仅适用于可修正的 WARNING/HIGH（超剂量等，重开方让模型降剂量/换药）。
+    # BLOCKER（过敏/禁忌/十八反十九畏等硬门禁）重开方无法消除不安全性——重开只会浪费
+    # 模型调用并延迟 fail-closed 拦截，故含 BLOCKER 时立即落 blocked，不进入自动重开。
+    has_blocker = any(item.severity == Severity.BLOCKER for item in result.issues)
+    reopened_for_safety = (
+        (not result.passed)
+        and not has_blocker
+        and safety_attempt < MAX_SAFETY_REOPEN_ATTEMPTS
+    )
     delta = DomainDelta(
         delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:safety:{run_id}"),
         run_id=run_id,
@@ -1172,6 +1221,7 @@ def _submission_payload(record: ArtifactPayloadRecord) -> tuple[str, uuid.UUID, 
         raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID) from None
     if parsed_id != record.artifact_id:
         raise RepositoryError(RepositoryErrorCode.ARTIFACT_PAYLOAD_INVALID)
+    # 上方守卫已确保 action 为四个已知字符串之一。
     return action, parsed_id, cast(dict[str, Any], payload)
 
 
@@ -1692,6 +1742,7 @@ class LangGraphReviewService:
                     cast(SafetyProfileSchema, domain_state.safety_profile),
                     observations=domain_state.observations,
                 ),
+                observe_metric=True,
             )
             # A blocked override must remain auditable without replacing the
             # last passed Formula/Safety authority.  Otherwise the next

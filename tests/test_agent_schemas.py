@@ -6,7 +6,6 @@ import pytest
 from pydantic import ValidationError
 
 from app.rag.schemas import Evidence as RAGEvidence
-from app.schemas.review import ReviewRequest
 from app.schemas.agent import (
     Evidence,
     FormulaResult,
@@ -25,6 +24,7 @@ from app.schemas.agent import (
     XuanhuState,
     is_pregnancy_risk_status,
 )
+from app.schemas.review import ReviewRequest
 from app.schemas.types import PregnancyStatus, Severity
 
 

@@ -12,9 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-_logger = logging.getLogger("xuanhu.agents.syndrome_draft")
-
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import DomainState
 from app.agent_runtime.repository import (
     DomainRepository,
@@ -74,6 +73,8 @@ from app.schemas.syndrome import (
     SyndromeDraftInput,
     SyndromeObservationContext,
 )
+
+_logger = logging.getLogger("xuanhu.agents.syndrome_draft")
 
 SYNDROME_CONTEXT_TOKEN_LIMIT = 4_000
 SYNDROME_MODEL_MAX_TOKENS = 1_500
@@ -255,6 +256,7 @@ async def _execute_syndrome_draft(
             from app.core.rewrite_gateway import build_rewrite_gateway_settings
 
             rewrite_gs = build_rewrite_gateway_settings(get_settings())
+            rewrite_gateway: ModelGatewayClient | None
             if rewrite_gs is not None:
                 rewrite_gateway = ModelGatewayClient(settings=rewrite_gs)
             else:
@@ -575,7 +577,7 @@ def _run_artifact_from_payload(payload: dict[str, Any], output: SyndromeDraft) -
 def _retrieved_evidence_from_payload(payload: dict[str, Any]) -> tuple[Evidence, ...]:
     """从 payload 可选键 retrieved_evidence 重建证据元组（v1 兼容：无键读空）。"""
     raw = payload.get("retrieved_evidence")
-    if not isinstance(raw, (list, tuple)):
+    if not isinstance(raw, list | tuple):
         return ()
     try:
         return tuple(Evidence.model_validate(item) for item in raw)
@@ -706,16 +708,9 @@ def _context_from_domain_state(domain_state: DomainState) -> tuple[SyndromeObser
 
 
 def _active_observations(observations: tuple[ObservationSchema, ...]) -> tuple[ObservationSchema, ...]:
-    superseded = frozenset(
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        item
-        for item in observations
-        if item.status is ObservationStatus.ACTIVE and item.observation_id not in superseded
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _failed(

@@ -1256,7 +1256,7 @@ def verify_browser() -> None:
 
 
 def _get_session_id_from_url(page: Page) -> str | None:
-    url = page.url
+    url: str = page.url
     parts = url.split("/sessions/")
     if len(parts) > 1:
         return parts[1].split("/")[0].split("?")[0]

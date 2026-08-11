@@ -11,14 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
-
-_logger = logging.getLogger("xuanhu.agents.formula_draft")
 
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
 from app.agent_runtime.formula_verifier import (
@@ -42,6 +40,7 @@ from app.agent_runtime.formula_verifier import (
     validate_formula_preflight,
     verify_formula_artifact,
 )
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import DomainState
 from app.agent_runtime.repository import DomainRepository, ReasoningAuthoritySnapshot, RepositoryError
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
@@ -95,11 +94,21 @@ from app.schemas.formula import (
     BaseFormulaDraft,
     FormulaComposition,
     FormulaDraft,
+    FormulaDraftDecision,
     FormulaDraftInput,
     ModificationDraft,
     ModificationDraftInput,
 )
 from app.schemas.syndrome import SyndromeDraft, SyndromeObservationContext
+
+__all__ = [
+    "BASE_FORMULA_AGENT_VERSION",
+    "BASE_FORMULA_RAG_POLICY_VERSION",
+    "MODIFICATION_DRAFT_AGENT_VERSION",
+    "MODIFICATION_DRAFT_RAG_POLICY_VERSION",
+]
+
+_logger = logging.getLogger("xuanhu.agents.formula_draft")
 
 FORMULA_CONTEXT_TOKEN_LIMIT = 5_000
 _NOT_PROVIDED = object()
@@ -247,14 +256,28 @@ def assemble_modification_output(
     """
     from app.agent_runtime.formula_consistency import apply_modifications_to_base
 
-    candidate = apply_modifications_to_base(base_formula, model_output.modifications)
+    if model_output.decision is FormulaDraftDecision.COMPLETED:
+        candidate = apply_modifications_to_base(base_formula, model_output.modifications)
+        base_out: FormulaComposition | None = base_formula
+        candidate_out: FormulaComposition | None = candidate
+        modifications_out = model_output.modifications
+        rationale_out = model_output.rationale
+    else:
+        # NEEDS_MORE_INFO / ABSTAINED: the modification stage produced no
+        # candidate formula.  Leave base/candidate/modifications/rationale
+        # unset so the shared verifier's decision-consistency contract holds
+        # (those must be None/empty for non-COMPLETED decisions).
+        base_out = None
+        candidate_out = None
+        modifications_out = ()
+        rationale_out = None
     return FormulaDraft(
         schema_version=FORMULA_DRAFT_SCHEMA_VERSION,
         decision=model_output.decision,
-        base_formula=base_formula,
-        modifications=model_output.modifications,
-        candidate_formula=candidate,
-        rationale=model_output.rationale,
+        base_formula=base_out,
+        modifications=modifications_out,
+        candidate_formula=candidate_out,
+        rationale=rationale_out,
         confidence=model_output.confidence,
         evidence_mode=model_output.evidence_mode,
         claim_evidence_links=model_output.claim_evidence_links,
@@ -763,16 +786,9 @@ def _context_from_domain_state(domain_state: DomainState) -> tuple[SyndromeObser
 
 
 def _active_observations(observations: tuple[ObservationSchema, ...]) -> tuple[ObservationSchema, ...]:
-    superseded = frozenset(
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        item
-        for item in observations
-        if item.status is ObservationStatus.ACTIVE and item.observation_id not in superseded
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _failed(

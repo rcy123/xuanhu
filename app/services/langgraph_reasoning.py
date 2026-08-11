@@ -14,13 +14,11 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-_logger = logging.getLogger("xuanhu.services.langgraph_reasoning")
 
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, NODE_REASONING_SUBGRAPH_V1
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
@@ -140,6 +138,20 @@ from app.schemas.syndrome import (
     SyndromeDraftInput,
     SyndromeObservationContext,
 )
+
+# 开方策略版本 Literal（与 input schema 的 policy_version 字段对齐）。
+# _reasoning_policy 按 stage 返回这些已校验常量，此处仅用于收窄传入 typed input。
+_SyndromePolicyVersion = Literal["syndrome-draft-policy.no-rag.v1", "syndrome-draft-policy.rag.v1"]
+_FormulaPolicyVersion = Literal[
+    "formula-draft-policy.no-rag.v1",
+    "formula-draft-policy.rag.v1",
+    "base-formula-draft-policy.no-rag.v1",
+    "base-formula-draft-policy.rag.v1",
+    "modification-draft-policy.no-rag.v1",
+    "modification-draft-policy.rag.v1",
+]
+
+_logger = logging.getLogger("xuanhu.services.langgraph_reasoning")
 
 REASONING_COMMAND_COMPLETED = "reasoning.command_completed.v1"
 REASONING_ARTIFACT_COMMITTED = "reasoning.artifact_committed.v1"
@@ -429,9 +441,8 @@ async def _unknown_herbs_in_candidate(output: object) -> tuple[str, ...]:
         herb = getattr(item, "herb", None)
         if not isinstance(herb, str) or not herb:
             continue
-        if normalizer.normalize(herb) not in normalizer._standard_names:
-            if herb not in unknown:
-                unknown.append(herb)
+        if normalizer.normalize(herb) not in normalizer._standard_names and herb not in unknown:
+            unknown.append(herb)
     return tuple(unknown)
 
 
@@ -630,7 +641,7 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             retriever=_rag_retriever(),
         )
         if result.status is not SyndromeExecutionStatus.SUCCEEDED or result.output is None or result.verification is None:
-            code = str(result.failure_code or "SYNDROME_FAILED")
+            code: str | None = str(result.failure_code or "SYNDROME_FAILED")
             retried = 0
             if _reasoning_failure_is_retryable(code):
                 while retried < _REASONING_MAX_RETRIES:
@@ -669,6 +680,9 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
                     "reasoning_route": ROUTE_MANUAL_REQUIRED,
                     "last_error": None,
                 }
+        # 走到此处时 result.output 必非空：要么初测 SUCCEEDED（已判 output 非 None），
+        # 要么重试成功并在循环内把 result 替换为 output 非 None 的结果。
+        assert result.output is not None
         commit = await _commit_syndrome_artifact(repository, claim, result, trace_id=_node_trace_id(state))
         if commit is None:
             await _save_intermediate(
@@ -1075,6 +1089,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                     "last_error": None,
                 }
             base_result, _ = base_stage
+            # 重试循环仅在 result.output 非 None 时返回非 None，因此此处必然非空。
+            assert base_result.output is not None
             base_formula = base_result.output.base_formula
             base_missing = _formula_missing_dimension(base_result.output)
             if base_result.output.decision is not FormulaDraftDecision.COMPLETED or base_formula is None:
@@ -1155,7 +1171,7 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                 session_id=input_payload.session_id,
                 state_version=input_payload.state_version,
                 current_stage=input_payload.current_stage,
-                policy_version=mod_policy,
+                policy_version=cast(_FormulaPolicyVersion, mod_policy),
                 domain_state=input_payload.domain_state,
                 triage_gate=input_payload.triage_gate,
                 completeness_gate=input_payload.completeness_gate,
@@ -1218,6 +1234,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                     "mod_confidence": mod_result.output.confidence if mod_result.output else 0,
                 })
                 if primary is None and mod_result.output is not None:
+                    # stage 元组在 result 非 None 时 consistency 也必然非 None。
+                    assert mod_consistency is not None
                     primary = (i, mod_result, mod_consistency)
 
         if primary is None:
@@ -1241,6 +1259,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             }
 
         _i, result, consistency = primary
+        # primary 仅在 mod_result.output 非 None 时设置，此处必然非空。
+        assert result.output is not None
         formula_missing_dimension = _formula_missing_dimension(result.output)
         if result.output.decision is FormulaDraftDecision.NEEDS_MORE_INFO and formula_missing_dimension is None:
             await _save_intermediate(
@@ -1575,7 +1595,7 @@ def _build_syndrome_input(
         session_id=authority.session_id,
         state_version=authority.current_state_version,
         current_stage=SYNDROME_READY_STAGE,
-        policy_version=policy,
+        policy_version=cast(_SyndromePolicyVersion, policy),
         domain_state=authority.domain_state,
         triage_gate=authority.triage_gate,
         completeness_gate=authority.completeness_gate,
@@ -1592,7 +1612,7 @@ def _build_formula_input(
         session_id=authority.session_id,
         state_version=authority.current_state_version,
         current_stage=FORMULA_READY_STAGE,
-        policy_version=policy,
+        policy_version=cast(_FormulaPolicyVersion, policy),
         domain_state=authority.domain_state,
         triage_gate=authority.triage_gate,
         completeness_gate=authority.completeness_gate,

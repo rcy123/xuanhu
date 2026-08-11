@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-"""Enrich the herbs table with pinyin aliases so the safety engine can match
+r"""Enrich the herbs table with pinyin aliases so the safety engine can match
 pinyin herb names emitted by formula models (e.g. "Bai Bu" -> 百部).
 
 Idempotent: existing aliases are preserved; duplicates are dropped.
@@ -8,7 +7,6 @@ Idempotent: existing aliases are preserved; duplicates are dropped.
 """
 import asyncio
 import json
-import sys
 
 from sqlalchemy import text
 

@@ -10,11 +10,12 @@
 """
 
 import asyncio
+import contextlib
 import json
 import statistics
-import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -22,7 +23,7 @@ BASE_URL = "http://localhost:8000"
 SESSION_ID = "ab973f4b-f4a7-4efa-9e69-f71b611b933b"
 
 
-async def test_health_llm() -> dict:
+async def test_health_llm() -> dict[str, Any]:
     """测试 LLM 健康检查——测量网关层连接复用在多次调用之间的效果
 
     首轮：新建 TCP 连接 + LLM 网关 chat 调用
@@ -44,15 +45,9 @@ async def test_health_llm() -> dict:
         }
 
 
-async def test_chat_gateway() -> dict:
+async def test_chat_gateway() -> dict[str, Any]:
     """调用一次真实的LLM chat，测量网关层耗时（注意：会消耗API配额）"""
     async with httpx.AsyncClient(timeout=120) as c:
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": "请用一句话回答: 1+1=?"}],
-            "max_tokens": 50,
-            "temperature": 0.0,
-        }
         timings = []
         for i in range(3):
             t0 = time.perf_counter()
@@ -72,7 +67,7 @@ async def test_chat_gateway() -> dict:
         }
 
 
-async def test_api_concurrent_health() -> dict:
+async def test_api_concurrent_health() -> dict[str, Any]:
     """并发健康检查 — 模拟高并发场景下连接池复用的效果"""
     async with httpx.AsyncClient(timeout=30) as c:
         t0 = time.perf_counter()
@@ -89,7 +84,7 @@ async def test_api_concurrent_health() -> dict:
         }
 
 
-async def test_embedding_cache_hit() -> dict:
+async def test_embedding_cache_hit() -> dict[str, Any]:
     """直接观察 EmbeddingCache 命中效果（绕过 HTTP，直测 Redis 缓存层）
 
     策略：对同一 query 文本连续取 2 次 embedding。
@@ -100,7 +95,7 @@ async def test_embedding_cache_hit() -> dict:
     from app.core.config import get_settings
     from app.core.embedding_gateway import build_embedding_gateway_settings
     from app.core.gateway import ModelGatewayClient
-    from app.rag.embedding_cache import get_embedding, set_embedding, clear_cache
+    from app.rag.embedding_cache import clear_cache, get_embedding, set_embedding
 
     # 提前清掉该 query 的缓存，保证第 1 次必 miss
     query = "__perf_benchmark_embedding_cache_probe__"
@@ -144,7 +139,7 @@ async def test_embedding_cache_hit() -> dict:
     }
 
 
-async def test_prometheus_metrics() -> dict:
+async def test_prometheus_metrics() -> dict[str, Any]:
     """检查Prometheus /api/v1/metrics 端点是否曝光正确指标
 
     经过本轮优化后，/api/v1/metrics 路由已挂载且 prometheus_client 已正式加入依赖。
@@ -159,7 +154,7 @@ async def test_prometheus_metrics() -> dict:
                 "note": "metrics端点不可用",
             }
         lines = r.text.splitlines()
-        relevant = [l for l in lines if "xuanhu_" in l and not l.startswith("#")]
+        relevant = [line for line in lines if "xuanhu_" in line and not line.startswith("#")]
         print(f"  Prometheus xuanhu_ 指标行数: {len(relevant)}")
         for m in relevant[:15]:
             print(f"    {m}")
@@ -172,7 +167,7 @@ async def test_prometheus_metrics() -> dict:
         }
 
 
-async def test_embedding_cache_hit_rate() -> dict:
+async def test_embedding_cache_hit_rate() -> dict[str, Any]:
     """T2.7：模拟问诊场景的 query 重复率，统计 EmbeddingCache 命中率。
 
     计划门禁："命中率 ≥ 40%"（99 文档）。本测试构造一个混合 query 流：
@@ -254,7 +249,7 @@ async def test_embedding_cache_hit_rate() -> dict:
     }
 
 
-async def test_concurrent_vector_retrieval() -> dict:
+async def test_concurrent_vector_retrieval() -> dict[str, Any]:
     """T3：并发向量检索 wall-clock 收益（to_thread 后事件循环不阻塞）。
 
     通过 8 路并发 ``_vector_search`` 测总耗时对比"理论串行"耗时——如果 to_thread
@@ -262,7 +257,7 @@ async def test_concurrent_vector_retrieval() -> dict:
     避免 HTTP 测量的客户端连接噪声；如真实后端需要，将 BASE_URL 改 /api/v1/health/rag。
     """
     from app.core.config import get_settings
-    from app.rag.retriever import RAGRetriever, get_shared_rag_retriever
+    from app.rag.retriever import get_shared_rag_retriever
 
     retriever = get_shared_rag_retriever()
     settings = get_settings()
@@ -270,10 +265,8 @@ async def test_concurrent_vector_retrieval() -> dict:
     top_k = settings.rag_top_k_vector
 
     # 先触发一次"暖机"——确保 Milvus client 已建好、embedding 缓存预热
-    try:
+    with contextlib.suppress(Exception):
         await retriever.retrieve(query=query, primary_sources=["formula"], top_k=top_k)
-    except Exception:
-        pass
 
     # 单路耗时（参考）
     t0 = time.perf_counter()
@@ -311,7 +304,7 @@ async def test_concurrent_vector_retrieval() -> dict:
     }
 
 
-async def main():
+async def main() -> dict[str, Any]:
     print("=" * 60)
     print("Xuanhu 后端性能对比测试")
     print("=" * 60)

@@ -427,3 +427,180 @@ describe('useMessages', () => {
     expect(result.current.lastFailedContent).toBe('\u5934\u75db')
   })
 })
+
+function makeAccepted(overrides: Partial<import('@/types/api').AsyncCommandAccepted> = {}) {
+  return {
+    command_id: 'cmd-1',
+    operation: 'intake.message' as const,
+    status: 'queued' as const,
+    replayed: false,
+    attempt_count: 0,
+    links: { self: '/self', session: '/s', stream: '/stream' },
+    ...overrides,
+  }
+}
+
+describe('useMessages R7 \u5df2\u63a5\u53d7\u547d\u4ee4', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('202 accepted\uff1a\u767b\u8bb0\u5bf9\u8d26\u3001\u4e0d\u505a\u4e50\u89c2\u5237\u65b0\u3001\u4fdd\u7559 pending', async () => {
+    const accepted = makeAccepted()
+    const submitSpy = vi.spyOn(api, 'submitMessageWithRetry').mockResolvedValue(accepted)
+    const listSpy = vi.spyOn(api, 'listMessages')
+    const onCommandAccepted = vi.fn()
+    const { result } = renderHook(() => useMessages({ onCommandAccepted }))
+    const refresh = vi.fn(async () => 1 as number)
+
+    let ok = false
+    await act(async () => {
+      ok = await result.current.submit('s', '\u5934\u75db', 1, refresh)
+    })
+
+    expect(ok).toBe(true)
+    // \u7edd\u4e0d\u628a 202 \u5f53\u4f5c\u5df2\u5b8c\u6210\u4e1a\u52a1\uff1a\u4e0d\u505a\u4e50\u89c2\u5237\u65b0\u3001\u4e0d\u6e05\u7a7a pending\u3001\u4e0d\u62c9\u5386\u53f2\u3002
+    expect(listSpy).not.toHaveBeenCalled()
+    expect(refresh).not.toHaveBeenCalled()
+    expect(result.current.pendingSubmission).toMatchObject({
+      content: '\u5934\u75db',
+      idempotencyKey: expect.any(String),
+    })
+    // \u767b\u8bb0\u5bf9\u8d26\uff0c\u5e76\u628a\u5e42\u7b49\u952e\u4e00\u5e76\u4ea4\u7ed9\u4e0a\u5c42\uff08\u5230\u8fbe\u7ec8\u6001\u524d\u4fdd\u7559\uff09\u3002
+    expect(onCommandAccepted).toHaveBeenCalledTimes(1)
+    const [acceptedArg, idemKey] = onCommandAccepted.mock.calls[0]
+    expect(acceptedArg).toMatchObject({ command_id: 'cmd-1', operation: 'intake.message' })
+    expect(idemKey).toBeTruthy()
+    expect(submitSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('accepted \u5f85\u51b3\u671f\u95f4\u518d\u6b21 submit \u4e0d\u628a\u5df2\u63a5\u53d7\u547d\u4ee4\u5f53\u4f5c\u65b0\u903b\u8f91\u547d\u4ee4\u91cd\u53d1', async () => {
+    const accepted = makeAccepted()
+    const submitSpy = vi.spyOn(api, 'submitMessageWithRetry').mockResolvedValue(accepted)
+    const onCommandAccepted = vi.fn()
+    const { result } = renderHook(() => useMessages({ onCommandAccepted }))
+    const refresh = vi.fn(async () => 1 as number)
+
+    await act(async () => {
+      await result.current.submit('s', 'first', 1, refresh)
+    })
+    expect(result.current.pendingSubmission).not.toBeNull()
+
+    let secondOk = true
+    await act(async () => {
+      secondOk = await result.current.submit('s', 'second', 1, refresh)
+    })
+    // pending \u672a\u51b3 \u2192 \u62d2\u7edd\u518d\u6b21\u63d0\u4ea4\uff0c\u4e0d\u53d1\u51fa\u65b0\u547d\u4ee4\u3002
+    expect(secondOk).toBe(false)
+    expect(submitSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('settleMessage(commandId, true) \u6210\u529f\u7ec8\u6001\u540e\u6e05\u9664 pending\uff0c\u4e0d\u8bbe\u9519\u8bef', async () => {
+    vi.spyOn(api, 'submitMessageWithRetry').mockResolvedValue(makeAccepted())
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 1 as number)
+
+    await act(async () => {
+      await result.current.submit('s', '\u5934\u75db', 1, refresh)
+    })
+    expect(result.current.pendingSubmission).not.toBeNull()
+
+    act(() => {
+      result.current.settleMessage('cmd-1', true)
+    })
+    expect(result.current.pendingSubmission).toBeNull()
+    expect(result.current.submitError).toBeNull()
+    // \u6210\u529f\u7ec8\u6001\u540e\u4e0a\u5c42\u4ee5\u6743\u5a01\u8bfb\u6a21\u578b\u5237\u65b0\uff0c\u6b64\u5904\u4e0d\u7559\u9519\u8bef\u5185\u5bb9\u3002
+    expect(result.current.lastFailedContent).toBeNull()
+  })
+
+  it('settleMessage(commandId, false, errorCode) \u5931\u8d25\u7ec8\u6001\u8bbe\u7f6e\u6709\u754c\u9519\u8bef\u5e76\u6e05\u9664 pending', async () => {
+    vi.spyOn(api, 'submitMessageWithRetry').mockResolvedValue(makeAccepted())
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 1 as number)
+
+    await act(async () => {
+      await result.current.submit('s', '\u5934\u75db', 1, refresh)
+    })
+
+    act(() => {
+      result.current.settleMessage('cmd-1', false, 'AGENT_TRIGGER_FAILED')
+    })
+    expect(result.current.pendingSubmission).toBeNull()
+    expect(result.current.submitError).toMatchObject({
+      code: 'AGENT_TRIGGER_FAILED',
+      retryable: false,
+    })
+    expect(result.current.lastFailedContent).toBe('\u5934\u75db')
+  })
+
+  it('settleMessage \u7528\u4e0d\u5339\u914d\u7684 commandId \u65f6\u88ab\u5ffd\u7565', async () => {
+    vi.spyOn(api, 'submitMessageWithRetry').mockResolvedValue(makeAccepted())
+    const { result } = renderHook(() => useMessages())
+    const refresh = vi.fn(async () => 1 as number)
+
+    await act(async () => {
+      await result.current.submit('s', '\u5934\u75db', 1, refresh)
+    })
+
+    act(() => {
+      result.current.settleMessage('other-cmd', true)
+    })
+    // \u4e0d\u5339\u914d\u7684\u7ec8\u6001\u56de\u8c03\u4e0d\u5e72\u6270\u5f53\u524d pending\u3002
+    expect(result.current.pendingSubmission).not.toBeNull()
+  })
+
+  it('rebase \u540e\u7b2c\u4e8c\u6b21\u63d0\u4ea4\u8fd4\u56de 202\uff1a\u4e0e\u9996\u6b21 202 \u4e00\u81f4\uff0c\u767b\u8bb0\u5bf9\u8d26\u5e76\u4fdd\u7559 rebased pending', async () => {
+    const versionErr = new ApiRequestError({
+      code: 'INVALID_STATE_VERSION',
+      userMessage: 'stale version',
+      status: 409,
+      retryable: true,
+    })
+    const accepted = makeAccepted({ command_id: 'cmd-rebased' })
+    const submitSpy = vi
+      .spyOn(api, 'submitMessageWithRetry')
+      .mockRejectedValueOnce(versionErr)
+      .mockResolvedValueOnce(accepted)
+    const listSpy = vi.spyOn(api, 'listMessages').mockResolvedValue({
+      items: [],
+      has_more: false,
+      next_cursor: null,
+    })
+    const onCommandAccepted = vi.fn()
+    const { result } = renderHook(() => useMessages({ onCommandAccepted }))
+    const refresh = vi.fn(async () => 2 as number)
+
+    let ok = false
+    await act(async () => {
+      ok = await result.current.submit('s', '\u5934\u75db', 1, refresh)
+    })
+
+    expect(ok).toBe(true)
+    // \u7edd\u4e0d\u628a 202 \u5f53\u540c\u6b65\u6210\u529f\uff1a\u4e0d\u6e05\u9664 pending\u3001\u4e0d\u4e50\u89c2\u5237\u65b0\u3001
+    // \u4e0d\u62c9\u5386\u53f2\uff08\u4ec5 rebase \u65f6\u7684\u7248\u672c\u68c0\u67e5\u90a3\u6b21\uff09\u3001\u4e0d\u8c03\u7528 refresh\u3002
+    expect(listSpy).toHaveBeenCalledTimes(1)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    // \u767b\u8bb0\u5bf9\u8d26\uff0c\u5e26 rebased \u5e42\u7b49\u952e\uff08\u4e0e\u9996\u6b21\u4e0d\u540c\uff09\u3002
+    expect(onCommandAccepted).toHaveBeenCalledTimes(1)
+    const [acceptedArg, idemKey] = onCommandAccepted.mock.calls[0]
+    expect(acceptedArg).toMatchObject({ command_id: 'cmd-rebased', operation: 'intake.message' })
+    const firstKey = submitSpy.mock.calls[0][2]?.idempotencyKey
+    const secondKey = submitSpy.mock.calls[1][2]?.idempotencyKey
+    expect(secondKey).toBeTruthy()
+    expect(secondKey).not.toBe(firstKey)
+    expect(idemKey).toBe(secondKey)
+    // \u672a\u51b3 pending \u4fdd\u7559\uff1a\u5185\u5bb9\u4e0e rebased \u5e42\u7b49\u952e\u3001\u65b0 stateVersion \u5747\u4fdd\u6301\u3002
+    expect(result.current.pendingSubmission).toMatchObject({
+      content: '\u5934\u75db',
+      stateVersion: 2,
+      idempotencyKey: secondKey,
+    })
+    // \u7ec8\u6001\u7ed3\u7b97\uff1a\u4ee5 rebased command id \u6e05\u9664 pending\uff08\u4e0d\u4ee5\u65e7\u7684\u5e42\u7b49\u952e\u91cd\u53d1\uff09\u3002
+    act(() => {
+      result.current.settleMessage('cmd-rebased', true)
+    })
+    expect(result.current.pendingSubmission).toBeNull()
+    expect(result.current.submitError).toBeNull()
+  })
+})

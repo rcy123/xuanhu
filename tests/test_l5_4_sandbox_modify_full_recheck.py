@@ -2371,7 +2371,7 @@ def test_l5_4_authority_qualification_helpers_have_bounded_ownership() -> None:
     functions = {
         node.name: node
         for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     }
     assert not {
         "_authority_refs",
@@ -2437,7 +2437,7 @@ def test_l5_4_production_has_only_offline_reference_capabilities() -> None:
     imported = {
         alias.name.split(".")[0]
         for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
+        if isinstance(node, ast.Import | ast.ImportFrom)
         for alias in node.names
     }
     assert not imported.intersection(

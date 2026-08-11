@@ -17,6 +17,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSessions } from '@/hooks/useSessions'
 import { useSessionDetail } from '@/hooks/useSessionDetail'
 import { useMessages } from '@/hooks/useMessages'
+import { useCommandReconciliation } from '@/hooks/useCommandReconciliation'
 import { SessionSider } from '@/components/SessionSider'
 import { ChatPanel } from '@/components/ChatPanel'
 import './styles/workbench.css'
@@ -65,14 +66,21 @@ function BrandHeader({ onOpenNavigation }: { onOpenNavigation: () => void }) {
 function Workbench() {
   const sessionsHook = useSessions()
   const detailHook = useSessionDetail()
-  const messagesHook = useMessages()
-  const refreshSessions = sessionsHook.refresh
   const navigate = useNavigate()
   const params = useParams<{ id?: string }>()
   const [navigationOpen, setNavigationOpen] = useState(false)
   const [sessionSiderCollapsed, setSessionSiderCollapsed] = useState(false)
 
   const selectedId = params.id ?? null
+  // R7：异步命令终态对账由本层持有，供 useMessages 登记已接受（202）消息命令；
+  // 终态刷新处理器由 ChatPanel 通过 setHandlers 注册（拥有读模型刷新能力）。
+  const commandReconciler = useCommandReconciliation()
+  const messagesHook = useMessages({
+    onCommandAccepted: (accepted, idempotencyKey) => {
+      if (selectedId) commandReconciler.registerAccepted(accepted, selectedId, idempotencyKey)
+    },
+  })
+  const refreshSessions = sessionsHook.refresh
 
   // 路由切换后刷新一次列表，确保新建或直接访问的会话能在侧栏同步出来。
   useEffect(() => {
@@ -97,9 +105,10 @@ function Workbench() {
         sessionId={selectedId}
         detailHook={detailHook}
         messagesHook={messagesHook}
+        commandReconciler={commandReconciler}
       />
     ),
-    [selectedId, detailHook, messagesHook],
+    [selectedId, detailHook, messagesHook, commandReconciler],
   )
 
   return (

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """批量真实问诊驱动：生成 20-30 条多场景医案会话。
 
 用法:
@@ -25,11 +24,11 @@ import io
 import json
 import re
 import sys
-import time
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any, cast
 
 from dotenv import load_dotenv
 
@@ -69,7 +68,13 @@ SAFETY_REPLACE_HERB = {
 }
 
 
-def req(method: str, path: str, payload=None, headers=None, timeout: int = 300):
+def req(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 300,
+) -> tuple[int, Any]:
     url = BASE + path
     h = {"X-Doctor-Id": DOCTOR}
     if headers:
@@ -91,7 +96,7 @@ def req(method: str, path: str, payload=None, headers=None, timeout: int = 300):
         return exc.code, err_body
 
 
-def post_message(sid: str, content: str, state_version: int):
+def post_message(sid: str, content: str, state_version: int) -> tuple[int, Any]:
     return req(
         "POST",
         f"/sessions/{sid}/messages",
@@ -103,7 +108,7 @@ def post_message(sid: str, content: str, state_version: int):
     )
 
 
-def post_advance(sid: str, state_version: int, force: bool = False):
+def post_advance(sid: str, state_version: int, force: bool = False) -> tuple[int, Any]:
     return req(
         "POST",
         f"/sessions/{sid}/advance",
@@ -115,17 +120,17 @@ def post_advance(sid: str, state_version: int, force: bool = False):
     )
 
 
-def get_session(sid: str) -> dict:
+def get_session(sid: str) -> dict[str, Any]:
     _, body = req("GET", f"/sessions/{sid}", timeout=30)
-    return body["data"]
+    return cast(dict[str, Any], body["data"])
 
 
-def get_messages(sid: str) -> list[dict]:
+def get_messages(sid: str) -> list[dict[str, Any]]:
     _, body = req("GET", f"/sessions/{sid}/messages", timeout=30)
-    return body["data"]["items"]
+    return cast(list[dict[str, Any]], body["data"]["items"])
 
 
-def latest_agent_message(msgs: list[dict]) -> dict | None:
+def latest_agent_message(msgs: list[dict[str, Any]]) -> dict[str, Any] | None:
     for m in msgs:
         if m["role"] == "agent" and m.get("content"):
             return m
@@ -203,7 +208,7 @@ class IntakeAnswers:
 # 场景定义（高频证型 + 语料空缺）
 # ---------------------------------------------------------------------------
 
-SCENARIOS: list[dict] = [
+SCENARIOS: list[dict[str, Any]] = [
     {
         "label": "风寒感冒咳嗽",
         "chief_complaint": "受凉后咳嗽三天，痰白稀，怕冷，流清涕",
@@ -294,7 +299,7 @@ def _safety_confirm(sid: str, state_version: int) -> int:
             {"reason_code": "DOCTOR_CONFIRMED"},
             timeout=30,
         )
-    return get_session(sid).get("state_version", state_version)
+    return cast(int, get_session(sid).get("state_version", state_version))
 
 
 def _review_resolve(sid: str, state_version: int) -> int:
@@ -308,7 +313,7 @@ def _review_resolve(sid: str, state_version: int) -> int:
     )
     print(f"  REVIEW confirm status={st} stage={(body.get('data') or {}).get('current_stage')}")
     if st == 200:
-        return (body.get("data") or {}).get("state_version", state_version)
+        return cast(int, (body.get("data") or {}).get("state_version", state_version))
     # confirm 被安全引擎拒绝（方剂仍不通过）→ 转自动 modify 修正
     if body.get("code") == "SAFETY_REVIEW_BLOCKED":
         print("  REVIEW confirm blocked → auto modify")
@@ -330,17 +335,16 @@ def _safety_blocked_modify(sid: str, state_version: int) -> int:
 
     import psycopg
 
-    def _load() -> tuple[list[dict], dict, dict[str, float]]:
-        with psycopg.connect(os.environ["DB_URL"]) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT issues, formula_snapshot FROM safety_rule_runs "
-                    "WHERE session_id=%s ORDER BY created_at DESC LIMIT 1",
-                    (uuid.UUID(sid),),
-                )
-                row = cur.fetchone()
-                cur.execute("SELECT name, max_dose FROM herbs WHERE deleted_at IS NULL")
-                max_dose_rows = cur.fetchall()
+    def _load() -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, float]]:
+        with psycopg.connect(os.environ["DB_URL"]) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT issues, formula_snapshot FROM safety_rule_runs "
+                "WHERE session_id=%s ORDER BY created_at DESC LIMIT 1",
+                (uuid.UUID(sid),),
+            )
+            row = cur.fetchone()
+            cur.execute("SELECT name, max_dose FROM herbs WHERE deleted_at IS NULL")
+            max_dose_rows = cur.fetchall()
         max_dose = {name: float(value) for name, value in max_dose_rows if value}
         if row is None:
             return [], {}, max_dose
@@ -366,7 +370,7 @@ def _safety_blocked_modify(sid: str, state_version: int) -> int:
 
     composition = list(formula.get("composition") or [])
     notes: list[str] = []
-    kept: list[dict] = []
+    kept: list[dict[str, Any]] = []
     for item in composition:
         herb = item.get("herb", "")
         dose = item.get("dose")
@@ -387,9 +391,9 @@ def _safety_blocked_modify(sid: str, state_version: int) -> int:
                 break
         if limit is None:
             limit = max_dose.get(herb)
-        if limit is None and isinstance(dose, (int, float)):
+        if limit is None and isinstance(dose, int | float):
             limit = round(float(dose) * 0.8, 1)
-        if limit is not None and isinstance(dose, (int, float)) and dose > limit:
+        if limit is not None and isinstance(dose, int | float) and dose > limit:
             item = {**item, "dose": limit}
             notes.append(f"{herb} {dose}g→{limit}g")
         kept.append(item)
@@ -410,7 +414,7 @@ def _safety_blocked_modify(sid: str, state_version: int) -> int:
     print(f"  BLOCKED modify status={st} notes={notes}")
     if st != 200:
         return state_version
-    return (body.get("data") or {}).get("state_version", state_version)
+    return cast(int, (body.get("data") or {}).get("state_version", state_version))
 
 
 def _intake_loop(sid: str, answers: IntakeAnswers, state_version: int, max_rounds: int = 30) -> int:
@@ -457,7 +461,7 @@ def _intake_loop(sid: str, answers: IntakeAnswers, state_version: int, max_round
     return state_version
 
 
-def run_scenario(scenario: dict, max_rounds: int = 30) -> dict:
+def run_scenario(scenario: dict[str, Any], max_rounds: int = 30) -> dict[str, Any]:
     label = scenario["label"]
     print(f"\n{'=' * 70}\nSCENARIO: {label}\nchief={scenario['chief_complaint']!r}")
     answers = IntakeAnswers(scenario.get("overrides") or {})
@@ -560,7 +564,7 @@ def main() -> None:
     manifest_path = MANIFEST_PATH
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    manifest: list[dict] = []
+    manifest: list[dict[str, Any]] = []
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 

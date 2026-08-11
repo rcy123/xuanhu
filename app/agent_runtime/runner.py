@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
+from langgraph.errors import GraphInterrupt
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -112,11 +114,11 @@ class GraphRunner:
         # 运行前校验（复用 L1-3 逻辑，不削弱 checkpoint 写入边界）
         validate_checkpoint_config(config, state)
 
-        timeout_ctx = (
-            asyncio.timeout(self._timeout_seconds)
-            if self._timeout_seconds and self._timeout_seconds > 0
-            else _NullTimeout()
-        )
+        timeout_ctx: AbstractAsyncContextManager[Any]
+        if self._timeout_seconds and self._timeout_seconds > 0:
+            timeout_ctx = asyncio.timeout(self._timeout_seconds)
+        else:
+            timeout_ctx = _NullTimeout()
 
         execution_error: GraphRunnerError | None = None
 
@@ -133,6 +135,10 @@ class GraphRunner:
             raise
         except CheckpointConfigMismatchError:
             # 校验错误直接传播，不包装
+            raise
+        except GraphInterrupt:
+            # GraphInterrupt 是 LangGraph 的正常挂起语义（interrupt() 调用），
+            # 不是执行失败。直接传播给调用方，由调用方决定如何响应中断。
             raise
         except Exception as exc:
             # 不读取或链式保留底层异常；异常文本可能包含密钥、prompt 或患者信息。
@@ -173,11 +179,11 @@ class GraphRunner:
                 code="RUNNER_RESUME_REF_INVALID",
             )
 
-        timeout_ctx = (
-            asyncio.timeout(self._timeout_seconds)
-            if self._timeout_seconds and self._timeout_seconds > 0
-            else _NullTimeout()
-        )
+        timeout_ctx: AbstractAsyncContextManager[Any]
+        if self._timeout_seconds and self._timeout_seconds > 0:
+            timeout_ctx = asyncio.timeout(self._timeout_seconds)
+        else:
+            timeout_ctx = _NullTimeout()
         execution_error: GraphRunnerError | None = None
         try:
             async with timeout_ctx:
@@ -192,6 +198,9 @@ class GraphRunner:
         except CheckpointConfigMismatchError:
             raise
         except GraphRunnerError:
+            raise
+        except GraphInterrupt:
+            # GraphInterrupt 是 LangGraph 的正常挂起语义，直接传播。
             raise
         except Exception:
             execution_error = GraphRunnerError(
@@ -241,11 +250,11 @@ class GraphRunner:
         else:
             run_id = ""
 
-        timeout_ctx = (
-            asyncio.timeout(self._timeout_seconds)
-            if self._timeout_seconds and self._timeout_seconds > 0
-            else _NullTimeout()
-        )
+        timeout_ctx: AbstractAsyncContextManager[Any]
+        if self._timeout_seconds and self._timeout_seconds > 0:
+            timeout_ctx = asyncio.timeout(self._timeout_seconds)
+        else:
+            timeout_ctx = _NullTimeout()
 
         execution_error: GraphRunnerError | None = None
         _t0_node = time.perf_counter()
@@ -309,7 +318,7 @@ class GraphRunner:
             raise execution_error
 
 
-class _NullTimeout:
+class _NullTimeout(AbstractAsyncContextManager[None]):
     """无超时上下文管理器（当 timeout_seconds 为 0 或 None 时使用）。
 
     实现与 ``asyncio.timeout`` 相同的 ``async with`` 接口但不限制时间。

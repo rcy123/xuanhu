@@ -7,6 +7,8 @@
 - 数值字段类型正确
 """
 
+import os
+
 import pytest
 from pydantic import ValidationError
 
@@ -280,6 +282,22 @@ def test_numeric_fields_have_correct_types(monkeypatch) -> None:
     assert isinstance(settings.event_dedupe_ttl_seconds, int)
 
 
+def test_async_command_enabled_defaults_true_and_kill_switch_false(monkeypatch) -> None:
+    """R7: the production worker is on by default; the kill switch forces it off."""
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("XUANHU_ASYNC_COMMAND_ENABLED", raising=False)
+
+    # R7 default: async-command worker enabled, so the three POST endpoints
+    # prefer the durable 202 path when ready.
+    assert Settings(_env_file=None).async_command_enabled is True  # type: ignore[call-arg]
+
+    # Operator kill switch / rollback: explicitly disable -> worker not started,
+    # admission never ready, synchronous R1-R5 path stays the default.
+    monkeypatch.setenv("XUANHU_ASYNC_COMMAND_ENABLED", "false")
+    assert Settings(_env_file=None).async_command_enabled is False  # type: ignore[call-arg]
+
+
 def test_event_dedupe_ttl_is_configurable_and_bounded(monkeypatch) -> None:
     for key, value in REQUIRED_ENV.items():
         monkeypatch.setenv(key, value)
@@ -323,3 +341,37 @@ def test_get_settings_cache_clear(monkeypatch) -> None:
     get_settings.cache_clear()
     s2 = get_settings()
     assert s1 is not s2
+
+
+# ---------------------------------------------------------------------------
+# 单元测试环境固定网关超时
+# ---------------------------------------------------------------------------
+
+
+def test_unit_environment_pins_model_gateway_timeout() -> None:
+    """conftest 须固定 MODEL_GATEWAY_TIMEOUT_SECONDS=60，且 get_settings 读到该值。
+
+    不读取外部 .env：env 中 MODEL_GATEWAY_TIMEOUT_SECONDS 由
+    conftest._set_test_defaults() 直接赋值，且环境变量优先于 .env 文件。
+    """
+    try:
+        assert os.environ["MODEL_GATEWAY_TIMEOUT_SECONDS"] == "60"
+        get_settings.cache_clear()
+        assert get_settings().model_gateway_timeout_seconds == 60
+    finally:
+        get_settings.cache_clear()
+
+
+def test_unit_environment_pins_rag_query_rewrite_disabled() -> None:
+    """conftest 须固定 RAG_QUERY_REWRITE_ENABLED=false，且 get_settings 读到该值。
+
+    改写是真实网关调用：本地 .env 的 RAG_QUERY_REWRITE_ENABLED=true 若泄漏进
+    测试会话，辨证路径会发起真实改写请求。该值由 conftest._set_test_defaults()
+    直接赋值固定，且环境变量优先于 .env 文件。
+    """
+    try:
+        assert os.environ["RAG_QUERY_REWRITE_ENABLED"] == "false"
+        get_settings.cache_clear()
+        assert get_settings().rag_query_rewrite_enabled is False
+    finally:
+        get_settings.cache_clear()

@@ -906,7 +906,7 @@ class TestIdempotency:
         except Exception as exc:  # noqa: BLE001
             # 只跳过真正的连接拒绝异常（PostgreSQL 未启动/网络不通），
             # 不吞掉 AttributeError、TypeError 等代码逻辑错误。
-            if isinstance(exc, (AttributeError, TypeError)):
+            if isinstance(exc, AttributeError | TypeError):
                 raise
             pytest.fail(f"PostgreSQL integration dependency unavailable: {type(exc).__name__}: {exc}")
 

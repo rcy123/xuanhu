@@ -23,10 +23,21 @@ export {
   rejectSafetyAssertion,
   recoverSession,
   reviewPrescription,
+  getCommandStatus,
   getRecord,
   updateRecord,
   exportRecord,
   getHealth,
   toQuery,
 } from './index'
+export {
+  isAsyncCommandAccepted,
+} from '@/types/api'
+export type {
+  AsyncCommandAccepted,
+  CommandMutationResult,
+  MessageSubmitResult,
+  AdvanceMutationResult,
+  ReviewMutationResult,
+} from '@/types/api'
 export { downloadFileResponse } from './download'

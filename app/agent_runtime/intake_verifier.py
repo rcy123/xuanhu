@@ -24,7 +24,10 @@ from app.schemas.intake import (
     IntakeExtractionInput,
     IntakeExtractionOutput,
     IntakeMessageRole,
+    LactationDelta,
     ObservationOperation,
+    PregnancyDelta,
+    SafetyListDelta,
 )
 
 INTAKE_AGENT_NAME = "intake_extraction"
@@ -245,14 +248,15 @@ def _verify_sources(
     sources.extend(item.source_message_id for item in output.red_flag_candidates)
     sources.extend(item.span.source_message_id for item in output.red_flag_candidates)
     sources.extend(item.source_message_id for item in output.ambiguities)
-    for field in (
+    safety_fields: tuple[SafetyListDelta | PregnancyDelta | LactationDelta, ...] = (
         output.patient_safety_delta.allergy,
         output.patient_safety_delta.pregnancy,
         output.patient_safety_delta.lactation,
         output.patient_safety_delta.medications,
         output.patient_safety_delta.major_conditions,
         output.patient_safety_delta.contraindications,
-    ):
+    )
+    for field in safety_fields:
         if field.source_message_id is not None:
             sources.append(field.source_message_id)
     for field in (
@@ -265,10 +269,11 @@ def _verify_sources(
             sources.extend(span.source_message_id for span in field.value_spans)
         if field.negation_span is not None:
             sources.append(field.negation_span.source_message_id)
-    for field in (
+    scalar_fields: tuple[PregnancyDelta | LactationDelta, ...] = (
         output.patient_safety_delta.pregnancy,
         output.patient_safety_delta.lactation,
-    ):
+    )
+    for field in scalar_fields:
         if field.span is not None:
             sources.append(field.span.source_message_id)
     if any(source not in allowed for source in sources):
@@ -418,7 +423,7 @@ def _contains_forbidden_key(value: Any) -> bool:
         if any(str(key).lower() in _FORBIDDEN_AUTHORITY_KEYS for key in value):
             return True
         return any(_contains_forbidden_key(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return any(_contains_forbidden_key(item) for item in value)
     return False
 
@@ -428,7 +433,7 @@ def _contains_identity_key(value: Any) -> bool:
         if any(_is_identity_key(str(key)) for key in value):
             return True
         return any(_contains_identity_key(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return any(_contains_identity_key(item) for item in value)
     return False
 
@@ -447,7 +452,7 @@ def _contains_direct_identifier(value: Any) -> bool:
         return any(pattern.search(value) for pattern in _PII_PATTERNS)
     if isinstance(value, dict):
         return any(_contains_direct_identifier(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return any(_contains_direct_identifier(item) for item in value)
     return False
 
@@ -476,13 +481,13 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 for name in allowed
             )
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)
 
 
 def _fact_value_key(fact_key: str, value: Any, normalized_value: Any) -> str:

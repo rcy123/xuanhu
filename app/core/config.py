@@ -10,7 +10,7 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
@@ -400,10 +400,48 @@ class Settings(BaseSettings):
         description="Redis Stream 每会话 Outbox 去重窗口的滑动 TTL（秒）",
     )
 
+    # ---- Durable Async Command Worker (R6-A / R6-B / R7) ----
+    # R7 default ON: the three POST endpoints prefer the durable async 202 path
+    # and fall back to synchronous only when the worker/runtime/registry is
+    # unavailable. This is the operator kill switch: set
+    # XUANHU_ASYNC_COMMAND_ENABLED=false to fall back to the synchronous R1-R5
+    # path (worker not started => admission never ready => sync fallback).
+    async_command_enabled: bool = Field(
+        default=True,
+        validation_alias="XUANHU_ASYNC_COMMAND_ENABLED",
+        description="启动后台 AsyncCommandWorker（R7 默认开启；设 false 为回滚/熔断回同步路径）",
+    )
+    async_command_batch_size: int = Field(default=10, ge=1, le=200)
+    async_command_lease_seconds: int = Field(default=60, ge=5, le=3600)
+    async_command_heartbeat_seconds: float = Field(
+        default=20,
+        ge=1,
+        description="Worker 心跳间隔，必须严格小于 lease（构造时校验）",
+    )
+    async_command_max_attempts: int = Field(default=8, ge=1, le=100)
+    async_command_retry_base_seconds: int = Field(default=1, ge=0, le=3600)
+    async_command_retry_max_seconds: int = Field(default=300, ge=1, le=86_400)
+    async_command_poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
+    async_command_shutdown_grace_seconds: float = Field(default=10, gt=0, le=120)
+
     # ---- 会话锁与导出 ----
     session_lock_ttl_seconds: int = Field(default=90, ge=1, description="会话锁 TTL（秒）")
     session_lock_wait_seconds: int = Field(default=0, ge=0, description="会话锁等待超时（秒），0 表示不等待")
     export_file_ttl_seconds: int = Field(default=3600, ge=1, description="导出文件 TTL（秒）")
+
+    # -------------------------------------------------------------------
+    # 校验
+    # -------------------------------------------------------------------
+
+    @model_validator(mode="after")
+    def async_command_invariants(self) -> Settings:
+        """Heartbeat must stay strictly below the lease for the R6-A worker."""
+        if self.async_command_enabled and self.async_command_heartbeat_seconds >= self.async_command_lease_seconds:
+            raise ValueError(
+                "async_command_heartbeat_seconds must be strictly less than "
+                "async_command_lease_seconds"
+            )
+        return self
 
     # -------------------------------------------------------------------
     # 脱敏

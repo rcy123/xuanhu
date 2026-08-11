@@ -568,7 +568,7 @@ def _json_ready(value: object) -> object:
         return value.model_dump(mode="json")
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_ready(item) for item in value]
     return value
 
@@ -975,7 +975,7 @@ def _parse_model[ModelT: BaseModel](model_type: type[ModelT], value: object) -> 
     parsed: ModelT | None = None
     failed = False
     try:
-        if isinstance(value, (str, bytes, bytearray)):
+        if isinstance(value, str | bytes | bytearray):
             parsed = model_type.model_validate_json(value, strict=True)
         else:
             if isinstance(value, BaseModel):
@@ -1003,14 +1003,14 @@ def _input_exceeds_resource_budget(value: object) -> bool:
             budget -= 16 * len(current)
             stack.extend(current.keys())
             stack.extend(current.values())
-        elif isinstance(current, (list, tuple)):
+        elif isinstance(current, list | tuple):
             budget -= 8 * len(current)
             stack.extend(current)
         elif isinstance(current, str):
             if len(current) > budget:
                 return True
             budget -= len(current.encode("utf-8")) + 2
-        elif isinstance(current, (bytes, bytearray)):
+        elif isinstance(current, bytes | bytearray):
             budget -= len(current)
         else:
             budget -= 32

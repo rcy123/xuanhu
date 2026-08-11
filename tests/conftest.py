@@ -49,11 +49,17 @@ def _set_test_defaults() -> None:
     os.environ["XUANHU_INTAKE_SLOT_PATH_ENABLED"] = "false"
     os.environ.setdefault("MODEL_GATEWAY_BASE_URL", "http://localhost:8080/v1")
     os.environ.setdefault("MODEL_GATEWAY_API_KEY", "sk-test-placeholder")
+    # 固定网关超时：必须赋值而非 setdefault，保证单元测试环境恒为 60s，
+    # 本地 shell/.env 的 MODEL_GATEWAY_TIMEOUT_SECONDS 不得污染测试会话。
+    os.environ["MODEL_GATEWAY_TIMEOUT_SECONDS"] = "60"
     os.environ.setdefault("CHAT_MODEL", "test-chat-model")
     os.environ.setdefault("EMBEDDING_MODEL", "test-embedding-model")
     os.environ.setdefault("EMBEDDING_DIM", "768")
     # 测试环境默认关闭 RAG（测试 fakes 按 no-rag 契约编写）。
     os.environ["XUANHU_RAG_ENABLED"] = "false"
+    # P2: 固定关闭 query LLM 改写。必须赋值而非 setdefault——改写是真实网关调用，
+    # 本地 .env 的 RAG_QUERY_REWRITE_ENABLED=true 不得污染单元测试会话。
+    os.environ["RAG_QUERY_REWRITE_ENABLED"] = "false"
     # 测试环境关闭 reasoning 重试退避（避免失败路径测试等待 10s/20s）。
     os.environ["REASONING_RETRY_BACKOFF_BASE_SECONDS"] = "0"
 

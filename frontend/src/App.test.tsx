@@ -6,9 +6,10 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { ConfigProvider, App as AntdApp } from 'antd'
+import { Profiler } from 'react'
 import App from '@/App'
 import * as api from '@/api/index'
 import type { PageData, SessionListItem } from '@/types/api'
@@ -84,5 +85,49 @@ describe('App Shell', () => {
     // 无选中会话时，步骤条可能渲染在 ChatPanel 外部（无 detail 则不渲染 StepBar）
     // 这里只验证步骤条存在，不验证具体标签（因为 StepBar 只在有 session 时渲染）
     expect(labels.length).toBeGreaterThanOrEqual(0)
+  })
+
+  it('R7 回归：/workbench 渲染后稳定收敛、卸载无残留定时器/渲染循环', async () => {
+    // 回归防护：修复前 useCommandReconciliation 每次渲染返回新对象，ChatPanel 的
+    // 副作用依赖其标识并调用 clear() → setOutstanding([])（即使内容为空）→ 无限
+    // 渲染/副作用循环，测试进程永不退出。这里用 Profiler 统计提交次数证明收敛。
+    let commits = 0
+    const { unmount } = render(
+      <Profiler id="app-loop-regression" onRender={() => { commits += 1 }}>
+        <ConfigProvider>
+          <AntdApp>
+            <MemoryRouter initialEntries={['/workbench']}>
+              <App />
+            </MemoryRouter>
+          </AntdApp>
+        </ConfigProvider>
+      </Profiler>,
+    )
+
+    // 收敛：反复冲刷副作用/微任务，提交次数必须稳定（不再有渲染循环）。
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        await Promise.resolve()
+      })
+    }
+    const stableCommits = commits
+    expect(stableCommits).toBeGreaterThan(0)
+
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        await Promise.resolve()
+      })
+    }
+    expect(commits).toBe(stableCommits)
+
+    // 卸载后不再有新的提交（组件树被干净拆除，无遗留定时器驱动的重渲染）。
+    act(() => {
+      unmount()
+    })
+    const afterUnmount = commits
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(commits).toBe(afterUnmount)
   })
 })

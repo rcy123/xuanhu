@@ -23,11 +23,12 @@ import json
 import re
 from collections.abc import Iterable
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.specs import AgentSpec, Capability, RunArtifact, RunSpec, run_artifact_subject_digest
 from app.agent_runtime.syndrome_verifier import (
     _SLOT_PROJECTION_SCHEMA_KEYS,
@@ -37,13 +38,14 @@ from app.agent_runtime.syndrome_verifier import (
     SyndromeGateAuthority,
     SyndromeVerificationReport,
     _context_matches_authority,
+    _is_uuid_string,
 )
 from app.agent_runtime.syndrome_verifier import (
     verify_syndrome_artifact as _verify_syndrome_artifact_l4,
 )
 from app.core.config import agent_model_timeout_seconds
 from app.schemas.completeness import COMPLETENESS_GATE_NAME, COMPLETENESS_POLICY_VERSION
-from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema, ObservationStatus
+from app.schemas.domain import GateDecision, GateResultSchema, ObservationSchema
 from app.schemas.formula import (
     BASE_FORMULA_AGENT_NAME,
     BASE_FORMULA_AGENT_VERSION,
@@ -530,7 +532,7 @@ def _build_syndrome_input_from_formula(formula_input: FormulaDraftInput) -> Synd
     and policy version.  RAG 模式贯通：formula 是 rag policy 时，重建的
     syndrome input 也用 rag policy（L4-1 verifier 按 syndrome_run_spec 分派）。
     """
-    policy_version = (
+    policy_version: Literal["syndrome-draft-policy.no-rag.v1", "syndrome-draft-policy.rag.v1"] = (
         SYNDROME_RAG_POLICY_VERSION
         if formula_input.policy_version == FORMULA_RAG_POLICY_VERSION
         else SYNDROME_POLICY_VERSION
@@ -756,16 +758,9 @@ def _verify_authority(output: FormulaDraft) -> FormulaVerificationFailureCode | 
 
 
 def _active_observations(observations: Iterable[ObservationSchema]) -> tuple[ObservationSchema, ...]:
-    superseded = frozenset(
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    )
-    return tuple(
-        item
-        for item in observations
-        if item.status is ObservationStatus.ACTIVE and item.observation_id not in superseded
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _active_observation_ids(observations: Iterable[ObservationSchema]) -> set[UUID]:
@@ -873,19 +868,40 @@ def _valid_clinical_text(value: str | None) -> bool:
     return bool(normalized) and normalized not in _PSEUDO_COMPLETED
 
 
+# 机器元数据标识符键：这些键名由程序定义，其取值是系统生成的规范化 UUID
+# （observation_id / session_id / source_message_id / slot_id），不是患者身份数据。
+# 值模式豁免只允许发生在这些明确键下、且整串是规范 UUID 时。其他任意业务值 / note
+# 里出现的 UUID 字符串必须照常过 PII 正则，不得被 UUID 规则自动豁免。
+_MACHINE_ID_KEYS = frozenset({"observation_id", "session_id", "source_message_id", "slot_id"})
+
+
 def _contains_identity_key_or_value(value: Any) -> bool:
+    return _scan_identity(value, parent_key=None)
+
+
+def _scan_identity(value: Any, parent_key: str | None) -> bool:
+    """Recursively scan for identity keys / PII-bearing values, key-aware.
+
+    Mirrors L4-1's key-aware scanner so Syndrome and Formula behave symmetrically:
+    only a canonical UUID string under a machine-id metadata key
+    (:data:`_MACHINE_ID_KEYS`) is skipped; identity-name keys always reject; a UUID
+    literal in an arbitrary business value/note is still matched against the PII
+    patterns.
+    """
     if isinstance(value, BaseModel):
-        return _contains_identity_key_or_value(value.model_dump(mode="python"))
+        return _scan_identity(value.model_dump(mode="python"), parent_key)
     if isinstance(value, dict):
-        if any(
-            _is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS
-            for key in value
-        ):
+        if any(_is_identity_key(str(key)) and str(key) not in _SLOT_PROJECTION_SCHEMA_KEYS for key in value):
             return True
-        return any(_contains_identity_key_or_value(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_identity_key_or_value(item) for item in value)
+        return any(_scan_identity(item, str(key)) for key, item in value.items())
+    if isinstance(value, list | tuple):
+        return any(_scan_identity(item, parent_key) for item in value)
     if isinstance(value, str):
+        # 整串是规范 UUID 且位于机器元数据 id 键下时才跳过值模式（程序化标识符，
+        # 非 PII；否则随机 source_message_id 会被身份证正则误判 → 同一条上下文随机
+        # CONTEXT_PRIVACY_INVALID，flaky）。任意业务值 / note 里的 UUID 字符串不豁免。
+        if parent_key in _MACHINE_ID_KEYS and _is_uuid_string(value):
+            return False
         return any(pattern.search(value) for pattern in _PII_PATTERNS)
     return False
 
@@ -922,7 +938,7 @@ def _contains_key(raw: Any, forbidden: frozenset[str]) -> bool:
         if {str(key).lower() for key in raw} & forbidden:
             return True
         return any(_contains_key(value, forbidden) for value in raw.values())
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         return any(_contains_key(value, forbidden) for value in raw)
     return False
 
@@ -943,13 +959,13 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 return True
             return any(_has_undeclared_fields(raw.get(name), getattr(canonical, name)) for name in allowed)
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)
 
 
 def _check(name: str, code: FormulaVerificationFailureCode | None) -> FormulaCheckResult:

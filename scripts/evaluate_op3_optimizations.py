@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -196,8 +196,6 @@ async def evaluate_p0(retriever: Any) -> list[P0Result]:
     from types import SimpleNamespace
 
     from app.rag.reasoning_retrieval import (
-        build_formula_query,
-        build_modification_query,
         retrieve_formula_evidence,
         retrieve_modification_evidence,
     )
@@ -320,11 +318,9 @@ async def evaluate_p2(retriever: Any, gateway: Any) -> list[P2Result]:
     from types import SimpleNamespace
 
     from app.rag.reasoning_retrieval import (
-        _format_observations_for_rewrite,
         build_syndrome_query,
         rewrite_syndrome_query,
     )
-    from app.rag.schemas import Evidence
 
     results: list[P2Result] = []
 
@@ -405,11 +401,11 @@ async def evaluate_p2(retriever: Any, gateway: Any) -> list[P2Result]:
 async def _retrieve_with_query(retriever: Any, query: str) -> list[Any]:
     """用给定 query 执行一次简单检索（绕过 reasoning 层的 query 构造）."""
     try:
-        return await retriever.hybrid_search(
+        return cast(list[Any], await retriever.hybrid_search(
             query=query,
             sources=("theory", "case", "herb", "formula"),
             top_k=8,
-        )
+        ))
     except Exception:
         return []
 
@@ -421,19 +417,12 @@ async def _retrieve_with_query(retriever: Any, query: str) -> list[Any]:
 
 async def evaluate_reranker(retriever: Any, gateway: Any) -> list[RerankerResult]:
     """对比 MVP vs LLM Reranker 路径的排序结果."""
-    import uuid as _uuid
 
-    from app.core.config import get_settings
     from app.rag.reranker import (
-        DEFAULT_FULLTEXT_WEIGHT,
-        DEFAULT_SOURCE_PRIORITY_WEIGHT,
-        DEFAULT_VECTOR_WEIGHT,
         llm_rerank,
         rerank,
     )
-    from app.rag.schemas import Evidence, MergedHit
 
-    settings = get_settings()
     results: list[RerankerResult] = []
 
     # 选取几条有代表性的 query
@@ -529,7 +518,7 @@ def _to_merged_hits(candidates: list[Any]) -> list[Any]:
             hit = MergedHit(
                 source_type=getattr(c, "source_type", "unknown"),
                 source_id=getattr(c, "source_id", ""),
-                chunk_id=getattr(c, "chunk_id", None),
+                chunk_id=cast(str, getattr(c, "chunk_id", None)),
                 title=getattr(c, "title", ""),
                 content_snippet=getattr(c, "content_snippet", ""),
                 vector_score=getattr(c, "vector_score", 0.0),
@@ -569,15 +558,15 @@ def generate_report(
         p2_improvement = 0.0
 
     lines = [
-        f"# OP3 优化方案真实后端评测报告",
-        f"",
+        "# OP3 优化方案真实后端评测报告",
+        "",
         f"生成时间：{datetime.now(UTC).isoformat()}",
-        f"",
-        f"## P0: Modification RAG 差异化",
-        f"",
+        "",
+        "## P0: Modification RAG 差异化",
+        "",
         f"- 通过率：{p0_pass}/{len(p0_results)} ({p0_pass_rate:.0%})",
-        f"- 核心指标：modification vs formula 检索证据重叠率、source type 正确性",
-        f"",
+        "- 核心指标：modification vs formula 检索证据重叠率、source type 正确性",
+        "",
     ]
 
     for r in p0_results:
@@ -593,25 +582,25 @@ def generate_report(
 
     lines.append("## P2: Query 改写 A/B 对比")
     lines.append("")
-    for r in p2_results:
-        lines.append(f"### {r.patient_case}")
-        lines.append(f"- Original: {r.original_query[:120]}...")
-        lines.append(f"- Rewritten ({r.rewrite_latency_ms:.0f}ms): {r.rewritten_query[:150]}...")
-        lines.append(f"- Original results: {r.original_evidence_count}, top: {r.original_top_titles}")
-        lines.append(f"- Rewritten results: {r.rewritten_evidence_count}, top: {r.rewritten_top_titles}")
-        lines.append(f"- Overlap: {r.overlap_count}, Verdict: **{r.verdict}**")
+    for p2 in p2_results:
+        lines.append(f"### {p2.patient_case}")
+        lines.append(f"- Original: {p2.original_query[:120]}...")
+        lines.append(f"- Rewritten ({p2.rewrite_latency_ms:.0f}ms): {p2.rewritten_query[:150]}...")
+        lines.append(f"- Original results: {p2.original_evidence_count}, top: {p2.original_top_titles}")
+        lines.append(f"- Rewritten results: {p2.rewritten_evidence_count}, top: {p2.rewritten_top_titles}")
+        lines.append(f"- Overlap: {p2.overlap_count}, Verdict: **{p2.verdict}**")
         lines.append("")
 
     lines.append("## Reranker")
     lines.append("")
-    for r in reranker_results:
-        lines.append(f"### Query: {r.query}...")
-        lines.append(f"- MVP ({r.mvp_latency_ms:.0f}ms): {r.mvp_top_titles}")
-        if r.llm_rerank_top_titles:
-            lines.append(f"- LLM ({r.llm_rerank_latency_ms:.0f}ms): {r.llm_rerank_top_titles}")
-        if r.cross_encoder_top_titles:
-            lines.append(f"- Cross-Encoder ({r.cross_encoder_latency_ms:.0f}ms): {r.cross_encoder_top_titles}")
-        lines.append(f"- Verdict: **{r.verdict}**")
+    for rk in reranker_results:
+        lines.append(f"### Query: {rk.query}...")
+        lines.append(f"- MVP ({rk.mvp_latency_ms:.0f}ms): {rk.mvp_top_titles}")
+        if rk.llm_rerank_top_titles:
+            lines.append(f"- LLM ({rk.llm_rerank_latency_ms:.0f}ms): {rk.llm_rerank_top_titles}")
+        if rk.cross_encoder_top_titles:
+            lines.append(f"- Cross-Encoder ({rk.cross_encoder_latency_ms:.0f}ms): {rk.cross_encoder_top_titles}")
+        lines.append(f"- Verdict: **{rk.verdict}**")
         lines.append("")
 
     return EvalReport(

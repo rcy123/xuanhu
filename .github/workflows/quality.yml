@@ -156,6 +156,12 @@ jobs:
           docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
             prom/prometheus:v3.5.0 test rules \
             deploy/prometheus/tests/xuanhu-outbox-alerts.test.yml
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 check rules \
+            deploy/prometheus/rules/xuanhu-r5-alerts.yml
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 test rules \
+            deploy/prometheus/tests/xuanhu-r5-alerts.test.yml
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -194,3 +200,33 @@ jobs:
             sbom-python.cdx.json
             sbom-node.cdx.json
           if-no-files-found: error
+
+  trajectory-gate:
+    name: Deterministic trajectory evaluation gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - name: Run trajectory evaluation twice and require a byte-identical pass
+        run: |
+          set -euo pipefail
+          uv run python -m scripts.evaluate_agent_trajectories > first.json
+          uv run python -m scripts.evaluate_agent_trajectories > second.json
+          cmp --silent first.json second.json
+          uv run python - <<'PY'
+          import json
+          report = json.load(open("first.json", encoding="utf-8"))
+          assert report["schema_version"] == "agent-trajectory-eval.v1"
+          assert report["trajectory_count"] == 6
+          assert report["passed_count"] == 6
+          assert report["failed_count"] == 0
+          assert report["failure_codes"] == []
+          assert len(report["reports"]) == 6
+          PY

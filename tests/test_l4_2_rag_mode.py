@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from app.agent_runtime.formula_verifier import (
     FORMULA_AGENT_VERSION,

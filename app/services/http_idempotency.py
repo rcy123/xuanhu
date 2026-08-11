@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,10 +27,13 @@ from app.core.exceptions import (
 )
 from app.db.session import get_session_factory
 from app.models.http_command import HttpCommandClaim
+from app.services.lease_guard import LeaseGuard, LeaseOwnershipLostError
 
 HTTP_COMMAND_LEASE_SECONDS = 90
 HTTP_COMMAND_HEARTBEAT_SECONDS = 20
 HTTP_COMMAND_WAIT_SECONDS = 130
+
+logger = logging.getLogger("xuanhu.http_idempotency")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,18 @@ class HttpCommandExecutor:
     disappears in the narrow interval between those commits, the heartbeat
     expires and the claim becomes ``ambiguous``; retries fail closed instead of
     executing a possibly-applied clinical write again.
+
+    The handler runs under the shared monotonic :class:`LeaseGuard`, which fences
+    the operation end to end: it confirms ownership before the handler starts,
+    keeps lease observation active through the business ``commit`` (which now runs
+    inside the guarded operation), and requires one final bounded owner
+    confirmation before any result is settled. On known ownership loss (owner
+    token or status lost, or the deadline exhausted) the guard cancels/drains the
+    handler and the executor best-effort rolls back any uncommitted stale write
+    and marks the claim ambiguous, raising ``HTTP_COMMAND_RECOVERY_REQUIRED`` so a
+    stale owner never completes a clinical write after its lease was reclaimed.
+    Cleanup failures are logged by bounded type only; the internal lease error is
+    never exposed.
     """
 
     def __init__(
@@ -64,9 +80,22 @@ class HttpCommandExecutor:
         db: AsyncSession,
         *,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        lease_seconds: int = HTTP_COMMAND_LEASE_SECONDS,
+        heartbeat_seconds: float = HTTP_COMMAND_HEARTBEAT_SECONDS,
+        renew_attempt_seconds: float | None = None,
     ) -> None:
+        if not 0 < heartbeat_seconds < lease_seconds:
+            raise ValueError("heartbeat_seconds must be in (0, lease_seconds)")
+        if renew_attempt_seconds is not None and renew_attempt_seconds <= 0:
+            raise ValueError("renew_attempt_seconds must be positive")
         self._db = db
         self._factory = session_factory or get_session_factory()
+        self._lease_seconds = lease_seconds
+        self._heartbeat_seconds = heartbeat_seconds
+        # Bound a single renew attempt independently of the heartbeat cadence.
+        # Defaults to the heartbeat; operators may decouple it so a real DB renew
+        # (typically tens of ms) can complete even under a tight watchdog.
+        self._renew_attempt_seconds = renew_attempt_seconds
 
     async def execute(
         self,
@@ -105,53 +134,69 @@ class HttpCommandExecutor:
         if isinstance(decision, HttpCommandResult):
             return decision
 
-        stop_heartbeat = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            self._heartbeat(decision, stop_heartbeat),
-            name=f"http-command-heartbeat:{decision.claim_id}",
+        guard = LeaseGuard(
+            heartbeat_seconds=self._heartbeat_seconds,
+            lease_seconds=self._lease_seconds,
+            renew_attempt_seconds=self._renew_attempt_seconds,
         )
+
+        async def _guarded_operation() -> dict[str, Any]:
+            # Keep lease observation active through the business commit so a
+            # stale owner can never commit a clinical write after its lease was
+            # reclaimed. A commit exception still rolls back / marks ambiguous.
+            data = await handler()
+            await self._db.commit()
+            return data
+
         try:
-            try:
-                data = await handler()
-            except XuanhuError as exc:
-                await self._db.rollback()
-                await self._complete_error(decision, _xuanhu_error_payload(exc))
-                raise
-            except ModelGatewayError as exc:
-                await self._db.rollback()
-                await self._complete_error(decision, _model_gateway_error_payload(exc))
-                raise
-            except asyncio.CancelledError:
-                await asyncio.shield(self._db.rollback())
-                await asyncio.shield(self._mark_ambiguous(decision))
-                raise
-            except Exception:
-                await self._db.rollback()
-                await self._mark_ambiguous(decision)
-                raise
-
-            try:
-                await self._db.commit()
-            except Exception:
-                await self._db.rollback()
-                await self._mark_ambiguous(decision)
-                raise
-
-            await self._complete_success(
-                decision,
-                data=data,
-                status_code=success_status,
-                message=success_message,
+            data = await guard.run(
+                operation=_guarded_operation,
+                renew=lambda: self._renew(decision),
             )
-            return HttpCommandResult(
-                data=data,
-                status_code=success_status,
-                message=success_message,
-                replayed=False,
-            )
-        finally:
-            stop_heartbeat.set()
-            await heartbeat
+        except LeaseOwnershipLostError:
+            # Ownership was lost (or the local deadline exhausted) — possibly after
+            # the business commit completed. Fail closed: best-effort rollback and
+            # ambiguous-marking never leak internal DB/lease details; durable-outcome
+            # repair handles the already-applied narrow-window state. The internal
+            # lease error is never exposed; only the stable PHI-safe public error.
+            await self._safe_rollback()
+            await self._safe_mark_ambiguous(decision)
+            raise HttpCommandRecoveryRequiredError(
+                detail="http_command ownership was lost during execution",
+                retryable=False,
+            ) from None
+        except XuanhuError as exc:
+            await self._safe_rollback()
+            await self._complete_error(decision, _xuanhu_error_payload(exc))
+            raise
+        except ModelGatewayError as exc:
+            await self._safe_rollback()
+            await self._complete_error(decision, _model_gateway_error_payload(exc))
+            raise
+        except asyncio.CancelledError:
+            await self._safe_rollback()
+            await self._safe_mark_ambiguous(decision)
+            raise
+        except Exception:
+            await self._safe_rollback()
+            await self._safe_mark_ambiguous(decision)
+            raise
+
+        # The guard already ran a final bounded owner confirmation before returning
+        # its result; ``_complete_success`` independently re-verifies ownership
+        # atomically, so the success write also fails closed on any late loss.
+        await self._complete_success(
+            decision,
+            data=data,
+            status_code=success_status,
+            message=success_message,
+        )
+        return HttpCommandResult(
+            data=data,
+            status_code=success_status,
+            message=success_message,
+            replayed=False,
+        )
 
     async def _claim_or_replay(
         self,
@@ -233,7 +278,7 @@ class HttpCommandExecutor:
                     request_digest=request_digest,
                     status="running",
                     owner_token=owner.owner_token,
-                    lease_expires_at=_lease_deadline(),
+                    lease_expires_at=self._lease_deadline(),
                 )
             )
             try:
@@ -307,9 +352,8 @@ class HttpCommandExecutor:
             resolved = _resolved_claim(claim)
             if resolved is not None:
                 return resolved
-            may_repair_from_durable = (
-                claim.status in {"ambiguous", "failed"}
-                or (claim.status == "running" and _lease_expired(claim))
+            may_repair_from_durable = claim.status in {"ambiguous", "failed"} or (
+                claim.status == "running" and _lease_expired(claim)
             )
             if durable_outcome_resolver is not None and may_repair_from_durable:
                 durable_data = await durable_outcome_resolver()
@@ -367,9 +411,8 @@ class HttpCommandExecutor:
             resolved = _resolved_claim(claim)
             if resolved is not None:
                 return resolved
-            repairable = (
-                claim.status in {"ambiguous", "failed"}
-                or (claim.status == "running" and _lease_expired(claim))
+            repairable = claim.status in {"ambiguous", "failed"} or (
+                claim.status == "running" and _lease_expired(claim)
             )
             if not repairable:
                 return None
@@ -397,29 +440,25 @@ class HttpCommandExecutor:
                 return True
         return False
 
-    async def _heartbeat(self, owner: _OwnerClaim, stop: asyncio.Event) -> None:
-        while True:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=HTTP_COMMAND_HEARTBEAT_SECONDS)
-                return
-            except TimeoutError:
-                pass
-            try:
-                async with self._factory() as db, db.begin():
-                    claim = await db.get(HttpCommandClaim, owner.claim_id, with_for_update=True)
-                    if (
-                        claim is None
-                        or claim.status != "running"
-                        or claim.owner_token != owner.owner_token
-                    ):
-                        return
-                    claim.lease_expires_at = _lease_deadline()
-                    claim.updated_at = datetime.now(UTC)
-            except Exception:
-                # Completion verifies ownership and status.  A transient heartbeat
-                # failure must not replace the business outcome with an unrelated
-                # infrastructure exception.
-                continue
+    async def _renew(self, owner: _OwnerClaim) -> bool:
+        """Renew the owner-fenced lease; ``False`` means owner/status was lost.
+
+        The shared lease guard calls this under the monotonic watchdog. A
+        transient failure is retried by the guard while the local deadline
+        remains; a ``False`` result (or deadline exhaustion) makes the guard
+        cancel/drain the business handler so a stale owner never keeps writing.
+        """
+        async with self._factory() as db, db.begin():
+            claim = await db.get(HttpCommandClaim, owner.claim_id, with_for_update=True)
+            if claim is None or claim.status != "running" or claim.owner_token != owner.owner_token:
+                return False
+            claim.lease_expires_at = self._lease_deadline()
+            claim.updated_at = datetime.now(UTC)
+        return True
+
+    def _lease_deadline(self) -> datetime:
+        """Wall-clock lease deadline using this executor's configured lease."""
+        return datetime.now(UTC) + timedelta(seconds=self._lease_seconds)
 
     async def _complete_success(
         self,
@@ -466,14 +505,40 @@ class HttpCommandExecutor:
                 claim.lease_expires_at = None
                 claim.updated_at = datetime.now(UTC)
 
+    async def _safe_rollback(self) -> None:
+        """Best-effort rollback that never leaks a cleanup failure.
+
+        A failing rollback must not replace the stable public error with an
+        internal DB exception. Cancellation is allowed through only so an
+        external cancel still wins; every other failure is logged with just its
+        bounded type name.
+        """
+        try:
+            await asyncio.shield(self._db.rollback())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("http-command lease-loss rollback failed: %s", type(exc).__name__)
+
+    async def _safe_mark_ambiguous(self, owner: _OwnerClaim) -> None:
+        """Best-effort ambiguous-marking that never leaks a cleanup failure.
+
+        If the ambiguous-mark cannot be written it is only logged by bounded type
+        name; the stable fail-closed public error still surfaces, and durable-outcome
+        repair can recover the claim later.
+        """
+        try:
+            await asyncio.shield(self._mark_ambiguous(owner))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("http-command lease-loss ambiguous-mark failed: %s", type(exc).__name__)
+
     @staticmethod
     def _validate_digest(claim: HttpCommandClaim, request_digest: str) -> None:
         if claim.request_digest != request_digest:
             raise IdempotencyConflictError(
-                detail=(
-                    f"operation={claim.operation} scope={claim.scope_key} "
-                    "request_digest_mismatch"
-                ),
+                detail=(f"operation={claim.operation} scope={claim.scope_key} request_digest_mismatch"),
                 retryable=False,
             )
 
@@ -506,11 +571,7 @@ def _resolved_claim(claim: HttpCommandClaim) -> HttpCommandResult | None:
 
 
 def _verify_owner(claim: HttpCommandClaim | None, owner: _OwnerClaim) -> None:
-    if (
-        claim is None
-        or claim.status != "running"
-        or claim.owner_token != owner.owner_token
-    ):
+    if claim is None or claim.status != "running" or claim.owner_token != owner.owner_token:
         raise HttpCommandRecoveryRequiredError(
             detail=f"http_command_claim={owner.claim_id} ownership was lost",
             retryable=False,
@@ -559,10 +620,6 @@ def _digest_json(payload: dict[str, Any]) -> str:
 
 def _digest_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _lease_deadline() -> datetime:
-    return datetime.now(UTC) + timedelta(seconds=HTTP_COMMAND_LEASE_SECONDS)
 
 
 def _lease_expired(claim: HttpCommandClaim) -> bool:

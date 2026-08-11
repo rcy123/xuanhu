@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
+from langgraph.errors import GraphInterrupt  # noqa: E402  — 放置在业务导入之后以匹配项目风格
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy import null as sql_null
@@ -45,6 +46,7 @@ from app.agent_runtime.intake_verifier import (
     INTAKE_PROMPT_VERSION,
 )
 from app.agent_runtime.lifecycle import SharedLangGraphRuntime
+from app.agent_runtime.observation_projection import project_current_observations
 from app.agent_runtime.reducer import (
     DomainDelta,
     DomainReducerError,
@@ -75,13 +77,7 @@ from app.agent_runtime.triage_precheck import (
     merge_red_flag_candidates,
 )
 from app.agent_runtime.verifiers import DEFAULT_VERIFIER_CHAIN, VerificationContext
-from app.agents.clarification import (
-    CLARIFICATION_AGENT_NAME,
-    CLARIFICATION_AGENT_VERSION,
-    CLARIFICATION_PROMPT_VERSION,
-    ClarificationInput,
-    execute_clarification,
-)
+from app.agents.clarification import execute_clarification
 from app.agents.intake_extraction import (
     IntakeExecutionResult,
     IntakeExecutionStatus,
@@ -113,7 +109,13 @@ from app.models.domain import (
     OutboxEvent,
     SafetyFactAssertion,
 )
-from app.schemas.clarification import CLARIFICATION_POLICY_VERSION
+from app.schemas.clarification import (
+    CLARIFICATION_AGENT_NAME,
+    CLARIFICATION_AGENT_VERSION,
+    CLARIFICATION_POLICY_VERSION,
+    CLARIFICATION_PROMPT_VERSION,
+    ClarificationInput,
+)
 from app.schemas.completeness import (
     CompletenessDisposition,
     CompletenessDomainSnapshot,
@@ -134,6 +136,8 @@ from app.schemas.domain import (
 )
 from app.schemas.intake import (
     ActiveObservationContext,
+    Ambiguity,
+    AmbiguityCode,
     EvidenceSpan,
     IntakeExtractionDecision,
     IntakeExtractionInput,
@@ -148,7 +152,13 @@ from app.schemas.intake import (
     PregnancyDelta,
     SafetyListDelta,
 )
-from app.schemas.message import AgentMessageItem, MessageCreateRequest, MessageCreateResponse, SufficiencyReportData
+from app.schemas.message import (
+    AgentMessageItem,
+    MessageCreateRequest,
+    MessageCreateResponse,
+    SufficiencyMissingItemData,
+    SufficiencyReportData,
+)
 from app.schemas.question import (
     QUESTION_COMPOSER_AGENT_VERSION,
     QUESTION_COMPOSER_PROMPT_VERSION,
@@ -264,6 +274,19 @@ _BOUND_EXPLICIT_NONE_PATTERN = re.compile(
     r"^\s*(?:无|没有|否|不是|未有|none|no)\s*[。.!！]?\s*$",
     re.IGNORECASE,
 )
+# R2-C: reply-bound ambiguous negation.  Only exact short uncertain-negation
+# utterances (as a full reply to one bound safety question) are captured here;
+# anything longer or more qualified stays on the model path.  The set mirrors
+# the grounding module's uncertainty vocabulary but is deliberately narrower so
+# this shortcut never swallows a grounded explicit negative or an affirmation.
+_BOUND_AMBIGUOUS_NEGATION_PATTERN = re.compile(
+    r"^\s*(?:我|俺)?(?:有点|有些|不太)?(?:"
+    r"不确定|不太确定|不知道|不好说|不清楚|不太清楚|说不准|说不好|说不清|"
+    r"not sure|unsure|maybe not|probably not|"
+    r"i(?:['’]m| am)? not sure|i don't think so|i do not think so"
+    r")(?:吧|啊|呢|呀|哦|嗯)?\s*[。.!！?？，,]?\s*$",
+    re.IGNORECASE,
+)
 _BOUND_REPLY_NORMAL_PATTERN = re.compile(
     r"^\s*(?:正常|正常吧|正常啊|还好|还行|可以|没问题|没大碍|都正常|差不多|一般|无异常|没有不适|没什么不舒服|是的|对的|对，正常|是，正常|嗯|好)\s*[。.!！?？]*\s*$"
 )
@@ -289,6 +312,27 @@ _BOUND_REQUIRED_OBSERVATION_DIMENSIONS = frozenset(
         InquiryDimension.TEN_PAIN,
         InquiryDimension.TEN_RESPIRATORY,
     }
+)
+
+# R2-C: safety dimensions eligible for the deterministic uncertain-negation
+# clarification shortcut.  This mirrors the collection-status surface
+# (InquiryDimension has no contraindication dimension).
+_BOUND_AMBIGUOUS_NEGATION_SAFETY_DIMENSIONS = frozenset(
+    {
+        InquiryDimension.ALLERGY_STATUS,
+        InquiryDimension.MEDICATION_STATUS,
+        InquiryDimension.MAJOR_CONDITION_STATUS,
+        InquiryDimension.PREGNANCY_STATUS,
+        InquiryDimension.LACTATION_STATUS,
+    }
+)
+
+# Fixed, PHI-free ambiguity description for reply-bound uncertain negations.
+# It never echoes patient content; the bound dimension is carried separately
+# in ``Ambiguity.fact_key``.
+_BOUND_UNCERTAIN_NEGATION_AMBIGUITY_DESCRIPTION = (
+    "Patient replied to a required safety question with an uncertain negation; "
+    "the same safety dimension must be re-asked to obtain a clear answer."
 )
 
 # REAL-SESSION FIX (e8c4b380): during a model-gateway outage the old fallback
@@ -381,6 +425,83 @@ class _IntakeComputation:
     classify_trace_payload: dict[str, Any] | None
 
 
+def _pending_intake_interrupt_kind(snapshot: Any) -> str | None:
+    """Return the ``kind`` of the currently pending LangGraph interrupt, if any.
+
+    The snapshot is inspected without reading patient content: only the
+    structured interrupt payloads (stable refs such as ``kind`` /
+    ``interrupt_id`` / ``resume_token_ref``) are examined, consistent with the
+    ADR-002 PHI-safe projection of the graph state.
+    """
+    values: list[dict[str, Any]] = []
+
+    def _append_from(container: Any) -> None:
+        for item in getattr(container, "interrupts", ()) or ():
+            value = getattr(item, "value", item)
+            if isinstance(value, dict):
+                values.append(value)
+        channel = getattr(container, "values", None)
+        if isinstance(channel, dict):
+            for item in channel.get("__interrupt__", ()) or ():
+                value = getattr(item, "value", item)
+                if isinstance(value, dict):
+                    values.append(value)
+        if isinstance(channel, dict):
+            pending = channel.get("pending_interrupt")
+            if isinstance(pending, dict):
+                values.append(pending)
+
+    _append_from(snapshot)
+    for task in getattr(snapshot, "tasks", ()) or ():
+        _append_from(task)
+        nested = getattr(task, "state", None)
+        if nested is not None:
+            _append_from(nested)
+    for sub in (getattr(snapshot, "subgraph_states", None) or {}).values():
+        _append_from(sub)
+
+    for payload in values:
+        kind = payload.get("kind")
+        if isinstance(kind, str):
+            return kind
+    return None
+
+
+async def _start_or_resume_intake(
+    *,
+    runner: GraphRunner,
+    graph: Any,
+    config: dict[str, Any],
+    graph_state: XuanhuGraphState,
+    session_id: str,
+    answer_claim_id: uuid.UUID,
+) -> None:
+    """Invoke the intake graph, or resume the pending intake interrupt.
+
+    Only a pending ``kind == "intake_question"`` interrupt is resumed as an
+    intake answer claim.  A pending task of any other kind (e.g. a doctor
+    review interrupt) is never resumed from a message submission: the claim
+    flow already rejects messages outside the ``inquiry`` stage, so this is a
+    defensive guard that fails loudly instead of driving the wrong interrupt.
+    """
+    snapshot = await graph.aget_state(config, subgraphs=True)
+    if not snapshot.tasks:
+        await runner.ainvoke(dict(graph_state), config=config)
+        return
+    if _pending_intake_interrupt_kind(snapshot) != "intake_question":
+        raise AgentTriggerFailedError(
+            detail=f"session_id={session_id} has a pending non-intake interrupt",
+            agent_error_code="INTAKE_PENDING_OTHER_INTERRUPT",
+            retryable=False,
+        )
+    await runner.aresume(
+        session_id=session_id,
+        graph_version=DEFAULT_GRAPH_VERSION,
+        resume={"intake_answer_claim_ref": str(answer_claim_id)},
+        config=config,
+    )
+
+
 class LangGraphIntakeMessageRunner:
     """Runs the versioned LangGraph intake flow for sessions fixed to langgraph."""
 
@@ -444,7 +565,15 @@ class LangGraphIntakeMessageRunner:
         try:
             if self._shared_runtime is not None:
                 runner = self._shared_runtime.runner(timeout_seconds=INTAKE_GRAPH_TIMEOUT_SECONDS)
-                await runner.ainvoke(dict(graph_state), config=config)
+                graph = self._shared_runtime.graph
+                await _start_or_resume_intake(
+                    runner=runner,
+                    graph=graph,
+                    config=config,
+                    graph_state=graph_state,
+                    session_id=session_id,
+                    answer_claim_id=claim.claim.id,
+                )
             elif self._allow_request_local_runtime:
                 # Explicit fallback for direct service/integration-test invocation.
                 # Production HTTP requests always receive the lifespan-owned state
@@ -452,7 +581,14 @@ class LangGraphIntakeMessageRunner:
                 async with postgres_checkpointer(get_settings().database_url) as saver:
                     graph = build_main_graph(checkpointer=saver)
                     runner = GraphRunner(graph, timeout_seconds=INTAKE_GRAPH_TIMEOUT_SECONDS)
-                    await runner.ainvoke(dict(graph_state), config=config)
+                    await _start_or_resume_intake(
+                        runner=runner,
+                        graph=graph,
+                        config=config,
+                        graph_state=graph_state,
+                        session_id=session_id,
+                        answer_claim_id=claim.claim.id,
+                    )
             else:
                 await self._mark_claim_failed(
                     claim.claim.id,
@@ -463,6 +599,11 @@ class LangGraphIntakeMessageRunner:
                     agent_error_code="LANGGRAPH_RUNTIME_UNAVAILABLE",
                     retryable=True,
                 )
+        except GraphInterrupt:
+            # R1: interrupt() 在 prepare_question_node 已完成 claim 之后调用，
+            # GraphInterrupt 是正常挂起信号而非执行失败。claim 已 durable 完成，
+            # 直接进入 _wait_for_completed_claim 读取响应。
+            pass
         except AgentTriggerFailedError:
             raise
         except Exception as exc:
@@ -470,7 +611,11 @@ class LangGraphIntakeMessageRunner:
             # 否则 claim 永远 running → 会话永久 SESSION_BUSY 且 recover 无入口。
             # 错误码优先取节点层已写的 last_failure_code（如 INTAKE_GROUNDING_*，
             # 可重试），图级 code（RUNNER_EXECUTION_FAILED）仅作兜底上下文。
-            payload = claim.claim.intermediate_payload if isinstance(claim.claim.intermediate_payload, dict) else {}
+            # intermediate_payload 是可选字段：用 getattr 兜底，避免错误路径自身
+            # 的 AttributeError 掩盖原始图异常、导致 claim 无法落 failed。
+            payload = getattr(claim.claim, "intermediate_payload", None)
+            if not isinstance(payload, dict):
+                payload = {}
             node_failure_code = None
             if isinstance(payload.get("failure"), dict):
                 node_failure_code = payload["failure"].get("last_failure_code")
@@ -974,14 +1119,12 @@ class LangGraphIntakeMessageRunner:
             # 0d-2：compose 等软失败 raise AgentTriggerFailedError 时也必须落 claim=failed，
             # 否则 claim 永远 running → 会话永久 SESSION_BUSY 且 recover 无入口。
             if not isinstance(exc, InvalidStateVersionError):
-                await self._mark_claim_failed(
-                    claim.id,
-                    (
-                        exc.agent_error_code
-                        if isinstance(exc, AgentTriggerFailedError)
-                        else type(exc).__name__.upper()[:64]
-                    ),
+                error_code = (
+                    exc.agent_error_code
+                    if isinstance(exc, AgentTriggerFailedError) and exc.agent_error_code is not None
+                    else type(exc).__name__.upper()[:64]
                 )
+                await self._mark_claim_failed(claim.id, error_code)
             raise
 
     async def _execute_clarification(
@@ -991,7 +1134,7 @@ class LangGraphIntakeMessageRunner:
         patient_message: ConsultMessage,
         trace_id: str,
         state: XuanhuGraphState,
-        trigger: str,
+        trigger: Literal["strong_signal", "abstained"],
     ) -> tuple[dict[str, Any], MessageCreateResponse]:
         """L3-6 澄清回复：跑澄清 Agent，写回复消息，空 delta commit，完成 claim。
 
@@ -1456,7 +1599,9 @@ async def run_intake_clarify_reply_node(state: XuanhuGraphState) -> dict[str, An
         completed = await _completed_graph_update(runner, claim)
         if completed is not None:
             return completed
-        trigger = "strong_signal" if state.get("clarify_requested") is True else "abstained"
+        trigger: Literal["strong_signal", "abstained"] = (
+            "strong_signal" if state.get("clarify_requested") is True else "abstained"
+        )
         update, _ = await runner._execute_clarification(  # noqa: SLF001
             claim=claim,
             patient_message=patient_message,
@@ -1581,6 +1726,7 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
         intake_input = _build_intake_input(domain_state, patient_message)
         bound_output = (
             _bound_explicit_none_output(intake_input)
+            or _bound_ambiguous_negation_output(intake_input)
             or _bound_social_reply_output(intake_input)
             or _bound_required_reply_normal_output(intake_input)
         )
@@ -1906,6 +2052,473 @@ async def run_recoverable_intake_node(state: XuanhuGraphState) -> dict[str, Any]
             )
             return _sanitized_graph_error(state, code, "intake finalize failed")
         return update
+
+
+# ---------------------------------------------------------------------------
+# R1: 跨轮次 interrupt/resume — 仿照 review_node.py 两阶段 durable 模式
+# ---------------------------------------------------------------------------
+
+
+class IntakeInterruptRejected(Exception):
+    """A submitted resume reference was rejected and the interrupt must stay open."""
+
+    def __init__(self, *, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class PreparedIntakeQuestion:
+    """Authoritative snapshot of the intake question at interrupt time.
+
+    All fields are stable refs — never raw patient content or ORM objects.
+    """
+
+    session_id: uuid.UUID
+    question_message_id: uuid.UUID
+    question_digest: str
+    state_version: int
+    interrupt_payload: dict[str, str]
+
+
+async def run_intake_prepare_question_node(state: XuanhuGraphState) -> dict[str, Any]:
+    """Compose the next intake question, commit domain changes, complete the
+    claim, and return a ``pending_interrupt`` state update.
+
+    This is the prepare phase of the two-phase interrupt pattern.  The caller
+    (``intake.prepare_question`` node) then routes to the interrupt node which
+    suspends.  On resume LangGraph restarts only the interrupt node, so this
+    preparation is never repeated.
+    """
+    loaded = await _load_running_intake_context(state)
+    if isinstance(loaded, dict):
+        return loaded
+    db, claim, patient_message, runner = loaded
+    try:
+        completed = await _completed_graph_update(runner, claim)
+        if completed is not None:
+            return completed
+
+        gate_route = None
+        if isinstance(claim.intermediate_payload, dict):
+            gates = claim.intermediate_payload.get("gates")
+            if isinstance(gates, dict):
+                gate_route = gates.get("route")
+        state_route = state.get("intake_route")
+        if gate_route is not None and gate_route not in {"incomplete", "conflict"}:
+            return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "prepare_question requires incomplete/conflict route")
+        if state_route is not None and state_route not in {"incomplete", "conflict"}:
+            return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "prepare_question requires incomplete/conflict route")
+
+        # T1.3 状态下推：优先复用 run_intake_gates_node 已算好的 _IntakeComputation
+        computation = _INTAKE_COMPUTATION_CACHE.get(claim.id)
+        if computation is None:
+            try:
+                computation = await _compute_intake_from_claim(
+                    claim,
+                    patient_message,
+                    _node_trace_id(state),
+                    runner=runner,
+                )
+            except KeyError:
+                return _sanitized_graph_error(state, "INTAKE_EXTRACTION_MISSING", "intake extraction output is missing")
+            except AgentTriggerFailedError as exc:
+                code = exc.agent_error_code or "INTAKE_VERIFICATION_FAILED"
+                await runner._mark_claim_failed(  # noqa: SLF001
+                    claim.id,
+                    code,
+                    failure_context={
+                        "failed_node": "prepare_question",
+                        "last_step": "prepare_question",
+                        "degraded": True,
+                        "last_failure_code": code,
+                    },
+                )
+                return _sanitized_graph_error(state, code, "intake verification failed")
+
+        disposition = computation.completeness_result.disposition
+        if _route_for_disposition(disposition) not in {"incomplete", "conflict"}:
+            return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "recomputed disposition must be incomplete/conflict")
+
+        # Compose question
+        question = await runner._compose_question(  # noqa: SLF001
+            claim.session_id,
+            computation.completeness_result,
+            computation.pending_safety_dimensions,
+            computation.next_state,
+            _node_trace_id(state),
+            claim.idempotency_key,
+            claim.id,
+        )
+        if question is None:
+            # No question to ask — treat as ready (complete with no further question)
+            return await _finalize_as_ready(runner, claim, patient_message, computation, state)
+
+        question_message_id = uuid.uuid4()
+        question_spec = ConsultMessageSpec(
+            message_id=question_message_id,
+            role="agent",
+            agent_name="question_composer",
+            stage="inquiry",
+            content=question["question"],
+            structured_delta=question,
+            trace_id=_node_trace_id(state)[:64],
+        )
+        agent_item = AgentMessageItem(
+            message_id=str(question_message_id),
+            role="agent",
+            agent_name="question_composer",
+            stage="inquiry",
+            content=question["question"],
+            created_at=None,
+        )
+        progress = computation.progress.model_copy(
+            update={"followup_rounds": computation.progress.followup_rounds + 1}
+        )
+
+        # 1a 主诉大类归集留痕
+        if computation.classify_trace_payload is not None:
+            await _save_intermediate(
+                claim.id,
+                {"classify_complaint": computation.classify_trace_payload},
+                step="classify_complaint",
+            )
+
+        session_updates = _session_updates(
+            disposition,
+            computation.triage_result.disposition,
+            trace_id=_node_trace_id(state),
+            run_id=claim.run_id,
+            patient_message=patient_message,
+            agent_item=agent_item,
+            triage_gate=computation.triage_gate,
+            completeness_gate=computation.completeness_gate,
+            progress=progress,
+            pending_safety_dimensions=computation.pending_safety_dimensions,
+            output_state_version=computation.next_state.state_version,
+        )
+        try:
+            await computation.repository.commit(
+                computation.delta,
+                computation.context,
+                graph_version=DEFAULT_GRAPH_VERSION,
+                gate_results=(computation.triage_gate, computation.completeness_gate),
+                graph_steps=_graph_steps(disposition),
+                consult_messages=(question_spec,),
+                safety_fact_assertions=_safety_assertion_specs(
+                    computation,
+                    claim,
+                    patient_message,
+                    _node_trace_id(state),
+                ),
+                session_updates=session_updates,
+                outbox_event_type=INTAKE_COMMAND_COMPLETED,
+                outbox_payload={
+                    "session_id": str(claim.session_id),
+                    "command_id": claim.idempotency_key,
+                    "input_state_version": claim.input_state_version,
+                    "output_state_version": computation.next_state.state_version,
+                    "triage_decision": computation.triage_gate.decision.value,
+                    "completeness_decision": computation.completeness_gate.decision.value,
+                    "completeness_disposition": (computation.completeness_gate.details or {}).get("disposition"),
+                    "patient_message_id": str(patient_message.id),
+                    "question_message_id": str(question_message_id),
+                },
+            )
+        except RepositoryError as exc:
+            await runner._mark_claim_failed(claim.id, exc.code.value)  # noqa: SLF001
+            if exc.code is RepositoryErrorCode.STATE_VERSION_CONFLICT:
+                raise InvalidStateVersionError(
+                    detail=f"session_id={claim.session_id} stale intake command",
+                    retryable=True,
+                ) from exc
+            raise
+
+        # Load the canonical persisted question message so the response carries
+        # the real database created_at (mirrors _execute_after_claim).
+        if question_message_id is not None:
+            persisted_agent_item = await _load_agent_item(db, question_message_id)
+            if persisted_agent_item is not None:
+                agent_item = persisted_agent_item
+
+        # Complete the claim before suspending — the interrupt is a graph-level
+        # concern; the claim must be durable so that idempotency replays work.
+        patient_message_id = patient_message.id
+        response = MessageCreateResponse(
+            message_id=str(patient_message_id),
+            session_id=str(claim.session_id),
+            role=patient_message.role,
+            stage=patient_message.stage,
+            content=patient_message.content,
+            current_stage=str(session_updates["current_stage"]),
+            state_version=computation.next_state.state_version,
+            created_at=patient_message.created_at,
+            agent_message=agent_item,
+            sufficiency_report=_sufficiency_report(computation.completeness_gate),
+        )
+        await runner._complete_claim(  # noqa: SLF001
+            claim.id, response, question_message_id, computation.next_state.state_version
+        )
+
+        _INTAKE_COMPUTATION_CACHE.pop(claim.id, None)
+        _INTAKE_OUTPUT_CACHE.pop(claim.id, None)
+        return {
+            "route": NODE_INTAKE_SUBGRAPH_V1,
+            "domain_state_version": computation.next_state.state_version,
+            "artifact_refs": [
+                {"kind": "message", "artifact_id": str(patient_message_id), "revision": 1},
+                {"kind": "message", "artifact_id": str(question_message_id), "revision": 1},
+            ],
+            "gate_results": [
+                {
+                    "gate_name": computation.triage_gate.gate_name,
+                    "decision": computation.triage_gate.decision.value,
+                    "policy_version": computation.triage_gate.policy_version,
+                },
+                {
+                    "gate_name": computation.completeness_gate.gate_name,
+                    "decision": computation.completeness_gate.decision.value,
+                    "policy_version": computation.completeness_gate.policy_version,
+                },
+            ],
+            "pending_interrupt": {
+                "kind": "intake_question",
+                "interrupt_id": str(question_message_id),
+                "resume_token_ref": "intake_answer_claim_ref",
+            },
+            "intake_loop_count": state.get("intake_loop_count", 0) + 1,
+            "last_error": None,
+        }
+    except AgentTriggerFailedError as exc:
+        code = exc.agent_error_code or "INTAKE_PREPARE_FAILED"
+        await runner._mark_claim_failed(  # noqa: SLF001
+            claim.id,
+            code,
+            failure_context={
+                "failed_node": "prepare_question",
+                "last_step": "prepare_question",
+                "degraded": True,
+                "last_failure_code": code,
+            },
+        )
+        return _sanitized_graph_error(state, code, "intake prepare question failed")
+    finally:
+        await db.close()
+
+
+async def _finalize_as_ready(
+    runner: LangGraphIntakeMessageRunner,
+    claim: IntakeCommandClaim,
+    patient_message: ConsultMessage,
+    computation: _IntakeComputation,
+    state: XuanhuGraphState,
+) -> dict[str, Any]:
+    """Fallback when composer produces no question: finalize as ready route."""
+    disposition = CompletenessDisposition.READY
+    session_updates = _session_updates(
+        disposition,
+        computation.triage_result.disposition,
+        trace_id=_node_trace_id(state),
+        run_id=claim.run_id,
+        patient_message=patient_message,
+        agent_item=None,
+        triage_gate=computation.triage_gate,
+        completeness_gate=computation.completeness_gate,
+        progress=computation.progress,
+        pending_safety_dimensions=computation.pending_safety_dimensions,
+        output_state_version=computation.next_state.state_version,
+    )
+    await computation.repository.commit(
+        computation.delta,
+        computation.context,
+        graph_version=DEFAULT_GRAPH_VERSION,
+        gate_results=(computation.triage_gate, computation.completeness_gate),
+        graph_steps=_graph_steps(disposition),
+        safety_fact_assertions=_safety_assertion_specs(
+            computation, claim, patient_message, _node_trace_id(state),
+        ),
+        session_updates=session_updates,
+        outbox_event_type=INTAKE_COMMAND_COMPLETED,
+        outbox_payload={
+            "session_id": str(claim.session_id),
+            "command_id": claim.idempotency_key,
+            "input_state_version": claim.input_state_version,
+            "output_state_version": computation.next_state.state_version,
+            "triage_decision": computation.triage_gate.decision.value,
+            "completeness_decision": computation.completeness_gate.decision.value,
+            "completeness_disposition": (computation.completeness_gate.details or {}).get("disposition"),
+            "patient_message_id": str(patient_message.id),
+            "question_message_id": None,
+        },
+    )
+    response = MessageCreateResponse(
+        message_id=str(patient_message.id),
+        session_id=str(claim.session_id),
+        role=patient_message.role,
+        stage=patient_message.stage,
+        content=patient_message.content,
+        current_stage=str(session_updates["current_stage"]),
+        state_version=computation.next_state.state_version,
+        created_at=patient_message.created_at,
+        agent_message=None,
+        sufficiency_report=_sufficiency_report(computation.completeness_gate),
+    )
+    await runner._complete_claim(  # noqa: SLF001
+        claim.id, response, None, computation.next_state.state_version
+    )
+    return _graph_update(
+        patient_message_id=patient_message.id,
+        agent_item=None,
+        output_state_version=computation.next_state.state_version,
+        triage_gate=computation.triage_gate,
+        completeness_gate=computation.completeness_gate,
+    )
+
+
+async def load_prepared_intake_question(state: XuanhuGraphState) -> PreparedIntakeQuestion:
+    """Reload authoritative intake question references without completing the node.
+
+    Authority or infrastructure failures intentionally propagate.  Turning
+    them into a normal graph update would consume the pending interrupt and
+    leave PostgreSQL with no resumable checkpoint.
+    """
+    try:
+        session_id = uuid.UUID(state.get("session_id", ""))
+    except (TypeError, ValueError):
+        raise IntakeInterruptRejected(
+            code="INTAKE_RESUME_REF_INVALID",
+            detail="intake session ref is invalid",
+        ) from None
+
+    pending = state.get("pending_interrupt")
+    if pending is None or pending.get("kind") != "intake_question":
+        raise IntakeInterruptRejected(
+            code="INTAKE_INTERRUPT_INVALID",
+            detail="no pending intake interrupt in state",
+        )
+
+    question_message_id_str = pending.get("interrupt_id", "")
+    try:
+        question_message_id = uuid.UUID(question_message_id_str)
+    except (TypeError, ValueError):
+        raise IntakeInterruptRejected(
+            code="INTAKE_INTERRUPT_INVALID",
+            detail="question message id is not a valid UUID",
+        ) from None
+
+    # Load the question message from PostgreSQL to get its digest
+    factory = get_session_factory()
+    async with factory() as db:
+        question_message = await db.get(ConsultMessage, question_message_id)
+        if question_message is None:
+            raise IntakeInterruptRejected(
+                code="INTAKE_QUESTION_NOT_FOUND",
+                detail="intake question message was not found",
+            )
+        question_digest = hashlib.sha256(
+            (question_message.content or "").encode("utf-8")
+        ).hexdigest()
+
+    domain_state_version = state.get("domain_state_version", 0)
+    return PreparedIntakeQuestion(
+        session_id=session_id,
+        question_message_id=question_message_id,
+        question_digest=question_digest,
+        state_version=domain_state_version,
+        interrupt_payload={
+            "kind": "intake_question",
+            "question_message_id": str(question_message_id),
+            "session_id": str(session_id),
+            "question_digest": question_digest,
+            "state_version": str(domain_state_version),
+            "resume_token_ref": "intake_answer_claim_ref",
+        },
+    )
+
+
+async def apply_intake_resume(
+    state: XuanhuGraphState,
+    *,
+    prepared: PreparedIntakeQuestion,
+    resume_value: object,
+) -> dict[str, Any]:
+    """Validate the resume value and return state update for the next cycle.
+
+    The resume value must be ``{"intake_answer_claim_ref": "<claim_uuid>"}``.
+    The referenced claim must belong to the same session, be in ``running``
+    status, and have a valid patient message.  On success, the graph state's
+    ``command_id`` is updated to the new claim's idempotency key so that
+    downstream nodes (triage_precheck → build_context → extract → …) load the
+    new answer message.
+    """
+    if not isinstance(resume_value, dict) or set(resume_value) != {"intake_answer_claim_ref"}:
+        raise IntakeInterruptRejected(
+            code="INTAKE_RESUME_REF_INVALID",
+            detail="intake resume ref is invalid",
+        )
+    raw_ref = resume_value.get("intake_answer_claim_ref")
+    if not isinstance(raw_ref, str):
+        raise IntakeInterruptRejected(
+            code="INTAKE_RESUME_REF_INVALID",
+            detail="intake resume ref is invalid",
+        )
+    try:
+        answer_claim_id = uuid.UUID(raw_ref)
+    except ValueError:
+        raise IntakeInterruptRejected(
+            code="INTAKE_RESUME_REF_INVALID",
+            detail="intake resume claim ref is not a valid UUID",
+        ) from None
+
+    factory = get_session_factory()
+    async with factory() as db:
+        answer_claim = await db.get(IntakeCommandClaim, answer_claim_id)
+        if answer_claim is None:
+            raise IntakeInterruptRejected(
+                code="INTAKE_ANSWER_CLAIM_NOT_FOUND",
+                detail="answer claim was not found",
+            )
+        if answer_claim.session_id != prepared.session_id:
+            raise IntakeInterruptRejected(
+                code="INTAKE_ANSWER_CLAIM_SESSION_MISMATCH",
+                detail="answer claim belongs to a different session",
+            )
+        if answer_claim.status != "running":
+            raise IntakeInterruptRejected(
+                code="INTAKE_ANSWER_CLAIM_NOT_RUNNING",
+                detail="answer claim is not in running status",
+            )
+        if answer_claim.patient_message_id is None:
+            raise IntakeInterruptRejected(
+                code="INTAKE_ANSWER_MESSAGE_NOT_FOUND",
+                detail="answer claim has no patient message",
+            )
+        # Verify the answer message exists
+        answer_message = await db.get(ConsultMessage, answer_claim.patient_message_id)
+        if answer_message is None or answer_message.session_id != prepared.session_id:
+            raise IntakeInterruptRejected(
+                code="INTAKE_ANSWER_MESSAGE_NOT_FOUND",
+                detail="answer patient message was not found or session mismatch",
+            )
+
+    # Clear caches that may hold stale data from the previous claim
+    _CLASSIFY_TRACE_CACHE.pop(answer_claim_id, None)
+    _INTAKE_OUTPUT_CACHE.pop(answer_claim_id, None)
+    _INTAKE_COMPUTATION_CACHE.pop(answer_claim_id, None)
+
+    return {
+        "route": NODE_INTAKE_SUBGRAPH_V1,
+        "command_id": answer_claim.idempotency_key,
+        "pending_interrupt": None,
+        "intake_resume_claim_ref": str(answer_claim_id),
+        "last_error": None,
+        "clarify_requested": False,
+        "intake_decision": "",
+        "intake_skip_clarification": False,
+        "intake_end_requested": False,
+        "intake_route": "",
+    }
 
 
 def _node_trace_id(state: XuanhuGraphState) -> str:
@@ -2436,13 +3049,14 @@ async def _pending_safety_dimensions(
             )
         )
     )
-    for field_name, item in (
+    safety_fields: tuple[tuple[str, SafetyListDelta | PregnancyDelta | LactationDelta], ...] = (
         ("allergy", current_delta.allergy),
         ("pregnancy", current_delta.pregnancy),
         ("lactation", current_delta.lactation),
         ("medications", current_delta.medications),
         ("major_conditions", current_delta.major_conditions),
-    ):
+    )
+    for field_name, item in safety_fields:
         if item.status is not CollectionStatus.UNKNOWN and item.status is not CollectionStatus.EXPLICITLY_NONE:
             pending_fields.add(field_name)
     return tuple(
@@ -2476,6 +3090,7 @@ async def _load_or_retry_intake_output(
     intake_input = _build_intake_input(domain_state, patient_message)
     bound_output = (
         _bound_explicit_none_output(intake_input)
+        or _bound_ambiguous_negation_output(intake_input)
         or _bound_social_reply_output(intake_input)
         or _bound_required_reply_normal_output(intake_input)
     )
@@ -3252,6 +3867,54 @@ def _bound_explicit_none_output(
     )
 
 
+def _bound_ambiguous_negation_output(
+    input_payload: IntakeExtractionInput,
+) -> IntakeExtractionOutput | None:
+    """Route an uncertain negation bound to one safety question to clarification.
+
+    R2-C: only a single current patient message explicitly reply-bound to a
+    required safety question (allergy / medications / major-condition /
+    pregnancy / lactation) that is *entirely* an uncertain-negation utterance
+    is captured here.  The model is never invoked, no SafetyFactAssertion or
+    safety-profile change is produced, the dimension is not marked covered, and
+    the ambiguity carries only a fixed PHI-free description (the bound dimension
+    goes in ``fact_key``).  The exact deterministic negations (\"无\"/\"没有\"/no)
+    are handled first by ``_bound_explicit_none_output``.
+
+    A conflict-bound or any non-required reply is never captured here: the
+    shortcut must not swallow an ambiguous answer that the conflict resolution
+    path owns, so such replies stay on the model path.
+    """
+
+    context = input_payload.reply_context
+    if (
+        context is None
+        or context.selection_kind != "required"
+        or len(input_payload.current_messages) != 1
+    ):
+        return None
+    try:
+        selected_dimension = InquiryDimension(context.selected_dimension)
+    except ValueError:
+        return None
+    if selected_dimension not in _BOUND_AMBIGUOUS_NEGATION_SAFETY_DIMENSIONS:
+        return None
+    message = input_payload.current_messages[0]
+    if _BOUND_AMBIGUOUS_NEGATION_PATTERN.fullmatch(message.content) is None:
+        return None
+    return IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.NEEDS_CLARIFICATION,
+        ambiguities=(
+            Ambiguity(
+                code=AmbiguityCode.UNCERTAIN_NEGATION,
+                source_message_id=message.message_id,
+                fact_key=context.selected_dimension,
+                description=_BOUND_UNCERTAIN_NEGATION_AMBIGUITY_DESCRIPTION,
+            ),
+        ),
+    )
+
+
 def _bound_required_reply_normal_output(
     input_payload: IntakeExtractionInput,
 ) -> IntakeExtractionOutput | None:
@@ -3466,6 +4129,20 @@ def _active_observation_ids_by_fact_key(
     return index
 
 
+def _delta_value_key(delta: ObservationDelta) -> str:
+    """Canonical JSON key of a delta's proposed effective value.
+
+    Mirrors ``reducer._observation_value_key`` (which is typed for
+    ``ObservationSchema`` but reads only ``normalized_value``/``value``, fields
+    ``ObservationDelta`` also carries), so the active-fact conflict comparison
+    stays in the same canonical form.  Delta values are already JSON-safe by
+    ``ObservationDelta`` construction, so the canonicalization cannot raise here.
+    """
+
+    value = delta.normalized_value if delta.normalized_value is not None else delta.value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def _drop_value_conflicting_adds(
     observations: Sequence[ObservationDelta],
     *,
@@ -3483,28 +4160,30 @@ def _drop_value_conflicting_adds(
     """
 
     active_values_by_key: dict[str, set[str]] = {}
-    for item in _current_observations(state.observations):
-        active_values_by_key.setdefault(item.fact_key, set()).add(_observation_value_key(item))
+    for active_item in _current_observations(state.observations):
+        active_values_by_key.setdefault(active_item.fact_key, set()).add(
+            _observation_value_key(active_item)
+        )
 
     kept: list[ObservationDelta] = []
-    for item in observations:
-        if item.operation is ObservationOperation.ADD:
-            active_values = active_values_by_key.get(item.fact_key)
-            if active_values is not None and _observation_value_key(item) not in active_values:
+    for delta in observations:
+        if delta.operation is ObservationOperation.ADD:
+            active_values = active_values_by_key.get(delta.fact_key)
+            if active_values is not None and _delta_value_key(delta) not in active_values:
                 if rejected_observations is not None:
                     rejected_observations.append(
                         RejectedObservation(
-                            fact_key=item.fact_key,
-                            operation=item.operation.value,
+                            fact_key=delta.fact_key,
+                            operation=delta.operation.value,
                             reason="value_conflicts_active_fact",
-                            target_observation_id=str(item.target_observation_id)
-                            if item.target_observation_id
+                            target_observation_id=str(delta.target_observation_id)
+                            if delta.target_observation_id
                             else None,
-                            value_preview=str(item.value)[:80] if item.value is not None else "",
+                            value_preview=str(delta.value)[:80] if delta.value is not None else "",
                         )
                     )
                 continue
-        kept.append(item)
+        kept.append(delta)
     return tuple(kept)
 
 
@@ -3620,22 +4299,26 @@ def _project_explicit_none_safety(
 ) -> SafetyProfileSchema | None:
     """Project deterministic safety collection outcomes into the safety profile.
 
-    Two collection outcomes are projected immediately (bypassing doctor confirmation):
+    Only the deterministic reply-bound explicit-negative outcome (\"无\"/\"没有\"
+    bound to one safety question) is projected here, and it is authoritative:
+    the collection_status becomes EXPLICITLY_NONE and any previously collected
+    value for the field is cleared (the prior positive stays auditable through
+    its own assertions/history — nothing is deleted).
 
-    - ``EXPLICITLY_NONE`` — deterministic reply-binding for explicit negative
-      answers (\"无\"/\"没有\") to safety questions.
-    - ``COLLECTED`` — model-extracted safety data from a direct answer to a
-      safety question (e.g. \"有高血压病史3年\" → major_conditions collected).
+    Model-extracted ``COLLECTED`` candidates are deliberately never projected.
+    They remain proposed SafetyFactAssertions and can reach the safety profile
+    only through an explicit, evidence-verified doctor confirmation transition
+    (R2-C safety authority boundary).  Completeness coverage for an affirmative
+    safety answer therefore comes from that confirmation, not from extraction.
 
-    Without the COLLECTED projection, safety dimensions that receive a substantive
-    affirmative answer can never be marked covered by the completeness gate
-    (the safety profile stays UNKNOWN), causing the same question to be re-asked
-    indefinitely (REAL-SESSION 0a456c42 疾病史 重复追问).
+    This returns a *delta projection*, never the current stored profile: a
+    delta carrying no candidate is a no-op and yields ``None`` even when a
+    current profile exists, so the reducer never sees a spurious safety change.
     """
 
     if not delta.has_candidate():
-        return current
-    profile_values = (
+        return None
+    profile_values: dict[str, Any] = (
         current.model_dump(mode="json", exclude={"session_id"})
         if current is not None
         else {
@@ -3653,8 +4336,10 @@ def _project_explicit_none_safety(
             "contraindications": None,
         }
     )
-    updates: list[tuple[str, str | None, Any]] = []
+    updates: list[tuple[str, str, Any]] = []
     # EXPLICITLY_NONE: deterministic reply-binding for "无"/"没有" answers.
+    # Only this authoritative outcome is projected.  COLLECTED candidates never
+    # enter the profile here (see docstring) — they are proposed-only.
     if delta.allergy.status is CollectionStatus.EXPLICITLY_NONE:
         updates.append(("allergy_collection_status", "allergens", None))
     if delta.medications.status is CollectionStatus.EXPLICITLY_NONE:
@@ -3667,19 +4352,6 @@ def _project_explicit_none_safety(
         updates.append(("lactation_collection_status", "lactation_value", None))
     if delta.contraindications.status is CollectionStatus.EXPLICITLY_NONE:
         updates.append(("contraindications_collection_status", "contraindications", None))
-    # COLLECTED: model-extracted safety data from substantive answers.
-    if delta.allergy.status is CollectionStatus.COLLECTED:
-        updates.append(("allergy_collection_status", "allergens", list(delta.allergy.values or [])))
-    if delta.medications.status is CollectionStatus.COLLECTED:
-        updates.append(("medications_collection_status", "medications", list(delta.medications.values or [])))
-    if delta.major_conditions.status is CollectionStatus.COLLECTED:
-        updates.append(("major_conditions_collection_status", "major_conditions", list(delta.major_conditions.values or [])))
-    if delta.pregnancy.status is CollectionStatus.COLLECTED:
-        updates.append(("pregnancy_collection_status", "pregnancy_value", delta.pregnancy.value))
-    if delta.lactation.status is CollectionStatus.COLLECTED:
-        updates.append(("lactation_collection_status", "lactation_value", delta.lactation.value))
-    if delta.contraindications.status is CollectionStatus.COLLECTED:
-        updates.append(("contraindications_collection_status", "contraindications", list(delta.contraindications.values or [])))
     if not updates:
         return None
     for status_column, value_column, value in updates:
@@ -3781,16 +4453,9 @@ def _raise_verification_failed(code: object) -> VerificationContext:
 
 
 def _current_observations(observations: tuple[ObservationSchema, ...]) -> tuple[ObservationSchema, ...]:
-    superseded_ids = {
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    }
-    return tuple(
-        item
-        for item in observations
-        if item.observation_id not in superseded_ids and item.status is not ObservationStatus.RETRACTED
-    )
+    # R2-B1: current semantic chain heads (CORRECTED successors count, superseded
+    # targets and RETRACTED heads do not) from the single shared projection.
+    return tuple(project_current_observations(observations))
 
 
 def _completeness_snapshot(state: DomainState) -> CompletenessDomainSnapshot:
@@ -4062,7 +4727,9 @@ async def _recent_question_turns(
     for item, masked_content in zip(ordered, masked, strict=False):
         if not masked_content or not masked_content.strip():
             continue
-        role = "patient" if item.role in {"doctor", "patient_proxy"} else "doctor"
+        role: Literal["doctor", "patient"] = (
+            "patient" if item.role in {"doctor", "patient_proxy"} else "doctor"
+        )
         turns.append(QuestionComposerTurn(role=role, content=masked_content.strip()[:1000]))
         if len(turns) == 8:
             break
@@ -4089,11 +4756,20 @@ def _graph_steps(disposition: CompletenessDisposition) -> tuple[GraphStepSpec, .
 
 def _sufficiency_report(completeness_gate: GateResultSchema) -> SufficiencyReportData:
     details = completeness_gate.details or {}
+    missing_items = [
+        SufficiencyMissingItemData(
+            key=payload["key"],
+            label=payload["label"],
+            reason=payload["reason"],
+            suggested_question=payload["suggested_question"],
+        )
+        for payload in missing_item_payloads(details.get("missing_required") or ())
+    ]
     return SufficiencyReportData(
         sufficient=details.get("disposition") == CompletenessDisposition.READY.value,
         covered=list(details.get("covered_dimensions") or []),
         missing=list(details.get("missing_required") or []),
-        missing_items=missing_item_payloads(details.get("missing_required") or ()),
+        missing_items=missing_items,
         suggestions=[],
     )
 

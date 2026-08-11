@@ -162,7 +162,7 @@ class SafetyRuleResult(BaseModel):
     issues: list[SafetyIssue] = Field(default_factory=list)
     normalized_formula: FormulaResult
     warnings: list[str] = Field(default_factory=list)
-    rule_version: str = Field(default="v1.0.0", min_length=1)
+    rule_version: str = Field(default="v1.2.0", min_length=1)
     """本次审核使用的规则版本（写入 ``safety_rule_runs.rule_version``）。"""
 
     execution_order: list[str] = Field(default_factory=list)

@@ -1,0 +1,129 @@
+rule_files:
+  - ../rules/xuanhu-r5-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- structured terminal failure rate -------------------------------------
+  - name: structured terminal failure rate fires above 5%
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="parse_failed"}'
+        values: '0+4x16'
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="truncated"}'
+        values: '0x16'
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="success"}'
+        values: '0+40x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuStructuredTerminalFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: gateway
+            exp_annotations:
+              summary: Xuanhu structured-output terminal failure rate is high
+              description: More than 5% of chat_structured calls failed to produce usable structured output (parse or truncation) over five minutes.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-terminal-failure
+
+  - name: structured terminal failure rate stays quiet when clean
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="parse_failed"}'
+        values: '0x16'
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="truncated"}'
+        values: '0x16'
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="success"}'
+        values: '0+40x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuStructuredTerminalFailureRateHigh
+        exp_alerts: []
+
+  # --- structured JSON fallback rate ----------------------------------------
+  - name: structured fallback rate fires above 0.2 attempts per structured call
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_gateway_structured_fallback_total{outcome="attempted"}'
+        values: '0+10x16'
+      - series: 'xuanhu_gateway_requests_total{operation="chat_structured",outcome="success"}'
+        values: '0+20x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuStructuredFallbackRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: gateway
+            exp_annotations:
+              summary: Xuanhu structured-output JSON fallback rate is high
+              description: More than 0.2 structured-output JSON fallback attempts per chat_structured call over five minutes, indicating model format drift in the primary tool-call path.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-fallback-rate
+
+  # --- structured JSON fallback failure rate --------------------------------
+  - name: structured fallback failure rate fires above 50%
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_gateway_structured_fallback_total{outcome="attempted"}'
+        values: '0+8x16'
+      - series: 'xuanhu_gateway_structured_fallback_total{outcome="failure"}'
+        values: '0+6x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuStructuredFallbackFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: gateway
+            exp_annotations:
+              summary: Xuanhu structured-output JSON fallback failure rate is high
+              description: More than half of structured-output JSON fallback attempts failed over five minutes, so recovery from malformed primary output is no longer working.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#structured-fallback-failure
+
+  - name: structured fallback failure rate stays quiet when fallback succeeds
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_gateway_structured_fallback_total{outcome="attempted"}'
+        values: '0+8x16'
+      - series: 'xuanhu_gateway_structured_fallback_total{outcome="failure"}'
+        values: '0x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuStructuredFallbackFailureRateHigh
+        exp_alerts: []
+
+  # --- safety block-rate drift ----------------------------------------------
+  - name: safety block rate drift fires above majority
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_safety_checks_total{outcome="blocked"}'
+        values: '0+16x16'
+      - series: 'xuanhu_safety_checks_total{outcome="passed"}'
+        values: '0+12x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuSafetyBlockRateDrift
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: safety
+            exp_annotations:
+              summary: Xuanhu safety block rate drifted above majority over five minutes
+              description: More than half of authoritative safety decisions blocked over five minutes, indicating a possible fail-closed regression in the safety rule engine.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#safety-block-rate-drift
+
+  - name: safety block rate drift stays quiet when most decisions pass
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_safety_checks_total{outcome="blocked"}'
+        values: '0x16'
+      - series: 'xuanhu_safety_checks_total{outcome="passed"}'
+        values: '0+20x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuSafetyBlockRateDrift
+        exp_alerts: []

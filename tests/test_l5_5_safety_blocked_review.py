@@ -660,7 +660,6 @@ async def test_safety_fail_auto_reopens_to_syndrome_with_feedback() -> None:
     from app.agent_runtime.state import XuanhuGraphState
     from app.models.domain import ArtifactRevision, IntakeCommandClaim
     from app.services.langgraph_review import (
-        MAX_SAFETY_REOPEN_ATTEMPTS,
         prepare_review_interrupt,
     )
 

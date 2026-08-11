@@ -5,6 +5,7 @@ Alembic 在 ``env.py`` 中依赖此行为。
 """
 
 from app.models.agent import AgentEvidence, AgentRun
+from app.models.async_command import ASYNC_COMMAND_OPERATIONS, AsyncCommand
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import (
@@ -38,6 +39,8 @@ __all__ = [
     "Acupoint",
     "AgentEvidence",
     "AgentRun",
+    "AsyncCommand",
+    "ASYNC_COMMAND_OPERATIONS",
     "AuditEvent",
     "ConsultMessage",
     "ConsultSession",

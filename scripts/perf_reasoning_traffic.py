@@ -13,10 +13,10 @@
 
 import asyncio
 import json
-import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 
@@ -27,10 +27,11 @@ def _idempotency_key() -> str:
     return f"perf-traffic-{uuid.uuid4().hex[:12]}"
 
 
-async def find_ready_session() -> dict | None:
+async def find_ready_session() -> dict[str, Any] | None:
     """从 PG 中查找一个 completeness=passed 且 disposition=ready 的 inquiry 会话。"""
-    from app.db.session import get_session_factory
     from sqlalchemy import text
+
+    from app.db.session import get_session_factory
 
     factory = get_session_factory()
     async with factory() as db:
@@ -53,7 +54,7 @@ async def find_ready_session() -> dict | None:
         return {"session_id": str(row[0]), "state_version": row[1]}
 
 
-async def advance_session(session_id: str, state_version: int, label: str) -> dict:
+async def advance_session(session_id: str, state_version: int, label: str) -> dict[str, Any]:
     """对指定会话调用 advance API 触发推理。"""
     async with httpx.AsyncClient(timeout=180) as c:
         t0 = time.perf_counter()
@@ -81,7 +82,7 @@ async def advance_session(session_id: str, state_version: int, label: str) -> di
         return {"status": r.status_code, "elapsed": round(elapsed, 3), "body": body}
 
 
-async def collect_metrics() -> dict:
+async def collect_metrics() -> dict[str, Any]:
     """从 /api/v1/metrics 抓取 xuanhu_ histogram 的 count/sum。"""
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.get(f"{BASE_URL}/api/v1/metrics")
@@ -123,10 +124,10 @@ async def get_session_state(session_id: str) -> int | None:
         stage = data.get("current_stage")
         sv = data.get("state_version")
         print(f"    session stage={stage}, state_version={sv}")
-        return sv
+        return cast(int | None, sv)
 
 
-async def main():
+async def main() -> None:
     print("=" * 60)
     print("Xuanhu 问诊推理流量模拟")
     print("=" * 60)
@@ -158,8 +159,9 @@ async def main():
     results = []
 
     # 收集多个 ready 会话，逐个触发
-    from app.db.session import get_session_factory
     from sqlalchemy import text
+
+    from app.db.session import get_session_factory
 
     factory = get_session_factory()
     async with factory() as db:
@@ -212,9 +214,9 @@ async def main():
         print(f"  avg: {sum(times)/len(times):.2f}s")
     else:
         print("advance: 全部失败")
-        for r in results:
-            body = r["body"]
-            print(f"  status={r['status']}, code={body.get('code')}, msg={body.get('message','')}")
+        for res in results:
+            body = res["body"]
+            print(f"  status={res['status']}, code={body.get('code')}, msg={body.get('message','')}")
     print()
 
     # Histogram diff
@@ -235,7 +237,7 @@ async def main():
         print(
             f"  {name}: "
             f"count {b_count}→{a_count} (+{d_count}), "
-            f"sum {b_sum:.3f}→{a_sum:.3f}s, "
+            f"sum {b_sum:.3f}→{a_sum:.3f}s (+{d_sum:.3f}s), "
             f"avg {avg_before*1000:.1f}→{avg_after*1000:.1f}ms"
         )
 

@@ -16,7 +16,6 @@ general → 激活错误的 4 维 + 漏激活正确维度 → 漏采 + 噪声追
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
@@ -41,6 +40,11 @@ from app.schemas.intake import (
     ComplaintClassificationOutput,
     EvidenceSpan,
 )
+
+__all__ = [
+    "ComplaintClassificationOutput",
+]
+
 COMPLAINT_CLASSIFIER_AGENT_NAME = "complaint_classifier"
 COMPLAINT_CLASSIFIER_AGENT_VERSION = "complaint-classifier-agent.v1"
 COMPLAINT_CLASSIFIER_PROMPT_VERSION = "complaint_classifier_v1.jinja2"
@@ -167,6 +171,7 @@ def _canonicalize_output(output: object) -> ComplaintClassificationOutput:
     # 以 contains 语义校验（防编造），对象形态仍逐字节严格对齐。
     try:
         category = ComplaintCategory(canonical.category)
+        evidence: EvidenceSpan | str
         if isinstance(canonical.evidence, dict):
             evidence = EvidenceSpan.model_validate(canonical.evidence)
         elif isinstance(canonical.evidence, str) and canonical.evidence.strip():

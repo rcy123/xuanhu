@@ -3,7 +3,13 @@ import { Alert, Button, Space, Typography } from 'antd'
 import { ArrowRightOutlined, ReloadOutlined } from '@ant-design/icons'
 import { advanceSession, recoverSession } from '@/api'
 import { ApiRequestError } from '@/api/errors'
-import type { AdvanceData, RecoveryData, SessionDetail } from '@/types/api'
+import { isAsyncCommandAccepted } from '@/types/api'
+import type {
+  AdvanceData,
+  AsyncCommandAccepted,
+  RecoveryData,
+  SessionDetail,
+} from '@/types/api'
 import {
   canAdvanceLangGraph,
   langGraphDisposition,
@@ -19,6 +25,10 @@ interface LangGraphAdvanceBarProps {
   onRecovered?: (result: RecoveryData) => Promise<void> | void
   onRecordGenerationStart?: () => void
   onRecordGenerationFailed?: () => void
+  /** R7: 收到已接受（202）推进命令时登记对账（上层持有 reconciler）。 */
+  onCommandAccepted?: (accepted: AsyncCommandAccepted, idempotencyKey: string) => void
+  /** R7: 是否存在未决推进命令（有界对账中），用于禁用按钮。 */
+  pending?: boolean
 }
 
 interface PendingAdvanceRequest {
@@ -34,6 +44,8 @@ export function LangGraphAdvanceBar({
   onRecovered,
   onRecordGenerationStart,
   onRecordGenerationFailed,
+  onCommandAccepted,
+  pending = false,
 }: LangGraphAdvanceBarProps) {
   const [submitting, setSubmitting] = useState(false)
   const [recoverySubmitting, setRecoverySubmitting] = useState(false)
@@ -77,6 +89,12 @@ export function LangGraphAdvanceBar({
         { idempotencyKey: request.idempotencyKey, stateVersion: request.stateVersion },
       )
       pendingAdvance.current = null
+      if (isAsyncCommandAccepted(result)) {
+        // R7: 202 仅表示已接受，登记对账；不乐观刷新，终态由 reconciler 处理
+        // （成功刷新读模型；失败展示有界错误）。pending prop 保持按钮禁用。
+        onCommandAccepted?.(result, request.idempotencyKey)
+        return
+      }
       await onAdvanced(result)
     } catch (caught: unknown) {
       const commandError = caught instanceof ApiRequestError ? caught : new ApiRequestError({
@@ -101,6 +119,8 @@ export function LangGraphAdvanceBar({
       if (generatingRecord) onRecordGenerationFailed?.()
       setError(commandError)
     } finally {
+      // submitting 仅覆盖「请求在途」；已接受（202）后的对账窗口由 pending prop
+      // 负责禁用按钮，避免本组件局部 submitting 在对账终态后残留为 true。
       setSubmitting(false)
     }
   }
@@ -184,13 +204,16 @@ export function LangGraphAdvanceBar({
             type="primary"
             icon={<ArrowRightOutlined />}
             disabled={
-              detail.current_stage === 'inquiry'
-                ? !canAdvance
-                : canRestartReasoning
-                  ? detail.status !== 'active' || detail.recovery_status !== 'normal'
-                  : !canRunStageAction
+              pending
+              || (
+                detail.current_stage === 'inquiry'
+                  ? !canAdvance
+                  : canRestartReasoning
+                    ? detail.status !== 'active' || detail.recovery_status !== 'normal'
+                    : !canRunStageAction
+              )
             }
-            loading={submitting}
+            loading={submitting || pending}
             onClick={() => void handleAdvance()}
             data-testid="langgraph-advance-button"
           >

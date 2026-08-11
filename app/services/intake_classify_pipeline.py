@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
+from app.agent_runtime.reducer import DomainState
 from app.schemas.completeness import ComplaintCategory
 from app.schemas.domain import ObservationSchema, ObservationStatus
 from app.schemas.intake import ComplaintClassificationInput
-from app.agent_runtime.reducer import DomainState
-
 
 COMPLAINT_CLASSIFY_DELTA_RUN_SPEC_STAGE = "intake_classify_complaint"
 # agent_spec_version/prompt_version 直接取 app.agents.complaint_classifier 的
@@ -124,8 +123,8 @@ def _build_classification_input(
         return None
     return ComplaintClassificationInput(
         chief_complaint_text=raw.strip()[:4_000],
-        patient_sex=_population_value(state, "patient.sex"),
-        patient_age=_population_value(state, "patient.age"),
+        patient_sex=cast("str | None", _population_value(state, "patient.sex")),
+        patient_age=cast("int | None", _population_value(state, "patient.age")),
     )
 
 

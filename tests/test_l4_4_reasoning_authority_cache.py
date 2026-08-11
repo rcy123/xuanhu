@@ -16,8 +16,8 @@ import inspect
 import uuid
 
 import app.services.langgraph_reasoning as reasoning_module
-from app.agent_runtime.repository import ReasoningAuthoritySnapshot
 from app.agent_runtime.reducer import DomainState
+from app.agent_runtime.repository import ReasoningAuthoritySnapshot
 
 
 class _CountingRepository:

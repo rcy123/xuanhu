@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """真实问诊医案标准化：DB 会话 → 标准医案数据集（对齐 sample_cases.json）。
 
 数据源（每个 done 会话）：
@@ -24,9 +23,11 @@ import json
 import re
 import selectors
 import sys
+from io import TextIOWrapper
 from pathlib import Path
+from typing import Any, cast
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+cast(TextIOWrapper, sys.stdout).reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -42,7 +43,7 @@ SCHEMA_VERSION = "xuanhu.generated-cases.v1"
 REDACTED_RECORD_ID = "[REDACTED_RECORD_ID]"
 
 # 主诉 → 病名映射（disease_category 用；无映射留空由医师归口）
-DISEASE_KEYWORDS: tuple[tuple[str, ...], str] = (
+DISEASE_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("咳嗽", "咳"), "咳嗽"),
     (("泄泻", "便溏", "腹泻"), "泄泻"),
     (("胁痛", "胁胀", "胁下", "胀痛"), "胁痛"),
@@ -56,7 +57,7 @@ DISEASE_KEYWORDS: tuple[tuple[str, ...], str] = (
 )
 
 
-def _fact_text(value) -> str:
+def _fact_text(value: Any) -> str:
     """observation value 兼容 str/dict/list → 短文本。"""
     if value is None:
         return ""
@@ -65,12 +66,12 @@ def _fact_text(value) -> str:
     if isinstance(value, dict):
         parts = [str(v) for v in value.values() if isinstance(v, str) and v]
         return "，".join(parts)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return "，".join(str(v) for v in value if v)
     return str(value)
 
 
-def _pick_facts(observations: list[dict], *keys: str) -> list[str]:
+def _pick_facts(observations: list[dict[str, Any]], *keys: str) -> list[str]:
     """按 fact_key 取 active 观察的文本值（去重）。"""
     seen: set[str] = set()
     out: list[str] = []
@@ -90,7 +91,7 @@ def _disease_category(symptom_text: str) -> str:
     return ""
 
 
-def _age_band(age) -> str:
+def _age_band(age: Any) -> str:
     try:
         age_value = int(age)
     except (TypeError, ValueError):
@@ -102,17 +103,17 @@ def _age_band(age) -> str:
     return "adult"
 
 
-def _sex(sex) -> str:
+def _sex(sex: Any) -> str:
     if sex in ("male", "female"):
-        return sex
+        return cast(str, sex)
     return "unspecified"
 
 
-def _sex_cn(sex_value) -> str:
+def _sex_cn(sex_value: Any) -> str:
     return "男" if sex_value == "male" else "女" if sex_value == "female" else ""
 
 
-async def _load_session(session_id: str) -> dict | None:
+async def _load_session(session_id: str) -> dict[str, Any] | None:
     """聚合单会话的全部医案原料。"""
     async with get_session_factory()() as db:
         session_row = (
@@ -172,7 +173,7 @@ def _redact_pii(text_value: str) -> str:
     return redacted
 
 
-def _compose_content(raw: dict) -> str:
+def _compose_content(raw: dict[str, Any]) -> str:
     """拼自然语言医案正文。"""
     observations = raw["observations"]
     record_json = raw["record_json"] or {}
@@ -255,7 +256,7 @@ def _compose_content(raw: dict) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _build_case(raw: dict, label: str | None) -> dict | None:
+def _build_case(raw: dict[str, Any], label: str | None) -> dict[str, Any] | None:
     observations = raw["observations"]
     syndrome_output = ((raw["artifacts"] or {}).get("syndrome_draft") or {}).get("output") or {}
     formula_payload = (raw["artifacts"] or {}).get("formula_draft") or {}
@@ -319,8 +320,8 @@ def _build_case(raw: dict, label: str | None) -> dict | None:
     }
 
 
-async def _build_all(session_ids: list[str], labels: dict[str, str]) -> list[dict]:
-    cases: list[dict] = []
+async def _build_all(session_ids: list[str], labels: dict[str, str]) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
     skipped: list[str] = []
     for session_id in session_ids:
         raw = await _load_session(session_id)

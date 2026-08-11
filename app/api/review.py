@@ -16,6 +16,9 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.async_command_admission import (
+    try_rollout_async_admission,
+)
 from app.agent_runtime.lifecycle import (
     SharedLangGraphRuntime,
     allow_request_local_runtime_fallback,
@@ -28,6 +31,7 @@ from app.api.request_context import (
 )
 from app.core.exceptions import (
     FormulaOverrideRequiredError,
+    IdempotencyConflictError,
     InvalidReviewActionError,
     InvalidStageTransitionError,
     InvalidStateVersionError,
@@ -111,6 +115,24 @@ async def review_prescription(
     preflight = await db.get(ConsultSession, parsed_session_id)
     if preflight is None:
         raise SessionNotFoundError(detail=f"session_id={session_id} not found", retryable=False)
+    # R7 rollout: prefer the durable async 202 path when the R6 substrate is
+    # enabled/ready/registered; otherwise fall through to the synchronous path
+    # (exact R1-R5 semantics). Single centralized rollout decision; admission
+    # does bounded session/enqueue only — no model or review execution inline.
+    accepted = await try_rollout_async_admission(
+        request,
+        request.app.state,
+        session_id=session_id,
+        operation="prescription.review",
+        idempotency_key=context.idempotency_key,
+        request_payload={
+            "body": body.model_dump(mode="json"),
+            "doctor_id": doctor_id,
+            "state_version": state_version,
+        },
+    )
+    if accepted is not None:
+        return accepted
     is_langgraph = preflight.agent_runtime == "langgraph"
     runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
     shared_runtime: SharedLangGraphRuntime | None = (
@@ -290,6 +312,24 @@ async def review_session_not_found_handler(
     )
 
 
+async def review_idempotency_conflict_handler(
+    request: Request, exc: IdempotencyConflictError
+) -> JSONResponse:
+    """Return a stable conflict when one public key is reused for another payload."""
+    trace_id = _get_trace_id(request)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
+
+
 async def review_invalid_stage_handler(
     request: Request, exc: InvalidStageTransitionError
 ) -> JSONResponse:
@@ -387,6 +427,7 @@ review_exception_handlers: dict[Any, Any] = {
     SafetyReviewBlockedError: review_safety_blocked_handler,
     SafetyAcceptRiskUnsupportedError: review_safety_accept_risk_handler,
     SessionNotFoundError: review_session_not_found_handler,
+    IdempotencyConflictError: review_idempotency_conflict_handler,
     InvalidStageTransitionError: review_invalid_stage_handler,
     InvalidStateVersionError: review_invalid_state_version_handler,
     SessionTerminatedError: review_session_terminated_handler,

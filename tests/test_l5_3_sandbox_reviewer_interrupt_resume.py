@@ -2464,7 +2464,7 @@ def test_l5_3_no_settings_env_network_runtime_db_gateway_legacy_or_export_import
     assert "data/" not in source
     for name in ("complete", "record", "export"):
         assert not any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
             and node.name == name
             for node in ast.walk(tree)
         )

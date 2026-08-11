@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Generator
 from typing import Any
 
 import httpx
@@ -56,7 +57,7 @@ def _intake_output_payload(patient_safety_delta: str) -> dict[str, Any]:
 
 
 @pytest.fixture
-def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Generator[Settings, None, None]:
     """创建测试用 Settings 实例。"""
     monkeypatch.setenv("DB_URL", "postgresql://xuanhu:xuanhu_dev@localhost:5432/xuanhu")
     monkeypatch.setenv("REDIS_URL", "redis://:xuanhu_dev@localhost:6379/0")
@@ -67,8 +68,11 @@ def mock_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("CHAT_MODEL", "test-chat")
     monkeypatch.setenv("EMBEDDING_MODEL", "test-embed")
     monkeypatch.setenv("EMBEDDING_DIM", "768")
-    get_settings.cache_clear()
-    return get_settings()
+    try:
+        get_settings.cache_clear()
+        yield get_settings()
+    finally:
+        get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------

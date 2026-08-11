@@ -225,6 +225,55 @@ describe('useSessionStream', () => {
     expect(onResync).toHaveBeenCalledWith('stream trimmed')
   })
 
+  it.each(['command.queued', 'command.running', 'command.succeeded', 'command.failed'] as const)(
+    '%s 转发有界 payload 到 onCommandEvent',
+    async (eventType) => {
+      const onCommandEvent = vi.fn()
+      const { getCaptured } = setupConnectSpy()
+      renderHook(() =>
+        useSessionStream({
+          sessionId: 's1',
+          stateVersion: 1,
+          onCommandEvent,
+        }),
+      )
+      const base = { command_id: 'cmd-1', operation: 'intake.message', attempt: 1 }
+      const payload =
+        eventType === 'command.failed'
+          ? { ...base, error_code: 'SESSION_NOT_FOUND' }
+          : base
+      await act(async () => {
+        getCaptured().onEvent(makeEvent(eventType, payload))
+      })
+      expect(onCommandEvent).toHaveBeenCalledWith(expect.objectContaining(base))
+      if (eventType === 'command.failed') {
+        expect(onCommandEvent).toHaveBeenCalledWith(
+          expect.objectContaining({ error_code: 'SESSION_NOT_FOUND' }),
+        )
+      }
+    },
+  )
+
+  it('command.* 唤醒不改变连接状态，也不关闭连接', async () => {
+    const { conn, getCaptured } = setupConnectSpy()
+    const { result } = renderHook(() =>
+      useSessionStream({ sessionId: 's1', stateVersion: 1, onCommandEvent: vi.fn() }),
+    )
+    await act(async () => {
+      getCaptured().onOpen()
+      getCaptured().onEvent(
+        makeEvent('command.succeeded', {
+          command_id: 'cmd-1',
+          operation: 'session.advance',
+          status: 'succeeded',
+          attempt: 2,
+        }),
+      )
+    })
+    expect(result.current.connectionState).toBe('connected')
+    expect(conn.close).not.toHaveBeenCalled()
+  })
+
   it('agent.started 设置 agentRuns 为 running', async () => {
     const { getCaptured } = setupConnectSpy()
     const { result } = renderHook(() =>

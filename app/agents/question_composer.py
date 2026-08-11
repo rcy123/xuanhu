@@ -40,6 +40,11 @@ from app.schemas.question import (
     QuestionSource,
 )
 
+__all__ = [
+    "QUESTION_COMPOSER_AGENT_VERSION",
+    "QUESTION_COMPOSER_PROMPT_VERSION",
+]
+
 # 真实会话复盘（a7c32b0b）：十问激活集扩全后，6 轮对话 + 最多 24 条事实 +
 # 主诉原文在 1000 token 预算下会顶满甚至超限，导致 CONTEXT_BUILD_FAILED 静默断链。
 # 放宽到 6000（与 intake_extraction 同级），并保留 CONTEXT_BUILD_FAILED 的模板兜底。
@@ -812,6 +817,7 @@ async def _run_composer_once(
     # 2.8：SINGLE_QUESTION_INVALID 时 _model_result 会带 retry_hint 重试一次，
     # 重试仍失败才回落模板。
     question_text = model_output.question.strip()
+    assert selection.selected_dimension is not None
     if not _question_targets_dimension(question_text, selection.selected_dimension):
         return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
     if _question_repeats_recent(question_text, input_payload.recent_turns):
@@ -1016,7 +1022,7 @@ def _has_forbidden_model_field(raw: Any) -> bool:
         if set(raw) & _FORBIDDEN_MODEL_FIELDS:
             return True
         return any(_has_forbidden_model_field(value) for value in raw.values())
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         return any(_has_forbidden_model_field(value) for value in raw)
     return False
 
@@ -1036,7 +1042,7 @@ def _has_forbidden_selection_field(raw: Any) -> bool:
         if set(raw) & _FORBIDDEN_SELECTION_FIELDS:
             return True
         return any(_has_forbidden_selection_field(value) for value in raw.values())
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, list | tuple):
         return any(_has_forbidden_selection_field(value) for value in raw)
     return False
 
@@ -1057,13 +1063,13 @@ def _has_undeclared_fields(raw: Any, canonical: Any) -> bool:
                 return True
             return any(_has_undeclared_fields(raw.get(name), getattr(canonical, name)) for name in allowed)
         return True
-    if isinstance(canonical, (list, tuple)):
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(canonical):
+    if isinstance(canonical, list | tuple):
+        if not isinstance(raw, list | tuple) or len(raw) != len(canonical):
             return True
         return any(_has_undeclared_fields(raw_item, item) for raw_item, item in zip(raw, canonical, strict=True))
     if isinstance(canonical, dict):
         return not isinstance(raw, dict)
-    return isinstance(raw, (BaseModel, dict, list, tuple))
+    return isinstance(raw, BaseModel | dict | list | tuple)
 
 
 def _failed(code: QuestionComposerFailureCode) -> QuestionCompositionOutcome:

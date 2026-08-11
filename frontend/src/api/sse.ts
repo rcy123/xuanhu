@@ -139,4 +139,8 @@ const KNOWN_EVENT_TYPES: EventType[] = [
   'doctor.reviewed',
   'heartbeat',
   'resync',
+  'command.queued',
+  'command.running',
+  'command.succeeded',
+  'command.failed',
 ]

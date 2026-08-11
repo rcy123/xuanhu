@@ -127,6 +127,16 @@ class XuanhuGraphState(TypedDict, total=False):
     clarify_requested: bool
     # L3-6 澄清：extract 节点的抽取决策（abstained 时转向澄清回复）
     intake_decision: str
+    # L3-6 澄清：extract 节点标记跳过澄清路由（社交消息/诊毕信号）
+    intake_skip_clarification: bool
+    # L3-6 澄清：extract 节点检测到问诊结束信号
+    intake_end_requested: bool
+    # 1b fix: 四诊回复绑定的 fallback 标记
+    intake_four_diagnosis_bound: bool
+    # R1: 跨轮次 interrupt/resume — 当前追问轮次计数器（仅 ref，不含患者数据）
+    intake_loop_count: int
+    # R1: resume 时携带的新 answer claim 引用（仅 UUID 字符串，不含患者数据）
+    intake_resume_claim_ref: str
 
 
 # ---------------------------------------------------------------------------
@@ -178,4 +188,11 @@ def default_state(
         pending_interrupt=None,
         budget=Budget(remaining_steps=0, remaining_tokens=0, deadline_ref=""),
         last_error=None,
+        clarify_requested=False,
+        intake_decision="",
+        intake_skip_clarification=False,
+        intake_end_requested=False,
+        intake_four_diagnosis_bound=False,
+        intake_loop_count=0,
+        intake_resume_claim_ref="",
     )

@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as sse from '@/api/sse'
 import type { SseConnection } from '@/api/sse'
-import type { Formula, SafetyIssue, SessionEvent } from '@/types/api'
+import type { CommandEventPayload, Formula, SafetyIssue, SessionEvent } from '@/types/api'
 
 export type StreamConnectionState = 'idle' | 'connecting' | 'connected' | 'polling' | 'disconnected'
 
@@ -38,6 +38,11 @@ export interface UseSessionStreamOptions {
   onSessionDone?: (recordId?: string) => void
   onSessionBlocked?: (reason: string) => void
   onSessionTerminated?: () => void
+  /**
+   * R6-B 异步命令生命周期唤醒（command.*）。SSE 仅作唤醒信号，权威状态以
+   * GET /commands/{id} 与常规读模型为准；收到后上层应据此 refetch。
+   */
+  onCommandEvent?: (payload: CommandEventPayload) => void
   /** SSE 不可用或持续失败时由上层提供权威刷新入口（= refreshDetail）。 */
   onPollingRefresh?: () => Promise<void>
 }
@@ -186,6 +191,14 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
       case 'heartbeat':
       case 'doctor.reviewed':
         // 不处理
+        break
+      case 'command.queued':
+      case 'command.running':
+      case 'command.succeeded':
+      case 'command.failed':
+        // 唤醒信号：转发有界的命令事件 payload，权威状态走 GET status/读模型。
+        // SSE payload 是宽泛的泛型类型；命令事件约定字段有限，经 unknown 收窄。
+        opts.onCommandEvent?.(payload as unknown as CommandEventPayload)
         break
       default:
         break

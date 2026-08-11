@@ -13,9 +13,12 @@
 
 OP2 实现了 `EmbeddingCache`（[embedding_cache.py](../app/rag/embedding_cache.py)）：
 
-- Key：`sha1(query_text)`，严格精确匹配
-- Value：`list[float]`（embedding 向量）
-- Store：Redis，TTL=3600s（1h）
+- Key：`embed:<cache_version>:<sha1(query_text)>`，严格精确匹配；`cache_version`
+  由 embedding 模型 + 精确维度 + schema 版本派生（模型/维度切换 → 硬 miss），
+  仅保留 query 文本的 sha1 摘要
+- Value：`list[float]`（embedding 向量，写入/读回均经维度、有限性校验，
+  `allow_nan=False` 序列化；损坏/维度不符/非有限数据视为 miss 并 best-effort 删除）
+- Store：Redis，TTL=3600s（1h）；Redis 任意读/写/删故障 → miss/no-op，不破坏 RAG
 - Miss 代价：~700ms/次（网关 embedding API 调用）
 
 ### 1.2 命中率数据

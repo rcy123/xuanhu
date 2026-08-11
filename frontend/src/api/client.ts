@@ -43,6 +43,15 @@ export interface RequestContext {
   idempotencyKey?: string
   /** 客户端 state_version（写操作携带） */
   stateVersion?: number
+  /**
+   * R7 异步偏好：为 true 时注入标准 `Prefer: respond-async`（RFC 7240）。
+   * 三处 R7 写封装（submitMessage / advanceSession / reviewPrescription）缺省
+   * 即为 true；显式传 false 仅**省略该兼容偏好头**，并不强制后端同步——R7
+   * 后端就绪时即便没有该头也会返回 HTTP 202。真正的同步回退是部署方设置
+   * `XUANHU_ASYNC_COMMAND_ENABLED=false`。前端一律用 `isAsyncCommandAccepted`
+   * 判别实际返回（202 或同步结果）。
+   */
+  respondAsync?: boolean
   /** 额外请求头 */
   extraHeaders?: Record<string, string>
 }
@@ -94,6 +103,9 @@ export async function request<T>(
   }
   if (ctx?.stateVersion !== undefined) {
     headers['X-State-Version'] = String(ctx.stateVersion)
+  }
+  if (ctx?.respondAsync) {
+    headers['Prefer'] = 'respond-async'
   }
   if (ctx?.extraHeaders) {
     Object.assign(headers, ctx.extraHeaders)

@@ -15,8 +15,8 @@ CLARIFICATION_AGENT_NAME = "clarification"
 CLARIFICATION_AGENT_VERSION = "clarification-agent.v1"
 CLARIFICATION_PROMPT_VERSION = "clarification_v1.jinja2"
 CLARIFICATION_POLICY_VERSION = "clarification-policy.v1"
-CLARIFICATION_INPUT_SCHEMA_VERSION = "clarification-model-input.v1"
-CLARIFICATION_OUTPUT_SCHEMA_VERSION = "clarification-model-output.v1"
+CLARIFICATION_INPUT_SCHEMA_VERSION: Literal["clarification-model-input.v1"] = "clarification-model-input.v1"
+CLARIFICATION_OUTPUT_SCHEMA_VERSION: Literal["clarification-model-output.v1"] = "clarification-model-output.v1"
 CLARIFICATION_CONTEXT_TOKEN_LIMIT = 4_000
 
 

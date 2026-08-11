@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
+    FetchedValue,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -39,8 +40,8 @@ class Observation(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
     )
     fact_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
-    normalized_value: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    value: Mapped[Any | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
+    normalized_value: Mapped[Any | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
     source_message_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("consult_messages.id", ondelete="RESTRICT"), nullable=False
     )
@@ -81,20 +82,20 @@ class SafetyProfile(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False, unique=True
     )
     allergy_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    allergens: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    allergens: Mapped[list[str] | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
     pregnancy_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
     pregnancy_value: Mapped[str | None] = mapped_column(String(16), nullable=True)
     lactation_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
     lactation_value: Mapped[str | None] = mapped_column(String(16), nullable=True)
     medications_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    medications: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    medications: Mapped[list[str] | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
     major_conditions_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    major_conditions: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    major_conditions: Mapped[list[str] | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
     contraindications_collection_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
-    contraindications: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    contraindications: Mapped[list[str] | None] = mapped_column(cast(Any, JSONB)(none_as_null=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), server_onupdate=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), server_onupdate=cast(FetchedValue, func.now()), nullable=False
     )
 
     __table_args__ = (
@@ -489,8 +490,11 @@ class OutboxEvent(Base, UUIDPrimaryKeyMixin):
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("consult_sessions.id", ondelete="CASCADE"), nullable=False
     )
-    graph_run_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=False
+    # Nullable only for async_command.* lifecycle rows (which are not graph
+    # runs); the chk_outbox_events_graph_run_boundary check keeps async rows
+    # graph_run_id-free and all other rows non-null.
+    graph_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=True
     )
     state_version: Mapped[int] = mapped_column(Integer, nullable=False)
     trace_id: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -506,6 +510,11 @@ class OutboxEvent(Base, UUIDPrimaryKeyMixin):
     dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (
         CheckConstraint("char_length(event_type) > 0", name="chk_outbox_events_type_nonempty"),
+        CheckConstraint(
+            "((event_type LIKE 'async_command.%' AND graph_run_id IS NULL) OR "
+            "(event_type NOT LIKE 'async_command.%' AND graph_run_id IS NOT NULL))",
+            name="chk_outbox_events_graph_run_boundary",
+        ),
         CheckConstraint("state_version >= 1", name="chk_outbox_events_state_version"),
         CheckConstraint("attempt_count >= 0", name="chk_outbox_events_attempt_count"),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="chk_outbox_events_payload_object"),
@@ -599,7 +608,7 @@ class IntakeCommandClaim(Base, UUIDPrimaryKeyMixin):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), server_onupdate=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), server_onupdate=cast(FetchedValue, func.now()), nullable=False
     )
 
     __table_args__ = (

@@ -27,8 +27,8 @@ from sqlalchemy import func, select
 from app.core.config import get_settings
 from app.core.embedding_gateway import build_embedding_gateway_settings
 from app.core.gateway import ModelGatewayClient
-from app.core.reranker_gateway import build_reranker_gateway_settings
 from app.core.metrics import measure
+from app.core.reranker_gateway import build_reranker_gateway_settings
 from app.db.session import get_session_factory
 from app.models.knowledge import KnowledgeChunk
 from app.rag.reranker import (
@@ -284,9 +284,10 @@ class RAGRetriever:
         if self._entity_index_loaded:
             return
         try:
+            from sqlalchemy import select
+
             from app.models.knowledge import KnowledgeChunk
             from app.rag.entity_index import get_entity_index
-            from sqlalchemy import select
 
             # 使用全局 session factory 而非 self._get_session_factory()：
             # 实体索引是进程级单例，应直连 PG，不受测试 mock 注入影响。
@@ -352,7 +353,7 @@ class RAGRetriever:
             vectors = await self._gateway.embed(to_embed, trace_id="l3-warm")
             pairs = [
                 (text, vec.tolist() if hasattr(vec, "tolist") else vec)
-                for text, vec in zip(to_embed, vectors)
+                for text, vec in zip(to_embed, vectors, strict=False)
             ]
             n = await batch_set_embeddings(pairs)
             if n:

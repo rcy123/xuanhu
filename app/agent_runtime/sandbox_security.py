@@ -523,7 +523,7 @@ def _json_ready(value: object) -> object:
         return value.model_dump(mode="json")
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_ready(item) for item in value]
     if isinstance(value, frozenset):
         return sorted(value)
@@ -681,7 +681,7 @@ class PrivacyPolicy:
                 _raise_error(SandboxSecurityFailureCode.PRIVACY_REDACTION_FAILED)
             # Nested or opaque values cannot be safely redacted by this
             # intentionally shallow reference implementation.
-            if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            if isinstance(value, Mapping | list | tuple | set | frozenset):
                 uncertain = True
                 continue
             for rule in self._policy.redaction_fields:

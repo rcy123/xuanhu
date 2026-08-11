@@ -17,6 +17,11 @@ from app.schemas.domain import CollectionStatus, LactationValue, PregnancyValue
 
 INTAKE_SCHEMA_VERSION = "intake-extraction.v2"
 
+#: R2-A 权威槽位投影契约版本。派生快照(dimension_slots 的权威真源)恒填充该版本;
+#: 模型侧 ``IntakeExtractionOutput.dimension_slots`` 为传输/候选契约,解析时允许缺省
+#: (回退到本常量),但权威派生快照必须显式携带。模型产物永不被当作域真源。
+SLOT_PROJECTION_SCHEMA_VERSION: str = "dimension-slot-projection.v1"
+
 
 class _IntakeModel(BaseModel):
     model_config = ConfigDict(
@@ -242,17 +247,15 @@ class PatientSafetyDelta(_IntakeModel):
     contraindications: SafetyListDelta = Field(default_factory=SafetyListDelta)
 
     def has_candidate(self) -> bool:
-        return any(
-            field.status is not CollectionStatus.UNKNOWN
-            for field in (
-                self.allergy,
-                self.pregnancy,
-                self.lactation,
-                self.medications,
-                self.major_conditions,
-                self.contraindications,
-            )
+        fields: tuple[SafetyListDelta | PregnancyDelta | LactationDelta, ...] = (
+            self.allergy,
+            self.pregnancy,
+            self.lactation,
+            self.medications,
+            self.major_conditions,
+            self.contraindications,
         )
+        return any(field.status is not CollectionStatus.UNKNOWN for field in fields)
 
 
 class RedFlagCategory(StrEnum):
@@ -340,8 +343,14 @@ class DimensionSlotValue(_IntakeModel):
     """2a: 一条粗槽位语义项(决策 12:采到 N 项即齐,槽位名程序定义)。
 
     槽位名与取值均为程序/模型契约:模型只能填,不能自创槽位名。
+
+    R2-A: ``slot_id`` 是程序派生的**确定性稳定槽位标识**(基于「canonical 维度 + fact_key」
+    的 uuid5 哈希,不依赖输入顺序/时间戳/置信度/模型文本)。纠正同一 canonical 槽位的值
+    时(新 observation、同 fact_key)``slot_id`` 保持不变。模型侧可缺省(解析默认空串),
+    权威派生快照恒填充。
     """
 
+    slot_id: str = Field(default="", max_length=64, pattern=r"^[a-z0-9_-]*$")
     slot_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
     value: Any = Field(...)
     source_message_id: UUID | None = Field(default=None)
@@ -363,12 +372,31 @@ class DimensionSlotSnapshot(_IntakeModel):
       ``app.agent_runtime.intake_dimension_mapping.slot_threshold_for``)。
     - completeness / missing_slots: 决策 25 的 LLM 完整性信号;
       确定性层(铁律 10)按粗槽位阈值复核,LLM 信号缺失时退回阈值判定。
+
+    R2-A 权威投影契约字段(模型侧可缺省走解析默认,权威派生快照恒填充):
+    - projection_version: 权威槽位投影契约版本(:data:`SLOT_PROJECTION_SCHEMA_VERSION`)。
+    - slot_count / candidate_count / sanitized_count / truncated: 计数与截断元数据
+      (candidate_count = 去重+清洗后候选槽位数;sanitized_count = 因非 JSON 值被丢弃数;
+      truncated = candidate_count > slot_count,即受每维/全局 cap 截断)。
+    - per_dimension_cap / global_cap: 本次派生实际执行的每维/全局槽位上限(正参数)。
     """
 
     dimension: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]*$")
+    projection_version: str = Field(
+        default=SLOT_PROJECTION_SCHEMA_VERSION,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9._-]*$",
+    )
     slots: tuple[DimensionSlotValue, ...] = Field(default=(), max_length=16)
     completeness: SlotCompleteness = SlotCompleteness.UNKNOWN
     missing_slots: tuple[str, ...] = Field(default=(), max_length=16)
+    slot_count: int = Field(default=0, ge=0)
+    candidate_count: int = Field(default=0, ge=0)
+    sanitized_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    per_dimension_cap: int = Field(default=8, gt=0)
+    global_cap: int = Field(default=32, gt=0)
 
     @field_validator("dimension")
     @classmethod
@@ -385,8 +413,12 @@ class DimensionSlotSnapshot(_IntakeModel):
 # 1a 主诉大类归集：独立一步把 chief_complaint 归到 ComplaintCategory 枚举之一。
 # 归集节点产出的 category 经 intake 落库成 chief_complaint.category，驱动十问动态维度激活。
 # schema 版本独立于 intake 抽取（INTAKE_SCHEMA_VERSION），用同一 _IntakeModel 基类拿到 frozen/forbid。
-COMPLAINT_CLASSIFICATION_INPUT_SCHEMA_VERSION: str = "complaint-classification-input.v1"
-COMPLAINT_CLASSIFICATION_OUTPUT_SCHEMA_VERSION: str = "complaint-classification-output.v1"
+COMPLAINT_CLASSIFICATION_INPUT_SCHEMA_VERSION: Literal["complaint-classification-input.v1"] = (
+    "complaint-classification-input.v1"
+)
+COMPLAINT_CLASSIFICATION_OUTPUT_SCHEMA_VERSION: Literal["complaint-classification-output.v1"] = (
+    "complaint-classification-output.v1"
+)
 
 
 class ComplaintClassificationInput(BaseModel):
@@ -432,7 +464,7 @@ def _validate_scalar_safety(
 
 
 def _ensure_json_safe(value: Any) -> None:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, str | bool | int):
         return
     if isinstance(value, float):
         if not math.isfinite(value):

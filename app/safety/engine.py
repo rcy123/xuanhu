@@ -12,16 +12,23 @@
 6. 配伍禁忌检查
 7. 剂量上限检查
 8. 过敏检查
-9. 去重 + 排序
+9. 药材禁忌检查（患者条件 × Herb.contraindications 精确匹配，R4-A）
+10. 用药相互作用覆盖率门禁（R4-A）
+11. 去重 + 排序
 """
 
 from __future__ import annotations
 
+import logging
+import re
+import unicodedata
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.metrics import observe_safety_outcome
 from app.models.knowledge import DosageUnit, Herb
 from app.models.safety import SafetyRuleRun
 from app.safety.datasets import (
@@ -40,6 +47,8 @@ from app.schemas.agent import (
     SafetyRuleResult,
 )
 from app.schemas.types import SafetyIssueType, Severity, is_pregnancy_risk_status
+
+logger = logging.getLogger("xuanhu.safety")
 
 # ---------------------------------------------------------------------------
 # 辅助：内存中的 Herb/ DosageUnit 轻量包装
@@ -62,6 +71,33 @@ class _HerbAliasAdapter:
     def aliases(self) -> list[str]:
         raw = self._herb.aliases or []
         return [a for a in raw if isinstance(a, str)]
+
+
+# ---------------------------------------------------------------------------
+# R4-A 患者特定安全检查：有界归一化常量
+# ---------------------------------------------------------------------------
+
+#: 对抗性增长防护：患者条件/药物条目数与字符串长度上限。
+_MAX_PATIENT_CONDITION_ITEMS = 200
+_MAX_PATIENT_MEDICATION_ITEMS = 200
+_MAX_TEXT_LENGTH = 512
+#: 单味药 contraindications 条目数上限。
+_MAX_HERB_CONTRAINDICATION_ENTRIES = 200
+
+#: 严格 dict 禁忌条目中承载条件/名称的固定键集（按优先级取首个可接受的字符串）。
+_CONTRAINDICATION_DICT_KEYS = ("condition", "name")
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+#: 固定权威规则来源（不随数据变化，保证审计可复现）。
+_HERB_CONTRAINDICATION_RULE_SOURCE = "Herb.contraindications"
+_MEDICATION_INTERACTION_RULE_SOURCE = "medication_interaction_coverage"
+# R4-B：fail-closed 覆盖率门禁同样使用固定来源，不随数据变化。
+_PATIENT_CONTEXT_COVERAGE_RULE_SOURCE = "patient_context_coverage"
+_HERB_CONTRAINDICATION_COVERAGE_RULE_SOURCE = "herb_contraindication_coverage"
+
+#: 本仓库当前没有权威中药-西药相互作用数据表；若将来引入该数据，置 True 关闭覆盖率门禁。
+_HAS_AUTHORITATIVE_HERB_DRUG_INTERACTION_DATA = False
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +144,8 @@ class SafetyRuleEngine:
             SafetyRuleResult，包含 ``passed`` / ``issues`` / ``warnings`` /
             ``normalized_formula`` / ``rule_version`` / ``execution_order``。
         """
-        result = await self.evaluate(formula, patient_info)
+        # check() is the authoritative safety gate — always observe the metric.
+        result = await self.evaluate(formula, patient_info, observe_metric=True)
         await self._write_safety_rule_run(
             session_id=session_id,
             trace_id=trace_id,
@@ -125,6 +162,8 @@ class SafetyRuleEngine:
         self,
         formula: FormulaResult,
         patient_info: PatientInfo,
+        *,
+        observe_metric: bool = False,
     ) -> SafetyRuleResult:
         """Evaluate every deterministic rule without writing a run row.
 
@@ -132,6 +171,13 @@ class SafetyRuleEngine:
         result, Domain artifact, gate, compatibility projection and session
         transition can be committed atomically by the Domain Repository.
         Legacy ``check()`` keeps its existing evaluate-and-persist behaviour.
+
+        R5: the bounded safety pass/block metric is opt-in at the authoritative
+        boundary.  ``evaluate()`` defaults to ``observe_metric=False`` so
+        pure/advisory evaluation does not count; callers that own the
+        authoritative decision (``check()`` and the review gate) pass
+        ``observe_metric=True`` explicitly.  This never alters the result or
+        any transaction.
         """
 
         execution_order: list[str] = []
@@ -180,11 +226,25 @@ class SafetyRuleEngine:
         all_issues.extend(_check_dose_limits(converted, normalizer, herb_records, unit_table))
         execution_order.append("allergy")
         all_issues.extend(_check_allergy(herb_names, patient_info.allergies, normalizer, herb_records))
+        execution_order.append("herb_contraindication")
+        all_issues.extend(
+            _check_herb_contraindications(herb_names, patient_info, herb_records, normalizer)
+        )
+        execution_order.append("medication_interaction_coverage")
+        all_issues.extend(_check_medication_interaction_coverage(patient_info))
         execution_order.extend(("deduplicate", "sort"))
         all_issues = _sort_issues(_deduplicate(all_issues))
 
+        passed = _determine_passed(all_issues)
+        if observe_metric:
+            # Observation must never alter the safety decision: a metric
+            # failure is swallowed so the authoritative result still returns.
+            try:
+                observe_safety_outcome(passed)
+            except Exception:  # noqa: BLE001 - metrics must never mask the safety result
+                logger.warning("safety outcome metric observation failed")
         return SafetyRuleResult(
-            passed=_determine_passed(all_issues),
+            passed=passed,
             issues=all_issues,
             normalized_formula=normalized_formula,
             warnings=all_warnings,
@@ -807,6 +867,274 @@ def _check_allergy(
 
 
 # ---------------------------------------------------------------------------
+# R4-A 患者特定检查：有界归一化纯函数
+# ---------------------------------------------------------------------------
+
+
+def _normalize_bounded_text(value: Any, *, max_length: int = _MAX_TEXT_LENGTH) -> str | None:
+    """NFKC + 空白折叠 + casefold 的有界文本归一化。
+
+    非字符串、空白后为空、或归一化后超长的条目一律返回 ``None``（安全忽略），
+    不抛异常、不做截断——截断可能制造并不存在的前缀假匹配。结果只依赖输入，
+    不依赖模型/网络/时间/随机。
+    """
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if not text:
+        return None
+    text = text.casefold()
+    if len(text) > max_length:
+        return None
+    return text
+
+
+def _bounded_normalized_conditions(
+    major_conditions: Any,
+    special_conditions: Any,
+) -> frozenset[str]:
+    """有界归一化患者条件集（major_conditions + special_conditions）。"""
+    entries = [*(major_conditions or ()), *(special_conditions or ())]
+    entries = entries[:_MAX_PATIENT_CONDITION_ITEMS]
+    result: set[str] = set()
+    for entry in entries:
+        norm = _normalize_bounded_text(entry)
+        if norm is not None:
+            result.add(norm)
+    return frozenset(result)
+
+
+def _bounded_normalized_medications(medications: Any) -> tuple[str, ...]:
+    """有界去重归一化患者当前用药（仅用于判定是否存在用药，名称不外泄）。"""
+    entries = (medications or ())[:_MAX_PATIENT_MEDICATION_ITEMS]
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in entries:
+        norm = _normalize_bounded_text(entry)
+        if norm is not None and norm not in seen:
+            seen.add(norm)
+            result.append(norm)
+    return tuple(result)
+
+
+def _patient_conditions_overflow(major_conditions: Any, special_conditions: Any) -> bool:
+    """患者条件（major + special）合并**原始条目数**是否超过有界上限。
+
+    只统计条目数、不扫描条目内容，保证 O(1) 工作量且不依赖输入顺序。
+    超过上限时上层必须 fail-closed，不能把截断子集当作完整结果评估。
+    """
+    return len(major_conditions or ()) + len(special_conditions or ()) > _MAX_PATIENT_CONDITION_ITEMS
+
+
+def _medications_overflow(medications: Any) -> bool:
+    """患者当前用药**原始条目数**是否超过有界上限。
+
+    超过上限即可能隐藏后续用药，必须 fail-closed 触发覆盖率门禁。
+    """
+    return len(medications or ()) > _MAX_PATIENT_MEDICATION_ITEMS
+
+
+def _has_non_whitespace_medication(value: Any) -> bool:
+    """有界判断单条用药是否构成"非空白报告条目"。
+
+    只对字符串判定：非字符串忽略；字符串先做长度检查（不扫描超过
+    ``_MAX_TEXT_LENGTH`` 的内容），超长条目 fail-closed 视为存在——无法在不
+    越界扫描的前提下确认超长字符串为纯空白。空白折叠后非空的字符串视为存在。
+    """
+    if not isinstance(value, str):
+        return False
+    if len(value) > _MAX_TEXT_LENGTH:
+        return True
+    return bool(value.strip())
+
+
+def _herb_contraindications_overflow(contraindications: Any) -> bool:
+    """单味药 ``contraindications`` 原始条目数是否超过有界上限。
+
+    超过上限时上层必须对该味药 fail-closed，避免截断后漏检禁忌命中。
+    """
+    return isinstance(contraindications, list) and len(contraindications) > _MAX_HERB_CONTRAINDICATION_ENTRIES
+
+
+def _contraindication_entry_condition(entry: Any) -> str | None:
+    """从单条 ``Herb.contraindications`` 条目提取有界归一化条件。
+
+    - 字符串条目：直接归一化；
+    - 严格 dict 条目：仅当固定键（condition/name）携带可接受的字符串时取该值；
+    - 其余（非字符串、非 dict、键缺失、值非字符串/无界/超长/空白）一律忽略。
+    """
+    if isinstance(entry, str):
+        return _normalize_bounded_text(entry)
+    if isinstance(entry, dict):
+        for key in _CONTRAINDICATION_DICT_KEYS:
+            value = entry.get(key)
+            norm = _normalize_bounded_text(value)
+            if norm is not None:
+                return norm
+    return None
+
+
+def _herb_contraindication_conditions(contraindications: Any) -> tuple[str, ...]:
+    """提取一株药 ``contraindications`` 列表中全部去重后的有界归一化条件。"""
+    if not isinstance(contraindications, list):
+        return ()
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in contraindications[:_MAX_HERB_CONTRAINDICATION_ENTRIES]:
+        norm = _contraindication_entry_condition(entry)
+        if norm is not None and norm not in seen:
+            seen.add(norm)
+            result.append(norm)
+    return tuple(result)
+
+
+def _patient_context_coverage_issue() -> SafetyIssue:
+    """固定的患者上下文覆盖率门禁 issue（R4-B，fail-closed）。
+
+    患者条件（major + special）合并条目数超过有界上限时，无法在不截断的前提下
+    评估药材禁忌——不能把截断子集当作完整结果。此 issue 文本完全固定、不含任何
+    条件名，保证审计可复现。
+    """
+    return SafetyIssue(
+        type=SafetyIssueType.PATIENT_CONTEXT_COVERAGE,
+        severity=Severity.HIGH,
+        herbs=[],
+        rule_source=_PATIENT_CONTEXT_COVERAGE_RULE_SOURCE,
+        suggestion=(
+            "PATIENT_CONTEXT_VERIFICATION_REQUIRED: 患者条件数量超过可审核上限，"
+            "无法完整执行药材禁忌覆盖审核，发药前必须由医师人工核对患者情况。"
+        ),
+    )
+
+
+def _herb_contraindication_coverage_issue(herb: str) -> SafetyIssue:
+    """固定的单味药禁忌覆盖率门禁 issue（R4-B，fail-closed）。
+
+    该味药 ``contraindications`` 条目数超过有界上限时，无法确认是否存在与患者
+    条件的禁忌命中——不能静默截断后当作完整匹配。文本固定、不含任何原始禁忌
+    条目，保证审计可复现。
+    """
+    return SafetyIssue(
+        type=SafetyIssueType.HERB_CONTRAINDICATION_COVERAGE,
+        severity=Severity.HIGH,
+        herbs=[herb],
+        rule_source=_HERB_CONTRAINDICATION_COVERAGE_RULE_SOURCE,
+        suggestion=(
+            f"「{herb}」的禁忌条目超过可审核上限，无法确认是否与患者情况冲突，"
+            "发药前必须由医师人工核对。"
+        ),
+    )
+
+
+def _check_herb_contraindications(
+    herbs: list[str],
+    patient_info: PatientInfo,
+    herb_records: dict[str, Herb],
+    normalizer: HerbNormalizer,
+) -> list[SafetyIssue]:
+    """患者条件与每味药 ``contraindications`` 的精确匹配检查（R4-A/R4-B）。
+
+    仅做归一化后的**精确**相等匹配，不做子串/模糊匹配。条件来自知识库
+    ``Herb.contraindications`` 中既有字符串条目或严格 dict 条目，不虚构任何
+    医学交互表。命中的每味药产生一条 BLOCKER（suggestion 列出全部命中条件，
+    条件做确定性排序）；同一药名重复出现只检查一次。空患者条件直接返回。
+
+    R4-B fail-closed 边界：
+    - 患者条件合并条目数超过上限时，**不评估截断子集**，改为发射恰好一条
+      HIGH 的 ``PATIENT_CONTEXT_COVERAGE`` 覆盖率门禁；
+    - 单味药 ``contraindications`` 条目数超过上限时，对该味药发射一条固定的
+      HIGH ``HERB_CONTRAINDICATION_COVERAGE`` 覆盖率门禁，替代精确匹配。
+    """
+    if _patient_conditions_overflow(
+        patient_info.major_conditions,
+        patient_info.special_conditions,
+    ):
+        return [_patient_context_coverage_issue()]
+    patient_conditions = _bounded_normalized_conditions(
+        patient_info.major_conditions,
+        patient_info.special_conditions,
+    )
+    if not patient_conditions:
+        return []
+    issues: list[SafetyIssue] = []
+    seen_herbs: set[str] = set()
+    for herb_name in herbs:
+        std = normalizer.normalize(herb_name)
+        if not std or std in seen_herbs:
+            continue
+        seen_herbs.add(std)
+        record = herb_records.get(std)
+        if record is None:
+            continue
+        contraindications = getattr(record, "contraindications", None)
+        if _herb_contraindications_overflow(contraindications):
+            issues.append(_herb_contraindication_coverage_issue(std))
+            continue
+        matched = sorted(
+            condition
+            for condition in _herb_contraindication_conditions(contraindications)
+            if condition in patient_conditions
+        )
+        if not matched:
+            continue
+        issues.append(
+            SafetyIssue(
+                type=SafetyIssueType.HERB_CONTRAINDICATION,
+                severity=Severity.BLOCKER,
+                herbs=[std],
+                rule_source=_HERB_CONTRAINDICATION_RULE_SOURCE,
+                suggestion=(
+                    f"「{std}」与患者情况存在用药禁忌："
+                    + "、".join(f"「{condition}」" for condition in matched)
+                    + "（知识库 Herb.contraindications 精确匹配）。请医师核对后决定是否换药或调整。"
+                ),
+            )
+        )
+    return issues
+
+
+def _medication_interaction_coverage_issue() -> SafetyIssue:
+    """固定的用药相互作用覆盖率门禁 issue（R4-A/R4-B，fail-closed）。
+
+    文本完全固定、不含任何药物名称，保证审计可复现。
+    """
+    return SafetyIssue(
+        type=SafetyIssueType.MEDICATION_INTERACTION_COVERAGE,
+        severity=Severity.HIGH,
+        herbs=[],
+        rule_source=_MEDICATION_INTERACTION_RULE_SOURCE,
+        suggestion=(
+            "MEDICATION_INTERACTION_VERIFICATION_REQUIRED: 患者正在用药，"
+            "知识库无权威中药-西药相互作用数据，发药前必须由医师人工核对相互作用。"
+        ),
+    )
+
+
+def _check_medication_interaction_coverage(patient_info: PatientInfo) -> list[SafetyIssue]:
+    """用药-药物相互作用覆盖率门禁（R4-A/R4-B，fail-closed）。
+
+    患者存在用药且本仓库没有权威中药-西药相互作用数据时，发射**恰好一条** HIGH
+    兜底 issue，要求医师人工核对相互作用。这是覆盖率阻断而非虚构的相互作用结论；
+    药物名称不进入 rule_source/suggestion。
+
+    R4-B 修复：
+    - 只要存在任意**非空白**报告条目即触发门禁——包括超长条目（无法在不越界
+      扫描的前提下确认其内容）以及条目数超过上限的列表；
+    - 只有空/纯空白条目的列表保持为空、不触发门禁；
+    - 超长或非法首条目不会"遮蔽"后续合法用药（存在性判定逐条扫描全部条目）。
+    """
+    if _HAS_AUTHORITATIVE_HERB_DRUG_INTERACTION_DATA:
+        return []
+    medications = patient_info.current_medications
+    if _medications_overflow(medications):
+        return [_medication_interaction_coverage_issue()]
+    if any(_has_non_whitespace_medication(entry) for entry in (medications or ())):
+        return [_medication_interaction_coverage_issue()]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # 未知药名检查（保守假设：§1.1）
 # ---------------------------------------------------------------------------
 
@@ -867,6 +1195,12 @@ _RULE_ORDER: dict[SafetyIssueType, int] = {
     SafetyIssueType.ALLERGY: 5,
     SafetyIssueType.UNIT_CONVERSION: 6,
     SafetyIssueType.CAUTION: 7,
+    # R4-A 患者特定规则（追加在既有规则之后，保持既有相对顺序不变）。
+    SafetyIssueType.HERB_CONTRAINDICATION: 8,
+    SafetyIssueType.MEDICATION_INTERACTION_COVERAGE: 9,
+    # R4-B fail-closed 覆盖率门禁（继续追加，保持既有相对顺序不变）。
+    SafetyIssueType.HERB_CONTRAINDICATION_COVERAGE: 10,
+    SafetyIssueType.PATIENT_CONTEXT_COVERAGE: 11,
 }
 
 

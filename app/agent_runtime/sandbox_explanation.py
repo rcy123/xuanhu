@@ -171,7 +171,7 @@ def _json_ready(value: object) -> object:
         return value.model_dump(mode="json")
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_ready(item) for item in value]
     return value
 
@@ -236,7 +236,7 @@ def _parse_model[ModelT: BaseModel](
     value: object,
 ) -> ModelT | None:
     try:
-        if isinstance(value, (str, bytes, bytearray)):
+        if isinstance(value, str | bytes | bytearray):
             return model_type.model_validate_json(value, strict=True)
         if isinstance(value, BaseModel):
             value = value.model_dump(mode="python")
@@ -247,7 +247,7 @@ def _parse_model[ModelT: BaseModel](
         return None
 
 
-type _SourceInvariants = tuple[
+_SourceInvariants = tuple[
     str,
     str,
     SandboxSafetyDecision,
@@ -256,7 +256,7 @@ type _SourceInvariants = tuple[
     str,
     str,
 ]
-type _AllowlistInvariants = tuple[str, tuple[tuple[str, str], ...]]
+_AllowlistInvariants = tuple[str, tuple[tuple[str, str], ...]]
 
 
 def _source_invariants(source: SandboxSafetyResultV1) -> _SourceInvariants:

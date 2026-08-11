@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -262,7 +263,7 @@ def validate_bundle_records(bundle: LoadedBundle) -> dict[str, TypeImportStats]:
     unit_lookup = _build_lookup(units, name_field="unit_name")
     herb_lookup = _build_lookup(herbs, name_field="name")
 
-    validators = {
+    validators: dict[str, Callable[[Any, int], list[dict[str, Any]]]] = {
         "dosage_units": lambda row, index: validate_dosage_unit(row, index),
         "herbs": lambda row, index: validate_herb(row, index),
         "formulas": lambda row, index: validate_formula(
@@ -639,13 +640,13 @@ async def _import_cases(
 
 
 def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, str | int | float | bool):
         return value
-    if isinstance(value, (uuid.UUID, datetime, date, Decimal)):
+    if isinstance(value, uuid.UUID | datetime | date | Decimal):
         return str(value)
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_safe(item) for item in value]
     return str(value)
 

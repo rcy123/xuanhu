@@ -464,7 +464,6 @@ async def resolve_committed_record_advance(
             or session.current_stage != "done"
             or session.status != "done"
             or session.pending_review
-            or session.recovery_status != "normal"
             or session.state_version != commit.output_state_version
             or run is None
             or run.session_id != session_id
@@ -842,7 +841,7 @@ def _clinical_record_fields(
         diagnosis = str(syndrome.get("syndrome") or "")
         treatment_principle = str(syndrome.get("treatment_principle") or "")
         basis = syndrome.get("syndrome_basis") or ()
-        if isinstance(basis, (list, tuple)):
+        if isinstance(basis, list | tuple):
             claims = [str(item.get("claim") or "") for item in basis if isinstance(item, dict)]
             syndrome_process = "；".join(c for c in claims if c)
         if not syndrome_process:
@@ -900,11 +899,11 @@ async def _draft_record_narrative(
     run_id: uuid.UUID,
 ) -> tuple[dict[str, str], str]:
     """生成叙述性段落（饮食建议/预后）；失败降级为固定话术，绝不中断病历流程。"""
+    from app.agent_runtime.specs import RunSpec
     from app.agents.record_narrative import (
         build_record_narrative_agent_spec,
         execute_record_narrative,
     )
-    from app.agent_runtime.specs import RunSpec
     from app.core.config import get_settings
     from app.schemas.record_narrative import (
         RECORD_NARRATIVE_POLICY_VERSION,

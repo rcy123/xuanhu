@@ -20,6 +20,8 @@ from app.agent_runtime.lifecycle import (
 )
 from app.api.advance import advance_exception_handlers
 from app.api.advance import router as advance_router
+from app.api.commands import command_exception_handlers
+from app.api.commands import router as commands_router
 from app.api.health import router as health_router
 from app.api.messages import message_exception_handlers
 from app.api.messages import router as messages_router
@@ -70,6 +72,8 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
     stop: asyncio.Event | None = None
     publisher_task: asyncio.Task[None] | None = None
+    command_stop: asyncio.Event | None = None
+    command_task: asyncio.Task[None] | None = None
     try:
         if settings.outbox_publisher_enabled:
             from app.agent_runtime.repository import PostgresDomainRepository
@@ -94,30 +98,107 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                 publisher.run_forever(stop),
                 name="xuanhu-outbox-publisher",
             )
+        # R6-A async-command worker, R6-B business handlers, R7 rollout default.
+        # Admission is initialized disabled unconditionally (also clearing stale
+        # state from a prior lifespan). When the worker is enabled (R7 default
+        # true; operator kill switch = set false), handlers are registered ONLY
+        # if the shared LangGraph runtime started; a runtime that failed to start
+        # (or an empty registry) leaves admission disabled, so the three POST
+        # routes fail closed to the synchronous R1-R5 path. Readiness is marked
+        # only by the supervised worker task itself once it is actually running
+        # (start handshake), so admission can never read "ready" with no consumer.
+        from app.agent_runtime.async_command_lifecycle import (
+            disable_async_command_state,
+            init_async_command_state,
+            run_supervised_async_command_worker,
+        )
+
+        init_async_command_state(app.state)
+        command_started: asyncio.Event | None = None
+        if settings.async_command_enabled:
+            from app.agent_runtime.async_command import PostgresAsyncCommandRepository
+            from app.agent_runtime.async_command_worker import build_async_command_worker
+            from app.agent_runtime.async_handlers import build_async_command_handlers
+            from app.db.session import get_session_factory
+
+            runtime_state = getattr(app.state, "langgraph_runtime_state", None)
+            ready_runtime = (
+                runtime_state.runtime
+                if runtime_state is not None
+                and getattr(runtime_state, "status", "") == "ready"
+                else None
+            )
+            handlers = build_async_command_handlers(ready_runtime)
+            if handlers:
+                command_stop = asyncio.Event()
+                command_started = asyncio.Event()
+                worker = build_async_command_worker(
+                    PostgresAsyncCommandRepository(get_session_factory()),
+                    handlers=handlers,
+                    worker_id=f"async-{uuid.uuid4().hex}",
+                    batch_size=settings.async_command_batch_size,
+                    lease_seconds=settings.async_command_lease_seconds,
+                    heartbeat_interval_seconds=settings.async_command_heartbeat_seconds,
+                    max_attempts=settings.async_command_max_attempts,
+                    retry_base_seconds=settings.async_command_retry_base_seconds,
+                    retry_max_seconds=settings.async_command_retry_max_seconds,
+                    poll_interval_seconds=settings.async_command_poll_interval_seconds,
+                )
+                app.state.async_command_worker = worker
+                command_task = asyncio.create_task(
+                    run_supervised_async_command_worker(
+                        app_state=app.state,
+                        worker=worker,
+                        stop=command_stop,
+                        started=command_started,
+                        handler_operations=frozenset(handlers.keys()),
+                    ),
+                    name="xuanhu-async-command-worker",
+                )
+                # Start handshake: only begin serving once the worker task has
+                # actually been scheduled and marked readiness. If the task never
+                # runs (pathological loop failure), fail closed and stay disabled.
+                await command_started.wait()
         yield
     finally:
         try:
-            if stop is not None and publisher_task is not None:
-                stop.set()
+            if command_stop is not None and command_task is not None:
+                # Disable admission BEFORE stopping the worker so no new commands
+                # are accepted during the shutdown drain window.
+                disable_async_command_state(app.state)
+                command_stop.set()
                 try:
                     await asyncio.wait_for(
-                        asyncio.shield(publisher_task),
-                        timeout=settings.outbox_publisher_shutdown_grace_seconds,
+                        asyncio.shield(command_task),
+                        timeout=settings.async_command_shutdown_grace_seconds,
                     )
                 except TimeoutError:
-                    publisher_task.cancel()
+                    command_task.cancel()
                     with suppress(asyncio.CancelledError):
-                        await publisher_task
+                        await command_task
         finally:
             try:
-                if runtime_entered:
-                    await runtime_cm.__aexit__(None, None, None)
+                if stop is not None and publisher_task is not None:
+                    stop.set()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(publisher_task),
+                            timeout=settings.outbox_publisher_shutdown_grace_seconds,
+                        )
+                    except TimeoutError:
+                        publisher_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await publisher_task
             finally:
-                app.state.langgraph_runtime_state = LangGraphRuntimeState(
-                    status="closed"
-                )
-                # 关闭 gateway 连接池
-                await gateway.aclose()
+                try:
+                    if runtime_entered:
+                        await runtime_cm.__aexit__(None, None, None)
+                finally:
+                    app.state.langgraph_runtime_state = LangGraphRuntimeState(
+                        status="closed"
+                    )
+                    # 关闭 gateway 连接池
+                    await gateway.aclose()
 
 
 app = FastAPI(
@@ -137,6 +218,7 @@ app.include_router(review_router)
 app.include_router(record_router)
 app.include_router(advance_router)
 app.include_router(safety_confirmations_router)
+app.include_router(commands_router)
 
 # 注册会话、消息、恢复、review 与 record 路由自定义异常处理器
 for exc_cls, handler in {
@@ -147,6 +229,7 @@ for exc_cls, handler in {
     **record_exception_handlers,
     **advance_exception_handlers,
     **safety_confirmation_exception_handlers,
+    **command_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
 

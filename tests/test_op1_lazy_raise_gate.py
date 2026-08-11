@@ -203,6 +203,9 @@ async def test_get_state_with_supersede_chain_no_lazy_load(
     original_id = uuid.uuid4()
     corrected_id = uuid.uuid4()
     async with factory() as db, db.begin():
+        # Domain invariant (chk_observations_status_relation): the ACTIVE head
+        # carries no supersedes pointer; the CORRECTED successor points at the
+        # observation it replaces via supersedes_observation_id.
         db.add(
             Observation(
                 id=original_id,
@@ -211,7 +214,7 @@ async def test_get_state_with_supersede_chain_no_lazy_load(
                 value="migraine",
                 normalized_value="migraine",
                 source_message_id=message_id,
-                status=ObservationStatus.CORRECTED.value,
+                status=ObservationStatus.ACTIVE.value,
                 confidence=0.8,
                 supersedes_observation_id=None,
             )
@@ -224,7 +227,7 @@ async def test_get_state_with_supersede_chain_no_lazy_load(
                 value="headache",
                 normalized_value="headache",
                 source_message_id=message_id,
-                status=ObservationStatus.ACTIVE.value,
+                status=ObservationStatus.CORRECTED.value,
                 confidence=0.95,
                 supersedes_observation_id=original_id,
             )
@@ -236,8 +239,8 @@ async def test_get_state_with_supersede_chain_no_lazy_load(
     active = [o for o in state.observations if o.status == ObservationStatus.ACTIVE]
     corrected = [o for o in state.observations if o.status == ObservationStatus.CORRECTED]
     assert len(active) == 1 and len(corrected) == 1
-    assert active[0].supersedes_observation_id == original_id
-    assert corrected[0].supersedes_observation_id is None
+    assert active[0].supersedes_observation_id is None
+    assert corrected[0].supersedes_observation_id == original_id
 
 
 async def test_get_state_with_safety_profile_no_lazy_load(
@@ -407,6 +410,9 @@ async def test_get_state_full_domain_snapshot_exercises_all_converters(
             )
         )
         await db.flush()
+        # Domain invariant (chk_observations_status_relation): the ACTIVE head
+        # carries no supersedes pointer; the CORRECTED successor points at the
+        # observation it replaces via supersedes_observation_id.
         db.add(
             Observation(
                 id=superseded_id,
@@ -415,7 +421,7 @@ async def test_get_state_full_domain_snapshot_exercises_all_converters(
                 value="old-value",
                 normalized_value="old-value",
                 source_message_id=message_id,
-                status=ObservationStatus.CORRECTED.value,
+                status=ObservationStatus.ACTIVE.value,
                 confidence=0.7,
             )
         )
@@ -427,7 +433,7 @@ async def test_get_state_full_domain_snapshot_exercises_all_converters(
                 value="headache",
                 normalized_value="headache",
                 source_message_id=message_id,
-                status=ObservationStatus.ACTIVE.value,
+                status=ObservationStatus.CORRECTED.value,
                 confidence=0.95,
                 supersedes_observation_id=superseded_id,
             )
@@ -474,8 +480,11 @@ async def test_get_state_full_domain_snapshot_exercises_all_converters(
     # Observations
     assert len(state.observations) == 3
     active = [o for o in state.observations if o.status == ObservationStatus.ACTIVE]
+    corrected = [o for o in state.observations if o.status == ObservationStatus.CORRECTED]
     assert len(active) == 2
-    assert active[0].supersedes_observation_id == superseded_id
+    assert all(o.supersedes_observation_id is None for o in active)
+    assert len(corrected) == 1
+    assert corrected[0].supersedes_observation_id == superseded_id
 
     # Safety
     assert state.safety_profile is not None

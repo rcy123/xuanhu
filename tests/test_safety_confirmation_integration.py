@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -12,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from app.api.request_context import WriteRequestContext
+from app.core.config import get_settings
 from app.core.exceptions import InvalidStageTransitionError, ValidationError
 from app.db.session import get_session_factory
 from app.main import app
@@ -38,6 +40,7 @@ from app.schemas.intake import (
     RedFlagCategory,
     SafetyListDelta,
 )
+from app.schemas.safety_confirmation import SafetyAssertionStatus, SafetyFactAssertionRead
 from app.services.safety_confirmation import SafetyConfirmationService
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
@@ -142,6 +145,7 @@ _FINAL_INQUIRY_FACT_KEYS = (
     "ten_questions.chest_abdomen",
     "ten_questions.thirst",
     "ten_questions.sleep",
+    "four_diagnosis.inspection",
 )
 
 
@@ -714,3 +718,170 @@ async def test_explicit_structured_form_is_confirmed_with_privacy_minimal_audit(
         assert "青霉素" not in json.dumps(
             [row.payload for row in audit_rows], ensure_ascii=False, sort_keys=True
         )
+
+
+async def test_r2c_positive_confirmation_overrides_explicitly_none_profile_with_slot_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-C confirmation transition: a doctor-confirmed positive model-extraction
+    allergy proposal flips a pre-existing explicitly_none profile to collected.
+
+    The seeded explicitly_none profile mirrors what the R2-C intake flow already
+    persists. Confirmation runs against the real PostgreSQL ledger: an exact
+    same-key replay and a duplicate confirm with a different public key both
+    return the same authoritative assertion without writing a second transition
+    or recompute outbox event. Slot gray-scale on/off must leave the compact
+    safety/domain semantics identical.
+    """
+
+    async def run_case(slot_enabled: bool) -> dict[str, Any]:
+        monkeypatch.setattr(get_settings(), "intake_slot_path_enabled", slot_enabled)
+        factory = get_session_factory()
+        slot_tag = "on" if slot_enabled else "off"
+
+        # 1. Grounded model-extraction allergy proposal for penicillin.
+        session_id, _, assertion_id = await _create_proposal(
+            text="我对青霉素过敏",
+            allergen="青霉素",
+        )
+
+        # 2. The R2-C intake flow already recorded an authoritative
+        #    explicitly_none allergy profile; persist it for this session.
+        async with factory() as db, db.begin():
+            db.add(
+                SafetyProfile(
+                    id=uuid.uuid4(),
+                    session_id=session_id,
+                    allergy_collection_status="explicitly_none",
+                    allergens=None,
+                )
+            )
+
+        # 3. Before confirmation: proposal is PROPOSED and the profile says
+        #    explicitly_none; record the pre-confirmation state version.
+        async with factory() as db:
+            assertion = await db.get(SafetyFactAssertion, assertion_id)
+            profile = await db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session_id))
+            session = await db.get(ConsultSession, session_id)
+            assert assertion is not None and assertion.status == "proposed"
+            assert profile is not None
+            assert profile.allergy_collection_status == "explicitly_none"
+            assert profile.allergens is None
+            assert session is not None
+            state_version_before = session.state_version
+            profile_before = (profile.allergy_collection_status, tuple(profile.allergens or ()))
+
+        key = f"r2c-confirm-{slot_tag}"
+        actor_id = "doctor-safety"
+
+        async def _confirm(idempotency_key: str) -> SafetyFactAssertionRead:
+            async with factory() as db, db.begin():
+                return await SafetyConfirmationService(db).transition(
+                    session_id=session_id,
+                    assertion_id=assertion_id,
+                    action="confirm",
+                    actor_id=actor_id,
+                    context=WriteRequestContext(
+                        trace_id=uuid.uuid4().hex,
+                        idempotency_key=idempotency_key,
+                        is_idempotent=True,
+                    ),
+                    reason_code=None,
+                )
+
+        # 4. Confirm the positive proposal in one committed transaction.
+        confirmed = await _confirm(key)
+        assert confirmed.status is SafetyAssertionStatus.CONFIRMED
+        assert confirmed.source_kind == "model_extraction"
+
+        async with factory() as db:
+            session = await db.get(ConsultSession, session_id)
+            assert session is not None and session.state_version == state_version_before + 1
+            state_version_after_confirm = session.state_version
+
+        # 5. Replay the exact same request/key: same assertion, no duplicate
+        #    transition or recompute outbox event, and the state version stays.
+        replayed = await _confirm(key)
+        assert replayed == confirmed
+        async with factory() as db:
+            session = await db.get(ConsultSession, session_id)
+            assert session is not None and session.state_version == state_version_after_confirm
+            replay_transitions = await db.scalar(
+                select(func.count()).select_from(SafetyFactTransition).where(
+                    SafetyFactTransition.assertion_id == assertion_id
+                )
+            )
+            replay_outbox = await db.scalar(
+                select(func.count()).select_from(OutboxEvent).where(
+                    OutboxEvent.session_id == session_id,
+                    OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+                )
+            )
+            assert replay_transitions == 1
+            assert replay_outbox == 1
+
+        # 8. Duplicate confirm with a different public key returns the already
+        #    authoritative result without inventing a second doctor decision.
+        duplicate = await _confirm(f"{key}-dup")
+        assert duplicate == confirmed
+
+        # 6. Final state: collected profile, confirmed provenance, nothing
+        #    deleted, and exactly one transition/outbox event survived replay.
+        async with factory() as db:
+            session = await db.get(ConsultSession, session_id)
+            profile = await db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session_id))
+            assertion = await db.get(SafetyFactAssertion, assertion_id)
+            transition_count = await db.scalar(
+                select(func.count()).select_from(SafetyFactTransition).where(
+                    SafetyFactTransition.assertion_id == assertion_id
+                )
+            )
+            outbox_count = await db.scalar(
+                select(func.count()).select_from(OutboxEvent).where(
+                    OutboxEvent.session_id == session_id,
+                    OutboxEvent.event_type == "safety_confirmation.recomputed.v1",
+                )
+            )
+            assertion_count = await db.scalar(
+                select(func.count()).select_from(SafetyFactAssertion).where(
+                    SafetyFactAssertion.session_id == session_id
+                )
+            )
+            assert session is not None and session.state_version == state_version_after_confirm
+            assert profile is not None
+            assert profile.allergy_collection_status == "collected"
+            assert profile.allergens == ["青霉素"]
+            assert assertion is not None
+            assert assertion.status == "confirmed"
+            assert assertion.source_kind == "model_extraction"
+            assert assertion.confirmed_by_actor_type == "doctor"
+            assert assertion.confirmed_by_actor_id == actor_id
+            assert assertion.confirmed_at is not None
+            assert assertion_count == 1
+            assert transition_count == 1
+            assert outbox_count == 1
+            return {
+                "profile_before": profile_before,
+                "profile_after": (profile.allergy_collection_status, tuple(profile.allergens or ())),
+                "assertion_before": ("proposed", "model_extraction"),
+                "assertion_after": (assertion.status, assertion.source_kind),
+                "state_version_delta": state_version_after_confirm - state_version_before,
+                "transition_count": transition_count,
+                "recompute_event_count": outbox_count,
+            }
+
+    slot_results: dict[bool, dict[str, Any]] = {}
+    for slot_enabled in (False, True):
+        slot_results[slot_enabled] = await run_case(slot_enabled)
+
+    # 7. Slot on/off produce identical compact safety semantics with an exact
+    #    +1 state-version delta and a single transition/recompute event.
+    for _slot_enabled, result in slot_results.items():
+        assert result["profile_before"] == ("explicitly_none", ())
+        assert result["profile_after"] == ("collected", ("青霉素",))
+        assert result["assertion_before"] == ("proposed", "model_extraction")
+        assert result["assertion_after"] == ("confirmed", "model_extraction")
+        assert result["state_version_delta"] == 1
+        assert result["transition_count"] == 1
+        assert result["recompute_event_count"] == 1
+    assert slot_results[False] == slot_results[True]

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from app.core.config import get_settings
 from app.rag.schemas import Evidence
@@ -130,7 +130,7 @@ def _fact_text(value: Any) -> str:
             if isinstance(v, str) and v:
                 parts.append(v)
         return "，".join(parts)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return "，".join(str(v) for v in value if v)
     return str(value)
 
@@ -487,7 +487,7 @@ async def _retrieve_with_degrade(
             top_k=top_k,
         )
         logger.info("RAG %s 检索完成: query_len=%d hits=%d", stage, len(query), len(results), extra=extra)
-        return results
+        return cast(list[Evidence], results)
     except Exception as exc:  # noqa: BLE001 - 检索失败必须降级而非阻断推理
         logger.warning(
             "RAG %s 检索失败，降级为空证据模式: %s: %s",

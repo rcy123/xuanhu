@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.agent_runtime.observation_projection import project_current_observations
 from app.schemas.domain import (
     ArtifactRevisionSchema,
     ArtifactStatus,
@@ -144,17 +146,11 @@ def _observation_value_key(observation: ObservationSchema) -> str:
     return _json_value(value)
 
 
-def _current_observations(observations: list[ObservationSchema]) -> list[ObservationSchema]:
-    superseded_ids = {
-        item.supersedes_observation_id
-        for item in observations
-        if item.status is not ObservationStatus.ACTIVE and item.supersedes_observation_id is not None
-    }
-    return [
-        item
-        for item in observations
-        if item.observation_id not in superseded_ids and item.status is not ObservationStatus.RETRACTED
-    ]
+def _current_observations(observations: Sequence[ObservationSchema]) -> list[ObservationSchema]:
+    # Chain heads are the current semantic truths: CORRECTED successors count,
+    # superseded targets and RETRACTED heads do not.  The projection is the
+    # single deterministic source so every consumer agrees on chain position.
+    return list(project_current_observations(observations))
 
 
 def _same_observation_event(left: ObservationSchema, right: ObservationSchema) -> bool:
@@ -224,22 +220,28 @@ def _apply_observations(
         elif candidate.value is None and candidate.normalized_value is None:
             raise DomainReducerError(ReducerErrorCode.OBSERVATION_VALUE_REQUIRED)
 
-        semantic_duplicate = next(
-            (item for item in observations if _same_observation_event(item, candidate)),
-            None,
-        )
-        if semantic_duplicate is not None:
-            continue
+        # Semantic replay of an already-applied CORRECT/RETRACT event (new
+        # observation id, identical provenance) is a no-op.  ACTIVE facts are
+        # decided against the current chain head below: their "current value"
+        # is the head's effective value, not any historical row, so re-adding
+        # an old superseded value must conflict rather than replay.
+        if candidate.status is not ObservationStatus.ACTIVE:
+            semantic_duplicate = next(
+                (item for item in observations if _same_observation_event(item, candidate)),
+                None,
+            )
+            if semantic_duplicate is not None:
+                continue
 
         current = _current_observations(observations)
         if candidate.status is ObservationStatus.ACTIVE:
-            conflicting = [
-                item
-                for item in current
-                if item.fact_key == candidate.fact_key
-                and _observation_value_key(item) != _observation_value_key(candidate)
-            ]
-            if conflicting:
+            same_key = [item for item in current if item.fact_key == candidate.fact_key]
+            if same_key:
+                if any(_observation_value_key(item) == _observation_value_key(candidate) for item in same_key):
+                    # Same canonical fact_key and same effective value as a
+                    # current semantic fact: true no-op regardless of
+                    # observation_id/source/confidence/created_at.
+                    continue
                 raise DomainReducerError(ReducerErrorCode.OBSERVATION_SOURCE_CONFLICT)
         else:
             target = next(
@@ -253,14 +255,19 @@ def _apply_observations(
             if target.fact_key != candidate.fact_key:
                 raise DomainReducerError(ReducerErrorCode.OBSERVATION_FACT_KEY_MISMATCH)
             if candidate.status is ObservationStatus.CORRECTED:
-                conflicts = [
+                if _observation_value_key(target) == _observation_value_key(candidate):
+                    # CORRECT to the same effective value as the exact current
+                    # chain head is a true no-op regardless of new id/source.
+                    continue
+                # A different-value CORRECT must leave exactly one current truth
+                # for its canonical key: any other current head of the same key
+                # would produce two truths, which a single delta may not create.
+                other_heads = [
                     item
                     for item in current
-                    if item.fact_key == candidate.fact_key
-                    and item.observation_id != target.observation_id
-                    and _observation_value_key(item) != _observation_value_key(candidate)
+                    if item.fact_key == candidate.fact_key and item.observation_id != target.observation_id
                 ]
-                if conflicts:
+                if other_heads:
                     raise DomainReducerError(ReducerErrorCode.OBSERVATION_SOURCE_CONFLICT)
 
         observations.append(candidate.model_copy(deep=True))

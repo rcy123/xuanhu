@@ -313,7 +313,7 @@ def validate_dosage_unit(item: dict[str, Any], index: int) -> list[dict[str, Any
                 "level": "blocker", "field": "to_grams", "index": index,
                 "message": f"conversion_type={conv_type} 时 to_grams 必须非空",
             })
-        elif not isinstance(to_grams, (int, float)) or to_grams <= 0:
+        elif not isinstance(to_grams, int | float) or to_grams <= 0:
             issues.append({
                 "level": "blocker", "field": "to_grams", "index": index,
                 "message": f"to_grams 必须 > 0，当前: {to_grams}",
@@ -358,7 +358,7 @@ def validate_herb(item: dict[str, Any], index: int) -> list[dict[str, Any]]:
             "message": f"药材 '{name}' 缺少 max_dose（数据缺口）",
             "name": name,
         })
-    elif not isinstance(max_dose, (int, float)) or max_dose <= 0:
+    elif not isinstance(max_dose, int | float) or max_dose <= 0:
         issues.append({
             "level": "blocker", "field": "max_dose", "index": index,
             "message": f"药材 '{name}' 的 max_dose 必须 > 0，当前: {max_dose}",
@@ -436,7 +436,7 @@ def validate_formula(
             })
 
         # 校验 dose
-        if dose is not None and (not isinstance(dose, (int, float)) or dose <= 0):
+        if dose is not None and (not isinstance(dose, int | float) or dose <= 0):
             issues.append({
                 "level": "blocker", "field": "composition", "index": index,
                 "comp_index": ci,

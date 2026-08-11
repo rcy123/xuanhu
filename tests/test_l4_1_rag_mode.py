@@ -25,7 +25,6 @@ from app.agent_runtime.specs import RunArtifact, RunSpec
 from app.agent_runtime.syndrome_verifier import (
     SYNDROME_AGENT_VERSION,
     SYNDROME_PROMPT_VERSION,
-    SYNDROME_RAG_AGENT_NAME,
     SYNDROME_RAG_PROMPT_VERSION,
     SyndromeGateAuthority,
     SyndromeVerificationFailureCode,

@@ -55,6 +55,10 @@ from app.schemas.intake import (
     RedFlagCategory,
     SafetyListDelta,
 )
+from app.services.langgraph_intake import (
+    _BOUND_UNCERTAIN_NEGATION_AMBIGUITY_DESCRIPTION,
+    _bound_ambiguous_negation_output,
+)
 
 MANIFEST = Path(__file__).parents[1] / "app" / "agents" / "prompts" / "manifest.yaml"
 
@@ -1158,3 +1162,170 @@ def test_prompt_contract_mismatch_returns_fixed_code_without_patient_text() -> N
     assert result.failure_code is IntakeBoundaryFailureCode.PROMPT_CONTRACT_MISMATCH
     assert gateway.actual_request_count == 0
     assert "Alice" not in result.model_dump_json()
+
+
+def _allergy_reply(text: str) -> IntakeExtractionInput:
+    return make_input(
+        text,
+        reply_context=IntakeReplyContext(
+            question_message_id=uuid4(),
+            selected_dimension=InquiryDimension.ALLERGY_STATUS,
+            selection_kind="required",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "不确定",
+        "不知道",
+        "不好说",
+        "不清楚",
+        "说不准",
+        "说不好",
+        "说不清",
+        "我不确定",
+        "我不太清楚",
+        "不太确定",
+        "不确定吧",
+        "not sure",
+        "unsure",
+        "maybe not",
+        "probably not",
+        "I don't think so",
+        "I'm not sure",
+    ),
+)
+def test_bound_uncertain_negation_returns_one_clarification_ambiguity(text: str) -> None:
+    payload = _allergy_reply(text)
+    output = _bound_ambiguous_negation_output(payload)
+    assert output is not None
+    assert output.decision is IntakeExtractionDecision.NEEDS_CLARIFICATION
+    # No assertion candidate, no profile projection, no observation, no red flag.
+    assert output.patient_safety_delta.has_candidate() is False
+    assert len(output.observations) == 0
+    assert len(output.red_flag_candidates) == 0
+    assert len(output.ambiguities) == 1
+    ambiguity = output.ambiguities[0]
+    assert ambiguity.code is AmbiguityCode.UNCERTAIN_NEGATION
+    assert ambiguity.source_message_id == payload.current_messages[0].message_id
+    assert ambiguity.fact_key == InquiryDimension.ALLERGY_STATUS.value
+    assert ambiguity.description == _BOUND_UNCERTAIN_NEGATION_AMBIGUITY_DESCRIPTION
+
+
+def test_bound_uncertain_negation_ambiguity_is_phi_safe_fixed_text() -> None:
+    payload = _allergy_reply("不确定")
+    output = _bound_ambiguous_negation_output(payload)
+    assert output is not None
+    description = output.ambiguities[0].description
+    # The description is a fixed constant and never echoes patient content.
+    assert description == _BOUND_UNCERTAIN_NEGATION_AMBIGUITY_DESCRIPTION
+    assert "不确定" not in description
+    assert payload.current_messages[0].content not in description
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "没有",
+        "无",
+        "否",
+        "no",
+        "none",
+        "有",
+        "是的",
+        "是",
+        "正常",
+        "你好",
+        "我不确定有没有过敏史",
+        "以前不确定",
+        "家人不确定",
+        "不确定，但好像有点痒",
+    ),
+)
+def test_bound_uncertain_negation_is_strict_about_reply_content(text: str) -> None:
+    assert _bound_ambiguous_negation_output(_allergy_reply(text)) is None
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    (
+        InquiryDimension.TEN_PAIN,
+        InquiryDimension.CHIEF_COMPLAINT_SYMPTOM,
+        InquiryDimension.FOUR_DIAGNOSIS,
+    ),
+)
+def test_bound_uncertain_negation_is_safety_only(dimension: InquiryDimension) -> None:
+    payload = make_input(
+        "不确定",
+        reply_context=IntakeReplyContext(
+            question_message_id=uuid4(),
+            selected_dimension=dimension,
+            selection_kind="required",
+        ),
+    )
+    assert _bound_ambiguous_negation_output(payload) is None
+
+
+def test_bound_uncertain_negation_requires_single_reply_bound_message() -> None:
+    unbound = make_input("不确定")
+    assert _bound_ambiguous_negation_output(unbound) is None
+
+    multi = IntakeExtractionInput(
+        current_messages=(
+            IntakeMessage(message_id=uuid4(), role=IntakeMessageRole.PATIENT, content="不确定"),
+            IntakeMessage(message_id=uuid4(), role=IntakeMessageRole.PATIENT, content="不确定"),
+        ),
+        reply_context=IntakeReplyContext(
+            question_message_id=uuid4(),
+            selected_dimension=InquiryDimension.ALLERGY_STATUS,
+            selection_kind="required",
+        ),
+    )
+    assert _bound_ambiguous_negation_output(multi) is None
+
+
+def test_bound_uncertain_negation_requires_required_selection_kind() -> None:
+    # A conflict-bound (or any non-required) reply must never take the
+    # deterministic shortcut: the ambiguity stays on the model path so the
+    # conflict resolution owns it rather than being short-circuited.
+    conflict = make_input(
+        "不确定",
+        reply_context=IntakeReplyContext(
+            question_message_id=uuid4(),
+            selected_dimension=InquiryDimension.ALLERGY_STATUS,
+            selection_kind="conflict",
+        ),
+    )
+    assert _bound_ambiguous_negation_output(conflict) is None
+
+
+@pytest.mark.asyncio
+async def test_uncertain_explicit_none_candidate_still_fails_grounding() -> None:
+    text = "不确定"
+    source = uuid4()
+    payload = make_input(
+        text,
+        message_id=source,
+        reply_context=IntakeReplyContext(
+            question_message_id=uuid4(),
+            selected_dimension=InquiryDimension.ALLERGY_STATUS,
+            selection_kind="required",
+        ),
+    )
+    unsafe = IntakeExtractionOutput(
+        decision=IntakeExtractionDecision.EXTRACTED,
+        patient_safety_delta=PatientSafetyDelta(
+            allergy=SafetyListDelta(
+                status=CollectionStatus.EXPLICITLY_NONE,
+                source_message_id=source,
+                negation_span=evidence_span(source, text),
+            )
+        ),
+    )
+    result, gateway = await execute(payload, unsafe)
+    assert result.status is IntakeExecutionStatus.FAILED
+    assert result.failure_code is IntakeVerificationFailureCode.GROUNDING_VALUE_MISMATCH
+    assert result.output is None
+    assert gateway.actual_request_count == 1

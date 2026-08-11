@@ -31,6 +31,7 @@ class BoundedTTLCache[K, V](MutableMapping[K, V]):
         self._ttl_seconds = ttl_seconds
         self._entries: OrderedDict[K, _Entry[V]] = OrderedDict()
 
+
     @property
     def max_size(self) -> int:
         return self._max_size

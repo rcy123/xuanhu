@@ -271,6 +271,10 @@ export type EventType =
   | 'doctor.reviewed'
   | 'heartbeat'
   | 'resync'
+  | 'command.queued'
+  | 'command.running'
+  | 'command.succeeded'
+  | 'command.failed'
 
 // ---------------------------------------------------------------------------
 // §4.1 会话管理
@@ -680,6 +684,112 @@ export interface SessionEvent<T = Record<string, unknown>> {
     session_id?: string
     timestamp?: string
   }
+}
+
+/** 异步命令生命周期（command.*）事件 payload，与后端 Outbox→SSE 投影一致。
+ *
+ * 仅承载有界的标识符/操作/状态/attempt，以及失败时的固定 error_code。
+ * 绝不携带私有 request/result payload、异常文本或 digests。 */
+export interface CommandEventPayload {
+  command_id: string
+  operation: CommandOperation
+  status: CommandStatus
+  attempt: number
+  /** 仅 command.failed 事件携带，来自后端固定的 PHI 安全错误码白名单。 */
+  error_code?: string
+}
+
+/** R6-B 异步命令操作。 */
+export type CommandOperation = 'intake.message' | 'session.advance' | 'prescription.review'
+
+/** R6-B 异步命令状态。 */
+export type CommandStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+
+/** 状态 GET 接口返回的有界终端结果（仅 succeed 时）。 */
+export interface AsyncCommandResultInfo {
+  http_status?: number | null
+}
+
+/** 状态 GET 接口返回的有界失败信息（仅 failed 时）。 */
+export interface AsyncCommandErrorInfo {
+  code?: string | null
+}
+
+/** 状态 GET 接口返回的时间戳。 */
+export interface AsyncCommandTimestamps {
+  created_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  updated_at?: string | null
+}
+
+/** 状态 GET 接口返回的稳定链接。 */
+export interface AsyncCommandLinks {
+  self: string
+  session: string
+  stream: string
+}
+
+/** 异步命令公共状态（与后端 AsyncCommandStatus 对齐，全部有界且 PHI 安全）。 */
+export interface AsyncCommandStatus {
+  command_id: string
+  operation: CommandOperation
+  status: CommandStatus
+  attempt_count: number
+  result?: AsyncCommandResultInfo | null
+  error?: AsyncCommandErrorInfo | null
+  timestamps: AsyncCommandTimestamps
+  links: AsyncCommandLinks
+}
+
+/**
+ * R6-B/R7 HTTP 202 接受响应（R7 后端就绪时默认返回，`Prefer: respond-async`
+ * 只是兼容偏好头；未就绪时回退同步业务结果）。
+ * 仅含命令标识、操作、状态、replayed/attempt 与稳定链接；不包含任何业务结果。
+ * 客户端应轮询 / 等待 SSE 后以 GET 权威读模型 / status 为准。
+ */
+export interface AsyncCommandAccepted {
+  command_id: string
+  operation: CommandOperation
+  status: 'queued'
+  replayed: boolean
+  attempt_count: number
+  links: AsyncCommandLinks
+}
+
+/**
+ * R7 判别并集：三处写操作（消息/推进/医师复核）的返回要么是 HTTP 202 的
+ * 异步命令 envelope（`AsyncCommandAccepted`），要么是同步业务结果（
+ * `MessageCreateData` / `AdvanceData` / `ReviewData`）。
+ *
+ * UI 必须用 `isAsyncCommandAccepted` 收窄后再消费，**绝不**把 202 envelope
+ * 当作已完成业务结果使用——202 仅表示「已接受为持久命令」，真正的临床结果以
+ * GET /commands/{id} 状态 + 权威读模型为准。
+ */
+export type CommandMutationResult<T> = AsyncCommandAccepted | T
+
+export type MessageSubmitResult = CommandMutationResult<MessageCreateData>
+export type AdvanceMutationResult = CommandMutationResult<AdvanceData>
+export type ReviewMutationResult = CommandMutationResult<ReviewData>
+
+/**
+ * 结构判别守卫：仅当返回体确为 R6-B 202 命令 envelope 时为 true。
+ *
+ * 不依赖任何隐藏头或自定义字段，仅凭后端 202 数据与同步业务结果在结构上的
+ * 差异（`command_id` + `status==='queued'` + `links`）判别。
+ */
+export function isAsyncCommandAccepted(value: unknown): value is AsyncCommandAccepted {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return (
+    typeof v.command_id === 'string'
+    && typeof v.operation === 'string'
+    && v.status === 'queued'
+    && typeof v.replayed === 'boolean'
+    && typeof v.attempt_count === 'number'
+    && typeof v.links === 'object'
+    && v.links !== null
+  )
 }
 
 /** stage.changed 事件 payload。 */
