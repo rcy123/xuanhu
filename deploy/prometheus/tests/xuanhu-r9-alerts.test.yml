@@ -98,3 +98,102 @@ tests:
       - eval_time: 15m
         alertname: XuanhuQuestionContractIntegrityError
         exp_alerts: []
+
+  # --- degraded contract assembly --------------------------------------------
+  - name: degraded contract share fires above 30%
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contracts_total{outcome="degraded"}'
+        values: '0+4x16'
+      - series: 'xuanhu_question_contracts_total{outcome="created"}'
+        values: '0+6x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionContractDegradedHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu question contracts are degrading at a high rate
+              description: More than 30% of question-contract creations degraded (model plan failed validation or abstained) over five minutes, indicating contract-assembly quality loss under real load.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#contract-degraded
+
+  - name: degraded contract share stays quiet when healthy
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contracts_total{outcome="degraded"}'
+        values: '0+1x16'
+      - series: 'xuanhu_question_contracts_total{outcome="created"}'
+        values: '0+9x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionContractDegradedHigh
+        exp_alerts: []
+
+  # --- residual convergence quality ------------------------------------------
+  - name: partial coverage share fires above 30%
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="partial"}'
+        values: '0+4x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+6x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoveragePartialRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu contracts converge partially at a high rate
+              description: More than 30% of question-coverage evaluations ended partial (follow-up cap reached with aspects still unanswered) over five minutes, indicating prompt or judgment quality is failing to close residual aspects.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-partial
+
+  - name: partial coverage share stays quiet when clean
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="partial"}'
+        values: '0+1x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+9x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoveragePartialRatioHigh
+        exp_alerts: []
+
+  # --- manual-required spike -------------------------------------------------
+  - name: manual-required (unable) spike fires above 5 in five minutes
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="unable"}'
+        values: '0+2x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+8x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoverageUnableSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu question coverage is ending manual-required frequently
+              description: More than 5 question-coverage evaluations ended manual-required (unable) over five minutes, a sign a safety-critical contract may be behaving abnormally.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-manual
+
+  - name: manual-required (unable) spike stays quiet under threshold
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="unable"}'
+        values: '0+1x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+9x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoverageUnableSpike
+        exp_alerts: []

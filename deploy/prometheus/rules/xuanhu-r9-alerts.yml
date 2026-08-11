@@ -63,3 +63,72 @@ groups:
           summary: Xuanhu question contracts are failing integrity checks
           description: More than 3 question-contract creations ended in an integrity error over five minutes, indicating internal consistency failures in contract assembly.
           runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#integrity-error
+
+      # Degraded contract assembly.  A creation that could not build a contract
+      # from the model's plan (validation failure or abstention) records
+      # "degraded": the turn proceeds without contract coverage.  A sustained
+      # degraded share means the Rubric merge or the composer's plan validation
+      # is failing under real load.  Guards: >=10 creations in 10m, share >30%.
+      - alert: XuanhuQuestionContractDegradedHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_question_contracts_total{
+              outcome="degraded"}[5m]))
+            /
+            sum(increase(xuanhu_question_contracts_total[5m]))
+          ) > 0.3
+          and sum(increase(xuanhu_question_contracts_total[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu question contracts are degrading at a high rate
+          description: More than 30% of question-contract creations degraded (model plan failed validation or abstained) over five minutes, indicating contract-assembly quality loss under real load.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#contract-degraded
+
+      # Residual convergence quality.  A coverage evaluation that ends
+      # "partial" maps to the exhausted_partial disposition: the chain hit its
+      # follow-up cap with aspects still unaddressed.  The R9 semantic
+      # downgrade (addressed -> unclear) is a designed driver, but a sustained
+      # high share means prompts/decisions fail to converge residual demand.
+      # Guards: >=10 evaluations in 10m, partial share >30%.
+      - alert: XuanhuQuestionCoveragePartialRatioHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_question_coverage_evaluations_total{
+              outcome="partial"}[5m]))
+            /
+            sum(increase(xuanhu_question_coverage_evaluations_total[5m]))
+          ) > 0.3
+          and sum(increase(xuanhu_question_coverage_evaluations_total[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu contracts converge partially at a high rate
+          description: More than 30% of question-coverage evaluations ended partial (follow-up cap reached with aspects still unanswered) over five minutes, indicating prompt or judgment quality is failing to close residual aspects.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-partial
+
+      # Manual-required spike.  A coverage evaluation that ends "unable" maps
+      # to the manual_required disposition, most commonly a safety-critical
+      # aspect the consulted person could not confirm.  A burst signals an
+      # abnormal safety contract rather than ordinary inquiry noise.  Guards:
+      # >=10 evaluations in 10m, >5 manual-required in 5m.
+      - alert: XuanhuQuestionCoverageUnableSpike
+        expr: >-
+          sum(increase(xuanhu_question_coverage_evaluations_total{
+            outcome="unable"}[5m])) > 5
+          and sum(increase(xuanhu_question_coverage_evaluations_total[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu question coverage is ending manual-required frequently
+          description: More than 5 question-coverage evaluations ended manual-required (unable) over five minutes, a sign a safety-critical contract may be behaving abnormally.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-manual
