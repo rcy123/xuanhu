@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="">
-    <img alt="Xuanhu" src="" width="128" height="128" style="border-radius: 24px;">
+    <source media="(prefers-color-scheme: dark)" srcset="./image.png">
+    <img alt="Xuanhu" src="./image.png" width="128" height="128" style="border-radius: 24px;">
   </picture>
 </p>
 
