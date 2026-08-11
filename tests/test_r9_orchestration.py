@@ -351,3 +351,66 @@ def test_delta_contract_flow_reduces_into_state(monkeypatch) -> None:
     projection = project_contract_dimensions((contract,), ())
     assert projection.open_dimensions == (InquiryDimension.TEN_RESPIRATORY,)
     assert projection.roots[0].coverage.disposition is ContractCoverageDisposition.OPEN
+
+
+# ---- wiring C: _correct_coverage_semantics (R9-C) ----
+
+
+def test_semantic_correction_downgrades_color_addressed_without_term() -> None:
+    from app.schemas.question_contract import CoverageStatus
+    from app.services.langgraph_intake import _correct_coverage_semantics
+
+    contract = _contract()
+    answer_id = uuid4()
+    message = IntakeMessage(message_id=answer_id, role=IntakeMessageRole.PATIENT, content="有痰")
+    # Model claims the sputum-color aspect is addressed by "有痰" — a semantic
+    # miss: no color term.  The correction downgrades it to unclear.
+    candidate = QuestionCoverageCandidate(
+        contract_id=contract.contract_id,
+        answer_message_id=answer_id,
+        items=(
+            CoverageCandidateItem(
+                aspect_id=contract.aspects[1].aspect_id,  # 痰液颜色
+                status="addressed",
+                evidence=(
+                    CoverageEvidenceCandidate(
+                        source_message_id=answer_id, start_char=0, end_char=2, quote="有痰"
+                    ),
+                ),
+            ),
+            *(CoverageCandidateItem(aspect_id=aspect.aspect_id, status="unanswered") for aspect in contract.aspects if aspect.ordinal != 1),
+        ),
+    )
+    corrected = _correct_coverage_semantics(
+        candidate,
+        contract,
+        {answer_id: message.content},
+    )
+    color_item = next(item for item in corrected.items if item.aspect_id == contract.aspects[1].aspect_id)
+    assert color_item.status is CoverageStatus.UNCLEAR
+
+
+def test_semantic_correction_keeps_addressed_with_color_term() -> None:
+    from app.services.langgraph_intake import _correct_coverage_semantics
+
+    contract = _contract()
+    answer_id = uuid4()
+    content = "痰是黄色的"
+    candidate = QuestionCoverageCandidate(
+        contract_id=contract.contract_id,
+        answer_message_id=answer_id,
+        items=(
+            CoverageCandidateItem(
+                aspect_id=contract.aspects[1].aspect_id,  # 痰液颜色
+                status="addressed",
+                evidence=(
+                    CoverageEvidenceCandidate(
+                        source_message_id=answer_id, start_char=0, end_char=len(content), quote=content
+                    ),
+                ),
+            ),
+            *(CoverageCandidateItem(aspect_id=aspect.aspect_id, status="unanswered") for aspect in contract.aspects if aspect.ordinal != 1),
+        ),
+    )
+    corrected = _correct_coverage_semantics(candidate, contract, {answer_id: content})
+    assert corrected is candidate  # unchanged candidate returned as-is

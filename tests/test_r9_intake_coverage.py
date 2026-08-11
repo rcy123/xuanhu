@@ -227,6 +227,43 @@ def test_span_from_wrong_message_fails_span() -> None:
     )
 
 
+def test_mask_wildcard_quote_passes_and_digests_raw_substring() -> None:
+    """D3: a quote crossing a privacy-masked identity sequence passes the
+    verifier, and the persisted evidence digest covers the raw answer text."""
+    from hashlib import sha256
+
+    from app.schemas.question_contract import build_coverage_event
+
+    contract = _contract()
+    answer_id = uuid4()
+    content = "我的电话是13812345678，痰是黄色的"
+    context = _context(contract, answer_id)
+    masked_phone = "█" * 11
+    first = contract.aspects[0]
+    span = CoverageEvidenceCandidate(
+        source_message_id=answer_id,
+        start_char=0,
+        end_char=len(content),
+        quote=f"我的电话是{masked_phone}，痰是黄色的",
+    )
+    candidate = QuestionCoverageCandidate(
+        contract_id=contract.contract_id,
+        answer_message_id=answer_id,
+        items=(
+            CoverageCandidateItem(aspect_id=first.aspect_id, status="addressed", evidence=(span,)),
+            *(CoverageCandidateItem(aspect_id=aspect.aspect_id, status="unanswered") for aspect in contract.aspects[1:]),
+        ),
+    )
+    assert (
+        _verify_coverage_binding(_output(candidate), _input(context=context, answer_id=answer_id, content=content))
+        is None
+    )
+    event = build_coverage_event(contract=contract, candidate=candidate, message_contents={answer_id: content})
+    ref = event.items[0].evidence[0]
+    assert content[ref.start_char : ref.end_char] == "我的电话是13812345678，痰是黄色的"
+    assert ref.quote_sha256 == sha256(content.encode("utf-8")).hexdigest()
+
+
 def test_coverage_without_contract_fails() -> None:
     contract = _contract()
     answer_id = uuid4()

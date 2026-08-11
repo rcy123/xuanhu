@@ -304,3 +304,47 @@ async def test_tampered_stored_event_fails_closed_on_load(
     with pytest.raises(RepositoryError) as exc:
         await repository.get_state(session_id)
     assert exc.value.code is RepositoryErrorCode.TRANSACTION_FAILED
+
+
+async def test_deleted_intermediate_event_fails_closed_with_envelope(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    """D2: structural ledger damage must surface as TRANSACTION_FAILED, never as
+    a raw pydantic ValidationError leaking past the repository boundary.
+
+    Deleting the root's coverage event leaves the follow-up chain without a
+    parent event: the fold rejects it during DomainState construction, and the
+    construction now lives inside the repository error envelope."""
+    repository, factory = store
+    session_id, question_message_id = await _session_and_message(factory)
+    contract = _contract(session_id=session_id, question_message_id=question_message_id)
+    state = await repository.get_state(session_id)
+    contract_delta = _delta(state=state, sources=(), contracts=(contract,))
+    await repository.commit(contract_delta, _context(state, contract_delta, idempotency_key="r9-d2-root"))
+
+    after_root = await repository.get_state(session_id)
+    answer_id = uuid4()
+    event = _answered_event(contract, answer_id=answer_id)  # partial: aspect0 addressed
+    followup = build_question_contract(
+        session_id=session_id,
+        question_message_id=uuid4(),
+        question_text="剩余两项能确认吗？",
+        parent_contract=contract,
+        residual_aspects=tuple(contract.aspects[1:]),
+    )
+    chain_delta = _delta(
+        state=after_root,
+        sources=(answer_id,),
+        contracts=(followup,),
+        events=(event,),
+    )
+    await repository.commit(chain_delta, _context(after_root, chain_delta, idempotency_key="r9-d2-chain"))
+
+    async with factory() as db, db.begin():
+        row = await db.get(QuestionCoverageEventRecord, event.event_id)
+        assert row is not None
+        await db.delete(row)
+
+    with pytest.raises(RepositoryError) as exc:
+        await repository.get_state(session_id)
+    assert exc.value.code is RepositoryErrorCode.TRANSACTION_FAILED

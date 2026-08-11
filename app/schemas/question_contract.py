@@ -19,6 +19,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.span_matching import find_quote_span, span_quote_matches
+
 QUESTION_CONTRACT_SCHEMA_VERSION: Literal["question-contract.v1"] = "question-contract.v1"
 QUESTION_CONTRACT_REF_SCHEMA_VERSION: Literal["question-contract-ref.v1"] = "question-contract-ref.v1"
 CONTRACT_REPLY_CONTEXT_SCHEMA_VERSION: Literal["contract-reply-context.v1"] = "contract-reply-context.v1"
@@ -491,24 +493,27 @@ def build_coverage_event(
             if span.source_message_id != candidate.answer_message_id:
                 raise ValueError("coverage evidence may reference only the current bound answer")
             raw = answer_content[span.start_char : span.end_char]
-            if span.end_char > len(answer_content) or raw != span.quote:
+            if not span_quote_matches(answer_content, span.start_char, span.end_char, span.quote):
                 # Offset repair: the quote is a genuine substring of the answer
                 # (the verifier already enforced this), but the model may have
                 # miscounted Unicode code points.  Re-anchor deterministically
                 # on the first occurrence so the persisted evidence locator is
                 # always correct (真实后端复盘 2026-08)。
-                position = answer_content.find(span.quote)
-                if position == -1:
+                position = find_quote_span(answer_content, span.quote)
+                if position is None:
                     raise ValueError("coverage evidence quote is not grounded in the current answer")
                 span = span.model_copy(
-                    update={"start_char": position, "end_char": position + len(span.quote)}
+                    update={"start_char": position[0], "end_char": position[1]}
                 )
+            raw = answer_content[span.start_char : span.end_char]
             refs.append(
                 EvidenceRef(
                     source_message_id=span.source_message_id,
                     start_char=span.start_char,
                     end_char=span.end_char,
-                    quote_sha256=hashlib.sha256(span.quote.encode("utf-8")).hexdigest(),
+                    # Digest the raw answer substring, never the masked quote,
+                    # so the locator remains forensically re-verifiable (D3).
+                    quote_sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 )
             )
         event_items.append(CoverageEventItem(aspect_id=aspect_id, status=item.status, evidence=tuple(refs)))

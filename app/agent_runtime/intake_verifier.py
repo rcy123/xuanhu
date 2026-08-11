@@ -29,6 +29,7 @@ from app.schemas.intake import (
     PregnancyDelta,
     SafetyListDelta,
 )
+from app.schemas.span_matching import find_quote_span
 
 INTAKE_AGENT_NAME = "intake_extraction"
 INTAKE_AGENT_VERSION = "intake-extraction-agent.v2"
@@ -342,11 +343,13 @@ def _verify_coverage_binding(
             if span.source_message_id != candidate.answer_message_id:
                 return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
             # Grounding contract: the quote must be a genuine substring of the
-            # bound answer (fabricated text is rejected).  Offsets are advisory
-            # — a model that miscounts Unicode code points but quotes the real
-            # answer is repaired deterministically by ``build_coverage_event``
-            # (真实后端复盘 2026-08: 模型对中文回答反复产出偏移偏差 span)。
-            if span.quote not in answer_content:
+            # bound answer (fabricated text is rejected).  The match is
+            # mask-wildcard aware (identity sequences are masked with equal
+            # length ``█`` before the model sees them) and offsets are advisory
+            # — a model that miscounts code points but quotes the real answer
+            # is repaired deterministically by ``build_coverage_event``
+            # (真实后端复盘 2026-08 + D3)。
+            if find_quote_span(answer_content, span.quote) is None:
                 return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
     return None
 

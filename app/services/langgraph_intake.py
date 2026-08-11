@@ -38,6 +38,7 @@ from app.agent_runtime.contract_projection import (
     ContractDimensionProjection,
     project_contract_dimensions,
 )
+from app.agent_runtime.coverage_semantics import validate_aspect_semantics
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.intake_fact_key_legality import (
@@ -59,6 +60,7 @@ from app.agent_runtime.question_contract import (
     QuestionContractIntegrityError,
     evaluate_contract_coverage,
 )
+from app.agent_runtime.question_rubric import plan_contract_aspects
 from app.agent_runtime.reducer import (
     DomainDelta,
     DomainReducerError,
@@ -110,6 +112,11 @@ from app.core.exceptions import (
     SessionNotFoundError,
     SessionTerminatedError,
     ValidationError,
+)
+from app.core.metrics import (
+    observe_question_contract,
+    observe_question_coverage,
+    observe_question_followup,
 )
 from app.db.session import get_session_factory
 from app.models.audit import AuditEvent
@@ -189,6 +196,7 @@ from app.schemas.question_contract import (
     QuestionAspect,
     QuestionContract,
     QuestionCoverageCandidate,
+    QuestionCoverageEvent,
     build_coverage_event,
     build_question_contract,
 )
@@ -1496,18 +1504,40 @@ class LangGraphIntakeMessageRunner:
                         residual_aspects=forced[1],
                     )
                 else:
+                    # R9-C 规划层：Rubric 维度按确定性规则规划契约 aspects
+                    # （Rubric 优先 + 模型 aspects 并集），其余维度维持模型
+                    # 自由 aspects；条件必填（有痰→痰色/痰量/痰质）在事实账本
+                    # 命中时冻结，根除"有痰只问一次"的规划退化。
+                    planned_aspects = plan_contract_aspects(
+                        outcome.result.selected_dimension,
+                        outcome.result.aspects,
+                        _active_fact_contexts(domain_state),
+                    )
                     contract = build_question_contract(
                         session_id=session_id,
                         question_message_id=question_message_id,
                         question_text=outcome.result.question,
                         dimension=outcome.result.selected_dimension.value,
                         selection_kind=cast(Literal["required", "conflict"], outcome.result.selection_kind.value),
-                        aspect_criteria=tuple(item.criterion for item in outcome.result.aspects),
+                        aspect_criteria=planned_aspects,
                         max_followups=get_settings().question_contract_max_followups,
                         safety_critical=_is_safety_dimension(outcome.result.selected_dimension),
                     )
             except ValueError:
                 contract = None
+            if contract is not None:
+                observe_question_contract("created", aspect_count=len(contract.aspects))
+            else:
+                observe_question_contract("degraded")
+        # R9 残余追问指标：实际问出去了记 asked；投影到 cap（partial）且本轮
+        # 未强制残余时记 cap_reached，用于观测"持续不答"是否堆积。
+        if get_settings().question_contract_enabled:
+            if forced is not None:
+                observe_question_followup("asked")
+            elif project_contract_dimensions(
+                domain_state.question_contracts, domain_state.question_coverage_events
+            ).partial_dimensions:
+                observe_question_followup("cap_reached")
         return question_message_id, outcome.result.model_dump(mode="json"), contract
 
     async def _complete_claim(
@@ -3030,18 +3060,27 @@ async def _compute_intake_from_claim(
         rejected_observations=rejected_observations,
         normalized_observations=normalized_observations,
     )
-    # R9 接线点 C：模型/确定性产出的覆盖候选 → 对质原文 → 落为持久化覆盖事件。
-    # 事件并入 delta，reducer 追加式合并 + 链校验；失败降级为无事件（契约保持
-    # open，残余追问有界推进），不让一个 grounding 异常卡死整轮 intake。
+    # R9 接线点 C：模型/确定性产出的覆盖候选 → 语义校正 → 对质原文 →
+    # 落为持久化覆盖事件。事件并入 delta，reducer 追加式合并 + 链校验；
+    # 失败降级为无事件（契约保持 open，残余追问有界推进）。
     if (
         get_settings().question_contract_enabled
         and output.question_coverage is not None
         and intake_input.contract_reply_context is not None
     ):
         try:
+            contract_context = intake_input.contract_reply_context
+            # R9-C 语义充分性：span 真实 ≠ 答到位。程序校正模型对
+            # addressed/not_applicable 的判定（词表确信不足才降级 unclear，
+            # 留在残余追问），证据引文不变。
+            corrected = _correct_coverage_semantics(
+                output.question_coverage,
+                contract_context.contract,
+                {item.message_id: item.content for item in intake_input.current_messages},
+            )
             event = build_coverage_event(
-                contract=intake_input.contract_reply_context.contract,
-                candidate=output.question_coverage,
+                contract=contract_context.contract,
+                candidate=corrected,
                 message_contents={
                     item.message_id: item.content for item in intake_input.current_messages
                 },
@@ -3057,6 +3096,9 @@ async def _compute_intake_from_claim(
                     "question_coverage_events": (event,),
                     "artifact_revisions": () if not delta.observations else delta.artifact_revisions,
                 }
+            )
+            observe_question_coverage(
+                _coverage_metric_outcome(event, contract_context.contract, domain_state)
             )
     if rejected_observations or normalized_observations:
         extraction_trace: dict[str, Any] = {}
@@ -3952,8 +3994,10 @@ def _response_from_payload(payload: dict[str, Any]) -> MessageCreateResponse:
     return MessageCreateResponse.model_validate(payload)
 
 
-def _build_intake_input(state: DomainState, message: ConsultMessage) -> IntakeExtractionInput:
-    facts = tuple(
+def _active_fact_contexts(state: DomainState) -> tuple[ActiveObservationContext, ...]:
+    """Deterministic active-fact projection shared by intake input and the
+    R9-C planning layer (Rubric conditional evaluation)."""
+    return tuple(
         ActiveObservationContext(
             observation_id=item.observation_id,
             fact_key=item.fact_key,
@@ -3963,11 +4007,14 @@ def _build_intake_input(state: DomainState, message: ConsultMessage) -> IntakeEx
         for item in _current_observations(state.observations)
         if item.value is not None or item.normalized_value is not None
     )
+
+
+def _build_intake_input(state: DomainState, message: ConsultMessage) -> IntakeExtractionInput:
     return IntakeExtractionInput(
         current_messages=(
             IntakeMessage(message_id=message.id, role=IntakeMessageRole.PATIENT, content=message.content),
         ),
-        historical_active_facts=facts[:128],
+        historical_active_facts=_active_fact_contexts(state)[:128],
         reply_context=_reply_context_from_message(message),
         # R9 接线点 B：仅当回复绑定到「仍待回答」的契约时注入私有契约上下文，
         # 模型据此产出 question_coverage；无绑定则维持 legacy 双键结构。
@@ -4104,6 +4151,71 @@ def _attach_bound_coverage(
         ),
     )
     return output.model_copy(update={"question_coverage": candidate})
+
+
+def _correct_coverage_semantics(
+    candidate: QuestionCoverageCandidate,
+    contract: QuestionContract,
+    message_contents: dict[Any, str],
+) -> QuestionCoverageCandidate:
+    """R9-C 语义充分性：程序校正模型对 addressed/not_applicable 的覆盖判定。
+
+    词表确信不足时降级为 ``unclear``（留在残余追问），证据引文不变；词表
+    未覆盖的 criterion 或命中关键词时维持模型判定（默信，不误伤）。
+    """
+    content = message_contents.get(candidate.answer_message_id)
+    if content is None:
+        return candidate
+    aspect_by_id = {aspect.aspect_id: aspect for aspect in contract.aspects}
+    items: list[CoverageCandidateItem] = []
+    changed = False
+    for item in candidate.items:
+        status = item.status
+        aspect = aspect_by_id.get(item.aspect_id)
+        if aspect is not None and item.evidence:
+            for span in item.evidence:
+                text = (
+                    content[span.start_char : span.end_char]
+                    if span.end_char <= len(content)
+                    else span.quote
+                )
+                corrected = validate_aspect_semantics(aspect, text, status)
+                if corrected is not None and corrected is not status:
+                    status = corrected
+                    changed = True
+                    break
+        items.append(item.model_copy(update={"status": status}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"items": tuple(items)})
+
+
+def _coverage_metric_outcome(
+    event: QuestionCoverageEvent,
+    contract: QuestionContract,
+    state: DomainState,
+) -> str:
+    """Fold the chain with the new event and map the disposition to a bounded
+    metric outcome (satisfied / partial / no_progress / unable / error)."""
+    root_id = contract.root_contract_id
+    chain = tuple(item for item in state.question_contracts if item.root_contract_id == root_id)
+    chain_events = tuple(
+        item for item in state.question_coverage_events if item.root_contract_id == root_id
+    ) + (event,)
+    try:
+        projection = evaluate_contract_coverage(chain, chain_events)
+    except QuestionContractIntegrityError:
+        return "error"
+    disposition = projection.disposition
+    if disposition is ContractCoverageDisposition.SATISFIED:
+        return "satisfied"
+    if disposition is ContractCoverageDisposition.EXHAUSTED_PARTIAL:
+        return "partial"
+    if disposition is ContractCoverageDisposition.MANUAL_REQUIRED:
+        return "unable"
+    if disposition is ContractCoverageDisposition.OPEN:
+        return "no_progress"
+    return "error"
 
 
 def _reply_context_from_message(message: ConsultMessage) -> IntakeReplyContext | None:

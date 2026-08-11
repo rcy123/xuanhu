@@ -479,7 +479,10 @@ def _reduce_checked(state: DomainState, delta: DomainDelta) -> DomainState:
         delta.invalidate_artifact_ids,
         run_id=delta.run_id,
         expected_state_version=delta.expected_state_version,
-        invalidate_all_current=observation_changed or safety_changed or contract_changed or event_changed,
+        # D1: artifacts derive from clinical facts (observations/safety), never
+        # from "asking/coverage".  A question contract or its coverage event
+        # alone must not STALE derived products (formula, syndrome, records).
+        invalidate_all_current=observation_changed or safety_changed,
     )
     changed = observation_changed or safety_changed or contract_changed or event_changed or artifact_changed
     if not changed:

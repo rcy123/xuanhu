@@ -356,7 +356,9 @@ def test_contract_and_artifact_change_are_mixed_and_rejected() -> None:
     assert exc.value.code is ReducerErrorCode.MIXED_FACT_AND_ARTIFACT_CHANGE
 
 
-def test_contract_change_invalidates_current_artifacts() -> None:
+def test_contract_change_does_not_invalidate_current_artifacts() -> None:
+    """D1: artifacts derive from clinical facts, not from asking.  A question
+    contract alone must not STALE derived products."""
     session_id = uuid4()
     run_id = uuid4()
     artifact_id = uuid4()
@@ -376,11 +378,13 @@ def test_contract_change_invalidates_current_artifacts() -> None:
     contract = root_contract(session_id=session_id)
     contract_delta = make_delta(state=state, run_id=run_id, contracts=(contract,))
     reduced = reduce_domain_state(state, contract_delta, authorized(contract_delta, state))
-    assert reduced.artifacts[0].status is ArtifactStatus.STALE
-    assert state.artifacts[0].status is ArtifactStatus.CURRENT
+    assert reduced.artifacts[0].status is ArtifactStatus.CURRENT
+    assert reduced.state_version == 2
 
 
-def test_coverage_change_invalidates_current_artifacts() -> None:
+def test_coverage_change_does_not_invalidate_current_artifacts() -> None:
+    """D1: a coverage event alone never STALEs derived products; only the
+    clinical facts carried by the same delta do."""
     session_id = uuid4()
     run_id = uuid4()
     state = DomainState(
@@ -406,7 +410,7 @@ def test_coverage_change_invalidates_current_artifacts() -> None:
         event_delta,
         authorized(event_delta, after_contract, sources=frozenset({answer_id})),
     )
-    assert after_event.artifacts[0].status is ArtifactStatus.STALE
+    assert after_event.artifacts[0].status is ArtifactStatus.CURRENT
 
 
 def test_multiple_contract_session_mismatch_rejected() -> None:

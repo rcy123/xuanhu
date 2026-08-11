@@ -1254,17 +1254,21 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
         try:
             contract_schemas = tuple(_contract_schema(row) for row in contracts)
             event_schemas = tuple(_coverage_event_schema(row) for row in events)
+            # D2: the DomainState construction lives inside the envelope too —
+            # structural ledger damage (e.g. a deleted intermediate coverage
+            # event) must surface as TRANSACTION_FAILED, never as a raw
+            # pydantic ValidationError leaking past the repository boundary.
+            return DomainState(
+                session_id=session_row.id,
+                state_version=session_row.state_version,
+                observations=tuple(self._observation_schema(row) for row in observations),
+                safety_profile=None if safety is None else self._safety_schema(safety),
+                artifacts=tuple(self._artifact_schema(row) for row in artifacts),
+                question_contracts=contract_schemas,
+                question_coverage_events=event_schemas,
+            )
         except (ValueError, TypeError):
             raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
-        return DomainState(
-            session_id=session_row.id,
-            state_version=session_row.state_version,
-            observations=tuple(self._observation_schema(row) for row in observations),
-            safety_profile=None if safety is None else self._safety_schema(safety),
-            artifacts=tuple(self._artifact_schema(row) for row in artifacts),
-            question_contracts=contract_schemas,
-            question_coverage_events=event_schemas,
-        )
 
     async def _persist_state(
         self,

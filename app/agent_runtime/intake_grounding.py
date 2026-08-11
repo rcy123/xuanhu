@@ -27,6 +27,7 @@ from app.schemas.intake import (
     RedFlagCategory,
     SafetyListDelta,
 )
+from app.schemas.span_matching import span_quote_matches
 
 
 class IntakeGroundingFailureKind(StrEnum):
@@ -408,7 +409,11 @@ def _verified_message(
     message = messages.get(span.source_message_id)
     if message is None or span.start_char < 0 or span.end_char > len(message):
         return None
-    if span.start_char >= span.end_char or message[span.start_char : span.end_char] != span.quote:
+    # Mask-wildcard aware (D3): the model quotes identity-masked content, so a
+    # quote may hold equal-length ``█`` where the raw answer has digits.
+    if span.start_char >= span.end_char or not span_quote_matches(
+        message, span.start_char, span.end_char, span.quote
+    ):
         return None
     return message
 
