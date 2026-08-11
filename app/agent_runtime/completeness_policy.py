@@ -383,7 +383,13 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
     safety_missing = any(_is_safety_dimension(dim) for dim in missing_required)
     stagnation = _stagnation(policy_input.progress, safety_missing=safety_missing)
     rule_outcomes = _rule_outcomes(required, covered, conflicts)
-    disposition = _disposition(policy_input, stagnation, conflicts, missing_required)
+    disposition = _disposition(
+        policy_input,
+        stagnation,
+        conflicts,
+        missing_required,
+        contract_partial=bool(policy_input.contract_partial_dimensions),
+    )
     decision = _decision_for_disposition(disposition)
     details = CompletenessGateDetails(
         disposition=disposition,
@@ -396,6 +402,9 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
         stagnation=stagnation,
         applicability=applicability,
         triage_disposition=_triage_disposition(policy_input),
+        contract_open_dimensions=policy_input.contract_open_dimensions,
+        contract_resolved_dimensions=policy_input.contract_resolved_dimensions,
+        contract_partial_dimensions=policy_input.contract_partial_dimensions,
     )
     gate_result = CompletenessGateResult(
         gate_name=COMPLETENESS_GATE_NAME,
@@ -414,6 +423,9 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
         stagnation=stagnation,
         gate_result=gate_result,
         rule_outcomes=rule_outcomes,
+        contract_open_dimensions=policy_input.contract_open_dimensions,
+        contract_resolved_dimensions=policy_input.contract_resolved_dimensions,
+        contract_partial_dimensions=policy_input.contract_partial_dimensions,
     )
 
 
@@ -452,6 +464,15 @@ def completeness_to_gate_result_schema(
             "stagnation": details.stagnation.model_dump(mode="json"),
             "applicability": details.applicability.model_dump(mode="json"),
             "triage_disposition": details.triage_disposition,
+            "contract_open_dimensions": [
+                item.value for item in details.contract_open_dimensions
+            ],
+            "contract_resolved_dimensions": [
+                item.value for item in details.contract_resolved_dimensions
+            ],
+            "contract_partial_dimensions": [
+                item.value for item in details.contract_partial_dimensions
+            ],
         },
     )
 
@@ -594,6 +615,11 @@ def _covered_dimensions(
             covered.add(InquiryDimension.PREGNANCY_STATUS)
         if _collection_complete(safety.lactation_collection_status):
             covered.add(InquiryDimension.LACTATION_STATUS)
+    # R9 contract projection is applied last so an open contract cannot be
+    # accidentally closed by a coarse canonical fact from the first partial
+    # answer.  All safety contract projections are rejected by the input schema.
+    covered.update(policy_input.contract_resolved_dimensions)
+    covered.difference_update(policy_input.contract_open_dimensions)
     return tuple(sorted(covered, key=lambda item: item.value))
 
 
@@ -619,6 +645,7 @@ def _required_dimensions(
                 InquiryDimension.MAJOR_CONDITION_STATUS,
             }
         )
+    required.update(policy_input.contract_open_dimensions)
     return tuple(sorted(required, key=lambda item: item.value))
 
 
@@ -722,6 +749,8 @@ def _disposition(
     stagnation: CompletenessStagnationResult,
     conflicts: tuple[CompletenessConflict, ...],
     missing_required: tuple[InquiryDimension, ...],
+    *,
+    contract_partial: bool = False,
 ) -> CompletenessDisposition:
     if not _triage_allows_ready(policy_input):
         return CompletenessDisposition.TRIAGE_BLOCKED
@@ -737,6 +766,8 @@ def _disposition(
         return CompletenessDisposition.CONFLICT
     if missing_required:
         return CompletenessDisposition.INCOMPLETE
+    if contract_partial:
+        return CompletenessDisposition.PARTIAL
     return CompletenessDisposition.READY
 
 

@@ -2,8 +2,9 @@
 
 Two Prometheus scrape endpoints are exported by the backend:
 
-- `GET /api/v1/metrics` — performance histograms plus the bounded R5 outcome
-  counters (gateway requests, structured-output fallback, safety decisions).
+- `GET /api/v1/metrics` — performance histograms plus the bounded R5/R9 outcome
+  counters (gateway requests, structured-output fallback, safety decisions,
+  question-contract, coverage-evaluation, and follow-up outcomes).
 - `GET /api/v1/metrics/outbox` — durable Outbox health gauges.
 
 Both return the Prometheus 0.0.4 text format with the exact content type
@@ -55,6 +56,22 @@ Any unexpected value is fail-closed to a fixed `unknown` bucket — it can never
 create a new time series — and the gateway duration histograms carry no dynamic
 labels. The endpoint and content type are unchanged.
 
+## R9 question-contract outcome counters
+
+`GET /api/v1/metrics` also exports three bounded, low-cardinality counters for
+the R9 question-contract flow, plus one label-free aspect-count histogram:
+
+| Metric | Labels | Counting semantics |
+| ------ | ------ | ------------------ |
+| `xuanhu_question_contracts_total` | `outcome` ∈ {`created`, `degraded`, `rejected`, `integrity_error`} | One increment per terminal question-contract creation outcome. `integrity_error` is an internal consistency failure during contract assembly. |
+| `xuanhu_question_coverage_evaluations_total` | `outcome` ∈ {`satisfied`, `partial`, `no_progress`, `ambiguous`, `unable`, `invalid`, `error`} | One increment per coverage-fold evaluation of a question. `invalid` and `error` feed the coverage-failure-rate alert. |
+| `xuanhu_question_contract_followups_total` | `outcome` ∈ {`asked`, `cap_reached`, `manual`} | One increment per residual follow-up decision. `cap_reached` marks a follow-up suppressed by the follow-up cap. |
+| `xuanhu_question_contract_aspects` | (none) | Histogram of how many coverage aspects are frozen into each contract, with integer-oriented buckets. |
+
+The R9 allowlists live in `app/core/metrics.py` alongside the R5 ones and carry
+the same fail-closed `unknown` guarantee. No R9 metric carries session,
+dimension, or free-form text labels.
+
 ## Alert rules
 
 - `rules/xuanhu-outbox-alerts.yml` — durable Outbox readiness/dead-letter rules.
@@ -65,8 +82,14 @@ labels. The endpoint and content type are unchanged.
   annotation, with no PHI labels. Structured terminal failure, structured
   fallback/failure, and safety block-rate drift are computed from the bounded
   counters above.
+- `rules/xuanhu-r9-alerts.yml` — question-contract rules:
+  `XuanhuQuestionCoverageFailureRateHigh` (coverage invalid/error ratio),
+  `XuanhuQuestionCapReachedHigh` (follow-up cap exhaustion), and
+  `XuanhuQuestionContractIntegrityError`. Each carries the same
+  `severity`/`service`/`component` labels and `runbook` annotation with a
+  minimum-volume guard, computed from the bounded R9 counters above.
 
-Load both rule files through Prometheus `rule_files`.
+Load all three rule files through Prometheus `rule_files`.
 
 Validate both syntax and behavior from the repository root:
 
@@ -75,7 +98,10 @@ promtool check rules deploy/prometheus/rules/xuanhu-outbox-alerts.yml
 promtool test rules deploy/prometheus/tests/xuanhu-outbox-alerts.test.yml
 promtool check rules deploy/prometheus/rules/xuanhu-r5-alerts.yml
 promtool test rules deploy/prometheus/tests/xuanhu-r5-alerts.test.yml
+promtool check rules deploy/prometheus/rules/xuanhu-r9-alerts.yml
+promtool test rules deploy/prometheus/tests/xuanhu-r9-alerts.test.yml
 ```
 
-CI validates all four commands; the unit suite independently guards the R5 rule
-structure and PHI-free labels (`tests/test_r5_metrics.py`).
+CI validates all six commands; the unit suite independently guards the R5 and
+R9 rule structure and PHI-free labels (`tests/test_r5_metrics.py`,
+`tests/test_r9_question_contract_metrics.py`).

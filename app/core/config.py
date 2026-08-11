@@ -331,6 +331,20 @@ class Settings(BaseSettings):
         validation_alias="XUANHU_INTAKE_SLOT_PATH_ENABLED",
         description="新会话走槽位采集范式(阶段 2 灰度);默认关闭,转正后置 true",
     )
+    # R9 问题契约编排开关：开启后接线点 A-E 生效（契约创建/绑定/覆盖事件/完整性
+    # 投影/残余追问），关闭则全部跳过、与现网行为完全一致。灰度观察期稳定后转正。
+    question_contract_enabled: bool = Field(
+        default=False,
+        validation_alias="XUANHU_QUESTION_CONTRACT_ENABLED",
+        description="R9 问题契约编排开关;默认关闭=现网行为不变",
+    )
+    question_contract_max_followups: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        validation_alias="XUANHU_QUESTION_CONTRACT_MAX_FOLLOWUPS",
+        description="R9 根契约允许的残余追问次数上限(契约 revision 上限 = 该值+1)",
+    )
     agent_runtime_rollout_phase: Literal[
         "legacy",
         "development",

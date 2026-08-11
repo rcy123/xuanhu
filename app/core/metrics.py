@@ -1,14 +1,15 @@
-"""Per-stage Prometheus metrics for the performance baseline and R5 outcomes.
+"""Per-stage Prometheus metrics for the performance baseline, R5, and R9 outcomes.
 
-All histograms use the same bucket profile tuned for millisecond-to-second
-ranges: 0.01/0.05/0.1/0.25/0.5/1/2.5/5/10/30.  Labels never carry
-high-cardinality or PHI values (no session_id, patient_ref, or query text).
+Histograms default to a bucket profile tuned for millisecond-to-second ranges
+(0.01/0.05/0.1/0.25/0.5/1/2.5/5/10/30); the R9 aspect-count histogram overrides
+it with integer-oriented buckets.  Labels never carry high-cardinality or PHI
+values (no session_id, patient_ref, or query text).
 
-R5 adds bounded, low-cardinality outcome counters (gateway request outcomes,
-structured-output fallback attempts, and safety pass/block) whose label values
-are drawn exclusively from a finite allowlist.  Any unexpected label value is
-fail-closed to a fixed ``unknown`` bucket rather than creating a new time
-series.
+R5/R9 add bounded, low-cardinality outcome counters (gateway request outcomes,
+structured-output fallback attempts, safety pass/block, and question-contract,
+coverage-evaluation, and follow-up outcomes) whose label values are drawn
+exclusively from a finite allowlist.  Any unexpected label value is fail-closed
+to a fixed ``unknown`` bucket rather than creating a new time series.
 
 Usage::
 
@@ -62,7 +63,13 @@ class _Histogram:
 
     __slots__ = ("_inner", "_labelnames")
 
-    def __init__(self, name: str, description: str, labelnames: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        labelnames: tuple[str, ...] = (),
+        buckets: tuple[float, ...] = _DEFAULT_BUCKETS,
+    ) -> None:
         self._inner: Any = None
         self._labelnames: tuple[str, ...] = tuple(labelnames)
         try:
@@ -73,13 +80,13 @@ class _Histogram:
                     name,
                     description,
                     labelnames=self._labelnames,
-                    buckets=_DEFAULT_BUCKETS,
+                    buckets=buckets,
                 )
             else:
                 self._inner = prometheus_client.Histogram(
                     name,
                     description,
-                    buckets=_DEFAULT_BUCKETS,
+                    buckets=buckets,
                 )
         except ImportError:
             logger.debug("prometheus_client not available — metrics are no-ops")
@@ -214,7 +221,7 @@ reasoning_get_state = _Histogram(
 )
 
 # ---------------------------------------------------------------------------
-# R5 outcome counters (bounded, low-cardinality labels only)
+# R5/R9 outcome counters (bounded, low-cardinality labels only)
 # ---------------------------------------------------------------------------
 
 #: Gateway call kinds instrumented on the production ModelGateway call paths.
@@ -225,6 +232,13 @@ _GATEWAY_OUTCOMES = frozenset({"success", "error", "truncated", "parse_failed"})
 _FALLBACK_OUTCOMES = frozenset({"attempted", "success", "failure"})
 #: Authoritative safety decision outcomes.
 _SAFETY_OUTCOMES = frozenset({"passed", "blocked"})
+# R9 question-contract outcomes.  These sets are intentionally finite and do
+# not contain dimensions, contract/message ids, free-form errors, or text.
+_QUESTION_CONTRACT_OUTCOMES = frozenset({"created", "degraded", "rejected", "integrity_error"})
+_QUESTION_COVERAGE_OUTCOMES = frozenset(
+    {"satisfied", "partial", "no_progress", "ambiguous", "unable", "invalid", "error"}
+)
+_QUESTION_FOLLOWUP_OUTCOMES = frozenset({"asked", "cap_reached", "manual"})
 
 # One increment per top-level chat/chat_structured/embed call.  ``success`` is
 # a completed call; ``error`` is any gateway transport/response failure
@@ -256,6 +270,40 @@ safety_checks = _Counter(
     "Authoritative safety rule decisions by bounded passed/blocked outcome",
     labelnames=("outcome",),
     allowlists={"outcome": _SAFETY_OUTCOMES},
+)
+
+question_contracts = _Counter(
+    "xuanhu_question_contracts_total",
+    "Question contracts by bounded terminal creation outcome",
+    labelnames=("outcome",),
+    allowlists={"outcome": _QUESTION_CONTRACT_OUTCOMES},
+)
+
+question_coverage_evaluations = _Counter(
+    "xuanhu_question_coverage_evaluations_total",
+    "Question coverage evaluations by bounded outcome",
+    labelnames=("outcome",),
+    allowlists={"outcome": _QUESTION_COVERAGE_OUTCOMES},
+)
+
+question_contract_followups = _Counter(
+    "xuanhu_question_contract_followups_total",
+    "Question-contract follow-up decisions by bounded outcome",
+    labelnames=("outcome",),
+    allowlists={"outcome": _QUESTION_FOLLOWUP_OUTCOMES},
+)
+
+#: Aspect counts are small non-negative integers, not durations, so the shared
+#: second-tuned profile would collapse every contract into the top bucket.
+_ASPECT_COUNT_BUCKETS = (1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30)
+
+#: Distribution of how many coverage aspects a contract freezes.  The name
+#: deliberately avoids a ``_count`` suffix so it cannot collide with the
+#: histogram's own ``_count`` time series.
+question_contract_aspects = _Histogram(
+    "xuanhu_question_contract_aspects",
+    "Number of coverage aspects frozen into a question contract",
+    buckets=_ASPECT_COUNT_BUCKETS,
 )
 
 
@@ -301,6 +349,51 @@ def observe_safety_outcome(passed: bool) -> None:
         safety_checks.inc({"outcome": "passed" if passed else "blocked"})
     except Exception:  # noqa: BLE001 - observation must never raise into the call path
         logger.warning("safety outcome metric observation failed")
+
+
+def observe_question_contract(outcome: str, *, aspect_count: int | None = None) -> None:
+    """Record a privacy-safe R9 contract outcome and optional aspect count.
+
+    The contract outcome and the aspect-count histogram are guarded
+    independently: a malformed aspect count degrades only the histogram, never
+    the contract outcome counter, and never raises into the caller.
+    """
+
+    try:
+        question_contracts.inc(
+            {"outcome": _bounded(outcome, _QUESTION_CONTRACT_OUTCOMES)}
+        )
+    except Exception:  # noqa: BLE001 - observation must never alter intake
+        logger.warning("question contract metric observation failed")
+        return
+    if aspect_count is not None:
+        try:
+            question_contract_aspects.observe(float(aspect_count))
+        except Exception:  # noqa: BLE001 - a bad aspect count is not a crash
+            logger.warning("question contract aspect count observation failed")
+
+
+def observe_question_coverage(outcome: str) -> None:
+    """Record one bounded coverage-fold outcome without clinical labels."""
+
+    try:
+        question_coverage_evaluations.inc(
+            {"outcome": _bounded(outcome, _QUESTION_COVERAGE_OUTCOMES)}
+        )
+    except Exception:  # noqa: BLE001 - observation must never alter intake
+        logger.warning("question coverage metric observation failed")
+
+
+def observe_question_followup(outcome: str) -> None:
+    """Record one bounded residual follow-up decision."""
+
+    try:
+        question_contract_followups.inc(
+            {"outcome": _bounded(outcome, _QUESTION_FOLLOWUP_OUTCOMES)}
+        )
+    except Exception:  # noqa: BLE001 - observation must never alter intake
+        logger.warning("question follow-up metric observation failed")
+
 
 # ---------------------------------------------------------------------------
 # Measure context manager
@@ -359,11 +452,12 @@ def _observe(stage: str, value: float, labels: dict[str, str] | None = None) -> 
 # ---------------------------------------------------------------------------
 
 def render_perf_metrics() -> str:
-    """Render *all* performance histograms and R5 outcome counters.
+    """Render *all* performance histograms and the R5/R9 outcome counters.
 
-    Renders the shared ``prometheus_client`` registry, so the bounded R5
-    counters (gateway requests, structured fallback, safety decisions) are
-    exported alongside the histograms on the same endpoint.
+    Renders the shared ``prometheus_client`` registry, so the bounded R5/R9
+    counters (gateway requests, structured fallback, safety decisions, and the
+    question-contract / coverage / follow-up counters) are exported alongside
+    the histograms on the same endpoint.
 
     Returns an empty string when prometheus_client is not installed
     (all metrics are no-ops with no recorded values).

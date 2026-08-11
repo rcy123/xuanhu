@@ -28,6 +28,7 @@ from app.schemas.completeness import (
     CompletenessDomainSnapshot,
     CompletenessObservationFact,
     CompletenessPolicyInput,
+    CompletenessPolicyResult,
     CompletenessProgress,
     CompletenessSafetyProfile,
     InquiryDimension,
@@ -133,6 +134,9 @@ def policy_input(
     triage: TriageGateResult | None = None,
     safety_profile: CompletenessSafetyProfile | None = None,
     progress: CompletenessProgress | None = None,
+    contract_open_dimensions: tuple[InquiryDimension, ...] = (),
+    contract_resolved_dimensions: tuple[InquiryDimension, ...] = (),
+    contract_partial_dimensions: tuple[InquiryDimension, ...] = (),
 ) -> CompletenessPolicyInput:
     return CompletenessPolicyInput(
         input_state_version=state_version,
@@ -143,6 +147,9 @@ def policy_input(
         ),
         triage_gate=triage or passed_triage(state_version),
         progress=progress or CompletenessProgress(),
+        contract_open_dimensions=contract_open_dimensions,
+        contract_resolved_dimensions=contract_resolved_dimensions,
+        contract_partial_dimensions=contract_partial_dimensions,
     )
 
 
@@ -187,6 +194,162 @@ def test_contract_is_versioned_strict_serializable_and_output_uses_authoritative
                 "ready": True,
             }
         )
+
+
+def test_open_contract_overrides_coarse_observation_and_remains_incomplete() -> None:
+    result = evaluate_completeness_policy(
+        policy_input(
+            *complete_general_facts(),
+            contract_open_dimensions=(InquiryDimension.TEN_SLEEP,),
+        )
+    )
+
+    assert result.disposition is CompletenessDisposition.INCOMPLETE
+    assert result.gate_result.decision is GateDecision.FAILED
+    assert InquiryDimension.TEN_SLEEP not in result.covered_dimensions
+    assert InquiryDimension.TEN_SLEEP in result.missing_required
+    assert result.contract_open_dimensions == (InquiryDimension.TEN_SLEEP,)
+    assert result.gate_result.details.contract_open_dimensions == result.contract_open_dimensions
+
+
+def test_resolved_non_safety_contract_advances_sparse_legacy_projection() -> None:
+    facts = tuple(
+        item for item in complete_general_facts() if item.fact_key != "ten_questions.sleep"
+    )
+
+    result = evaluate_completeness_policy(
+        policy_input(
+            *facts,
+            contract_resolved_dimensions=(InquiryDimension.TEN_SLEEP,),
+        )
+    )
+
+    assert result.disposition is CompletenessDisposition.READY
+    assert result.gate_result.decision is GateDecision.PASSED
+    assert InquiryDimension.TEN_SLEEP in result.covered_dimensions
+    assert InquiryDimension.TEN_SLEEP not in result.missing_required
+    assert result.contract_resolved_dimensions == (InquiryDimension.TEN_SLEEP,)
+
+
+def test_exhausted_partial_contract_is_explicit_partial_not_ready() -> None:
+    facts = tuple(
+        item for item in complete_general_facts() if item.fact_key != "ten_questions.sleep"
+    )
+
+    result = evaluate_completeness_policy(
+        policy_input(
+            *facts,
+            contract_resolved_dimensions=(InquiryDimension.TEN_SLEEP,),
+            contract_partial_dimensions=(InquiryDimension.TEN_SLEEP,),
+        )
+    )
+
+    assert result.disposition is CompletenessDisposition.PARTIAL
+    assert result.gate_result.decision is GateDecision.PASSED
+    assert result.missing_required == ()
+    assert result.contract_partial_dimensions == (InquiryDimension.TEN_SLEEP,)
+    assert result.gate_result.details.contract_partial_dimensions == (
+        InquiryDimension.TEN_SLEEP,
+    )
+
+
+@pytest.mark.parametrize(
+    "projection_kind",
+    ("open", "resolved", "partial"),
+)
+def test_contract_projection_cannot_determine_safety_dimensions(
+    projection_kind: str,
+) -> None:
+    with pytest.raises(ValidationError, match="authoritative safety dimensions"):
+        if projection_kind == "open":
+            policy_input(
+                *complete_general_facts(),
+                contract_open_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+            )
+        elif projection_kind == "resolved":
+            policy_input(
+                *complete_general_facts(),
+                contract_resolved_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+            )
+        else:
+            policy_input(
+                *complete_general_facts(),
+                contract_resolved_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+                contract_partial_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+            )
+
+
+def test_contract_projection_rejects_open_resolved_overlap() -> None:
+    with pytest.raises(ValidationError, match="cannot be open and resolved"):
+        policy_input(
+            *complete_general_facts(),
+            contract_open_dimensions=(InquiryDimension.TEN_SLEEP,),
+            contract_resolved_dimensions=(InquiryDimension.TEN_SLEEP,),
+        )
+
+
+def test_contract_projection_rejects_partial_outside_resolved() -> None:
+    with pytest.raises(ValidationError, match="must also be resolved"):
+        policy_input(
+            *complete_general_facts(),
+            contract_partial_dimensions=(InquiryDimension.TEN_SLEEP,),
+        )
+
+
+def test_contract_projection_rejects_duplicate_or_unsorted_dimensions() -> None:
+    with pytest.raises(ValidationError, match="must be unique"):
+        policy_input(
+            *complete_general_facts(),
+            contract_open_dimensions=(InquiryDimension.TEN_SLEEP, InquiryDimension.TEN_SLEEP),
+        )
+    with pytest.raises(ValidationError, match="must be sorted"):
+        policy_input(
+            *complete_general_facts(),
+            contract_open_dimensions=(
+                InquiryDimension.TEN_SLEEP,
+                InquiryDimension.TEN_COLD_HEAT,
+            ),
+        )
+
+
+def test_gate_serialization_always_contains_fixed_safe_contract_projection_fields() -> None:
+    result = evaluate_completeness_policy(
+        policy_input(
+            *complete_general_facts(),
+            contract_open_dimensions=(InquiryDimension.TEN_PAIN,),
+            contract_resolved_dimensions=(InquiryDimension.PAST_HISTORY,),
+            contract_partial_dimensions=(InquiryDimension.PAST_HISTORY,),
+        )
+    )
+
+    compatible = completeness_to_gate_result_schema(result)
+    assert compatible.details is not None
+    assert compatible.details["contract_open_dimensions"] == ["ten_questions.pain"]
+    assert compatible.details["contract_resolved_dimensions"] == ["past_history"]
+    assert compatible.details["contract_partial_dimensions"] == ["past_history"]
+
+    default_details = completeness_to_gate_result_schema(
+        evaluate_completeness_policy(policy_input(*complete_general_facts()))
+    ).details
+    assert default_details is not None
+    assert default_details["contract_open_dimensions"] == []
+    assert default_details["contract_resolved_dimensions"] == []
+    assert default_details["contract_partial_dimensions"] == []
+
+
+def test_authoritative_result_rejects_contract_projection_mismatch_with_gate_details() -> None:
+    result = evaluate_completeness_policy(
+        policy_input(
+            *complete_general_facts(),
+            contract_resolved_dimensions=(InquiryDimension.PAST_HISTORY,),
+            contract_partial_dimensions=(InquiryDimension.PAST_HISTORY,),
+        )
+    )
+    forged = result.model_dump(mode="json")
+    forged["gate_result"]["details"]["contract_partial_dimensions"] = []
+
+    with pytest.raises(ValidationError, match="gate details must match result fields"):
+        CompletenessPolicyResult.model_validate(forged)
 
 
 def test_no_chief_complaint_is_incomplete_and_failed() -> None:

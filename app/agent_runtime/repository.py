@@ -39,9 +39,18 @@ from app.models.domain import (
     SafetyFactAssertion,
     SafetyProfile,
 )
+from app.models.question_contract import QuestionContractRecord, QuestionCoverageEventRecord
 from app.models.review import DoctorReview, MedicalRecord
 from app.models.safety import SafetyRuleRun
 from app.schemas.domain import ArtifactRevisionSchema, GateResultSchema, ObservationSchema, SafetyProfileSchema
+from app.schemas.question_contract import (
+    QUESTION_CONTRACT_SCHEMA_VERSION,
+    QUESTION_COVERAGE_EVENT_SCHEMA_VERSION,
+    CoverageEventItem,
+    QuestionAspect,
+    QuestionContract,
+    QuestionCoverageEvent,
+)
 
 DOMAIN_STATE_COMMITTED = "domain.state_committed.v1"
 SAFETY_FACT_MANIFEST_VERSION = "intake-safety-fact-manifest.v1"
@@ -85,6 +94,82 @@ def artifact_payload_digest(payload_schema_version: str, payload: dict[str, obje
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _contract_record_values(contract: QuestionContract) -> dict[str, object]:
+    """Durable column values for one immutable question contract."""
+    return {
+        "id": contract.contract_id,
+        "schema_version": contract.schema_version,
+        "session_id": contract.session_id,
+        "question_message_id": contract.question_message_id,
+        "root_contract_id": contract.root_contract_id,
+        "parent_contract_id": contract.parent_contract_id,
+        "revision": contract.revision,
+        "dimension": contract.dimension,
+        "selection_kind": contract.selection_kind,
+        "safety_critical": contract.safety_critical,
+        "max_followups": contract.max_followups,
+        "question_digest": contract.question_digest,
+        "aspects": [aspect.model_dump(mode="json") for aspect in contract.aspects],
+        "contract_digest": contract.contract_digest,
+    }
+
+
+def _coverage_event_record_values(event: QuestionCoverageEvent) -> dict[str, object]:
+    """Durable column values for one append-only, quote-free coverage event."""
+    return {
+        "id": event.event_id,
+        "schema_version": event.schema_version,
+        "session_id": event.session_id,
+        "contract_id": event.contract_id,
+        "root_contract_id": event.root_contract_id,
+        "answer_message_id": event.answer_message_id,
+        "items": [item.model_dump(mode="json") for item in event.items],
+        "event_digest": event.event_digest,
+    }
+
+
+def _contract_schema(row: QuestionContractRecord) -> QuestionContract:
+    """Rebuild the immutable schema from a protected row, re-verifying the
+    canonical digest so tampered storage fails closed."""
+    if row.schema_version != QUESTION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("question contract schema_version mismatch")
+    return QuestionContract.model_validate(
+        {
+            "contract_id": row.id,
+            "session_id": row.session_id,
+            "question_message_id": row.question_message_id,
+            "root_contract_id": row.root_contract_id,
+            "parent_contract_id": row.parent_contract_id,
+            "revision": row.revision,
+            "dimension": row.dimension,
+            "selection_kind": row.selection_kind,
+            "safety_critical": row.safety_critical,
+            "max_followups": row.max_followups,
+            "question_digest": row.question_digest,
+            "aspects": [QuestionAspect.model_validate(item) for item in row.aspects],
+            "contract_digest": row.contract_digest,
+        }
+    )
+
+
+def _coverage_event_schema(row: QuestionCoverageEventRecord) -> QuestionCoverageEvent:
+    """Rebuild the immutable coverage event from a protected row, re-verifying
+    the canonical digest so tampered storage fails closed."""
+    if row.schema_version != QUESTION_COVERAGE_EVENT_SCHEMA_VERSION:
+        raise ValueError("question coverage event schema_version mismatch")
+    return QuestionCoverageEvent.model_validate(
+        {
+            "event_id": row.id,
+            "session_id": row.session_id,
+            "contract_id": row.contract_id,
+            "root_contract_id": row.root_contract_id,
+            "answer_message_id": row.answer_message_id,
+            "items": [CoverageEventItem.model_validate(item) for item in row.items],
+            "event_digest": row.event_digest,
+        }
+    )
 
 
 class RepositoryErrorCode(StrEnum):
@@ -1143,12 +1228,37 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 .order_by(ArtifactRevision.artifact_id, ArtifactRevision.revision)
             )
         ).all()
+        contracts = (
+            await session.scalars(
+                select(QuestionContractRecord)
+                .where(QuestionContractRecord.session_id == session_row.id)
+                .order_by(QuestionContractRecord.root_contract_id, QuestionContractRecord.revision)
+            )
+        ).all()
+        events = (
+            await session.scalars(
+                select(QuestionCoverageEventRecord)
+                .where(QuestionCoverageEventRecord.session_id == session_row.id)
+                .order_by(
+                    QuestionCoverageEventRecord.root_contract_id,
+                    QuestionCoverageEventRecord.created_at,
+                    QuestionCoverageEventRecord.id,
+                )
+            )
+        ).all()
+        try:
+            contract_schemas = tuple(_contract_schema(row) for row in contracts)
+            event_schemas = tuple(_coverage_event_schema(row) for row in events)
+        except (ValueError, TypeError):
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
         return DomainState(
             session_id=session_row.id,
             state_version=session_row.state_version,
             observations=tuple(self._observation_schema(row) for row in observations),
             safety_profile=None if safety is None else self._safety_schema(safety),
             artifacts=tuple(self._artifact_schema(row) for row in artifacts),
+            question_contracts=contract_schemas,
+            question_coverage_events=event_schemas,
         )
 
     async def _persist_state(
@@ -1177,6 +1287,15 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                         created_at=observation_item.created_at,
                     )
                 )
+
+        previous_contract_ids = {item.contract_id for item in previous.question_contracts}
+        for contract_item in current.question_contracts:
+            if contract_item.contract_id not in previous_contract_ids:
+                session.add(QuestionContractRecord(**_contract_record_values(contract_item)))
+        previous_event_ids = {item.event_id for item in previous.question_coverage_events}
+        for event_item in current.question_coverage_events:
+            if event_item.event_id not in previous_event_ids:
+                session.add(QuestionCoverageEventRecord(**_coverage_event_record_values(event_item)))
 
         if delta.safety_profile is not None:
             safety_row = await session.scalar(

@@ -60,6 +60,38 @@ class InquiryDimension(StrEnum):
     LACTATION_APPLICABILITY_FLAG = "patient.lactation_applicability"
 
 
+_SAFETY_DIMENSIONS = frozenset(
+    {
+        InquiryDimension.ALLERGY_STATUS,
+        InquiryDimension.MEDICATION_STATUS,
+        InquiryDimension.MAJOR_CONDITION_STATUS,
+        InquiryDimension.PREGNANCY_STATUS,
+        InquiryDimension.LACTATION_STATUS,
+    }
+)
+
+
+def _validate_contract_dimension_projection(
+    open_dimensions: tuple[InquiryDimension, ...],
+    resolved_dimensions: tuple[InquiryDimension, ...],
+    partial_dimensions: tuple[InquiryDimension, ...],
+) -> None:
+    groups = (open_dimensions, resolved_dimensions, partial_dimensions)
+    if any(len(group) != len(set(group)) for group in groups):
+        raise ValueError("contract dimension projections must be unique")
+    if any(group != tuple(sorted(group, key=lambda item: item.value)) for group in groups):
+        raise ValueError("contract dimension projections must be sorted")
+    open_set = set(open_dimensions)
+    resolved_set = set(resolved_dimensions)
+    partial_set = set(partial_dimensions)
+    if open_set & resolved_set:
+        raise ValueError("a contract dimension cannot be open and resolved")
+    if not partial_set.issubset(resolved_set):
+        raise ValueError("partial contract dimensions must also be resolved")
+    if (open_set | resolved_set | partial_set) & _SAFETY_DIMENSIONS:
+        raise ValueError("question coverage cannot project authoritative safety dimensions")
+
+
 class ComplaintCategory(StrEnum):
     """主诉大类枚举——驱动十问动态维度激活（COMPLETENESS_COMPLAINT_TEN_QUESTION_RULES）。
 
@@ -200,11 +232,27 @@ class CompletenessPolicyInput(BaseModel):
     # covered」(现状)。安全维度不走槽位(仍认 collection_status)。
     # 由调用方按 settings.intake_slot_path_enabled 传入,纯函数不读全局。
     slot_based: bool = False
+    # R9 additive compatibility fields.  They are deterministic projections of
+    # the persisted question-contract ledger, never model decisions:
+    # - open: a required contract still has residual aspects and therefore
+    #   holds the dimension even when a coarse Observation already exists;
+    # - resolved: the contract reached a terminal outcome and must not be
+    #   asked again merely because the legacy fact-key projection is sparse;
+    # - partial: a resolved non-safety contract ended through unavailable/cap,
+    #   so downstream reasoning may proceed only with an explicit partial flag.
+    contract_open_dimensions: tuple[InquiryDimension, ...] = ()
+    contract_resolved_dimensions: tuple[InquiryDimension, ...] = ()
+    contract_partial_dimensions: tuple[InquiryDimension, ...] = ()
 
     @model_validator(mode="after")
     def state_version_matches_snapshot(self) -> CompletenessPolicyInput:
         if self.input_state_version != self.domain_snapshot.state_version:
             raise ValueError("input_state_version must match domain snapshot")
+        _validate_contract_dimension_projection(
+            self.contract_open_dimensions,
+            self.contract_resolved_dimensions,
+            self.contract_partial_dimensions,
+        )
         return self
 
 
@@ -256,6 +304,18 @@ class CompletenessGateDetails(_CompletenessModel):
     stagnation: CompletenessStagnationResult
     applicability: CompletenessApplicabilityResult
     triage_disposition: str | None = Field(default=None, max_length=64)
+    contract_open_dimensions: tuple[InquiryDimension, ...] = Field(default=())
+    contract_resolved_dimensions: tuple[InquiryDimension, ...] = Field(default=())
+    contract_partial_dimensions: tuple[InquiryDimension, ...] = Field(default=())
+
+    @model_validator(mode="after")
+    def validate_contract_projection(self) -> CompletenessGateDetails:
+        _validate_contract_dimension_projection(
+            self.contract_open_dimensions,
+            self.contract_resolved_dimensions,
+            self.contract_partial_dimensions,
+        )
+        return self
 
 
 class CompletenessGateResult(_CompletenessModel):
@@ -278,9 +338,17 @@ class CompletenessPolicyResult(_CompletenessModel):
     stagnation: CompletenessStagnationResult
     gate_result: CompletenessGateResult
     rule_outcomes: tuple[CompletenessRuleOutcome, ...] = Field(default=())
+    contract_open_dimensions: tuple[InquiryDimension, ...] = Field(default=())
+    contract_resolved_dimensions: tuple[InquiryDimension, ...] = Field(default=())
+    contract_partial_dimensions: tuple[InquiryDimension, ...] = Field(default=())
 
     @model_validator(mode="after")
     def gate_matches_result(self) -> CompletenessPolicyResult:
+        _validate_contract_dimension_projection(
+            self.contract_open_dimensions,
+            self.contract_resolved_dimensions,
+            self.contract_partial_dimensions,
+        )
         if (
             self.gate_result.gate_name != COMPLETENESS_GATE_NAME
             or self.gate_result.policy_version != self.policy_version
@@ -289,6 +357,22 @@ class CompletenessPolicyResult(_CompletenessModel):
             raise ValueError("completeness gate metadata must match result metadata")
         if self.gate_result.details.disposition is not self.disposition:
             raise ValueError("completeness gate details must carry the result disposition")
+        details = self.gate_result.details
+        mirrored_fields = (
+            "covered_dimensions",
+            "missing_required",
+            "missing_optional",
+            "conflicting_dimensions",
+            "stagnation",
+            "rule_outcomes",
+            "contract_open_dimensions",
+            "contract_resolved_dimensions",
+            "contract_partial_dimensions",
+        )
+        if any(getattr(self, field) != getattr(details, field) for field in mirrored_fields):
+            raise ValueError("completeness gate details must match result fields")
+        if details.rule_ids != tuple(item.rule_id for item in self.rule_outcomes):
+            raise ValueError("completeness gate rule ids must match result rule outcomes")
         decision_by_disposition = {
             CompletenessDisposition.READY: GateDecision.PASSED,
             CompletenessDisposition.INCOMPLETE: GateDecision.FAILED,

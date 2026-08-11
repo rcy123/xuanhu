@@ -61,6 +61,7 @@ from app.schemas.question import (
     GapSelectionDisposition,
     GapSelectionKind,
     GapSelectionResult,
+    QuestionAspectDraft,
     QuestionComposerClinicalFact,
     QuestionComposerFailureCode,
     QuestionComposerModelInput,
@@ -237,6 +238,39 @@ def test_gap_schema_versions_and_serialization_contract() -> None:
     assert selection.policy_version == GAP_SELECTOR_POLICY_VERSION
     assert selection.input_state_version == completeness.input_state_version
     assert GapSelectionResult.model_validate_json(selection.model_dump_json()) == selection
+
+
+def test_r9_aspect_schema_is_additive_and_bounded() -> None:
+    legacy = QuestionComposerModelOutput(question="请补充患者目前最主要的不适？")
+    assert legacy.aspects == ()
+
+    output = QuestionComposerModelOutput(
+        question="患者咳嗽是干咳还是有痰，痰的颜色和量如何？",
+        aspects=(
+            QuestionAspectDraft(criterion="说明咳嗽是否有痰"),
+            QuestionAspectDraft(criterion="说明痰的颜色"),
+            QuestionAspectDraft(criterion="说明痰量"),
+        ),
+    )
+    assert tuple(item.criterion for item in output.aspects) == (
+        "说明咳嗽是否有痰",
+        "说明痰的颜色",
+        "说明痰量",
+    )
+
+    with pytest.raises(ValidationError):
+        QuestionComposerModelOutput(
+            question="请补充患者咳嗽情况？",
+            aspects=tuple(QuestionAspectDraft(criterion=f"回答要求 {index}") for index in range(5)),
+        )
+    with pytest.raises(ValidationError):
+        QuestionComposerModelOutput(
+            question="请补充患者咳嗽情况？",
+            aspects=(
+                QuestionAspectDraft(criterion="说明咳嗽情况"),
+                QuestionAspectDraft(criterion="说明咳嗽情况"),
+            ),
+        )
 
 
 def test_incomplete_collects_chief_complaint_before_routine_safety_fields() -> None:
@@ -634,11 +668,188 @@ async def test_template_hit_generates_one_question_and_zero_model_requests() -> 
     assert outcome.result.source is QuestionSource.TEMPLATE
     assert outcome.result.template_version == "question-template-registry.v1"
     assert outcome.result.question.count("？") == 1
+    assert len(outcome.result.aspects) == 1
+    assert outcome.result.aspects[0].criterion
     assert gateway.actual_request_count == 0
     # 纯模板命中（不调模型）不是退化
     assert outcome.degraded is False
     assert outcome.last_failure_code is None
     assert outcome.failure_code is None
+
+
+@pytest.mark.asyncio
+async def test_r9_model_can_describe_multiple_generic_aspects() -> None:
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    gateway = FakeGateway(
+        [
+            {
+                "schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION,
+                "question": "请问您这次主要不舒服是什么？",
+                "aspects": [
+                    {"criterion": "说明患者当前最主要的不适"},
+                    {"criterion": "说明该不适的主要表现"},
+                ],
+            }
+        ]
+    )
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=FrozenQuestionTemplateRegistry(()),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert tuple(item.criterion for item in outcome.result.aspects) == (
+        "说明患者当前最主要的不适",
+        "说明该不适的主要表现",
+    )
+
+
+@pytest.mark.asyncio
+async def test_r9_frozen_residual_aspects_are_authoritative_and_legacy_output_may_omit_them() -> None:
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    frozen = (
+        QuestionAspectDraft(criterion="说明痰的颜色"),
+        QuestionAspectDraft(criterion="说明痰量"),
+    )
+    gateway = fallback_gateway()
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=FrozenQuestionTemplateRegistry(()),
+        frozen_residual_aspects=frozen,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.aspects == frozen
+    encoded_messages = json.dumps(gateway.calls[0]["messages"], ensure_ascii=False)
+    assert "frozen_residual_aspects" in encoded_messages
+    assert "说明痰的颜色" in encoded_messages
+    assert "说明痰量" in encoded_messages
+
+
+@pytest.mark.asyncio
+async def test_r9_model_cannot_expand_or_rewrite_frozen_residual_aspects() -> None:
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    frozen = (QuestionAspectDraft(criterion="说明痰的颜色"),)
+    gateway = FakeGateway(
+        [
+            {
+                "schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION,
+                "question": "请问您这次主要不舒服是什么？",
+                "aspects": [
+                    {"criterion": "说明痰的颜色"},
+                    {"criterion": "补充一个系统未要求的新目标"},
+                ],
+            }
+        ]
+    )
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=FrozenQuestionTemplateRegistry(()),
+        frozen_residual_aspects=frozen,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.FAILED
+    assert outcome.failure_code is QuestionComposerFailureCode.MODEL_OUTPUT_INVALID
+
+
+@pytest.mark.asyncio
+async def test_r9_model_cannot_allocate_aspect_ids_or_coverage_authority() -> None:
+    selection = select_gap(evaluate_completeness_policy(policy_input(*missing_symptom_facts())))
+    gateway = FakeGateway(
+        [
+            {
+                "schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION,
+                "question": "请问您这次主要不舒服是什么？",
+                "aspects": [
+                    {
+                        "criterion": "说明患者当前最主要的不适",
+                        "aspect_id": str(uuid4()),
+                        "complete": True,
+                    }
+                ],
+            }
+        ]
+    )
+
+    outcome = await question_composer._compose_question_with_template_registry(
+        selection=selection,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(selection),
+        template_registry=FrozenQuestionTemplateRegistry(()),
+    )
+
+    assert outcome.status is QuestionCompositionStatus.FAILED
+    assert outcome.failure_code is QuestionComposerFailureCode.MODEL_OUTPUT_INVALID
+
+
+@pytest.mark.asyncio
+async def test_r9_system_residual_dimension_can_override_only_a_routine_gap_rank() -> None:
+    covered = tuple(
+        item
+        for item in complete_general_facts()
+        if item.fact_key not in {"chief_complaint.symptom", "ten_questions.sleep"}
+    )
+    completeness = evaluate_completeness_policy(policy_input(*covered))
+    ordinary_selection = select_gap(completeness)
+    assert ordinary_selection.selected_dimension is InquiryDimension.CHIEF_COMPLAINT_SYMPTOM
+    frozen = (QuestionAspectDraft(criterion="说明患者当前睡眠质量"),)
+    gateway = FakeGateway(
+        [
+            {
+                "schema_version": QUESTION_MODEL_OUTPUT_SCHEMA_VERSION,
+                "question": "患者近期睡眠质量如何？",
+                "aspects": [{"criterion": "说明患者当前睡眠质量"}],
+            }
+        ]
+    )
+
+    outcome = await compose_question(
+        completeness_result=completeness,
+        runtime=AgentRuntime(gateway, recorder=None),
+        run_spec=build_run_spec(ordinary_selection),
+        frozen_residual_aspects=frozen,
+        _system_forced_dimension=InquiryDimension.TEN_SLEEP,
+    )
+
+    assert outcome.status is QuestionCompositionStatus.SUCCEEDED
+    assert outcome.result is not None
+    assert outcome.result.selected_dimension is InquiryDimension.TEN_SLEEP
+    assert outcome.result.aspects == frozen
+
+
+@pytest.mark.asyncio
+async def test_r9_system_residual_dimension_cannot_invent_gap_or_bypass_pending_safety() -> None:
+    completeness = evaluate_completeness_policy(policy_input(*missing_symptom_facts()))
+    selection = select_gap(completeness)
+    frozen = (QuestionAspectDraft(criterion="说明患者当前睡眠质量"),)
+
+    invented = await compose_question(
+        completeness_result=completeness,
+        frozen_residual_aspects=frozen,
+        _system_forced_dimension=InquiryDimension.TEN_SLEEP,
+    )
+    safety_pending = await compose_question(
+        completeness_result=completeness,
+        pending_safety_dimensions=(InquiryDimension.ALLERGY_STATUS,),
+        frozen_residual_aspects=frozen,
+        _system_forced_dimension=selection.selected_dimension,
+    )
+
+    assert invented.status is QuestionCompositionStatus.FAILED
+    assert invented.failure_code is QuestionComposerFailureCode.SELECTION_AUTHORITY_MISMATCH
+    assert safety_pending.status is QuestionCompositionStatus.FAILED
+    assert safety_pending.failure_code is QuestionComposerFailureCode.SELECTION_AUTHORITY_MISMATCH
 
 
 @pytest.mark.asyncio
@@ -907,7 +1118,7 @@ async def test_context_build_failed_falls_back_to_template_with_degraded_signal(
 
 
 def test_question_context_budget_covers_maximal_schema_inputs() -> None:
-    """7000 token 预算必须容纳 schema 允许的最大输入（24 事实 + 8 轮长对话 + 主诉 + 32 激活维度）。"""
+    """预算容纳最大上下文以及 R9 的 4 项冻结 residual criteria。"""
     facts = tuple(
         QuestionComposerClinicalFact(
             fact_key=(
@@ -937,6 +1148,9 @@ def test_question_context_budget_covers_maximal_schema_inputs() -> None:
         chief_complaint="感冒" * 1000,
         activated_dimensions=tuple(f"ten_questions.dim_{i:02d}" for i in range(32)),
         missing_slot="缺口" * 120,
+        frozen_residual_aspects=tuple(
+            QuestionAspectDraft(criterion=f"{index}" + "覆" * 159) for index in range(4)
+        ),
     )
     packet, _ = build_question_context(payload)
     used = sum(ContextBuilder.estimate_tokens(message.content) for message in packet.messages)

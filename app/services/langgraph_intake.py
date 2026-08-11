@@ -27,9 +27,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.checkpoint import postgres_checkpointer
 from app.agent_runtime.commands import NODE_INTAKE_SUBGRAPH_V1, XuanhuCommand
-from app.agent_runtime.completeness_policy import completeness_to_gate_result_schema, evaluate_completeness_policy
+from app.agent_runtime.completeness_policy import (
+    _is_safety_dimension,
+    completeness_to_gate_result_schema,
+    evaluate_completeness_policy,
+)
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.context import project_model_input_identity_sequences
+from app.agent_runtime.contract_projection import (
+    ContractDimensionProjection,
+    project_contract_dimensions,
+)
 from app.agent_runtime.ephemeral_cache import BoundedTTLCache
 from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.intake_fact_key_legality import (
@@ -47,6 +55,10 @@ from app.agent_runtime.intake_verifier import (
 )
 from app.agent_runtime.lifecycle import SharedLangGraphRuntime
 from app.agent_runtime.observation_projection import project_current_observations
+from app.agent_runtime.question_contract import (
+    QuestionContractIntegrityError,
+    evaluate_contract_coverage,
+)
 from app.agent_runtime.reducer import (
     DomainDelta,
     DomainReducerError,
@@ -162,10 +174,23 @@ from app.schemas.message import (
 from app.schemas.question import (
     QUESTION_COMPOSER_AGENT_VERSION,
     QUESTION_COMPOSER_PROMPT_VERSION,
+    QuestionAspectDraft,
     QuestionComposerClinicalFact,
     QuestionComposerTurn,
     QuestionCompositionOutcome,
     QuestionCompositionStatus,
+)
+from app.schemas.question_contract import (
+    ContractCoverageDisposition,
+    ContractReplyContext,
+    CoverageCandidateItem,
+    CoverageEvidenceCandidate,
+    CoverageStatus,
+    QuestionAspect,
+    QuestionContract,
+    QuestionCoverageCandidate,
+    build_coverage_event,
+    build_question_contract,
 )
 from app.schemas.triage import TriageDisposition, TriagePolicyInput
 from app.services.events import EventService
@@ -983,7 +1008,7 @@ class LangGraphIntakeMessageRunner:
                 CompletenessDisposition.INCOMPLETE,
                 CompletenessDisposition.CONFLICT,
             }:
-                question = await self._compose_question(
+                question_message_id, question, contract = await self._compose_question(
                     claim.session_id,
                     completeness_result,
                     computation.pending_safety_dimensions,
@@ -993,7 +1018,7 @@ class LangGraphIntakeMessageRunner:
                     claim.id,
                 )
                 if question is not None:
-                    question_message_id = uuid.uuid4()
+                    assert question_message_id is not None
                     question_spec = ConsultMessageSpec(
                         message_id=question_message_id,
                         role="agent",
@@ -1012,6 +1037,16 @@ class LangGraphIntakeMessageRunner:
                         created_at=None,
                     )
                     progress = progress.model_copy(update={"followup_rounds": progress.followup_rounds + 1})
+                    if contract is not None:
+                        # R9 接线点 A：契约随问句消息同一事务落库（并入 delta，
+                        # 重建 verification context 以覆盖契约字段）。
+                        delta = _delta_with_contract(delta, contract)
+                        context = _verification_context(
+                            delta=delta,
+                            state=computation.domain_state,
+                            trace_id=trace_id,
+                            idempotency_key=claim.idempotency_key,
+                        )
             elif completeness_result.disposition is CompletenessDisposition.READY:
                 already_noticed = await latest_agent_message_is_intake_complete(
                     self._db,
@@ -1353,7 +1388,15 @@ class LangGraphIntakeMessageRunner:
         trace_id: str,
         command_key: str,
         claim_id: uuid.UUID,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[uuid.UUID | None, dict[str, Any] | None, QuestionContract | None]:
+        """Compose one question and, when R9 is enabled and a question is really
+        asked, build the durable question contract for it.
+
+        Returns ``(question_message_id, question_payload, contract)`` — all
+        ``None`` when no question is asked this round.  The message id is
+        generated here (not by the caller) so the contract's stable identity
+        can be derived from it and persisted atomically with the question.
+        """
         run_spec = RunSpec(
             run_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:intake-question:{session_id}:{command_key}"),
             session_id=session_id,
@@ -1369,6 +1412,11 @@ class LangGraphIntakeMessageRunner:
             idempotency_key=f"{command_key}:question",
             trace_id=trace_id,
         )
+        # R9 接线点 E：存在待回答的 open 契约时强制残余追问——维度由系统冻结，
+        # 残余 aspects 由 fold 证明恰好等于上一轮未答集合，模型只能措辞不能改写。
+        forced: tuple[InquiryDimension, tuple[QuestionAspect, ...], QuestionContract] | None = None
+        if get_settings().question_contract_enabled and completeness_result.disposition is CompletenessDisposition.INCOMPLETE:
+            forced = _residual_contract(domain_state)
         recent_turns = await _recent_question_turns(self._db, session_id)
         outcome = await compose_question(
             completeness_result=completeness_result,
@@ -1381,9 +1429,15 @@ class LangGraphIntakeMessageRunner:
             chief_complaint=_chief_complaint_text(domain_state),
             activated_dimensions=_activated_dimension_values(completeness_result),
             missing_slot=_missing_slot_text(completeness_result, recent_turns),
+            frozen_residual_aspects=(
+                tuple(QuestionAspectDraft(criterion=item.criterion) for item in forced[1])
+                if forced is not None
+                else ()
+            ),
+            _system_forced_dimension=forced[0] if forced is not None else None,
         )
         if outcome.status is QuestionCompositionStatus.NO_QUESTION:
-            return None
+            return None, None, None
         if outcome.status is not QuestionCompositionStatus.SUCCEEDED or outcome.result is None:
             # 1b: compose 硬失败(模板缺失/契约不匹配)不再 raise 崩图——
             # 留痕 degraded 后本轮不追问(claim 正常 completed,下一轮再问)。
@@ -1405,14 +1459,42 @@ class LangGraphIntakeMessageRunner:
                 },
                 step="question_compose",
             )
-            return None
+            return None, None, None
         # 0a 模板兜底留痕：对称记录模型成功 / 模板退化，便于事后查"为什么这一轮是模板句"。
         await _save_intermediate(
             claim_id,
             {"question_composer": _question_composer_metadata(outcome, str(run_spec.run_id))},
             step="question_compose",
         )
-        return outcome.result.model_dump(mode="json")
+        question_message_id = uuid.uuid4()
+        contract = None
+        if get_settings().question_contract_enabled:
+            # R9 接线点 A：为真正问出去的这轮问题构建契约。残余追问链上继承
+            # 权威字段（维度/selection_kind/cap/安全标志）并冻结残余 aspects；
+            # 建契约失败（不可达）降级为无契约提问，回复走 legacy 路径。
+            try:
+                if forced is not None:
+                    contract = build_question_contract(
+                        session_id=session_id,
+                        question_message_id=question_message_id,
+                        question_text=outcome.result.question,
+                        parent_contract=forced[2],
+                        residual_aspects=forced[1],
+                    )
+                else:
+                    contract = build_question_contract(
+                        session_id=session_id,
+                        question_message_id=question_message_id,
+                        question_text=outcome.result.question,
+                        dimension=outcome.result.selected_dimension.value,
+                        selection_kind=cast(Literal["required", "conflict"], outcome.result.selection_kind.value),
+                        aspect_criteria=tuple(item.criterion for item in outcome.result.aspects),
+                        max_followups=get_settings().question_contract_max_followups,
+                        safety_critical=_is_safety_dimension(outcome.result.selected_dimension),
+                    )
+            except ValueError:
+                contract = None
+        return question_message_id, outcome.result.model_dump(mode="json"), contract
 
     async def _complete_claim(
         self,
@@ -1731,6 +1813,7 @@ async def run_intake_extract_node(state: XuanhuGraphState) -> dict[str, Any]:
             or _bound_required_reply_normal_output(intake_input)
         )
         if bound_output is not None:
+            bound_output = _attach_bound_coverage(bound_output, intake_input)
             _INTAKE_OUTPUT_CACHE[claim.id] = bound_output
             await _save_intermediate(
                 claim.id,
@@ -2142,7 +2225,7 @@ async def run_intake_prepare_question_node(state: XuanhuGraphState) -> dict[str,
             return _sanitized_graph_error(state, "INTAKE_ROUTE_MISMATCH", "recomputed disposition must be incomplete/conflict")
 
         # Compose question
-        question = await runner._compose_question(  # noqa: SLF001
+        question_message_id, question, contract = await runner._compose_question(  # noqa: SLF001
             claim.session_id,
             computation.completeness_result,
             computation.pending_safety_dimensions,
@@ -2155,7 +2238,7 @@ async def run_intake_prepare_question_node(state: XuanhuGraphState) -> dict[str,
             # No question to ask — treat as ready (complete with no further question)
             return await _finalize_as_ready(runner, claim, patient_message, computation, state)
 
-        question_message_id = uuid.uuid4()
+        assert question_message_id is not None
         question_spec = ConsultMessageSpec(
             message_id=question_message_id,
             role="agent",
@@ -2176,6 +2259,17 @@ async def run_intake_prepare_question_node(state: XuanhuGraphState) -> dict[str,
         progress = computation.progress.model_copy(
             update={"followup_rounds": computation.progress.followup_rounds + 1}
         )
+        delta = computation.delta
+        context = computation.context
+        if contract is not None:
+            # R9 接线点 A：契约并入 delta、重建 context，随问句同一事务落库。
+            delta = _delta_with_contract(delta, contract)
+            context = _verification_context(
+                delta=delta,
+                state=computation.domain_state,
+                trace_id=_node_trace_id(state),
+                idempotency_key=claim.idempotency_key,
+            )
 
         # 1a 主诉大类归集留痕
         if computation.classify_trace_payload is not None:
@@ -2200,8 +2294,8 @@ async def run_intake_prepare_question_node(state: XuanhuGraphState) -> dict[str,
         )
         try:
             await computation.repository.commit(
-                computation.delta,
-                computation.context,
+                delta,
+                context,
                 graph_version=DEFAULT_GRAPH_VERSION,
                 gate_results=(computation.triage_gate, computation.completeness_gate),
                 graph_steps=_graph_steps(disposition),
@@ -2900,7 +2994,14 @@ async def _compute_intake_from_claim(
 ) -> _IntakeComputation:
     repository = PostgresDomainRepository(get_session_factory())
     domain_state = await repository.get_state(claim.session_id)
-    output = await _load_or_retry_intake_output(claim, patient_message, domain_state, trace_id)
+    intake_input = _build_intake_input(domain_state, patient_message)
+    output = await _load_or_retry_intake_output(
+        claim,
+        patient_message,
+        domain_state,
+        trace_id,
+        intake_input=intake_input,
+    )
     precheck = evaluate_raw_text_triage_precheck(patient_message.id, patient_message.content)
     rejected_observations: list[RejectedObservation] = []
     normalized_observations: list[NormalizedObservation] = []
@@ -2915,6 +3016,26 @@ async def _compute_intake_from_claim(
         rejected_observations=rejected_observations,
         normalized_observations=normalized_observations,
     )
+    # R9 接线点 C：模型/确定性产出的覆盖候选 → 对质原文 → 落为持久化覆盖事件。
+    # 事件并入 delta，reducer 追加式合并 + 链校验；失败降级为无事件（契约保持
+    # open，残余追问有界推进），不让一个 grounding 异常卡死整轮 intake。
+    if (
+        get_settings().question_contract_enabled
+        and output.question_coverage is not None
+        and intake_input.contract_reply_context is not None
+    ):
+        try:
+            event = build_coverage_event(
+                contract=intake_input.contract_reply_context.contract,
+                candidate=output.question_coverage,
+                message_contents={
+                    item.message_id: item.content for item in intake_input.current_messages
+                },
+            )
+        except ValueError:
+            event = None
+        if event is not None:
+            delta = delta.model_copy(update={"question_coverage_events": (event,)})
     if rejected_observations or normalized_observations:
         extraction_trace: dict[str, Any] = {}
         if rejected_observations:
@@ -2994,6 +3115,17 @@ async def _compute_intake_from_claim(
             claim.session_id,
             output.patient_safety_delta,
         )
+    # R9 接线点 D：契约账本 → 三维度投影（open/resolved/partial），驱动完整性
+    # 判定：open 维度强制留在 missing_required（粗粒度事实不再能关闭维度）、
+    # resolved 不重复追问、partial 降级为 PARTIAL 推进。开关关闭时空投影（legacy）。
+    contract_projection = (
+        project_contract_dimensions(
+            next_state.question_contracts,
+            next_state.question_coverage_events,
+        )
+        if get_settings().question_contract_enabled
+        else ContractDimensionProjection()
+    )
     completeness_result = evaluate_completeness_policy(
         CompletenessPolicyInput(
             input_state_version=next_state.state_version,
@@ -3002,6 +3134,9 @@ async def _compute_intake_from_claim(
             progress=progress,
             # 2c 灰度: 槽位口径 covered 判定由 settings 开关驱动(默认关闭=现状认键)。
             slot_based=get_settings().intake_slot_path_enabled,
+            contract_open_dimensions=contract_projection.open_dimensions,
+            contract_resolved_dimensions=contract_projection.resolved_dimensions,
+            contract_partial_dimensions=contract_projection.partial_dimensions,
         )
     )
     return _IntakeComputation(
@@ -3072,6 +3207,7 @@ async def _load_or_retry_intake_output(
     patient_message: ConsultMessage,
     domain_state: DomainState,
     trace_id: str,
+    intake_input: IntakeExtractionInput | None = None,
 ) -> IntakeExtractionOutput:
     cached = _INTAKE_OUTPUT_CACHE.get(claim.id)
     if cached is not None:
@@ -3087,7 +3223,7 @@ async def _load_or_retry_intake_output(
         )
         return output
     run_id = _stable_intake_extraction_run_id(claim)
-    intake_input = _build_intake_input(domain_state, patient_message)
+    intake_input = intake_input or _build_intake_input(domain_state, patient_message)
     bound_output = (
         _bound_explicit_none_output(intake_input)
         or _bound_ambiguous_negation_output(intake_input)
@@ -3095,6 +3231,7 @@ async def _load_or_retry_intake_output(
         or _bound_required_reply_normal_output(intake_input)
     )
     if bound_output is not None:
+        bound_output = _attach_bound_coverage(bound_output, intake_input)
         _INTAKE_OUTPUT_CACHE[claim.id] = bound_output
         await _save_intermediate(
             claim.id,
@@ -3440,8 +3577,10 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
         question_spec: ConsultMessageSpec | None = None
         agent_item: AgentMessageItem | None = None
         progress = computation.progress
+        delta = computation.delta
+        context = computation.context
         if disposition in {CompletenessDisposition.INCOMPLETE, CompletenessDisposition.CONFLICT}:
-            question = await runner._compose_question(  # noqa: SLF001
+            question_message_id, question, contract = await runner._compose_question(  # noqa: SLF001
                 claim.session_id,
                 computation.completeness_result,
                 computation.pending_safety_dimensions,
@@ -3451,7 +3590,7 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                 claim.id,
             )
             if question is not None:
-                question_message_id = uuid.uuid4()
+                assert question_message_id is not None
                 question_spec = ConsultMessageSpec(
                     message_id=question_message_id,
                     role="agent",
@@ -3470,6 +3609,15 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
                     created_at=None,
                 )
                 progress = progress.model_copy(update={"followup_rounds": progress.followup_rounds + 1})
+                if contract is not None:
+                    # R9 接线点 A：契约并入 delta、重建 context，随问句同一事务落库。
+                    delta = _delta_with_contract(delta, contract)
+                    context = _verification_context(
+                        delta=delta,
+                        state=computation.domain_state,
+                        trace_id=_node_trace_id(state),
+                        idempotency_key=claim.idempotency_key,
+                    )
         elif disposition is CompletenessDisposition.READY:
             already_noticed = await latest_agent_message_is_intake_complete(
                 db,
@@ -3510,8 +3658,8 @@ async def _finalize_intake_route(state: XuanhuGraphState, *, expected_route: str
         )
         try:
             await computation.repository.commit(
-                computation.delta,
-                computation.context,
+                delta,
+                context,
                 graph_version=DEFAULT_GRAPH_VERSION,
                 gate_results=(computation.triage_gate, computation.completeness_gate),
                 graph_steps=_graph_steps(disposition),
@@ -3799,7 +3947,127 @@ def _build_intake_input(state: DomainState, message: ConsultMessage) -> IntakeEx
         ),
         historical_active_facts=facts[:128],
         reply_context=_reply_context_from_message(message),
+        # R9 接线点 B：仅当回复绑定到「仍待回答」的契约时注入私有契约上下文，
+        # 模型据此产出 question_coverage；无绑定则维持 legacy 双键结构。
+        contract_reply_context=_contract_context_from_message(state, message),
     )
+
+
+def _contract_context_from_message(
+    state: DomainState,
+    message: ConsultMessage,
+) -> ContractReplyContext | None:
+    """R9 接线点 B：把患者回复绑定到其回答的那份持久化契约。
+
+    仅当该契约所在根链仍是 ``OPEN``（尚有未答残余、未到 cap）时绑定——已满足、
+    已耗尽或转人工的契约不再绑定，晚来信息按普通 observation 吸收（MVP 晚来
+    信息策略）。绑定与反查全部基于 DomainState 内的确定性账本，无额外 DB 读。
+    """
+    if not get_settings().question_contract_enabled:
+        return None
+    reply_context = _reply_context_from_message(message)
+    if reply_context is None:
+        return None
+    contract = next(
+        (
+            item
+            for item in state.question_contracts
+            if item.question_message_id == reply_context.question_message_id
+        ),
+        None,
+    )
+    if contract is None:
+        return None
+    root_id = contract.root_contract_id
+    root_contracts = tuple(item for item in state.question_contracts if item.root_contract_id == root_id)
+    root_events = tuple(item for item in state.question_coverage_events if item.root_contract_id == root_id)
+    try:
+        coverage = evaluate_contract_coverage(root_contracts, root_events)
+    except QuestionContractIntegrityError:
+        return None
+    if coverage.disposition is not ContractCoverageDisposition.OPEN:
+        return None
+    return ContractReplyContext(contract=contract, answer_message_id=message.id)
+
+
+def _residual_contract(
+    state: DomainState,
+) -> tuple[InquiryDimension, tuple[QuestionAspect, ...], QuestionContract] | None:
+    """R9 接线点 E：返回第一个待回答 open 契约的
+    ``(强制维度, fold 证明的残余 aspects, 最新契约)``，无则 None。
+
+    安全契约由投影层排除（安全采集以 SafetyProfile 为准）；残余 aspects 是
+    确定性 fold 的输出，模型只能据其措辞、不能改写或扩缩。
+    """
+    projection = project_contract_dimensions(state.question_contracts, state.question_coverage_events)
+    if not projection.open_dimensions:
+        return None
+    dimension = projection.open_dimensions[0]
+    for root in projection.roots:
+        if root.dimension != dimension:
+            continue
+        if root.coverage.disposition is not ContractCoverageDisposition.OPEN:
+            continue
+        if not root.coverage.residual_aspects:
+            continue
+        latest = next(
+            (
+                item
+                for item in state.question_contracts
+                if item.contract_id == root.coverage.latest_contract_id
+            ),
+            None,
+        )
+        if latest is None:
+            continue
+        return dimension, root.coverage.residual_aspects, latest
+    return None
+
+
+def _delta_with_contract(
+    delta: DomainDelta,
+    contract: QuestionContract,
+) -> DomainDelta:
+    """R9 接线点 A：把新契约并入 delta 的追加式契约账本。"""
+    return delta.model_copy(update={"question_contracts": delta.question_contracts + (contract,)})
+
+
+def _attach_bound_coverage(
+    output: IntakeExtractionOutput,
+    intake_input: IntakeExtractionInput,
+) -> IntakeExtractionOutput:
+    """R9 接线点 C（确定性路径）：回复绑定的确定性抽取产出了事实，它就是对该
+    契约问题的回答——为每个契约 aspect 附加 ``addressed`` 覆盖候选（证据为整条
+    回复 span），使确定性短路不会让 open 契约永远无法关闭而无限追问。
+    """
+    context = intake_input.contract_reply_context
+    if context is None or output.question_coverage is not None:
+        return output
+    if output.decision is not IntakeExtractionDecision.EXTRACTED:
+        return output
+    if len(intake_input.current_messages) != 1:
+        return output
+    message = intake_input.current_messages[0]
+    contract = context.contract
+    span = CoverageEvidenceCandidate(
+        source_message_id=message.message_id,
+        start_char=0,
+        end_char=len(message.content),
+        quote=message.content,
+    )
+    candidate = QuestionCoverageCandidate(
+        contract_id=contract.contract_id,
+        answer_message_id=message.message_id,
+        items=tuple(
+            CoverageCandidateItem(
+                aspect_id=aspect.aspect_id,
+                status=CoverageStatus.ADDRESSED,
+                evidence=(span,),
+            )
+            for aspect in contract.aspects
+        ),
+    )
+    return output.model_copy(update={"question_coverage": candidate})
 
 
 def _reply_context_from_message(message: ConsultMessage) -> IntakeReplyContext | None:

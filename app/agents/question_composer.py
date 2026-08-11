@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent_runtime.context import ContextBuilder, ContextBuilderError, ContextPacket
-from app.agent_runtime.gap_selector import select_gap
+from app.agent_runtime.gap_selector import canonicalize_gap_selection_input, select_gap
 from app.agent_runtime.runtime import AgentRuntime, RuntimeErrorBase
 from app.agent_runtime.specs import AgentSpec, Capability, FailurePolicy, ModelPolicy, RunSpec, RuntimeErrorCode
 from app.agents.errors import PromptManifestError
@@ -29,6 +29,7 @@ from app.schemas.question import (
     GapSelectionDisposition,
     GapSelectionKind,
     GapSelectionResult,
+    QuestionAspectDraft,
     QuestionComposerClinicalFact,
     QuestionComposerFailureCode,
     QuestionComposerModelInput,
@@ -208,6 +209,12 @@ QUESTION_TEMPLATES = _QUESTION_TEMPLATES_AUTHORITY
 
 _FORBIDDEN_MODEL_FIELDS = frozenset(
     {
+        "aspect_id",
+        "contract_id",
+        "root_contract_id",
+        "coverage_status",
+        "required",
+        "complete",
         "selected_dimension",
         "next_gap",
         "missing_dimensions",
@@ -337,6 +344,7 @@ def build_question_context(
             "missing_slot",
             "summary_allowed",
             "retry_hint",
+            "frozen_residual_aspects",
         },
         token_limit=QUESTION_CONTEXT_TOKEN_LIMIT,
         overflow="reject",
@@ -355,6 +363,9 @@ def build_question_context(
                 "chief_complaint": input_payload.chief_complaint,
                 "activated_dimensions": list(input_payload.activated_dimensions),
                 "missing_slot": input_payload.missing_slot,
+                "frozen_residual_aspects": [
+                    item.model_dump(mode="json") for item in input_payload.frozen_residual_aspects
+                ],
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -418,12 +429,19 @@ async def compose_question(
     chief_complaint: str | None = None,
     activated_dimensions: tuple[str, ...] = (),
     missing_slot: str | None = None,
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = (),
+    # Internal service authority only: a persisted residual contract may keep
+    # its own dimension even when another routine gap has a higher rank.  The
+    # strict checks below require that dimension to remain missing and forbid
+    # overriding conflicts or pending safety work.
+    _system_forced_dimension: InquiryDimension | None = None,
 ) -> QuestionCompositionOutcome:
     """Compose zero or one question without writing state or changing gates."""
 
     try:
+        canonical_completeness = canonicalize_gap_selection_input(completeness_result)
         authoritative_selection = select_gap(
-            completeness_result,
+            canonical_completeness,
             pending_safety_dimensions=pending_safety_dimensions,
         )
     except (ValueError, TypeError, AttributeError):
@@ -435,6 +453,29 @@ async def compose_question(
             return _failed(exc.code)
         if supplied_selection != authoritative_selection:
             return _failed(QuestionComposerFailureCode.SELECTION_AUTHORITY_MISMATCH)
+    if _system_forced_dimension is not None:
+        try:
+            forced_dimension = InquiryDimension(_system_forced_dimension)
+        except (TypeError, ValueError):
+            return _failed(QuestionComposerFailureCode.INPUT_SCHEMA_INVALID)
+        if (
+            selection is not None
+            or not frozen_residual_aspects
+            or pending_safety_dimensions
+            or authoritative_selection.disposition is not GapSelectionDisposition.SELECTED
+            or authoritative_selection.selection_kind is not GapSelectionKind.REQUIRED
+            or forced_dimension not in canonical_completeness.missing_required
+        ):
+            return _failed(QuestionComposerFailureCode.SELECTION_AUTHORITY_MISMATCH)
+        authoritative_selection = GapSelectionResult(
+            input_state_version=canonical_completeness.input_state_version,
+            disposition=GapSelectionDisposition.SELECTED,
+            selected_dimension=forced_dimension,
+            selection_kind=GapSelectionKind.REQUIRED,
+            priority_rule_id="gap.priority.question_contract_residual.v1",
+            source_completeness_disposition=canonical_completeness.disposition.value,
+            deferred_dimensions=authoritative_selection.deferred_dimensions,
+        )
 
     # 2.7 自然度：临床上下文按本轮维度裁剪（只留维度自身事实 + 主诉/现病史背景），
     # 避免模型复读其他维度已采集事实；小结段许可由系统确定性判定。
@@ -468,6 +509,7 @@ async def compose_question(
         chief_complaint=chief_complaint,
         activated_dimensions=activated_dimensions,
         missing_slot=missing_slot,
+        frozen_residual_aspects=frozen_residual_aspects,
         summary_allowed=summary_allowed,
     )
 
@@ -485,6 +527,7 @@ async def _compose_question_with_template_registry(
     chief_complaint: str | None = None,
     activated_dimensions: tuple[str, ...] = (),
     missing_slot: str | None = None,
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = (),
     summary_allowed: bool = True,
 ) -> QuestionCompositionOutcome:
     """Compose with the model when runtime provenance is available.
@@ -502,6 +545,10 @@ async def _compose_question_with_template_registry(
         return QuestionCompositionOutcome(status=QuestionCompositionStatus.NO_QUESTION)
     if selection.selected_dimension is None or selection.selection_kind is GapSelectionKind.NONE:
         return _failed(QuestionComposerFailureCode.SELECTION_REQUIRED)
+    try:
+        frozen_residual_aspects = _canonicalize_aspects(frozen_residual_aspects)
+    except (ValidationError, TypeError, ValueError, AttributeError):
+        return _failed(QuestionComposerFailureCode.INPUT_SCHEMA_INVALID)
 
     template_key = (selection.selected_dimension, selection.selection_kind)
     template = template_registry.get(template_key)
@@ -511,6 +558,8 @@ async def _compose_question_with_template_registry(
             template,
             template_key=template_key,
             recent_turns=recent_turns,
+            missing_slot=missing_slot,
+            frozen_residual_aspects=frozen_residual_aspects,
         )
         if template is not None
         else None
@@ -531,6 +580,7 @@ async def _compose_question_with_template_registry(
         chief_complaint=chief_complaint,
         activated_dimensions=activated_dimensions,
         missing_slot=missing_slot,
+        frozen_residual_aspects=frozen_residual_aspects,
         summary_allowed=summary_allowed,
     )
     if model_outcome.status is QuestionCompositionStatus.SUCCEEDED:
@@ -714,12 +764,48 @@ def slot_followup_text(
     return None
 
 
+def _fallback_aspects(
+    dimension: InquiryDimension,
+    missing_slot: str | None,
+) -> tuple[QuestionAspectDraft, ...]:
+    """Build the one-criterion compatibility fallback at the trusted boundary."""
+
+    raw = missing_slot or f"补全 {dimension.value} 当前问题所需信息"
+    criterion = re.sub(r"[\r\n?？]+", " ", raw).strip(" ,，.。;；:：")
+    if not criterion:
+        criterion = f"补全 {dimension.value} 当前问题所需信息"
+    return (QuestionAspectDraft(criterion=criterion[:160].rstrip()),)
+
+
+def _result_aspects(
+    *,
+    dimension: InquiryDimension,
+    missing_slot: str | None,
+    model_aspects: tuple[QuestionAspectDraft, ...] = (),
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = (),
+) -> tuple[QuestionAspectDraft, ...] | None:
+    """Resolve draft criteria without granting the model residual authority.
+
+    A non-empty residual set is system-owned.  Legacy model outputs may omit
+    ``aspects`` and still use that set, while an attempted rewrite/expansion is
+    rejected.  First-question legacy outputs receive one generic criterion.
+    """
+
+    if frozen_residual_aspects:
+        if model_aspects and model_aspects != frozen_residual_aspects:
+            return None
+        return frozen_residual_aspects
+    return model_aspects or _fallback_aspects(dimension, missing_slot)
+
+
 def _template_result(
     selection: GapSelectionResult,
     template: QuestionTemplate,
     *,
     template_key: tuple[InquiryDimension, GapSelectionKind],
     recent_turns: tuple[QuestionComposerTurn, ...] = (),
+    missing_slot: str | None = None,
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = (),
 ) -> QuestionCompositionOutcome:
     if selection.selected_dimension is None:
         return _failed(QuestionComposerFailureCode.SELECTION_REQUIRED)
@@ -738,6 +824,12 @@ def _template_result(
     failure = validate_single_question_text(question)
     if failure is not None:
         return _failed(failure)
+    aspects = _result_aspects(
+        dimension=selection.selected_dimension,
+        missing_slot=missing_slot,
+        frozen_residual_aspects=frozen_residual_aspects,
+    )
+    assert aspects is not None
     return QuestionCompositionOutcome(
         status=QuestionCompositionStatus.SUCCEEDED,
         result=QuestionComposerResult(
@@ -745,6 +837,7 @@ def _template_result(
             selected_dimension=selection.selected_dimension,
             selection_kind=selection.selection_kind,
             question=question,
+            aspects=aspects,
             source=QuestionSource.TEMPLATE,
             template_version=template.template_version,
         ),
@@ -822,6 +915,17 @@ async def _run_composer_once(
         return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
     if _question_repeats_recent(question_text, input_payload.recent_turns):
         return _failed(QuestionComposerFailureCode.SINGLE_QUESTION_INVALID)
+    aspects = _result_aspects(
+        dimension=selection.selected_dimension,
+        missing_slot=input_payload.missing_slot,
+        model_aspects=model_output.aspects,
+        frozen_residual_aspects=input_payload.frozen_residual_aspects,
+    )
+    if aspects is None:
+        # The system-owned residual set is immutable: a non-empty model set
+        # must match it exactly (including order).  The model cannot introduce
+        # new targets or silently rename an existing target.
+        return _failed(QuestionComposerFailureCode.MODEL_OUTPUT_INVALID)
     return QuestionCompositionOutcome(
         status=QuestionCompositionStatus.SUCCEEDED,
         result=QuestionComposerResult(
@@ -829,6 +933,7 @@ async def _run_composer_once(
             selected_dimension=selection.selected_dimension,
             selection_kind=selection.selection_kind,
             question=question_text,
+            aspects=aspects,
             source=QuestionSource.MODEL,
             prompt_version=prompt_version,
         ),
@@ -847,6 +952,7 @@ async def _model_result(
     chief_complaint: str | None = None,
     activated_dimensions: tuple[str, ...] = (),
     missing_slot: str | None = None,
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = (),
     summary_allowed: bool = True,
 ) -> QuestionCompositionOutcome:
     assert selection.selected_dimension is not None
@@ -859,6 +965,7 @@ async def _model_result(
         chief_complaint=chief_complaint,
         activated_dimensions=activated_dimensions,
         missing_slot=missing_slot,
+        frozen_residual_aspects=frozen_residual_aspects,
         summary_allowed=summary_allowed,
     )
     outcome = await _run_composer_once(
@@ -981,6 +1088,23 @@ def _canonicalize_model_input(input_payload: object) -> QuestionComposerModelInp
     candidate = QuestionComposerModelInput.model_validate(input_payload)
     canonical_json = QuestionComposerModelInput.__pydantic_serializer__.to_json(candidate, warnings=False)
     return QuestionComposerModelInput.model_validate_json(canonical_json)
+
+
+def _canonicalize_aspects(raw: object) -> tuple[QuestionAspectDraft, ...]:
+    if not isinstance(raw, list | tuple) or len(raw) > 4:
+        raise ValueError("frozen residual aspects must be a bounded collection")
+    canonical: list[QuestionAspectDraft] = []
+    for item in raw:
+        candidate = QuestionAspectDraft.model_validate(item)
+        encoded = QuestionAspectDraft.__pydantic_serializer__.to_json(candidate, warnings=False)
+        normalized = QuestionAspectDraft.model_validate_json(encoded)
+        if _has_undeclared_fields(item, normalized) or _has_forbidden_model_field(item):
+            raise ValueError("frozen residual aspect contains an authority field")
+        canonical.append(normalized)
+    keys = tuple(item.criterion.casefold() for item in canonical)
+    if len(keys) != len(set(keys)):
+        raise ValueError("frozen residual aspects must be unique")
+    return tuple(canonical)
 
 
 def _canonicalize_model_output(output: object) -> QuestionComposerModelOutput:

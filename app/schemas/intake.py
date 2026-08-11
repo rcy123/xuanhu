@@ -14,6 +14,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.domain import CollectionStatus, LactationValue, PregnancyValue
+from app.schemas.question_contract import ContractReplyContext, QuestionCoverageCandidate
 
 INTAKE_SCHEMA_VERSION = "intake-extraction.v2"
 
@@ -83,6 +84,10 @@ class IntakeExtractionInput(_IntakeModel):
     current_messages: tuple[IntakeMessage, ...] = Field(min_length=1, max_length=8)
     historical_active_facts: tuple[ActiveObservationContext, ...] = Field(default=(), max_length=128)
     reply_context: IntakeReplyContext | None = None
+    # R9: private deterministic question-contract binding for this reply.  It is
+    # model *input* only, is never serialized into public artifacts, and its
+    # criteria/quote content never leaves the extraction boundary.
+    contract_reply_context: ContractReplyContext | None = None
 
     @model_validator(mode="after")
     def current_patient_messages_only(self) -> IntakeExtractionInput:
@@ -324,6 +329,10 @@ class IntakeExtractionOutput(_IntakeModel):
     # 是否要求模型产出;关闭时恒为空,维持裸 fact_key 路径。完整性信号(complete/
     # partial + missing_slots)为决策 25 的 LLM 主导判定提供语义缺口。
     dimension_slots: tuple[DimensionSlotSnapshot, ...] = Field(default=(), max_length=16)
+    # R9: exactly one coverage candidate when a contract bound this reply, else
+    # null.  Untrusted model product: the coverage-binding verifier grounds every
+    # span against the current message and binds candidate -> contract -> answer.
+    question_coverage: QuestionCoverageCandidate | None = None
 
 
 class SlotCompleteness(StrEnum):

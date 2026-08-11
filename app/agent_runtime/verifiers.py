@@ -73,6 +73,10 @@ class VerificationFailureCode(StrEnum):
     ARTIFACT_PARENT_INVALID = "ARTIFACT_PARENT_INVALID"
     ARTIFACT_STATUS_INVALID = "ARTIFACT_STATUS_INVALID"
     ARTIFACT_NOT_FOUND = "ARTIFACT_NOT_FOUND"
+    QUESTION_CONTRACT_CONFLICT = "QUESTION_CONTRACT_CONFLICT"
+    QUESTION_COVERAGE_CONFLICT = "QUESTION_COVERAGE_CONFLICT"
+    QUESTION_COVERAGE_SOURCE_UNDECLARED = "QUESTION_COVERAGE_SOURCE_UNDECLARED"
+    QUESTION_CONTRACT_CHAIN_INVALID = "QUESTION_CONTRACT_CHAIN_INVALID"
     DELTA_INVALID = "DELTA_INVALID"
     VERIFIER_CHAIN_INCOMPLETE = "VERIFIER_CHAIN_INCOMPLETE"
 
@@ -100,6 +104,8 @@ _HUMAN_DELTA_FAILURES = frozenset(
         VerificationFailureCode.OBSERVATION_TARGET_NOT_CURRENT,
         VerificationFailureCode.ARTIFACT_REVISION_CONFLICT,
         VerificationFailureCode.ARTIFACT_PARENT_INVALID,
+        VerificationFailureCode.QUESTION_CONTRACT_CONFLICT,
+        VerificationFailureCode.QUESTION_COVERAGE_CONFLICT,
     }
 )
 
@@ -289,6 +295,11 @@ class ProvenanceVersionVerifier(Verifier):
             ):
                 return _failed(self.name, VerificationFailureCode.SOURCE_NOT_ALLOWED)
             if any(
+                item.answer_message_id not in output.source_message_ids or item.answer_message_id not in allowed_sources
+                for item in output.question_coverage_events
+            ):
+                return _failed(self.name, VerificationFailureCode.SOURCE_NOT_ALLOWED)
+            if any(
                 item.produced_by_run_id != context.run_spec.run_id
                 or item.input_state_version != context.run_spec.state_version
                 or item.session_id != context.run_spec.session_id
@@ -331,6 +342,10 @@ _REDUCER_FAILURE_MAP: dict[ReducerErrorCode, VerificationFailureCode] = {
     ReducerErrorCode.ARTIFACT_PARENT_INVALID: VerificationFailureCode.ARTIFACT_PARENT_INVALID,
     ReducerErrorCode.ARTIFACT_STATUS_INVALID: VerificationFailureCode.ARTIFACT_STATUS_INVALID,
     ReducerErrorCode.ARTIFACT_NOT_FOUND: VerificationFailureCode.ARTIFACT_NOT_FOUND,
+    ReducerErrorCode.QUESTION_CONTRACT_CONFLICT: VerificationFailureCode.QUESTION_CONTRACT_CONFLICT,
+    ReducerErrorCode.QUESTION_COVERAGE_CONFLICT: VerificationFailureCode.QUESTION_COVERAGE_CONFLICT,
+    ReducerErrorCode.QUESTION_COVERAGE_SOURCE_UNDECLARED: VerificationFailureCode.QUESTION_COVERAGE_SOURCE_UNDECLARED,
+    ReducerErrorCode.QUESTION_CONTRACT_CHAIN_INVALID: VerificationFailureCode.QUESTION_CONTRACT_CHAIN_INVALID,
 }
 
 

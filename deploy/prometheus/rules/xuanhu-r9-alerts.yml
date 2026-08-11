@@ -1,0 +1,65 @@
+groups:
+  - name: xuanhu-r9-question-contract
+    interval: 30s
+    rules:
+      # Question-coverage failure rate.  "Failure" = a coverage-fold evaluation
+      # that ended in invalid (input failed validation) or error (internal
+      # failure) rather than producing a usable coverage outcome.  The
+      # minimum-volume guard (>=10 evaluations in 10m) keeps the ratio from
+      # firing on a handful of low-traffic samples.
+      - alert: XuanhuQuestionCoverageFailureRateHigh
+        expr: >-
+          (
+            sum(increase(xuanhu_question_coverage_evaluations_total{
+              outcome=~"invalid|error"}[5m]))
+            /
+            sum(increase(xuanhu_question_coverage_evaluations_total[5m]))
+          ) > 0.05
+          and sum(increase(xuanhu_question_coverage_evaluations_total[10m])) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu question-coverage failure rate is high
+          description: More than 5% of question-coverage evaluations were invalid or errored over five minutes, so the coverage fold is frequently unable to assess incoming questions.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-failure-rate
+
+      # Follow-up cap exhaustion.  A residual follow-up question whose decision
+      # is "cap_reached" was suppressed by the follow-up cap; a sustained rate
+      # means residual demand is outgrowing the follow-up budget.  The guard
+      # requires >=25 follow-up decisions in 10m so a single burst cannot fire.
+      - alert: XuanhuQuestionCapReachedHigh
+        expr: >-
+          sum(increase(xuanhu_question_contract_followups_total{
+            outcome="cap_reached"}[5m])) > 20
+          and sum(increase(xuanhu_question_contract_followups_total[10m])) >= 25
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu question-contract follow-up cap is being hit frequently
+          description: More than 20 residual follow-up questions hit the follow-up cap over five minutes, indicating residual demand is outgrowing the follow-up budget.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#cap-reached
+
+      # Contract integrity error.  An "integrity_error" terminal outcome means
+      # question-contract assembly failed an internal consistency check, so the
+      # produced contract could not be trusted.  Any sustained occurrence is
+      # critical: the guard requires >=5 contract creations in 10m.
+      - alert: XuanhuQuestionContractIntegrityError
+        expr: >-
+          sum(increase(xuanhu_question_contracts_total{
+            outcome="integrity_error"}[5m])) > 3
+          and sum(increase(xuanhu_question_contracts_total[10m])) >= 5
+        for: 5m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: question-contract
+        annotations:
+          summary: Xuanhu question contracts are failing integrity checks
+          description: More than 3 question-contract creations ended in an integrity error over five minutes, indicating internal consistency failures in contract assembly.
+          runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#integrity-error

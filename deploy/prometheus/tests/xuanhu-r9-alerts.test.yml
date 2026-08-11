@@ -1,0 +1,100 @@
+rule_files:
+  - ../rules/xuanhu-r9-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- question-coverage failure rate ---------------------------------------
+  - name: coverage failure rate fires above 5%
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="invalid"}'
+        values: '0+4x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="error"}'
+        values: '0+2x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+60x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoverageFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu question-coverage failure rate is high
+              description: More than 5% of question-coverage evaluations were invalid or errored over five minutes, so the coverage fold is frequently unable to assess incoming questions.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#coverage-failure-rate
+
+  - name: coverage failure rate stays quiet when clean
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="invalid"}'
+        values: '0x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="error"}'
+        values: '0x16'
+      - series: 'xuanhu_question_coverage_evaluations_total{outcome="satisfied"}'
+        values: '0+60x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCoverageFailureRateHigh
+        exp_alerts: []
+
+  # --- follow-up cap exhaustion ---------------------------------------------
+  - name: follow-up cap reached fires above 20 in five minutes
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contract_followups_total{outcome="cap_reached"}'
+        values: '0+8x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCapReachedHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu question-contract follow-up cap is being hit frequently
+              description: More than 20 residual follow-up questions hit the follow-up cap over five minutes, indicating residual demand is outgrowing the follow-up budget.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#cap-reached
+
+  - name: follow-up cap reached stays quiet under threshold
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contract_followups_total{outcome="cap_reached"}'
+        values: '0+2x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionCapReachedHigh
+        exp_alerts: []
+
+  # --- contract integrity error ---------------------------------------------
+  - name: contract integrity error fires above 3 in five minutes
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contracts_total{outcome="integrity_error"}'
+        values: '0+2x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionContractIntegrityError
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: question-contract
+            exp_annotations:
+              summary: Xuanhu question contracts are failing integrity checks
+              description: More than 3 question-contract creations ended in an integrity error over five minutes, indicating internal consistency failures in contract assembly.
+              runbook: https://github.com/rcy123/xuanhu/wiki/runbooks#integrity-error
+
+  - name: contract integrity error stays quiet when clean
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_question_contracts_total{outcome="integrity_error"}'
+        values: '0x16'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: XuanhuQuestionContractIntegrityError
+        exp_alerts: []

@@ -41,6 +41,7 @@ INTAKE_VERIFIER_CHAIN = (
     "stage",
     "source_provenance",
     "grounding",
+    "coverage_binding",
     "safety_semantics",
     "decision_consistency",
     "observation_legality",
@@ -54,6 +55,7 @@ class IntakeVerifierName(StrEnum):
     STAGE = "stage"
     SOURCE_PROVENANCE = "source_provenance"
     GROUNDING = "grounding"
+    COVERAGE_BINDING = "coverage_binding"
     SAFETY_SEMANTICS = "safety_semantics"
     DECISION_CONSISTENCY = "decision_consistency"
     OBSERVATION_LEGALITY = "observation_legality"
@@ -78,6 +80,11 @@ class IntakeVerificationFailureCode(StrEnum):
     VALUE_NOT_JSON = "INTAKE_VALUE_NOT_JSON"
     AUTHORITY_FIELD_FORBIDDEN = "INTAKE_AUTHORITY_FIELD_FORBIDDEN"
     IDENTITY_FACT_FORBIDDEN = "INTAKE_IDENTITY_FACT_FORBIDDEN"
+    COVERAGE_WITHOUT_CONTRACT = "INTAKE_COVERAGE_WITHOUT_CONTRACT"
+    COVERAGE_CONTRACT_MISMATCH = "INTAKE_COVERAGE_CONTRACT_MISMATCH"
+    COVERAGE_ASPECT_MISMATCH = "INTAKE_COVERAGE_ASPECT_MISMATCH"
+    COVERAGE_SOURCE_NOT_ALLOWED = "INTAKE_COVERAGE_SOURCE_NOT_ALLOWED"
+    COVERAGE_SPAN_INVALID = "INTAKE_COVERAGE_SPAN_INVALID"
 
 
 class IntakeCheckStatus(StrEnum):
@@ -160,6 +167,7 @@ def verify_intake_artifact(
         (IntakeVerifierName.STAGE, _verify_stage(run_spec)),
         (IntakeVerifierName.SOURCE_PROVENANCE, _verify_sources(output, input_payload)),
         (IntakeVerifierName.GROUNDING, _verify_grounding(output, input_payload)),
+        (IntakeVerifierName.COVERAGE_BINDING, _verify_coverage_binding(output, input_payload)),
         (IntakeVerifierName.SAFETY_SEMANTICS, _verify_safety(output)),
         (IntakeVerifierName.DECISION_CONSISTENCY, _verify_decision(output)),
         (IntakeVerifierName.OBSERVATION_LEGALITY, _verify_observations(output, input_payload)),
@@ -294,6 +302,48 @@ def _verify_grounding(
 ) -> IntakeVerificationFailureCode | None:
     failure = verify_intake_grounding(output, input_payload)
     return _GROUNDING_FAILURE_MAP.get(failure) if failure is not None else None
+
+
+def _verify_coverage_binding(
+    output: IntakeExtractionOutput,
+    input_payload: IntakeExtractionInput,
+) -> IntakeVerificationFailureCode | None:
+    """Bind any model-produced coverage candidate to the deterministic contract
+    context and ground every claimed span in the current answer.
+
+    A missing candidate under a contract is conservatively allowed for legacy
+    flows, but coverage is never inferred from a missing candidate and a
+    candidate without a bound contract is always rejected.
+    """
+    candidate = output.question_coverage
+    if candidate is None:
+        return None
+    context = input_payload.contract_reply_context
+    if context is None:
+        return IntakeVerificationFailureCode.COVERAGE_WITHOUT_CONTRACT
+    contract = context.contract
+    if candidate.contract_id != contract.contract_id or candidate.answer_message_id != context.answer_message_id:
+        return IntakeVerificationFailureCode.COVERAGE_CONTRACT_MISMATCH
+    allowed = {message.message_id for message in input_payload.current_messages}
+    if candidate.answer_message_id not in allowed:
+        return IntakeVerificationFailureCode.COVERAGE_SOURCE_NOT_ALLOWED
+    contract_ids = tuple(item.aspect_id for item in contract.aspects)
+    candidate_ids = tuple(item.aspect_id for item in candidate.items)
+    if candidate_ids != contract_ids:
+        return IntakeVerificationFailureCode.COVERAGE_ASPECT_MISMATCH
+    answer_content = next(
+        (message.content for message in input_payload.current_messages if message.message_id == candidate.answer_message_id),
+        None,
+    )
+    if answer_content is None:
+        return IntakeVerificationFailureCode.COVERAGE_SOURCE_NOT_ALLOWED
+    for item in candidate.items:
+        for span in item.evidence:
+            if span.source_message_id != candidate.answer_message_id:
+                return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
+            if span.end_char > len(answer_content) or answer_content[span.start_char : span.end_char] != span.quote:
+                return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
+    return None
 
 
 def _verify_safety(output: IntakeExtractionOutput) -> IntakeVerificationFailureCode | None:

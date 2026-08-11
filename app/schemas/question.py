@@ -159,6 +159,35 @@ class QuestionComposerTurn(_QuestionModel):
         return value
 
 
+class QuestionAspectDraft(_QuestionModel):
+    """Model-authored, non-authoritative coverage criterion for one question.
+
+    The composer may describe what a complete answer should address, but it may
+    not allocate IDs or decide routing/completeness.  Those authority fields are
+    deliberately absent from this value object and are added by the system when
+    it builds the durable question contract.
+    """
+
+    criterion: str = Field(min_length=1, max_length=160)
+
+    @field_validator("criterion")
+    @classmethod
+    def normalized_declarative_criterion(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or "\n" in normalized or "\r" in normalized:
+            raise ValueError("aspect criterion must be one non-blank line")
+        if "?" in normalized or "？" in normalized:
+            raise ValueError("aspect criterion must be declarative, not another question")
+        return normalized
+
+
+def _unique_aspects(aspects: tuple[QuestionAspectDraft, ...]) -> tuple[QuestionAspectDraft, ...]:
+    normalized = tuple(item.criterion.casefold() for item in aspects)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("question aspects must be unique")
+    return aspects
+
+
 class QuestionComposerModelInput(_QuestionModel):
     schema_version: Literal["question-composer-model-input.v2"] = QUESTION_MODEL_INPUT_SCHEMA_VERSION
     selected_dimension: InquiryDimension
@@ -178,6 +207,17 @@ class QuestionComposerModelInput(_QuestionModel):
     # 2.8 重试提示：上一轮模型问句被确定性校验拒绝（维度不符/与最近问句重复）时，
     # 系统带此提示重试一次；模型必须据此换一种角度/措辞，不得复用原句。
     retry_hint: str | None = Field(default=None, min_length=1, max_length=300)
+    # R9：残余追问的覆盖集合由系统冻结。模型只能据此措辞，不能扩张、删减或改写；
+    # 空元组表示首次生成，允许模型提出 1-4 个通用覆盖 criterion。
+    frozen_residual_aspects: tuple[QuestionAspectDraft, ...] = Field(default=(), max_length=4)
+
+    @field_validator("frozen_residual_aspects")
+    @classmethod
+    def residual_aspects_are_unique(
+        cls,
+        value: tuple[QuestionAspectDraft, ...],
+    ) -> tuple[QuestionAspectDraft, ...]:
+        return _unique_aspects(value)
 
     @model_validator(mode="after")
     def model_input_requires_selected_kind(self) -> QuestionComposerModelInput:
@@ -189,6 +229,17 @@ class QuestionComposerModelInput(_QuestionModel):
 class QuestionComposerModelOutput(_QuestionModel):
     schema_version: Literal["question-composer-model-output.v1"] = QUESTION_MODEL_OUTPUT_SCHEMA_VERSION
     question: str = Field(min_length=1, max_length=160)
+    # Additive/backward-compatible R9 field: legacy fakes may omit it.  The
+    # service synthesizes one generic criterion when it is absent.
+    aspects: tuple[QuestionAspectDraft, ...] = Field(default=(), max_length=4)
+
+    @field_validator("aspects")
+    @classmethod
+    def output_aspects_are_unique(
+        cls,
+        value: tuple[QuestionAspectDraft, ...],
+    ) -> tuple[QuestionAspectDraft, ...]:
+        return _unique_aspects(value)
 
 
 class QuestionComposerResult(_QuestionModel):
@@ -197,9 +248,20 @@ class QuestionComposerResult(_QuestionModel):
     selected_dimension: InquiryDimension
     selection_kind: GapSelectionKind
     question: str = Field(min_length=1, max_length=160)
+    # Always non-empty at the trusted boundary.  These remain draft criteria;
+    # durable IDs and residual status are assigned outside the wording agent.
+    aspects: tuple[QuestionAspectDraft, ...] = Field(min_length=1, max_length=4)
     source: QuestionSource
     template_version: str | None = Field(default=None, max_length=96)
     prompt_version: str | None = Field(default=None, max_length=96)
+
+    @field_validator("aspects")
+    @classmethod
+    def result_aspects_are_unique(
+        cls,
+        value: tuple[QuestionAspectDraft, ...],
+    ) -> tuple[QuestionAspectDraft, ...]:
+        return _unique_aspects(value)
 
     @model_validator(mode="after")
     def source_version_is_consistent(self) -> QuestionComposerResult:

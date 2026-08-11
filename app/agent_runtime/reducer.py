@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -16,6 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agent_runtime.observation_projection import project_current_observations
+from app.agent_runtime.question_contract import QuestionContractIntegrityError, evaluate_contract_coverage
 from app.schemas.domain import (
     ArtifactRevisionSchema,
     ArtifactStatus,
@@ -23,6 +24,7 @@ from app.schemas.domain import (
     ObservationStatus,
     SafetyProfileSchema,
 )
+from app.schemas.question_contract import QuestionContract, QuestionCoverageEvent
 
 if TYPE_CHECKING:
     from app.agent_runtime.verifiers import VerificationContext
@@ -51,6 +53,10 @@ class ReducerErrorCode(StrEnum):
     ARTIFACT_PARENT_INVALID = "ARTIFACT_PARENT_INVALID"
     ARTIFACT_STATUS_INVALID = "ARTIFACT_STATUS_INVALID"
     ARTIFACT_NOT_FOUND = "ARTIFACT_NOT_FOUND"
+    QUESTION_CONTRACT_CONFLICT = "QUESTION_CONTRACT_CONFLICT"
+    QUESTION_COVERAGE_CONFLICT = "QUESTION_COVERAGE_CONFLICT"
+    QUESTION_COVERAGE_SOURCE_UNDECLARED = "QUESTION_COVERAGE_SOURCE_UNDECLARED"
+    QUESTION_CONTRACT_CHAIN_INVALID = "QUESTION_CONTRACT_CHAIN_INVALID"
 
 
 class DomainReducerError(ValueError):
@@ -71,6 +77,8 @@ class DomainState(BaseModel):
     observations: tuple[ObservationSchema, ...] = ()
     safety_profile: SafetyProfileSchema | None = None
     artifacts: tuple[ArtifactRevisionSchema, ...] = ()
+    question_contracts: tuple[QuestionContract, ...] = ()
+    question_coverage_events: tuple[QuestionCoverageEvent, ...] = ()
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> DomainState:
@@ -80,6 +88,10 @@ class DomainState(BaseModel):
             raise ValueError("safety profile session mismatch")
         if any(item.session_id != self.session_id for item in self.artifacts):
             raise ValueError("artifact session mismatch")
+        if any(item.session_id != self.session_id for item in self.question_contracts):
+            raise ValueError("question contract session mismatch")
+        if any(item.session_id != self.session_id for item in self.question_coverage_events):
+            raise ValueError("question coverage event session mismatch")
         observation_ids = [item.observation_id for item in self.observations]
         if len(observation_ids) != len(set(observation_ids)):
             raise ValueError("duplicate observation id")
@@ -89,6 +101,13 @@ class DomainState(BaseModel):
         current_ids = [item.artifact_id for item in self.artifacts if item.status is ArtifactStatus.CURRENT]
         if len(current_ids) != len(set(current_ids)):
             raise ValueError("multiple current revisions")
+        contract_ids = [item.contract_id for item in self.question_contracts]
+        if len(contract_ids) != len(set(contract_ids)):
+            raise ValueError("duplicate question contract id")
+        event_ids = [item.event_id for item in self.question_coverage_events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("duplicate question coverage event id")
+        _validate_contract_chains(self.question_contracts, self.question_coverage_events)
         return self
 
 
@@ -106,6 +125,8 @@ class DomainDelta(BaseModel):
     safety_profile: SafetyProfileSchema | None = None
     artifact_revisions: tuple[ArtifactRevisionSchema, ...] = ()
     invalidate_artifact_ids: tuple[UUID, ...] = ()
+    question_contracts: tuple[QuestionContract, ...] = ()
+    question_coverage_events: tuple[QuestionCoverageEvent, ...] = ()
 
     @field_validator("source_message_ids", "invalidate_artifact_ids")
     @classmethod
@@ -118,7 +139,14 @@ class DomainDelta(BaseModel):
     def unique_operation_keys(self) -> DomainDelta:
         observation_ids = [item.observation_id for item in self.observations]
         artifact_keys = [(item.artifact_id, item.revision) for item in self.artifact_revisions]
-        if len(observation_ids) != len(set(observation_ids)) or len(artifact_keys) != len(set(artifact_keys)):
+        contract_ids = [item.contract_id for item in self.question_contracts]
+        event_ids = [item.event_id for item in self.question_coverage_events]
+        if (
+            len(observation_ids) != len(set(observation_ids))
+            or len(artifact_keys) != len(set(artifact_keys))
+            or len(contract_ids) != len(set(contract_ids))
+            or len(event_ids) != len(set(event_ids))
+        ):
             raise ValueError("duplicate operations are not allowed")
         return self
 
@@ -164,6 +192,53 @@ def _same_observation_event(left: ObservationSchema, right: ObservationSchema) -
     )
 
 
+def _merge_append_only[AppendOnlyModel: BaseModel](
+    existing: Sequence[AppendOnlyModel],
+    incoming: Sequence[AppendOnlyModel],
+    *,
+    identity: Callable[[AppendOnlyModel], UUID],
+    conflict_code: ReducerErrorCode,
+) -> tuple[tuple[AppendOnlyModel, ...], bool]:
+    """Append-only merge: same identity byte-equal is a no-op; same identity
+    with a different payload is an append-only violation and fails closed."""
+    merged = list(existing)
+    changed = False
+    by_key = {identity(item): item for item in merged}
+    for candidate in incoming:
+        candidate_key = identity(candidate)
+        current = by_key.get(candidate_key)
+        if current is not None:
+            if _model_key(current) != _model_key(candidate):
+                raise DomainReducerError(conflict_code)
+            continue
+        by_key[candidate_key] = candidate
+        merged.append(candidate)
+        changed = True
+    return tuple(merged), changed
+
+
+def _validate_contract_chains(
+    contracts: Sequence[QuestionContract],
+    events: Sequence[QuestionCoverageEvent],
+) -> None:
+    """Validate every root contract chain independently via the deterministic
+    coverage fold.  A session may hold multiple roots, and the fold assumes a
+    single chain, so each root group is folded on its own."""
+    answer_ids = [item.answer_message_id for item in events]
+    if len(answer_ids) != len(set(answer_ids)):
+        raise DomainReducerError(ReducerErrorCode.QUESTION_COVERAGE_CONFLICT)
+    grouped: dict[UUID, tuple[list[QuestionContract], list[QuestionCoverageEvent]]] = {}
+    for contract in contracts:
+        grouped.setdefault(contract.root_contract_id, ([], []))[0].append(contract)
+    for event in events:
+        grouped.setdefault(event.root_contract_id, ([], []))[1].append(event)
+    for root_contracts, root_events in grouped.values():
+        try:
+            evaluate_contract_coverage(root_contracts, root_events)
+        except QuestionContractIntegrityError:
+            raise DomainReducerError(ReducerErrorCode.QUESTION_CONTRACT_CHAIN_INVALID) from None
+
+
 def _validate_common(state: DomainState, delta: DomainDelta) -> None:
     if delta.session_id != state.session_id:
         raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
@@ -174,10 +249,17 @@ def _validate_common(state: DomainState, delta: DomainDelta) -> None:
         or delta.safety_profile is not None
         or delta.artifact_revisions
         or delta.invalidate_artifact_ids
+        or delta.question_contracts
+        or delta.question_coverage_events
     )
     if not has_operation:
         raise DomainReducerError(ReducerErrorCode.EMPTY_DELTA)
-    if (delta.observations or delta.safety_profile is not None) and delta.artifact_revisions:
+    if (
+        delta.observations
+        or delta.safety_profile is not None
+        or delta.question_contracts
+        or delta.question_coverage_events
+    ) and delta.artifact_revisions:
         raise DomainReducerError(ReducerErrorCode.MIXED_FACT_AND_ARTIFACT_CHANGE)
 
     sources = set(delta.source_message_ids)
@@ -185,16 +267,29 @@ def _validate_common(state: DomainState, delta: DomainDelta) -> None:
         raise DomainReducerError(ReducerErrorCode.OBSERVATION_SOURCE_UNDECLARED)
     if delta.safety_profile is not None and not sources:
         raise DomainReducerError(ReducerErrorCode.SAFETY_SOURCE_REQUIRED)
+    if any(item.answer_message_id not in sources for item in delta.question_coverage_events):
+        raise DomainReducerError(ReducerErrorCode.QUESTION_COVERAGE_SOURCE_UNDECLARED)
     if any(item.session_id != state.session_id for item in delta.observations):
         raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
     if delta.safety_profile is not None and delta.safety_profile.session_id != state.session_id:
         raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
     if any(item.session_id != state.session_id for item in delta.artifact_revisions):
         raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
+    if any(item.session_id != state.session_id for item in delta.question_contracts):
+        raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
+    if any(item.session_id != state.session_id for item in delta.question_coverage_events):
+        raise DomainReducerError(ReducerErrorCode.SESSION_MISMATCH)
 
     observation_ids = [item.observation_id for item in delta.observations]
     artifact_keys = [(item.artifact_id, item.revision) for item in delta.artifact_revisions]
-    if len(observation_ids) != len(set(observation_ids)) or len(artifact_keys) != len(set(artifact_keys)):
+    contract_ids = [item.contract_id for item in delta.question_contracts]
+    event_ids = [item.event_id for item in delta.question_coverage_events]
+    if (
+        len(observation_ids) != len(set(observation_ids))
+        or len(artifact_keys) != len(set(artifact_keys))
+        or len(contract_ids) != len(set(contract_ids))
+        or len(event_ids) != len(set(event_ids))
+    ):
         raise DomainReducerError(ReducerErrorCode.DUPLICATE_OPERATION)
     if len(delta.invalidate_artifact_ids) != len(set(delta.invalidate_artifact_ids)):
         raise DomainReducerError(ReducerErrorCode.DUPLICATE_OPERATION)
@@ -365,15 +460,28 @@ def _reduce_checked(state: DomainState, delta: DomainDelta) -> DomainState:
         if state.safety_profile is not None
         else None
     )
+    contracts, contract_changed = _merge_append_only(
+        state.question_contracts,
+        delta.question_contracts,
+        identity=lambda item: item.contract_id,
+        conflict_code=ReducerErrorCode.QUESTION_CONTRACT_CONFLICT,
+    )
+    events, event_changed = _merge_append_only(
+        state.question_coverage_events,
+        delta.question_coverage_events,
+        identity=lambda item: item.event_id,
+        conflict_code=ReducerErrorCode.QUESTION_COVERAGE_CONFLICT,
+    )
+    _validate_contract_chains(contracts, events)
     artifacts, artifact_changed = _apply_artifacts(
         state.artifacts,
         delta.artifact_revisions,
         delta.invalidate_artifact_ids,
         run_id=delta.run_id,
         expected_state_version=delta.expected_state_version,
-        invalidate_all_current=observation_changed or safety_changed,
+        invalidate_all_current=observation_changed or safety_changed or contract_changed or event_changed,
     )
-    changed = observation_changed or safety_changed or artifact_changed
+    changed = observation_changed or safety_changed or contract_changed or event_changed or artifact_changed
     if not changed:
         return state.model_copy(deep=True)
     return DomainState(
@@ -382,6 +490,8 @@ def _reduce_checked(state: DomainState, delta: DomainDelta) -> DomainState:
         observations=observations,
         safety_profile=safety_profile,
         artifacts=artifacts,
+        question_contracts=contracts,
+        question_coverage_events=events,
     )
 
 
