@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
 
 from app.core.config import get_settings
 from app.core.embedding_gateway import build_embedding_gateway_settings
@@ -54,6 +55,29 @@ logger = logging.getLogger("xuanhu.rag")
 # ---------------------------------------------------------------------------
 
 _SNIPPET_MAX_LENGTH = 500
+_CJK_RUN_PATTERN = re.compile(r"[\u3400-\u9fff]+")
+_LATIN_TERM_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}")
+_LEXICAL_STOP_TERMS = frozenset(
+    {
+        "患者",
+        "近日",
+        "近期",
+        "反复",
+        "出现",
+        "伴有",
+        "同时",
+        "自觉",
+        "感觉",
+        "明显",
+        "加重",
+        "减轻",
+        "症状",
+        "情况",
+        "因为",
+        "以及",
+        "目前",
+    }
+)
 
 
 def _truncate_snippet(content: str, max_length: int = _SNIPPET_MAX_LENGTH) -> str:
@@ -61,6 +85,38 @@ def _truncate_snippet(content: str, max_length: int = _SNIPPET_MAX_LENGTH) -> st
     if len(content) <= max_length:
         return content
     return content[:max_length] + "…"
+
+
+def extract_fulltext_lexical_terms(query: str, *, max_terms: int = 12) -> list[str]:
+    """Extract bounded CJK/Latin lexical terms for fulltext candidate recall.
+
+    PostgreSQL's ``simple`` parser does not segment natural Chinese symptom
+    sentences.  These terms add a lexical *candidate* leg only; semantic
+    ranking remains the vector retriever plus Cross-Encoder.
+    """
+    if max_terms < 1:
+        return []
+
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        normalized = term.strip().lower()
+        if len(normalized) < 2 or normalized in _LEXICAL_STOP_TERMS or normalized in seen or len(terms) >= max_terms:
+            return
+        seen.add(normalized)
+        terms.append(normalized)
+
+    for run in _CJK_RUN_PATTERN.findall(query):
+        for index in range(len(run) - 1):
+            add(run[index : index + 2])
+            if len(terms) >= max_terms:
+                return terms
+    for token in _LATIN_TERM_PATTERN.findall(query):
+        add(token)
+        if len(terms) >= max_terms:
+            break
+    return terms
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +211,130 @@ def merge_deduplicate(
             )
 
     return list(merged.values())
+
+
+def select_reranker_candidates(
+    merged_hits: Sequence[MergedHit],
+    *,
+    fulltext_quota: int,
+    limit: int,
+    max_chunks_per_source: int = 0,
+) -> list[MergedHit]:
+    """Select a bounded Cross-Encoder pool while reserving lexical-only evidence.
+
+    ``merge_deduplicate`` intentionally retains the vector leg's insertion
+    order for backward compatibility.  Once vector recall is widened, taking a
+    plain prefix can starve every fulltext-only candidate.  A positive quota
+    reserves space for those candidates; ``0`` retains the prior prefix
+    semantics for a safe rollout/rollback switch.
+    """
+    if limit < 1:
+        return []
+
+    if fulltext_quota <= 0 or len(merged_hits) <= limit:
+        preferred = list(merged_hits[:limit])
+    else:
+        lexical_only = [hit for hit in merged_hits if hit.vector_score <= 0.0 and hit.fulltext_score > 0.0]
+        reserved = min(fulltext_quota, len(lexical_only), limit)
+        primary_limit = limit - reserved
+        preferred = list(merged_hits[:primary_limit])
+        preferred_ids = {hit.chunk_id for hit in preferred}
+
+        for hit in lexical_only:
+            if len(preferred) >= limit:
+                break
+            if hit.chunk_id not in preferred_ids:
+                preferred.append(hit)
+                preferred_ids.add(hit.chunk_id)
+        for hit in merged_hits:
+            if len(preferred) >= limit:
+                break
+            if hit.chunk_id not in preferred_ids:
+                preferred.append(hit)
+                preferred_ids.add(hit.chunk_id)
+
+    # Soft source-level diversity is deliberately applied to the *candidate*
+    # pool, not as a hard final-output filter.  It prevents a chunked document
+    # from consuming most Cross-Encoder capacity while retaining same-source
+    # candidates as a deterministic backfill when the corpus lacks diversity.
+    if max_chunks_per_source <= 0 or len(preferred) <= 1:
+        return preferred
+
+    selected: list[MergedHit] = []
+    deferred: list[MergedHit] = []
+    selected_ids: set[str] = set()
+    source_counts: dict[tuple[str, str], int] = {}
+
+    def add_if_under_source_cap(hit: MergedHit) -> bool:
+        source_key = (hit.source_type, hit.source_id)
+        count = source_counts.get(source_key, 0)
+        if count >= max_chunks_per_source:
+            return False
+        selected.append(hit)
+        selected_ids.add(hit.chunk_id)
+        source_counts[source_key] = count + 1
+        return True
+
+    # Preserve normal quota/prefix priority first, then search the remaining
+    # merged candidates for different-source replacements.
+    for hit in preferred:
+        if not add_if_under_source_cap(hit):
+            deferred.append(hit)
+    for hit in merged_hits:
+        if len(selected) >= limit:
+            break
+        if hit.chunk_id in selected_ids:
+            continue
+        if not add_if_under_source_cap(hit):
+            deferred.append(hit)
+
+    # A source cap must never shorten the Cross-Encoder call solely because a
+    # narrow corpus contains many chunks from the same source.
+    for hit in deferred:
+        if len(selected) >= limit:
+            break
+        if hit.chunk_id not in selected_ids:
+            selected.append(hit)
+            selected_ids.add(hit.chunk_id)
+    return selected
+
+
+def reciprocal_rank_fuse_hits(
+    ranked_hit_lists: Sequence[Sequence[VectorHit | FulltextHit]],
+    *,
+    score_field: str,
+    rrf_k: int,
+) -> list[VectorHit | FulltextHit]:
+    """Fuse homogeneous ranked candidate lists with bounded Reciprocal Rank Fusion.
+
+    The resulting score is normalized RRF evidence, rather than a raw model
+    similarity, because the Cross-Encoder performs the final semantic ranking.
+    Ordering is deterministic for equal scores, which keeps eval checkpoints
+    reproducible across resumes.
+    """
+    if rrf_k < 1:
+        raise ValueError("rrf_k must be positive")
+    if score_field not in {"vector_score", "fulltext_score"}:
+        raise ValueError("score_field must be vector_score or fulltext_score")
+
+    fused: dict[str, tuple[VectorHit | FulltextHit, float, int]] = {}
+    for ranked_hits in ranked_hit_lists:
+        for rank, hit in enumerate(ranked_hits, start=1):
+            score = 1.0 / (rrf_k + rank)
+            prior = fused.get(hit.chunk_id)
+            if prior is None:
+                fused[hit.chunk_id] = (hit, score, rank)
+            else:
+                fused[hit.chunk_id] = (prior[0], prior[1] + score, min(prior[2], rank))
+    if not fused:
+        return []
+
+    ordered = sorted(fused.items(), key=lambda item: (-item[1][1], item[1][2], item[0]))
+    max_score = ordered[0][1][1]
+    return [
+        hit.model_copy(update={score_field: round(score / max_score, 6)})
+        for _chunk_id, (hit, score, _first_rank) in ordered
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +612,58 @@ class RAGRetriever:
             filters=filters,
         )
 
+    async def retrieve_dual_query(
+        self,
+        original_query: str,
+        rewritten_query: str,
+        primary_sources: list[str],
+        *,
+        allow_cross_source: bool = True,
+        top_k: int = 8,
+        filters: dict[str, Any] | None = None,
+    ) -> list[Evidence]:
+        """Retrieve two query views, fuse candidates with RRF, then rerank once.
+
+        This is intentionally a candidate-level fusion API: calling
+        :meth:`retrieve` twice and combining final top-k outputs would discard
+        useful candidates before the Cross-Encoder and would double its cost.
+        The current production use case is a structured intake query together
+        with its LLM-rewritten case-style view.
+        """
+        original = original_query.strip()
+        rewritten = rewritten_query.strip()
+        if not original and not rewritten:
+            return []
+        primary_query = rewritten or original
+        if (
+            not bool(getattr(self._settings, "rag_dual_query_enabled", False))
+            or not original
+            or not rewritten
+            or original == rewritten
+        ):
+            return await self.retrieve(
+                primary_query,
+                primary_sources,
+                allow_cross_source=allow_cross_source,
+                top_k=top_k,
+                filters=filters,
+            )
+
+        validated_sources = self._validate_sources(primary_sources)
+        search_sources = list(VALID_SOURCE_TYPES) if allow_cross_source else validated_sources
+        settings = self._settings
+        return await self.dual_query_hybrid_search(
+            [original, rewritten],
+            sources=search_sources,
+            primary_sources=set(validated_sources),
+            vector_top_k=int(getattr(settings, "rag_top_k_vector", 12)),
+            fulltext_top_k=int(getattr(settings, "rag_top_k_fulltext", 12)),
+            top_k=top_k,
+            rrf_k=int(getattr(settings, "rag_dual_query_rrf_k", 60)),
+            reranker_query=rewritten,
+            filters=filters,
+        )
+
     async def hybrid_search(
         self,
         query: str,
@@ -443,6 +675,7 @@ class RAGRetriever:
         vector_top_k: int = 12,
         fulltext_top_k: int = 12,
         top_k: int = 20,
+        reranker_query: str | None = None,
         filters: dict[str, Any] | None = None,
     ) -> list[Evidence]:
         """混合检索：向量 + PG 全文 → 合并 → 回填内容 → 重排（按最终加权分截取 top_k）。
@@ -473,87 +706,196 @@ class RAGRetriever:
         if primary_sources is None:
             primary_sources = set(sources)
 
-        # 计算 source_priority_weight，确保三权重之和为 1.0
-        source_priority_weight = round(1.0 - vector_weight - fulltext_weight, 6)
-        if source_priority_weight < 0:
-            source_priority_weight = 0.0
+        vector_hits, fulltext_hits = await self._collect_query_candidates(
+            query,
+            sources,
+            vector_top_k=vector_top_k,
+            fulltext_top_k=fulltext_top_k,
+            filters=filters,
+        )
+        return await self._rank_candidate_hits(
+            vector_hits,
+            fulltext_hits,
+            primary_sources=primary_sources,
+            vector_weight=vector_weight,
+            fulltext_weight=fulltext_weight,
+            top_k=top_k,
+            reranker_query=reranker_query or query,
+        )
 
+    async def dual_query_hybrid_search(
+        self,
+        query_views: Sequence[str],
+        sources: list[str],
+        *,
+        primary_sources: set[str] | None = None,
+        vector_weight: float = DEFAULT_VECTOR_WEIGHT,
+        fulltext_weight: float = DEFAULT_FULLTEXT_WEIGHT,
+        vector_top_k: int = 12,
+        fulltext_top_k: int = 12,
+        top_k: int = 20,
+        rrf_k: int = 60,
+        reranker_query: str | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[Evidence]:
+        """Fuse two retrieval views before one shared final rerank.
+
+        ``query_views`` is deduplicated and bounded to two views.  The first
+        view is normally the fact-key intake Query and the second is the LLM
+        case-style rewrite.  Each view runs the same production vector and
+        fulltext retrievers; their ranked candidates are separately fused by
+        RRF, then passed to the existing merger and reranker.
+        """
+        views: list[str] = []
+        for query in query_views:
+            normalized = query.strip()
+            if normalized and normalized not in views:
+                views.append(normalized)
+            if len(views) == 2:
+                break
+        if not views:
+            return []
+        if len(views) == 1:
+            return await self.hybrid_search(
+                views[0],
+                sources,
+                primary_sources=primary_sources,
+                vector_weight=vector_weight,
+                fulltext_weight=fulltext_weight,
+                vector_top_k=vector_top_k,
+                fulltext_top_k=fulltext_top_k,
+                top_k=top_k,
+                reranker_query=reranker_query,
+                filters=filters,
+            )
+        if primary_sources is None:
+            primary_sources = set(sources)
+
+        vector_batches: list[list[VectorHit]] = []
+        fulltext_batches: list[list[FulltextHit]] = []
+        for view in views:
+            vector_hits, fulltext_hits = await self._collect_query_candidates(
+                view,
+                sources,
+                vector_top_k=vector_top_k,
+                fulltext_top_k=fulltext_top_k,
+                filters=filters,
+            )
+            vector_batches.append(vector_hits)
+            fulltext_batches.append(fulltext_hits)
+
+        fused_vector_hits = [
+            hit
+            for hit in reciprocal_rank_fuse_hits(vector_batches, score_field="vector_score", rrf_k=rrf_k)
+            if isinstance(hit, VectorHit)
+        ]
+        fused_fulltext_hits = [
+            hit
+            for hit in reciprocal_rank_fuse_hits(fulltext_batches, score_field="fulltext_score", rrf_k=rrf_k)
+            if isinstance(hit, FulltextHit)
+        ]
+        return await self._rank_candidate_hits(
+            fused_vector_hits,
+            fused_fulltext_hits,
+            primary_sources=primary_sources,
+            vector_weight=vector_weight,
+            fulltext_weight=fulltext_weight,
+            top_k=top_k,
+            reranker_query=reranker_query or views[-1],
+        )
+
+    async def _collect_query_candidates(
+        self,
+        query: str,
+        sources: list[str],
+        *,
+        vector_top_k: int,
+        fulltext_top_k: int,
+        filters: dict[str, Any] | None,
+    ) -> tuple[list[VectorHit], list[FulltextHit]]:
+        """Collect one Query's vector/fulltext candidates using normal fallbacks."""
         vector_hits: list[VectorHit] = []
-        fulltext_hits: list[FulltextHit] = []
         vector_failed = False
-
-        # ---- 向量检索 ----
         try:
             async with measure("rag.vector"):
                 vector_hits = await self._vector_search(
-                    query, sources, top_k=vector_top_k, filters=filters,
+                    query,
+                    sources,
+                    top_k=vector_top_k,
+                    filters=filters,
                 )
         except Exception as exc:
             vector_failed = True
-            # 不泄露 API key 或完整异常响应
-            logger.warning(
-                "向量检索失败，降级为 PG 全文检索: error_type=%s",
-                type(exc).__name__,
-            )
+            logger.warning("向量检索失败，降级为 PG 全文检索: error_type=%s", type(exc).__name__)
 
-        # ---- PG 全文检索 ----
         async with measure("rag.fulltext"):
             fulltext_hits = await self._fulltext_search(
-                query, sources, top_k=fulltext_top_k, filters=filters,
+                query,
+                sources,
+                top_k=fulltext_top_k,
+                filters=filters,
             )
-
-        # ---- 降级：向量失败且全文也无结果 ----
         if vector_failed and not fulltext_hits:
-            return []
+            return [], []
+        return vector_hits, fulltext_hits
 
-        # ---- 合并去重 ----
+    async def _rank_candidate_hits(
+        self,
+        vector_hits: Sequence[VectorHit],
+        fulltext_hits: Sequence[FulltextHit],
+        *,
+        primary_sources: set[str] | None,
+        vector_weight: float,
+        fulltext_weight: float,
+        top_k: int,
+        reranker_query: str,
+    ) -> list[Evidence]:
+        """Merge, backfill and rank candidates for single and dual Query paths."""
+        if primary_sources is None:
+            primary_sources = set()
+        source_priority_weight = max(0.0, round(1.0 - vector_weight - fulltext_weight, 6))
         merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources)
-
         if not merged:
             return []
 
-        # ---- 回填向量命中缺失的 content_snippet ----
         async with measure("rag.backfill"):
             await self._backfill_content_snippets(merged)
 
-        # ---- 重排（MVP 加权 或 Cross-Encoder / LLM Reranker）----
-        settings = get_settings()
-        if (
-            settings.rag_reranker_enabled
-            and len(merged) > settings.rag_reranker_final_top_k
-        ):
-            # 先取 top-K 送入 reranker
-            candidates = merged[:settings.rag_reranker_top_k]
-
-            if settings.rag_reranker_provider == "llm":
-                evidences = await llm_rerank(
-                    query=query,
+        settings = self._settings
+        reranker_enabled = bool(getattr(settings, "rag_reranker_enabled", False))
+        reranker_final_top_k = int(getattr(settings, "rag_reranker_final_top_k", top_k))
+        if reranker_enabled and len(merged) > reranker_final_top_k:
+            candidates = select_reranker_candidates(
+                merged,
+                fulltext_quota=int(getattr(settings, "rag_reranker_fulltext_quota", 0)),
+                limit=int(getattr(settings, "rag_reranker_top_k", len(merged))),
+                max_chunks_per_source=int(getattr(settings, "rag_reranker_max_chunks_per_source", 0)),
+            )
+            if getattr(settings, "rag_reranker_provider", "cross_encoder") == "llm":
+                return await llm_rerank(
+                    query=reranker_query,
                     merged_hits=candidates,
                     gateway=self._get_reranker_gateway(),
                     model=settings.rag_reranker_model or settings.chat_model,
-                    top_k=settings.rag_reranker_final_top_k,
-                    timeout=settings.rag_reranker_timeout_seconds,
+                    top_k=reranker_final_top_k,
+                    timeout=float(getattr(settings, "rag_reranker_timeout_seconds", 5.0)),
                 )
-            else:
-                evidences = await cross_encoder_rerank(
-                    query=query,
-                    merged_hits=candidates,
-                    gateway=self._get_reranker_gateway(),
-                    model=settings.rag_reranker_model,
-                    top_k=settings.rag_reranker_final_top_k,
-                    timeout=settings.rag_reranker_timeout_seconds,
-                )
-        else:
-            # MVP 加权求和（默认路径 / 降级路径）
-            evidences = rerank(
-                merged,
-                top_k=top_k,
-                vector_weight=vector_weight,
-                fulltext_weight=fulltext_weight,
-                source_priority_weight=source_priority_weight,
+            return await cross_encoder_rerank(
+                query=reranker_query,
+                merged_hits=candidates,
+                gateway=self._get_reranker_gateway(),
+                model=settings.rag_reranker_model,
+                top_k=reranker_final_top_k,
+                timeout=float(getattr(settings, "rag_reranker_timeout_seconds", 5.0)),
             )
 
-        return evidences
+        return rerank(
+            merged,
+            top_k=top_k,
+            vector_weight=vector_weight,
+            fulltext_weight=fulltext_weight,
+            source_priority_weight=source_priority_weight,
+        )
 
     # -------------------------------------------------------------------
     # 向量检索
@@ -693,21 +1035,36 @@ class RAGRetriever:
         try:
             async with session_factory() as session:
                 ts_query = func.plainto_tsquery("simple", query)
-                rank_expr = func.ts_rank(
+                ts_rank_expr = func.ts_rank(
                     func.to_tsvector("simple", KnowledgeChunk.content),
                     ts_query,
                 )
-
-                ilike_pattern = f"%{query}%"
+                lexical_enabled = bool(getattr(self._settings, "rag_fulltext_lexical_enabled", True))
+                lexical_max_terms = int(getattr(self._settings, "rag_fulltext_lexical_max_terms", 12))
+                lexical_terms = (
+                    extract_fulltext_lexical_terms(query, max_terms=lexical_max_terms) if lexical_enabled else []
+                )
+                lexical_conditions = [KnowledgeChunk.content.ilike(f"%{term}%") for term in lexical_terms]
+                lexical_match_count = sum(
+                    (case((condition, 1), else_=0) for condition in lexical_conditions),
+                    start=0,
+                )
+                # A lexical match is deliberately scored above a zero-rank
+                # whole-sentence fallback.  Scores are normalized below per
+                # query, so this remains a candidate signal rather than a
+                # final relevance score.
+                rank_expr = (ts_rank_expr + lexical_match_count).label("ts_rank")
+                whole_query_match = KnowledgeChunk.content.ilike(f"%{query}%")
+                text_match = func.to_tsvector("simple", KnowledgeChunk.content).op("@@")(ts_query) | whole_query_match
+                if lexical_conditions:
+                    text_match = text_match | or_(*lexical_conditions)
 
                 # 基础 WHERE 条件
                 conditions = [
                     KnowledgeChunk.source_type.in_(sources),
                     KnowledgeChunk.deleted_at.is_(None),
                     KnowledgeChunk.embedding_status == "done",
-                    # 全文匹配 OR ilike 模糊匹配
-                    (func.to_tsvector("simple", KnowledgeChunk.content).op("@@")(ts_query))
-                    | (KnowledgeChunk.content.ilike(ilike_pattern)),
+                    text_match,
                 ]
 
                 # 应用 filters
@@ -726,7 +1083,9 @@ class RAGRetriever:
                         rank_expr.label("ts_rank"),
                     )
                     .where(*conditions)
-                    .order_by(rank_expr.desc())
+                    # Lexical bigrams often tie on match count; make the
+                    # candidate ordering deterministic before the reranker.
+                    .order_by(rank_expr.desc(), KnowledgeChunk.id.asc())
                     .limit(top_k)
                 )
 

@@ -57,6 +57,37 @@ def _candidate(index: int, *, stratum: str) -> builder.Candidate:
     )
 
 
+def _structured_candidate(*, forbidden_terms: list[str] | None = None) -> builder.Candidate:
+    symptom_text = "患者咳嗽三日，伴咽痛、恶寒发热，痰白稀，夜间加重，舌淡红苔薄白，脉浮紧。"
+    return builder.Candidate(
+        record_key=_record_key(999),
+        title="病例标题",
+        stratum="内科",
+        symptom_text=symptom_text,
+        source_symptom_sha256=builder.sha256_text(symptom_text),
+        syndrome=None,
+        treatment_principle=None,
+        formula_summary=None,
+        content=symptom_text,
+        forbidden_terms=forbidden_terms or [],
+    )
+
+
+class _StaticGenerator:
+    def __init__(self, raw_response: str) -> None:
+        self.raw_response = raw_response
+
+    async def generate(self, symptom_text: str, *, trace_id: str) -> builder.QueryGenerationResult:
+        del symptom_text, trace_id
+        return builder.QueryGenerationResult(
+            raw_response=self.raw_response,
+            model="fake-structured",
+            attempt_count=1,
+            latency_ms=0.0,
+            error_type=None,
+        )
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -92,8 +123,9 @@ def _make_bundle(tmp_path: Path, count: int = 220) -> tuple[Path, list[dict[str,
     return bundle, cases
 
 
-def _write_valid_frozen_dataset(tmp_path: Path) -> tuple[Path, Path]:
+def _write_valid_frozen_dataset(tmp_path: Path, *, query_style: str = builder.DEFAULT_QUERY_STYLE) -> tuple[Path, Path]:
     bundle, cases = _make_bundle(tmp_path)
+    query_style = builder.validate_query_style(query_style)
     candidates, rejected = builder.load_structurally_valid_candidates(cases)
     assert not rejected
     builder.apply_low_frequency_merge(candidates)
@@ -106,7 +138,16 @@ def _write_valid_frozen_dataset(tmp_path: Path) -> tuple[Path, Path]:
         record_key = case["metadata"]["record_key"]
         candidate = candidates_by_key[record_key]
         split = "smoke" if index < builder.FIXED_SMOKE_SIZE else "test"
-        query = _valid_query(index)
+        if query_style == builder.QUERY_STYLE_NATURAL_LANGUAGE_V1:
+            query = _valid_query(index)
+        else:
+            source_char = chr(0x4E00 + index)
+            query = builder.reconstruct_structured_query(
+                [
+                    builder.StructuredQueryFact("chief_complaint.symptom", source_char * 20),
+                    builder.StructuredQueryFact("present_illness.cough", source_char * 15),
+                ]
+            )
         accepted = builder.AcceptedQuery(
             query_id=builder.stable_query_id(split, record_key, builder.normalize_query_for_dedup(query)),
             query=query,
@@ -142,6 +183,21 @@ def _write_valid_frozen_dataset(tmp_path: Path) -> tuple[Path, Path]:
             "rejected.jsonl": builder.sha256_file(dataset_dir / "rejected.jsonl"),
         },
     }
+    if query_style != builder.DEFAULT_QUERY_STYLE:
+        prompt_version, _system_prompt, _user_prompt_template = builder.query_prompts_for_style(query_style)
+        manifest.update(
+            {
+                "query_style": query_style,
+                "query_generator": {
+                    "prompt_version": prompt_version,
+                    "input_contract": builder.query_style_manifest_contract(query_style),
+                    "model": "explicit-test-chat-model",
+                    "gateway_mode": "default_model_gateway",
+                    "model_selection": dict(builder.STRUCTURED_MODEL_SELECTION_CONTRACT),
+                },
+                "excluded_frozen_dataset_union": builder.exclusion_union_metadata(set(), []),
+            }
+        )
     builder.write_json_atomic(dataset_dir / "manifest.json", manifest)
     return bundle, dataset_dir
 
@@ -198,6 +254,23 @@ def test_structural_strata_handle_unclassified_and_low_frequency_categories() ->
     assert strata[_record_key(0)] == builder.UNCLASSIFIED_STRATUM
     assert {strata[_record_key(index)] for index in range(1, 6)} == {"常见类"}
     assert {strata[_record_key(index)] for index in range(6, 10)} == {builder.LOW_FREQUENCY_STRATUM}
+
+
+def test_sampling_candidates_exclude_before_low_frequency_merge() -> None:
+    cases = [_case(index, category="稀有类") for index in range(6)]
+    cases.extend(_case(index, category="常见类") for index in range(6, 12))
+
+    candidates, rejected = builder.sampling_candidates(cases, {_record_key(0), _record_key(1)})
+
+    assert not rejected
+    rare_strata = {
+        candidate.stratum for candidate in candidates if candidate.record_key in {_record_key(i) for i in range(2, 6)}
+    }
+    assert rare_strata == {builder.LOW_FREQUENCY_STRATUM}
+    common_strata = {
+        candidate.stratum for candidate in candidates if candidate.record_key in {_record_key(i) for i in range(6, 12)}
+    }
+    assert common_strata == {"常见类"}
 
 
 @pytest.mark.parametrize(
@@ -338,6 +411,163 @@ async def test_query_generator_payload_contains_only_prompts_and_symptom_text() 
     assert kwargs["max_tokens"] == 321
 
 
+def test_structured_response_requires_canonical_source_spans_and_reconstructs_production_query() -> None:
+    candidate = _structured_candidate()
+    raw_response = json.dumps(
+        {
+            "facts": [
+                {"fact_key": "chief_complaint.symptom", "value": "咳嗽三日"},
+                {"fact_key": "present_illness.sore_throat", "value": "咽痛"},
+                {"fact_key": "present_illness.sputum", "value": "痰白稀"},
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    facts, fence_removed = builder.parse_structured_query_model_response(raw_response)
+
+    assert not fence_removed
+    assert facts is not None
+    assert builder.validate_structured_query_facts(facts, symptom_text=candidate.symptom_text) == []
+    query = builder.reconstruct_structured_query(facts)
+    assert query == (
+        "chief_complaint.symptom=咳嗽三日；present_illness.sore_throat=咽痛；present_illness.sputum=痰白稀"
+    )
+    assert builder.parse_structured_query_string(query) == facts
+    assert builder.check_structured_query_length(query)
+    assert builder.parse_structured_query_model_response('{"query":"患者咳嗽"}')[0] is None
+
+
+@pytest.mark.asyncio
+async def test_structured_process_reconstructs_raw_query_without_persisting_fact_fields() -> None:
+    candidate = _structured_candidate()
+    generator = _StaticGenerator(
+        json.dumps(
+            {
+                "facts": [
+                    {"fact_key": "chief_complaint.symptom", "value": "咳嗽三日"},
+                    {"fact_key": "present_illness.sore_throat", "value": "咽痛"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = await builder.process_candidate(
+        candidate,
+        generator=generator,  # type: ignore[arg-type]
+        split="test",
+        accepted_normalized_queries=[],
+        accepted_target_keys=set(),
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+    assert isinstance(result, builder.AcceptedQuery)
+    assert result.query == "chief_complaint.symptom=咳嗽三日；present_illness.sore_throat=咽痛"
+    row = builder.accepted_to_jsonl_record(result, split="test")
+    assert isinstance(row["query"], str)
+    assert "facts" not in row
+    assert not (set(row) & builder._ANSWER_FIELDS_FORBIDDEN_IN_FROZEN_QUERIES)
+    assert "excessive_source_overlap" not in builder.evaluate_query_candidate(
+        result.query,
+        candidate=candidate,
+        accepted_normalized_queries=[],
+        accepted_target_keys=set(),
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_process_rejects_out_of_source_or_answer_like_facts_without_retaining_them() -> None:
+    candidate = _structured_candidate(forbidden_terms=["风寒束表"])
+    generator = _StaticGenerator(
+        json.dumps(
+            {
+                "facts": [
+                    {"fact_key": "chief_complaint.symptom", "value": "咳嗽三日"},
+                    {"fact_key": "present_illness.chills", "value": "风寒束表"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = await builder.process_candidate(
+        candidate,
+        generator=generator,  # type: ignore[arg-type]
+        split="test",
+        accepted_normalized_queries=[],
+        accepted_target_keys=set(),
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+    assert isinstance(result, builder.RejectedAttempt)
+    assert result.primary_reason == "structured_fact_value_not_in_source"
+    assert result.query is None
+
+
+def test_structured_query_runs_answer_leakage_gate_after_source_span_validation() -> None:
+    candidate = _structured_candidate(forbidden_terms=["咳嗽三日"])
+    facts = [
+        builder.StructuredQueryFact("chief_complaint.symptom", "咳嗽三日"),
+        builder.StructuredQueryFact("present_illness.sore_throat", "咽痛"),
+    ]
+    query = builder.reconstruct_structured_query(facts)
+
+    reasons = builder.evaluate_query_candidate(
+        query,
+        candidate=candidate,
+        accepted_normalized_queries=[],
+        accepted_target_keys=set(),
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+    assert "answer_leakage" in reasons
+
+
+@pytest.mark.asyncio
+async def test_structured_query_generator_receives_only_symptom_text() -> None:
+    gateway = _RecordingGateway(
+        '{"facts":[{"fact_key":"chief_complaint.symptom","value":"咳嗽三日"},'
+        '{"fact_key":"present_illness.sore_throat","value":"咽痛"}]}'
+    )
+    generator = builder.QueryGenerator(
+        gateway,
+        model="rewrite-model",
+        max_tokens=321,
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+    symptom_text = "患者咳嗽三日，伴咽痛。"
+
+    await generator.generate(symptom_text, trace_id="test-trace")
+
+    messages, _kwargs = gateway.calls[0]
+    assert messages == [
+        {"role": "system", "content": builder.STRUCTURED_QUERY_SYSTEM_PROMPT},
+        {"role": "user", "content": builder.STRUCTURED_USER_PROMPT_TEMPLATE.format(symptom_text=symptom_text)},
+    ]
+    payload_text = json.dumps(messages, ensure_ascii=False)
+    assert "病例标题" not in payload_text
+    assert "气血不足" not in payload_text
+    assert "益气养血" not in payload_text
+    assert "归脾汤" not in payload_text
+
+
+def test_structured_frozen_dataset_has_explicit_style_and_verifies_source_span_contract(tmp_path: Path) -> None:
+    bundle, dataset_dir = _write_valid_frozen_dataset(
+        tmp_path, query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    )
+
+    assert builder.verify_frozen_dataset(dataset_dir, bundle) == []
+    manifest = builder.read_json_file(dataset_dir / "manifest.json")
+    assert manifest["query_style"] == builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    assert manifest["query_generator"]["input_contract"]["fact_count"] == {"min": 2, "max": 8}
+    assert "raw_response" not in manifest["query_generator"]["input_contract"]
+    first_row = builder.read_jsonl_file(dataset_dir / "test.jsonl")[0]
+    assert isinstance(first_row["query"], str)
+    assert "facts" not in first_row
+
+
 def test_prompt_hashes_are_stable_and_separate() -> None:
     assert builder.sha256_text(builder.SYSTEM_PROMPT) == builder.sha256_text(builder.SYSTEM_PROMPT)
     assert builder.sha256_text(builder.USER_PROMPT_TEMPLATE) == builder.sha256_text(builder.USER_PROMPT_TEMPLATE)
@@ -351,6 +581,46 @@ def test_verify_frozen_dataset_is_read_only_and_checks_full_schema(tmp_path: Pat
     assert builder.verify_frozen_dataset(dataset_dir, bundle) == []
 
     assert {path: path.read_bytes() for path in dataset_dir.iterdir()} == before
+
+
+def test_load_exclusion_context_hash_binds_targets_and_queries(tmp_path: Path) -> None:
+    _bundle, dataset_dir = _write_valid_frozen_dataset(tmp_path)
+
+    target_keys, normalized_queries, descriptors = builder.load_exclusion_context([dataset_dir])
+
+    assert len(target_keys) == builder.FIXED_SMOKE_SIZE + builder.FIXED_TEST_SIZE
+    assert len(normalized_queries) == builder.FIXED_SMOKE_SIZE + builder.FIXED_TEST_SIZE
+    assert descriptors[0]["target_count"] == len(target_keys)
+    assert descriptors[0]["manifest_sha256"] == builder.sha256_file(dataset_dir / "manifest.json")
+
+
+def test_load_exclusion_context_unions_cross_dataset_overlap_with_hash_only_audit(tmp_path: Path) -> None:
+    _bundle_one, dataset_one = _write_valid_frozen_dataset(tmp_path / "one")
+    _bundle_two, dataset_two = _write_valid_frozen_dataset(tmp_path / "two")
+
+    target_keys, normalized_queries, descriptors = builder.load_exclusion_context([dataset_one, dataset_two])
+
+    assert len(target_keys) == builder.FIXED_SMOKE_SIZE + builder.FIXED_TEST_SIZE
+    assert len(normalized_queries) == 2 * (builder.FIXED_SMOKE_SIZE + builder.FIXED_TEST_SIZE)
+    overlap = descriptors[1]["overlap_with_prior_exclusions"]
+    assert overlap["target_count"] == len(target_keys)
+    assert overlap["target_keys_sha256"] == builder.sha256_text("\n".join(sorted(target_keys)))
+    assert builder.exclusion_union_metadata(target_keys, normalized_queries)["target_count"] == len(target_keys)
+
+
+def test_load_exclusion_context_rejects_duplicate_target_inside_one_frozen_dataset(tmp_path: Path) -> None:
+    _bundle, dataset_dir = _write_valid_frozen_dataset(tmp_path)
+    smoke_path = dataset_dir / "smoke.jsonl"
+    smoke_records = builder.read_jsonl_file(smoke_path)
+    smoke_records.append(dict(smoke_records[0]))
+    builder.write_jsonl_atomic(smoke_path, smoke_records)
+    manifest_path = dataset_dir / "manifest.json"
+    manifest = builder.read_json_file(manifest_path)
+    manifest["artifact_sha256"]["smoke.jsonl"] = builder.sha256_file(smoke_path)
+    builder.write_json_atomic(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="内部 target 重叠"):
+        builder.load_exclusion_context([dataset_dir])
 
 
 @pytest.mark.asyncio
@@ -433,3 +703,97 @@ async def test_build_uses_configured_dedicated_rewrite_gateway_and_freezes_a_com
     manifest = builder.read_json_file(output_dir / "manifest.json")
     assert manifest["query_generator"]["model"] == "Qwen3.5-2B-free"
     assert manifest["query_generator"]["gateway_mode"] == "dedicated_rewrite_gateway"
+
+
+@pytest.mark.asyncio
+async def test_structured_build_requires_explicit_chat_model_before_gateway_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.core.config as config_module
+    import app.core.gateway as gateway_module
+
+    bundle, _ = _make_bundle(tmp_path)
+    settings = SimpleNamespace(chat_model="deepseek-v4-flash-0731")
+
+    class FakeModelGateway:
+        instances: list[FakeModelGateway] = []
+
+        def __init__(self, *, settings: Any) -> None:
+            del settings
+            self.__class__.instances.append(self)
+
+        async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+            del messages, kwargs
+            raise AssertionError("structured build without --query-model must not call a gateway")
+
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(gateway_module, "ModelGatewayClient", FakeModelGateway)
+    config = builder.BuildConfig(
+        prepared_bundle=bundle,
+        output_dir=tmp_path / "structured-no-model",
+        seed=builder.FIXED_SEED,
+        smoke_size=builder.FIXED_SMOKE_SIZE,
+        test_size=builder.FIXED_TEST_SIZE,
+        query_model="",
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+    assert await builder.run_build(config) == 1
+    assert FakeModelGateway.instances == []
+
+
+@pytest.mark.asyncio
+async def test_structured_build_uses_explicit_chat_model_not_rewrite_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.core.config as config_module
+    import app.core.gateway as gateway_module
+
+    bundle, _ = _make_bundle(tmp_path)
+    settings = SimpleNamespace(chat_model="deepseek-v4-flash-0731")
+
+    class FakeModelGateway:
+        instances: list[FakeModelGateway] = []
+
+        def __init__(self, *, settings: Any) -> None:
+            self.settings = settings
+            self.calls: list[dict[str, Any]] = []
+            self.__class__.instances.append(self)
+
+        async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+            self.calls.append({"messages": messages, "kwargs": kwargs})
+            source_char = str(messages[1]["content"])[-1]
+            return json.dumps(
+                {
+                    "facts": [
+                        {"fact_key": "chief_complaint.symptom", "value": source_char * 20},
+                        {"fact_key": "present_illness.cough", "value": source_char * 15},
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(gateway_module, "ModelGatewayClient", FakeModelGateway)
+    output_dir = tmp_path / "structured-chat-model"
+    config = builder.BuildConfig(
+        prepared_bundle=bundle,
+        output_dir=output_dir,
+        seed=builder.FIXED_SEED,
+        smoke_size=builder.FIXED_SMOKE_SIZE,
+        test_size=builder.FIXED_TEST_SIZE,
+        query_model="deepseek-v4-flash-0731",
+        query_style=builder.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+
+    assert await builder.run_build(config) == 0
+    assert builder.verify_frozen_dataset(output_dir, bundle) == []
+    assert len(FakeModelGateway.instances) == 1
+    fake_gateway = FakeModelGateway.instances[0]
+    assert fake_gateway.settings is settings
+    assert len(fake_gateway.calls) == builder.FIXED_SMOKE_SIZE + builder.FIXED_TEST_SIZE
+    assert all(call["kwargs"]["model"] == "deepseek-v4-flash-0731" for call in fake_gateway.calls)
+    manifest = builder.read_json_file(output_dir / "manifest.json")
+    assert manifest["query_generator"]["model"] == "deepseek-v4-flash-0731"
+    assert manifest["query_generator"]["gateway_mode"] == "default_model_gateway"
+    assert manifest["query_generator"]["max_tokens"] == builder.STRUCTURED_QUERY_MODEL_MAX_TOKENS
+    assert manifest["query_generator"]["model_selection"] == builder.STRUCTURED_MODEL_SELECTION_CONTRACT

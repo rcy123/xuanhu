@@ -322,11 +322,90 @@ def test_paired_metrics_and_fixed_bootstrap_golden_values() -> None:
         seed=20260807,
     )
     assert metrics["paired_hits"] == {"0_0": 0, "0_1": 1, "1_0": 0, "1_1": 1}
-    assert metrics["arms"]["baseline"] == {"target_recall_at_8": 0.5, "mrr": 0.5}
-    assert metrics["arms"]["full"] == {"target_recall_at_8": 1.0, "mrr": 0.75}
+    assert metrics["paired_hits_by_cutoff"]["at_1"] == {"0_0": 0, "0_1": 1, "1_0": 1, "1_1": 0}
+    assert metrics["paired_hits_by_cutoff"]["at_5"] == {"0_0": 0, "0_1": 1, "1_0": 0, "1_1": 1}
+    assert metrics["arms"]["baseline"] == {
+        "target_recall_at_1": 0.5,
+        "target_recall_at_5": 0.5,
+        "target_recall_at_8": 0.5,
+        "mrr": 0.5,
+    }
+    assert metrics["arms"]["full"] == {
+        "target_recall_at_1": 0.5,
+        "target_recall_at_5": 1.0,
+        "target_recall_at_8": 1.0,
+        "mrr": 0.75,
+    }
+    assert metrics["deltas"]["target_recall_at_1"]["point"] == 0.0
+    assert metrics["deltas"]["target_recall_at_5"]["point"] == 0.5
     assert metrics["deltas"]["target_recall_at_8"]["point"] == 0.5
     assert metrics["deltas"]["target_recall_at_8"]["ci95"] == {"low": 0.0, "high": 1.0}
     assert metrics["deltas"]["mrr"]["ci95"] == {"low": -0.5, "high": 1.0}
+
+
+def test_candidate_audit_separates_candidate_recall_from_final_selection_loss() -> None:
+    baseline = [_record("q1", "baseline", source_ids=[]), _record("q2", "baseline", source_ids=[])]
+    full = [_full_record("q1", source_ids=["other"]), _full_record("q2", source_ids=["target-1"])]
+    full[0]["candidate_trace"] = {
+        "vector_candidate_count": 20,
+        "vector_target_rank": None,
+        "fulltext_candidate_count": 20,
+        "fulltext_target_rank": 3,
+        "merged_candidate_count": 35,
+        "merged_target_rank": 21,
+        "reranker_candidate_count": 28,
+        "reranker_candidate_target_rank": 28,
+        "reranker_attempted": True,
+    }
+    full[1]["candidate_trace"] = {
+        "vector_candidate_count": 20,
+        "vector_target_rank": 2,
+        "fulltext_candidate_count": 20,
+        "fulltext_target_rank": None,
+        "merged_candidate_count": 35,
+        "merged_target_rank": 2,
+        "reranker_candidate_count": 28,
+        "reranker_candidate_target_rank": 2,
+        "reranker_attempted": True,
+    }
+    for record in full:
+        record["record_sha256"] = evaluator._record_hash(record)
+        evaluator.validate_result_record(
+            record, arm="full", split="test", run_id="run", dataset_sha256="d" * 64, config_sha256="c" * 64
+        )
+
+    metrics = evaluator.compute_metrics(
+        baseline,
+        full,
+        run_id="run",
+        dataset_sha256="d" * 64,
+        config_sha256="c" * 64,
+    )
+
+    audit = metrics["candidate_audit"]
+    assert audit["coverage"] == 1.0
+    assert audit["stages"]["vector"]["target_present"] == 1
+    assert audit["stages"]["fulltext"]["target_present"] == 1
+    assert audit["stages"]["reranker_pool"]["candidate_count"]["median"] == 28.0
+    assert audit["reranker_pool_target_present_final_miss"] == 1
+
+
+def test_candidate_trace_rejects_rank_beyond_candidate_count() -> None:
+    record = _full_record("q1", source_ids=["other"])
+    record["candidate_trace"] = {
+        "vector_candidate_count": 20,
+        "vector_target_rank": 21,
+        "fulltext_candidate_count": 0,
+        "fulltext_target_rank": None,
+        "merged_candidate_count": 20,
+        "merged_target_rank": None,
+        "reranker_candidate_count": 20,
+        "reranker_candidate_target_rank": None,
+        "reranker_attempted": True,
+    }
+    record["record_sha256"] = evaluator._record_hash(record)
+    with pytest.raises(evaluator.ResumeIntegrityError, match="rank exceeds"):
+        evaluator.validate_result_record(record)
 
 
 @pytest.mark.parametrize(
@@ -366,7 +445,95 @@ def test_redacted_config_hash_is_stable_when_capture_time_changes() -> None:
     first = evaluator.redacted_config(settings)
     second = evaluator.redacted_config(settings)
     assert first["config_sha256"] == second["config_sha256"]
+    assert "query_style" not in first
+    assert first["models"]["rewrite"] == "Qwen3.5-2B-free"
+    assert first["rewrite"]["enabled"] is True
     assert "api_key" not in json.dumps(first).lower()
+
+
+def test_frozen_rewrite_cache_binds_all_split_queries_and_hashes(tmp_path: Path) -> None:
+    smoke = evaluator.FrozenSplit(
+        "smoke",
+        [{"query_id": "smoke-q", "query": "咳嗽"}],
+        "s" * 64,
+        {},
+    )
+    test = evaluator.FrozenSplit(
+        "test",
+        [{"query_id": "test-q", "query": "夜咳白痰"}],
+        "t" * 64,
+        {},
+    )
+    entries = [
+        {
+            "split": split.split,
+            "query_id": str(row["query_id"]),
+            "query_sha256": evaluator.sha256_text(str(row["query"])),
+            "effective_query": f"医案改写：{row['query']}",
+            "effective_query_sha256": evaluator.sha256_text(f"医案改写：{row['query']}"),
+            "gateway_status": "succeeded",
+            "gateway_latency_ms": 12.0,
+        }
+        for split in (smoke, test)
+        for row in split.records
+    ]
+    payload: dict[str, Any] = {
+        "schema_version": evaluator.FROZEN_REWRITE_CACHE_SCHEMA_VERSION,
+        "created_at": "2026-08-09T00:00:00Z",
+        "dataset": {"smoke_sha256": smoke.sha256, "test_sha256": test.sha256},
+        "rewrite": {"model": "rewrite", "temperature": 0.1},
+        "entries": entries,
+    }
+    payload["cache_sha256"] = evaluator.sha256_bytes(evaluator.compact_json_bytes(payload))
+    path = tmp_path / "rewrite-cache.json"
+    evaluator.write_json_atomic(path, payload)
+    settings = SimpleNamespace(
+        rag_query_rewrite_model="rewrite",
+        chat_model="chat",
+        rag_query_rewrite_model_temperature=0.1,
+    )
+
+    cache = evaluator.load_frozen_rewrite_cache(path, smoke=smoke, test=test, settings=settings)
+
+    assert cache.effective_query_for("test-q", "夜咳白痰") == "医案改写：夜咳白痰"
+    with pytest.raises(evaluator.EvaluationError, match="does not bind"):
+        cache.effective_query_for("test-q", "different")
+
+
+def test_redacted_config_records_frozen_rewrite_cache_and_reranker_switch() -> None:
+    settings = SimpleNamespace(
+        milvus_host="localhost",
+        milvus_port=19530,
+        milvus_collection="xuanhu_knowledge_v4",
+        embedding_dim=4096,
+        embedding_model="embedding",
+        rag_query_rewrite_model="rewrite",
+        chat_model="chat",
+        rag_reranker_model="reranker",
+        rag_top_k_vector=12,
+        rag_top_k_fulltext=12,
+        rag_reranker_enabled=True,
+        rag_reranker_provider="cross_encoder",
+        rag_reranker_top_k=20,
+        rag_reranker_final_top_k=8,
+        rag_query_rewrite_enabled=True,
+        rag_query_rewrite_model_temperature=0.1,
+        rag_query_rewrite_model_max_tokens=400,
+        embedding_gateway_timeout_seconds=0,
+        embedding_cache_ttl_seconds=0,
+        model_gateway_timeout_seconds=60,
+        rag_query_rewrite_gateway_timeout_seconds=0,
+        rag_query_rewrite_timeout_seconds=3,
+        reranker_gateway_timeout_seconds=0,
+        rag_reranker_timeout_seconds=5,
+    )
+    cache = evaluator.FrozenRewriteCache("a" * 64, "rewrite", 0.1, {"q": {}})
+
+    config = evaluator.redacted_config(settings, frozen_rewrite_cache=cache)
+
+    assert config["retrieval"]["reranker_enabled"] is True
+    assert config["rewrite"]["execution_mode"] == "frozen_replay"
+    assert config["rewrite"]["frozen_cache_sha256"] == "a" * 64
 
 
 def test_resume_r1_requires_bge_m3_even_with_positive_confidence_intervals() -> None:
@@ -430,6 +597,454 @@ def test_contract_environment_disables_unprovenanced_embedding_cache(monkeypatch
             assert key not in os.environ
         else:
             assert os.environ[key] == original[key]
+
+
+def test_expanded_profile_freezes_candidate_pool_and_lexical_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = evaluator.resolve_retrieval_profile("expanded-v20-f8")
+    evaluator.set_contract_environment("xuanhu_knowledge_v4", profile)
+
+    environment = __import__("os").environ
+    assert environment["RAG_TOP_K_VECTOR"] == "20"
+    assert environment["RAG_TOP_K_FULLTEXT"] == "20"
+    assert environment["RAG_RERANKER_TOP_K"] == "28"
+    assert environment["RAG_RERANKER_FULLTEXT_QUOTA"] == "8"
+    assert environment["RAG_FULLTEXT_LEXICAL_ENABLED"] == "true"
+    assert environment["RAG_FULLTEXT_LEXICAL_MAX_TERMS"] == "12"
+
+
+def test_lexical_ablation_profile_can_disable_only_the_new_candidate_leg() -> None:
+    profile = evaluator.resolve_retrieval_profile("v12-lexical-off")
+    evaluator.set_contract_environment("xuanhu_knowledge_v4", profile)
+
+    environment = __import__("os").environ
+    assert environment["RAG_TOP_K_VECTOR"] == "12"
+    assert environment["RAG_TOP_K_FULLTEXT"] == "12"
+    assert environment["RAG_RERANKER_TOP_K"] == "20"
+    assert environment["RAG_RERANKER_FULLTEXT_QUOTA"] == "0"
+    assert environment["RAG_FULLTEXT_LEXICAL_ENABLED"] == "false"
+
+
+def test_business_focused_ablation_profiles_keep_cross_encoder_contract() -> None:
+    source_diverse = evaluator.resolve_retrieval_profile("current-v12-source-diverse")
+    evaluator.set_contract_environment("xuanhu_knowledge_v4", source_diverse)
+    environment = __import__("os").environ
+    assert environment["RAG_RERANKER_ENABLED"] == "true"
+    assert environment["RAG_RERANKER_PROVIDER"] == "cross_encoder"
+    assert environment["RAG_RERANKER_TOP_K"] == "20"
+    assert environment["RAG_RERANKER_MAX_CHUNKS_PER_SOURCE"] == "1"
+    assert environment["RAG_DUAL_QUERY_ENABLED"] == "false"
+
+    dual_rrf = evaluator.resolve_retrieval_profile("current-v12-dual-rrf")
+    evaluator.set_contract_environment("xuanhu_knowledge_v4", dual_rrf)
+    assert environment["RAG_RERANKER_ENABLED"] == "true"
+    assert environment["RAG_RERANKER_TOP_K"] == "20"
+    assert environment["RAG_RERANKER_MAX_CHUNKS_PER_SOURCE"] == "0"
+    assert environment["RAG_DUAL_QUERY_ENABLED"] == "true"
+    assert environment["RAG_DUAL_QUERY_RRF_K"] == "60"
+
+    combined = evaluator.resolve_retrieval_profile("current-v12-dual-rrf-source-diverse")
+    evaluator.set_contract_environment("xuanhu_knowledge_v4", combined)
+    assert environment["RAG_RERANKER_ENABLED"] == "true"
+    assert environment["RAG_RERANKER_PROVIDER"] == "cross_encoder"
+    assert environment["RAG_RERANKER_TOP_K"] == "20"
+    assert environment["RAG_RERANKER_MAX_CHUNKS_PER_SOURCE"] == "1"
+    assert environment["RAG_DUAL_QUERY_ENABLED"] == "true"
+    assert environment["RAG_DUAL_QUERY_RRF_K"] == "60"
+
+
+def test_query_style_defaults_and_structured_fact_key_value_validation_fail_closed() -> None:
+    assert evaluator.query_style_from_manifest({}) == evaluator.QUERY_STYLE_NATURAL_LANGUAGE_V1
+    assert (
+        evaluator.query_style_from_manifest({"query_style": "structured_fact_key_value_v1"})
+        == evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    )
+    with pytest.raises(evaluator.DatasetError, match="unknown query_style"):
+        evaluator.query_style_from_manifest({"query_style": "unreviewed"})
+
+    evaluator.validate_structured_fact_key_value_query(
+        "present_illness.cough=咳嗽夜甚；present_illness.sputum=少量白痰"
+    )
+    with pytest.raises(evaluator.DatasetError, match="unknown canonical"):
+        evaluator.validate_structured_fact_key_value_query("unknown.fact=咳嗽；present_illness.sputum=少量白痰")
+    with pytest.raises(evaluator.DatasetError, match="fact_key=value"):
+        evaluator.validate_structured_fact_key_value_query("present_illness.cough=咳嗽;present_illness.sputum=白痰")
+
+
+def _structured_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        milvus_host="localhost",
+        milvus_port=19530,
+        milvus_collection="xuanhu_knowledge_v4",
+        embedding_dim=4096,
+        embedding_model="Qwen/Qwen3-Embedding-8B",
+        rag_query_rewrite_model="rewrite-should-not-appear",
+        chat_model="chat",
+        rag_reranker_model="jina-reranker-m0",
+        rag_top_k_vector=12,
+        rag_top_k_fulltext=12,
+        rag_reranker_provider="cross_encoder",
+        rag_reranker_top_k=20,
+        rag_reranker_final_top_k=8,
+        rag_query_rewrite_enabled=False,
+        rag_query_rewrite_model_temperature=0.1,
+        rag_query_rewrite_model_max_tokens=400,
+        embedding_gateway_timeout_seconds=0,
+        embedding_cache_ttl_seconds=0,
+        model_gateway_timeout_seconds=60,
+        rag_query_rewrite_gateway_timeout_seconds=0,
+        rag_query_rewrite_timeout_seconds=3,
+        reranker_gateway_timeout_seconds=0,
+        rag_reranker_timeout_seconds=5,
+    )
+
+
+def test_structured_contract_explicitly_disables_rewrite() -> None:
+    evaluator.set_contract_environment(
+        "xuanhu_knowledge_v4",
+        query_style=evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+    assert __import__("os").environ["RAG_QUERY_REWRITE_ENABLED"] == "false"
+
+    config = evaluator.redacted_config(
+        _structured_settings(), query_style=evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    )
+    assert config["query_style"] == evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    assert "rewrite" not in config["models"]
+    assert config["rewrite"] == {
+        "enabled": False,
+        "applicable": False,
+        "gateway_call": "not_applicable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_structured_full_arm_uses_direct_query_without_rewrite_gateway(tmp_path: Path) -> None:
+    query = "present_illness.cough=咳嗽夜甚；present_illness.sputum=少量白痰"
+
+    class FullRetriever:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[str], bool, int]] = []
+            self.components: dict[str, Any] = {}
+
+        def set_component_records(self, components: dict[str, Any]) -> None:
+            self.components = components
+
+        async def retrieve(
+            self, query: str, sources: list[str], *, allow_cross_source: bool, top_k: int
+        ) -> list[SimpleNamespace]:
+            self.calls.append((query, sources, allow_cross_source, top_k))
+            self.components["vector"].update({"status": "succeeded", "attempted": True, "embedding_model": "embed"})
+            self.components["fulltext"].update({"status": "succeeded", "attempted": True})
+            return [
+                SimpleNamespace(
+                    source_type="case",
+                    source_id="target-source",
+                    chunk_id="chunk-1",
+                    title="test",
+                    score=0.8,
+                    metadata={
+                        "reranker_provider": "cross_encoder",
+                        "reranker_model": "reranker",
+                        "reranker_score": 0.8,
+                    },
+                )
+            ]
+
+        def finalise_reranker_observation(self, _evidences: list[SimpleNamespace]) -> None:
+            self.components["reranker"].update({"status": "succeeded", "attempted": True, "model": "reranker"})
+
+        def candidate_trace(self, _target_source_id: str) -> dict[str, Any]:
+            return {
+                "vector_candidate_count": 1,
+                "vector_target_rank": 1,
+                "fulltext_candidate_count": 1,
+                "fulltext_target_rank": 1,
+                "merged_candidate_count": 1,
+                "merged_target_rank": 1,
+                "reranker_candidate_count": 1,
+                "reranker_candidate_target_rank": 1,
+                "reranker_attempted": True,
+            }
+
+    class UnexpectedRewriteGateway:
+        def __getattr__(self, _name: str) -> Any:
+            raise AssertionError("structured full arm must not touch the rewrite gateway")
+
+    full_retriever = FullRetriever()
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(rag_query_rewrite_enabled=False),
+        full_retriever=full_retriever,
+        rewrite_gateway=UnexpectedRewriteGateway(),
+    )
+    split = evaluator.FrozenSplit(
+        "test",
+        [],
+        "d" * 64,
+        {"query_style": evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1},
+    )
+    record = await evaluator.evaluate_full_query(
+        runtime,
+        run_dir=tmp_path / "run",
+        split=split,
+        query_row={"query_id": "q1", "query": query, "target_record_key": "a" * 64},
+        target=evaluator.TargetMapping("a" * 64, "target-source", ("chunk-1",), ("vector-1",)),
+        config_sha256="c" * 64,
+        attempt_count=1,
+    )
+
+    assert full_retriever.calls == [(query, ["case"], False, 8)]
+    assert record["effective_query"] == query
+    assert record["query_style"] == evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    assert record["components"]["rewrite"]["status"] == "not_applicable"
+    assert record["components"]["rewrite"]["attempted"] is False
+    assert record["candidate_trace"]["reranker_candidate_count"] == 1
+    evaluator.validate_result_record(record, query_style=evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1)
+    checkpoint = tmp_path / "full-results.jsonl"
+    checkpoint.write_bytes(evaluator.compact_json_bytes(record) + b"\n")
+    resumed = evaluator.read_resume_records(
+        checkpoint,
+        arm="full",
+        split="test",
+        dataset_sha256="d" * 64,
+        config_sha256="c" * 64,
+        run_dir=tmp_path / "run",
+        query_style=evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+    )
+    assert set(resumed) == {"q1"}
+
+
+@pytest.mark.asyncio
+async def test_natural_full_arm_uses_dual_candidate_api_when_profile_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FullRetriever:
+        def __init__(self) -> None:
+            self.components: dict[str, Any] = {}
+            self.dual_calls: list[tuple[str, str, list[str], bool, int]] = []
+
+        def set_component_records(self, components: dict[str, Any]) -> None:
+            self.components = components
+
+        async def retrieve(self, *_args: Any, **_kwargs: Any) -> list[SimpleNamespace]:
+            raise AssertionError("dual profile must not call single-view retrieve")
+
+        async def retrieve_dual_query(
+            self,
+            original_query: str,
+            rewritten_query: str,
+            sources: list[str],
+            *,
+            allow_cross_source: bool,
+            top_k: int,
+        ) -> list[SimpleNamespace]:
+            self.dual_calls.append((original_query, rewritten_query, sources, allow_cross_source, top_k))
+            self.components["vector"].update({"status": "succeeded", "attempted": True, "embedding_model": "embed"})
+            self.components["fulltext"].update({"status": "succeeded", "attempted": True})
+            return [
+                SimpleNamespace(
+                    source_type="case",
+                    source_id="target-source",
+                    chunk_id="chunk-1",
+                    title="test",
+                    score=0.8,
+                    metadata={
+                        "reranker_provider": "cross_encoder",
+                        "reranker_model": "reranker",
+                        "reranker_score": 0.8,
+                    },
+                )
+            ]
+
+        def finalise_reranker_observation(self, _evidences: list[SimpleNamespace]) -> None:
+            self.components["reranker"].update({"status": "succeeded", "attempted": True, "model": "reranker"})
+
+        def candidate_trace(self, _target_source_id: str) -> dict[str, Any]:
+            return {
+                "vector_candidate_count": 2,
+                "vector_target_rank": 1,
+                "fulltext_candidate_count": 2,
+                "fulltext_target_rank": 1,
+                "merged_candidate_count": 2,
+                "merged_target_rank": 1,
+                "reranker_candidate_count": 2,
+                "reranker_candidate_target_rank": 1,
+                "reranker_candidate_unique_source_count": 2,
+                "reranker_attempted": True,
+            }
+
+    async def fake_rewrite(_observations: list[Any], *, gateway: Any) -> str:
+        gateway._event_getter().update(
+            {
+                "status": "succeeded",
+                "attempted": True,
+                "gateway_call": "succeeded",
+                "model": "rewrite",
+            }
+        )
+        return "咳嗽痰白，夜间加重"
+
+    monkeypatch.setattr("app.rag.reasoning_retrieval.rewrite_syndrome_query", fake_rewrite)
+    full_retriever = FullRetriever()
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(rag_dual_query_enabled=True),
+        full_retriever=full_retriever,
+        rewrite_gateway=SimpleNamespace(),
+    )
+    split = evaluator.FrozenSplit("test", [], "d" * 64, {})
+    record = await evaluator.evaluate_full_query(
+        runtime,
+        run_dir=tmp_path / "run",
+        split=split,
+        query_row={"query_id": "q1", "query": "夜间咳嗽，白痰", "target_record_key": "a" * 64},
+        target=evaluator.TargetMapping("a" * 64, "target-source", ("chunk-1",), ("vector-1",)),
+        config_sha256="c" * 64,
+        attempt_count=1,
+    )
+
+    assert full_retriever.dual_calls == [("present_illness=夜间咳嗽，白痰", "咳嗽痰白，夜间加重", ["case"], False, 8)]
+    assert record["effective_query"] == "咳嗽痰白，夜间加重"
+    assert record["candidate_trace"]["reranker_candidate_unique_source_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_natural_full_arm_replays_frozen_rewrite_without_constructing_gateway(tmp_path: Path) -> None:
+    class FullRetriever:
+        def __init__(self) -> None:
+            self.components: dict[str, Any] = {}
+            self.queries: list[str] = []
+
+        def set_component_records(self, components: dict[str, Any]) -> None:
+            self.components = components
+
+        async def retrieve(
+            self, query: str, _sources: list[str], *, allow_cross_source: bool, top_k: int
+        ) -> list[SimpleNamespace]:
+            assert allow_cross_source is False
+            assert top_k == 8
+            self.queries.append(query)
+            self.components["vector"].update({"status": "succeeded", "attempted": True, "embedding_model": "embed"})
+            self.components["fulltext"].update({"status": "succeeded", "attempted": True})
+            return [
+                SimpleNamespace(
+                    source_type="case",
+                    source_id="target-source",
+                    chunk_id="chunk-1",
+                    title="test",
+                    score=0.8,
+                    metadata={
+                        "reranker_provider": "cross_encoder",
+                        "reranker_model": "reranker",
+                        "reranker_score": 0.8,
+                    },
+                )
+            ]
+
+        def finalise_reranker_observation(self, _evidences: list[SimpleNamespace]) -> None:
+            self.components["reranker"].update({"status": "succeeded", "attempted": True, "model": "reranker"})
+
+        def candidate_trace(self, _target_source_id: str) -> dict[str, Any]:
+            return {
+                "vector_candidate_count": 1,
+                "vector_target_rank": 1,
+                "fulltext_candidate_count": 1,
+                "fulltext_target_rank": 1,
+                "merged_candidate_count": 1,
+                "merged_target_rank": 1,
+                "reranker_candidate_count": 1,
+                "reranker_candidate_target_rank": 1,
+                "reranker_attempted": True,
+            }
+
+    original_query = "夜间咳嗽，白痰"
+    cache = evaluator.FrozenRewriteCache(
+        "a" * 64,
+        "rewrite",
+        0.1,
+        {
+            "q1": {
+                "query_sha256": evaluator.sha256_text(original_query),
+                "effective_query": "咳嗽痰白，夜间加重",
+                "effective_query_sha256": evaluator.sha256_text("咳嗽痰白，夜间加重"),
+            }
+        },
+    )
+    full_retriever = FullRetriever()
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(rag_dual_query_enabled=False),
+        full_retriever=full_retriever,
+        rewrite_gateway=None,
+        frozen_rewrite_cache=cache,
+    )
+    record = await evaluator.evaluate_full_query(
+        runtime,
+        run_dir=tmp_path / "run",
+        split=evaluator.FrozenSplit("test", [], "d" * 64, {}),
+        query_row={"query_id": "q1", "query": original_query, "target_record_key": "a" * 64},
+        target=evaluator.TargetMapping("a" * 64, "target-source", ("chunk-1",), ("vector-1",)),
+        config_sha256="c" * 64,
+        attempt_count=1,
+    )
+
+    assert full_retriever.queries == ["咳嗽痰白，夜间加重"]
+    assert record["components"]["rewrite"]["execution_mode"] == "frozen_replay"
+    assert record["components"]["rewrite"]["frozen_cache_sha256"] == "a" * 64
+
+
+def test_structured_preflight_accepts_disabled_rewrite_without_model_probe() -> None:
+    preflight = json.loads(json.dumps(_preflight_for_report()))
+    checks = {check["name"]: check for check in preflight["checks"]}
+    checks["frozen_dataset"]["evidence"]["query_style"] = evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    checks["effective_contract_configuration"]["evidence"]["query_style"] = (
+        evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    )
+    checks["model_gateways"]["evidence"]["rewrite"] = {"status": "not_applicable", "enabled": False}
+    assert evaluator.preflight_contract_errors(preflight) == []
+
+    checks["model_gateways"]["evidence"]["rewrite"] = {"model": "rewrite", "status": "succeeded"}
+    assert "preflight structured rewrite evidence is not explicitly disabled" in evaluator.preflight_contract_errors(
+        preflight
+    )
+
+
+def test_structured_report_and_resume_do_not_claim_query_rewrite() -> None:
+    metrics = _formal_metrics_for_report()
+    metrics["query_style"] = evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    metrics["components"]["full_rewrite"] = {"success": 0, "denominator": 200, "coverage": 0.0}
+    preflight = json.loads(json.dumps(_preflight_for_report()))
+    checks = {check["name"]: check for check in preflight["checks"]}
+    checks["frozen_dataset"]["evidence"]["query_style"] = evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    checks["effective_contract_configuration"]["evidence"]["query_style"] = (
+        evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1
+    )
+    checks["model_gateways"]["evidence"]["rewrite"] = {"status": "not_applicable", "enabled": False}
+    config = {
+        "query_style": evaluator.QUERY_STYLE_STRUCTURED_FACT_KEY_VALUE_V1,
+        "models": {"embedding": "BAAI/bge-m3", "reranker": "reranker"},
+        "rewrite": {"enabled": False, "applicable": False, "gateway_call": "not_applicable"},
+        "milvus": {"collection": "collection", "embedding_dim": 4096},
+        "config_sha256": "c" * 64,
+    }
+    environment = {"corpus": {"prepared_total_entries": 3808, "prepared_case_entries": 3254}}
+    bullet = evaluator.make_resume_bullet(
+        run_id="run", metrics=metrics, config=config, environment=environment, acceptance="PASS"
+    )
+    report = evaluator.make_report(
+        run_id="run",
+        acceptance="PASS",
+        metrics=metrics,
+        config=config,
+        environment=environment,
+        reasons=[],
+        dataset_sha256="a" * 64,
+        preflight=preflight,
+        validation=evaluator.make_validation_payload("PASS", []),
+        resume_bullet=bullet,
+    )
+    assert "rewrite: disabled_not_applicable" in bullet
+    assert "fact_key=value 结构化 Query（Rewrite 禁用）" in bullet
+    assert "原始 fact_key=value；… Query（Rewrite 已禁用 / 不适用）" in report
+    assert "Query Rewrite（禁用 / 不适用）" in report
+    assert "| full | Query Rewrite ->" not in report
 
 
 def _preflight_for_report() -> dict[str, Any]:

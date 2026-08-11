@@ -31,7 +31,10 @@ from app.rag.retriever import (
     _build_embedding_gateway_settings,
     _build_milvus_filter_expr,
     _truncate_snippet,
+    extract_fulltext_lexical_terms,
     merge_deduplicate,
+    reciprocal_rank_fuse_hits,
+    select_reranker_candidates,
 )
 from app.rag.schemas import (
     Evidence,
@@ -132,7 +135,8 @@ class TestBuildMilvusFilterExpr:
 
     def test_sources_with_source_id_filter(self) -> None:
         expr = _build_milvus_filter_expr(
-            ["herb"], filters={"source_id": "abc-123"},
+            ["herb"],
+            filters={"source_id": "abc-123"},
         )
         assert "source_type in ['herb']" in expr
         assert 'source_id == "abc-123"' in expr
@@ -192,22 +196,38 @@ class TestComputeFinalScore:
 
     def test_primary_hit(self) -> None:
         score = compute_final_score(vector_score=1.0, fulltext_score=1.0, is_primary=True)
-        expected = DEFAULT_VECTOR_WEIGHT * 1.0 + DEFAULT_FULLTEXT_WEIGHT * 1.0 + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        expected = (
+            DEFAULT_VECTOR_WEIGHT * 1.0
+            + DEFAULT_FULLTEXT_WEIGHT * 1.0
+            + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        )
         assert abs(score - expected) < 1e-9
 
     def test_cross_hit(self) -> None:
         score = compute_final_score(vector_score=1.0, fulltext_score=1.0, is_primary=False)
-        expected = DEFAULT_VECTOR_WEIGHT * 1.0 + DEFAULT_FULLTEXT_WEIGHT * 1.0 + DEFAULT_SOURCE_PRIORITY_WEIGHT * CROSS_PRIORITY
+        expected = (
+            DEFAULT_VECTOR_WEIGHT * 1.0
+            + DEFAULT_FULLTEXT_WEIGHT * 1.0
+            + DEFAULT_SOURCE_PRIORITY_WEIGHT * CROSS_PRIORITY
+        )
         assert abs(score - expected) < 1e-9
 
     def test_vector_only(self) -> None:
         score = compute_final_score(vector_score=0.9, fulltext_score=0.0, is_primary=True)
-        expected = DEFAULT_VECTOR_WEIGHT * 0.9 + DEFAULT_FULLTEXT_WEIGHT * 0.0 + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        expected = (
+            DEFAULT_VECTOR_WEIGHT * 0.9
+            + DEFAULT_FULLTEXT_WEIGHT * 0.0
+            + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        )
         assert abs(score - expected) < 1e-9
 
     def test_fulltext_only(self) -> None:
         score = compute_final_score(vector_score=0.0, fulltext_score=0.8, is_primary=True)
-        expected = DEFAULT_VECTOR_WEIGHT * 0.0 + DEFAULT_FULLTEXT_WEIGHT * 0.8 + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        expected = (
+            DEFAULT_VECTOR_WEIGHT * 0.0
+            + DEFAULT_FULLTEXT_WEIGHT * 0.8
+            + DEFAULT_SOURCE_PRIORITY_WEIGHT * PRIMARY_PRIORITY
+        )
         assert abs(score - expected) < 1e-9
 
     def test_primary_higher_than_cross(self) -> None:
@@ -218,8 +238,12 @@ class TestComputeFinalScore:
     def test_custom_weights(self) -> None:
         """自定义权重应生效。"""
         score = compute_final_score(
-            vector_score=1.0, fulltext_score=1.0, is_primary=True,
-            vector_weight=0.5, fulltext_weight=0.3, source_priority_weight=0.2,
+            vector_score=1.0,
+            fulltext_score=1.0,
+            is_primary=True,
+            vector_weight=0.5,
+            fulltext_weight=0.3,
+            source_priority_weight=0.2,
         )
         expected = 0.5 * 1.0 + 0.3 * 1.0 + 0.2 * 1.0
         assert abs(score - expected) < 1e-9
@@ -228,21 +252,33 @@ class TestComputeFinalScore:
         """增大 fulltext_weight 后，全文高分项排名提升。"""
         # 默认权重下 vector=0.9 + primary 更高
         default_score = compute_final_score(
-            vector_score=0.9, fulltext_score=0.3, is_primary=True,
+            vector_score=0.9,
+            fulltext_score=0.3,
+            is_primary=True,
         )
         # 自定义权重下 fulltext=0.9 更高
         custom_score = compute_final_score(
-            vector_score=0.3, fulltext_score=0.9, is_primary=True,
-            vector_weight=0.2, fulltext_weight=0.7, source_priority_weight=0.1,
+            vector_score=0.3,
+            fulltext_score=0.9,
+            is_primary=True,
+            vector_weight=0.2,
+            fulltext_weight=0.7,
+            source_priority_weight=0.1,
         )
         # 在默认权重下 default_score 应更高，但在自定义下 custom_score 应更高
         default_fulltext_heavy = compute_final_score(
-            vector_score=0.3, fulltext_score=0.9, is_primary=True,
+            vector_score=0.3,
+            fulltext_score=0.9,
+            is_primary=True,
         )
         assert default_score > default_fulltext_heavy  # 默认：向量高优先
         assert custom_score > compute_final_score(
-            vector_score=0.9, fulltext_score=0.3, is_primary=True,
-            vector_weight=0.2, fulltext_weight=0.7, source_priority_weight=0.1,
+            vector_score=0.9,
+            fulltext_score=0.3,
+            is_primary=True,
+            vector_weight=0.2,
+            fulltext_weight=0.7,
+            source_priority_weight=0.1,
         )  # 自定义：全文高优先
 
 
@@ -256,9 +292,14 @@ class TestRerank:
     def test_single_hit(self) -> None:
         merged = [
             MergedHit(
-                chunk_id="c1", source_type="herb", source_id="s1",
-                title="测试", content_snippet="内容",
-                vector_score=0.9, fulltext_score=0.8, is_primary=True,
+                chunk_id="c1",
+                source_type="herb",
+                source_id="s1",
+                title="测试",
+                content_snippet="内容",
+                vector_score=0.9,
+                fulltext_score=0.8,
+                is_primary=True,
             )
         ]
         result = rerank(merged, top_k=5)
@@ -270,14 +311,24 @@ class TestRerank:
         """得分高的排前面，rank 从 1 开始递增。"""
         merged = [
             MergedHit(
-                chunk_id="c1", source_type="herb", source_id="s1",
-                title="低分", content_snippet="内容",
-                vector_score=0.3, fulltext_score=0.2, is_primary=False,
+                chunk_id="c1",
+                source_type="herb",
+                source_id="s1",
+                title="低分",
+                content_snippet="内容",
+                vector_score=0.3,
+                fulltext_score=0.2,
+                is_primary=False,
             ),
             MergedHit(
-                chunk_id="c2", source_type="formula", source_id="s2",
-                title="高分", content_snippet="内容",
-                vector_score=0.9, fulltext_score=0.8, is_primary=True,
+                chunk_id="c2",
+                source_type="formula",
+                source_id="s2",
+                title="高分",
+                content_snippet="内容",
+                vector_score=0.9,
+                fulltext_score=0.8,
+                is_primary=True,
             ),
         ]
         result = rerank(merged, top_k=5)
@@ -288,9 +339,14 @@ class TestRerank:
         """top_k 截断。"""
         merged = [
             MergedHit(
-                chunk_id=f"c{i}", source_type="herb", source_id=f"s{i}",
-                title=f"标题{i}", content_snippet="内容",
-                vector_score=0.9 - i * 0.1, fulltext_score=0.8, is_primary=True,
+                chunk_id=f"c{i}",
+                source_type="herb",
+                source_id=f"s{i}",
+                title=f"标题{i}",
+                content_snippet="内容",
+                vector_score=0.9 - i * 0.1,
+                fulltext_score=0.8,
+                is_primary=True,
             )
             for i in range(10)
         ]
@@ -301,9 +357,14 @@ class TestRerank:
         """Evidence metadata 保留原始得分。"""
         merged = [
             MergedHit(
-                chunk_id="c1", source_type="herb", source_id="s1",
-                title="测试", content_snippet="内容",
-                vector_score=0.9, fulltext_score=0.8, is_primary=True,
+                chunk_id="c1",
+                source_type="herb",
+                source_id="s1",
+                title="测试",
+                content_snippet="内容",
+                vector_score=0.9,
+                fulltext_score=0.8,
+                is_primary=True,
             )
         ]
         result = rerank(merged, top_k=5)
@@ -314,14 +375,24 @@ class TestRerank:
         """相同 vector/fulltext 分数时，primary 排在 cross 前面。"""
         merged = [
             MergedHit(
-                chunk_id="cross", source_type="case", source_id="s1",
-                title="跨库", content_snippet="内容",
-                vector_score=0.8, fulltext_score=0.6, is_primary=False,
+                chunk_id="cross",
+                source_type="case",
+                source_id="s1",
+                title="跨库",
+                content_snippet="内容",
+                vector_score=0.8,
+                fulltext_score=0.6,
+                is_primary=False,
             ),
             MergedHit(
-                chunk_id="primary", source_type="herb", source_id="s2",
-                title="主查", content_snippet="内容",
-                vector_score=0.8, fulltext_score=0.6, is_primary=True,
+                chunk_id="primary",
+                source_type="herb",
+                source_id="s2",
+                title="主查",
+                content_snippet="内容",
+                vector_score=0.8,
+                fulltext_score=0.6,
+                is_primary=True,
             ),
         ]
         result = rerank(merged, top_k=5)
@@ -332,14 +403,24 @@ class TestRerank:
         """自定义权重传入 rerank 并影响到排序。"""
         merged = [
             MergedHit(
-                chunk_id="high_ft", source_type="herb", source_id="s1",
-                title="全文高", content_snippet="内容",
-                vector_score=0.5, fulltext_score=1.0, is_primary=True,
+                chunk_id="high_ft",
+                source_type="herb",
+                source_id="s1",
+                title="全文高",
+                content_snippet="内容",
+                vector_score=0.5,
+                fulltext_score=1.0,
+                is_primary=True,
             ),
             MergedHit(
-                chunk_id="high_vec", source_type="herb", source_id="s2",
-                title="向量高", content_snippet="内容",
-                vector_score=1.0, fulltext_score=0.5, is_primary=True,
+                chunk_id="high_vec",
+                source_type="herb",
+                source_id="s2",
+                title="向量高",
+                content_snippet="内容",
+                vector_score=1.0,
+                fulltext_score=0.5,
+                is_primary=True,
             ),
         ]
         # 默认权重：向量高应排前面
@@ -409,6 +490,111 @@ class TestMergeDeduplicate:
         fh = _make_fulltext_hit(chunk_id="c1", content=long_content)
         result = merge_deduplicate([], [fh], primary_sources={"herb"})
         assert len(result[0].content_snippet) <= 501  # 500 + "…"
+
+
+class TestLexicalCandidateRecall:
+    def test_extracts_cjk_bigrams_and_filters_boilerplate(self) -> None:
+        terms = extract_fulltext_lexical_terms("患者近期反复咳嗽咽痒，夜间明显，伴少量白痰", max_terms=12)
+
+        assert "咳嗽" in terms
+        assert "咽痒" in terms
+        assert "白痰" in terms
+        assert "患者" not in terms
+        assert len(terms) <= 12
+
+    def test_respects_zero_term_bound(self) -> None:
+        assert extract_fulltext_lexical_terms("咳嗽咽痒", max_terms=0) == []
+
+    def test_reserves_lexical_only_candidates_without_duplicate_chunks(self) -> None:
+        vector_hits = [_make_vector_hit(chunk_id=f"v{index}") for index in range(4)]
+        fulltext_hits = [_make_fulltext_hit(chunk_id=f"f{index}") for index in range(3)]
+        merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources={"herb"})
+
+        selected = select_reranker_candidates(merged, fulltext_quota=2, limit=4)
+
+        assert len(selected) == 4
+        assert len({hit.chunk_id for hit in selected}) == 4
+        assert {"f0", "f1"}.issubset({hit.chunk_id for hit in selected})
+
+    def test_expanded_pool_keeps_twenty_vector_and_eight_lexical_candidates(self) -> None:
+        vector_hits = [_make_vector_hit(chunk_id=f"v{index}") for index in range(20)]
+        fulltext_hits = [_make_fulltext_hit(chunk_id=f"f{index}") for index in range(20)]
+        merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources={"herb"})
+
+        selected = select_reranker_candidates(merged, fulltext_quota=8, limit=28)
+
+        selected_ids = {hit.chunk_id for hit in selected}
+        assert len(selected) == 28
+        assert {f"v{index}" for index in range(20)}.issubset(selected_ids)
+        assert {f"f{index}" for index in range(8)}.issubset(selected_ids)
+
+    def test_zero_quota_keeps_prior_prefix_behavior(self) -> None:
+        vector_hits = [_make_vector_hit(chunk_id=f"v{index}") for index in range(3)]
+        fulltext_hits = [_make_fulltext_hit(chunk_id="f0")]
+        merged = merge_deduplicate(vector_hits, fulltext_hits, primary_sources={"herb"})
+
+        selected = select_reranker_candidates(merged, fulltext_quota=0, limit=2)
+
+        assert [hit.chunk_id for hit in selected] == ["v0", "v1"]
+
+    def test_source_diversity_replaces_duplicate_source_in_reranker_pool(self) -> None:
+        merged = merge_deduplicate(
+            [
+                _make_vector_hit(chunk_id="a-1", source_type="case", source_id="source-a"),
+                _make_vector_hit(chunk_id="a-2", source_type="case", source_id="source-a"),
+                _make_vector_hit(chunk_id="b-1", source_type="case", source_id="source-b"),
+                _make_vector_hit(chunk_id="c-1", source_type="case", source_id="source-c"),
+            ],
+            [],
+            primary_sources={"case"},
+        )
+
+        selected = select_reranker_candidates(
+            merged,
+            fulltext_quota=0,
+            limit=3,
+            max_chunks_per_source=1,
+        )
+
+        assert [hit.chunk_id for hit in selected] == ["a-1", "b-1", "c-1"]
+
+    def test_source_diversity_backfills_when_corpus_has_only_one_source(self) -> None:
+        merged = merge_deduplicate(
+            [
+                _make_vector_hit(chunk_id="a-1", source_type="case", source_id="source-a"),
+                _make_vector_hit(chunk_id="a-2", source_type="case", source_id="source-a"),
+            ],
+            [],
+            primary_sources={"case"},
+        )
+
+        selected = select_reranker_candidates(
+            merged,
+            fulltext_quota=0,
+            limit=2,
+            max_chunks_per_source=1,
+        )
+
+        assert [hit.chunk_id for hit in selected] == ["a-1", "a-2"]
+
+    def test_rrf_fuses_repeated_candidate_and_keeps_deterministic_order(self) -> None:
+        first_view = [
+            _make_vector_hit(chunk_id="a", source_type="case", source_id="source-a"),
+            _make_vector_hit(chunk_id="b", source_type="case", source_id="source-b"),
+        ]
+        second_view = [
+            _make_vector_hit(chunk_id="b", source_type="case", source_id="source-b"),
+            _make_vector_hit(chunk_id="c", source_type="case", source_id="source-c"),
+        ]
+
+        fused = reciprocal_rank_fuse_hits(
+            [first_view, second_view],
+            score_field="vector_score",
+            rrf_k=60,
+        )
+
+        assert [hit.chunk_id for hit in fused] == ["b", "a", "c"]
+        assert fused[0].vector_score == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -549,17 +735,25 @@ class TestRAGRetrieverVectorSearch:
 
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{
-                "id": "vec1", "distance": 0.2,
-                "entity": {
-                    "chunk_id": "chunk-1", "source_type": "herb",
-                    "source_id": "src-1", "title": "黄芪", "content_hash": "abc",
-                },
-            }]
+            [
+                {
+                    "id": "vec1",
+                    "distance": 0.2,
+                    "entity": {
+                        "chunk_id": "chunk-1",
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "黄芪",
+                        "content_hash": "abc",
+                    },
+                }
+            ]
         ]
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, milvus_client=mock_milvus,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
         )
         hits = await retriever._vector_search("黄芪", ["herb"], top_k=5)
 
@@ -576,20 +770,22 @@ class TestRAGRetrieverVectorSearch:
 
         raw_similarities = [2.0, 1.0, 0.0, -1.0, -2.0]
         mock_milvus = MagicMock()
-        mock_milvus.search.return_value = [[
-            {
-                "id": f"vec-{index}",
-                "distance": similarity,
-                "entity": {
-                    "chunk_id": f"chunk-{index}",
-                    "source_type": "herb",
-                    "source_id": f"src-{index}",
-                    "title": f"标题 {index}",
-                    "content_hash": f"hash-{index}",
-                },
-            }
-            for index, similarity in enumerate(raw_similarities)
-        ]]
+        mock_milvus.search.return_value = [
+            [
+                {
+                    "id": f"vec-{index}",
+                    "distance": similarity,
+                    "entity": {
+                        "chunk_id": f"chunk-{index}",
+                        "source_type": "herb",
+                        "source_id": f"src-{index}",
+                        "title": f"标题 {index}",
+                        "content_hash": f"hash-{index}",
+                    },
+                }
+                for index, similarity in enumerate(raw_similarities)
+            ]
+        ]
 
         retriever = RAGRetriever(
             settings=settings,
@@ -612,7 +808,9 @@ class TestRAGRetrieverVectorSearch:
         mock_milvus.search.return_value = [[]]
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, milvus_client=mock_milvus,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
         )
         await retriever._vector_search("黄芪", ["herb"], top_k=5, filters={"source_id": "target-123"})
 
@@ -629,7 +827,9 @@ class TestRAGRetrieverVectorSearch:
         mock_milvus.search.return_value = [[]]
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, milvus_client=mock_milvus,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
         )
         hits = await retriever._vector_search("不存在的查询", ["herb"], top_k=5)
         assert hits == []
@@ -642,7 +842,9 @@ class TestRAGRetrieverVectorSearch:
         gateway.embed = AsyncMock(side_effect=EmbeddingUnavailableError("不可用"))
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, milvus_client=MagicMock(),
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=MagicMock(),
         )
         with pytest.raises(EmbeddingUnavailableError):
             await retriever._vector_search("测试", ["herb"])
@@ -655,7 +857,9 @@ class TestRAGRetrieverVectorSearch:
         mock_milvus.search.side_effect = Exception("Milvus connection failed")
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, milvus_client=mock_milvus,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
         )
         with pytest.raises(Exception, match="Milvus"):
             await retriever._vector_search("测试", ["herb"])
@@ -669,18 +873,34 @@ class TestRAGRetrieverFulltextSearch:
         chunk_uuid = uuid.uuid4()
         source_uuid = uuid.uuid4()
 
-        mock_session = _make_mock_session([
+        mock_session = _make_mock_session(
             [
-                MagicMock(id=chunk_uuid, source_type="herb", source_id=source_uuid,
-                          title="黄芪", content="黄芪，补气固表", ts_rank=1.5),
-                MagicMock(id=uuid.uuid4(), source_type="formula", source_id=uuid.uuid4(),
-                          title="补中益气汤", content="补中益气汤", ts_rank=0.8),
+                [
+                    MagicMock(
+                        id=chunk_uuid,
+                        source_type="herb",
+                        source_id=source_uuid,
+                        title="黄芪",
+                        content="黄芪，补气固表",
+                        ts_rank=1.5,
+                    ),
+                    MagicMock(
+                        id=uuid.uuid4(),
+                        source_type="formula",
+                        source_id=uuid.uuid4(),
+                        title="补中益气汤",
+                        content="补中益气汤",
+                        ts_rank=0.8,
+                    ),
+                ]
             ]
-        ])
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
         hits = await retriever._fulltext_search("黄芪", ["herb", "formula"], top_k=5)
 
@@ -696,7 +916,9 @@ class TestRAGRetrieverFulltextSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
         await retriever._fulltext_search("黄芪", ["herb"], top_k=5, filters={"source_id": "target-123"})
 
@@ -715,7 +937,9 @@ class TestRAGRetrieverFulltextSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
         with pytest.raises(RAGUnavailableError):
             await retriever._fulltext_search("测试", ["herb"])
@@ -726,7 +950,9 @@ class TestRAGRetrieverFulltextSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
         hits = await retriever._fulltext_search("不存在的查询", ["herb"], top_k=5)
         assert hits == []
@@ -741,20 +967,29 @@ class TestRAGRetrieverBackfillContentSnippets:
 
         chunk_uuid = uuid.uuid4()
         # 模拟 PG 返回 content
-        mock_session = _make_mock_session([
-            [MagicMock(id=chunk_uuid, content="黄芪，补气固表，升阳举陷")],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [MagicMock(id=chunk_uuid, content="黄芪，补气固表，升阳举陷")],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
 
         merged = [
             MergedHit(
-                chunk_id=str(chunk_uuid), source_type="herb", source_id="s1",
-                title="黄芪", content_snippet="",  # 空 snippet
-                vector_score=0.9, fulltext_score=0.0, is_primary=True,
+                chunk_id=str(chunk_uuid),
+                source_type="herb",
+                source_id="s1",
+                title="黄芪",
+                content_snippet="",  # 空 snippet
+                vector_score=0.9,
+                fulltext_score=0.0,
+                is_primary=True,
             ),
         ]
 
@@ -769,14 +1004,21 @@ class TestRAGRetrieverBackfillContentSnippets:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
 
         merged = [
             MergedHit(
-                chunk_id="c1", source_type="herb", source_id="s1",
-                title="已有", content_snippet="已有正文",
-                vector_score=0.9, fulltext_score=0.8, is_primary=True,
+                chunk_id="c1",
+                source_type="herb",
+                source_id="s1",
+                title="已有",
+                content_snippet="已有正文",
+                vector_score=0.9,
+                fulltext_score=0.8,
+                is_primary=True,
             ),
         ]
 
@@ -789,25 +1031,39 @@ class TestRAGRetrieverBackfillContentSnippets:
         settings = _make_settings()
         chunk_uuid = uuid.uuid4()
 
-        mock_session = _make_mock_session([
-            [MagicMock(id=chunk_uuid, content="回填的内容")],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [MagicMock(id=chunk_uuid, content="回填的内容")],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
 
         merged = [
             MergedHit(
-                chunk_id=str(chunk_uuid), source_type="herb", source_id="s1",
-                title="需回填", content_snippet="",  # 空
-                vector_score=0.9, fulltext_score=0.0, is_primary=True,
+                chunk_id=str(chunk_uuid),
+                source_type="herb",
+                source_id="s1",
+                title="需回填",
+                content_snippet="",  # 空
+                vector_score=0.9,
+                fulltext_score=0.0,
+                is_primary=True,
             ),
             MergedHit(
-                chunk_id="c2", source_type="formula", source_id="s2",
-                title="全文命中", content_snippet="全文已有正文",
-                vector_score=0.0, fulltext_score=0.8, is_primary=True,
+                chunk_id="c2",
+                source_type="formula",
+                source_id="s2",
+                title="全文命中",
+                content_snippet="全文已有正文",
+                vector_score=0.0,
+                fulltext_score=0.8,
+                is_primary=True,
             ),
         ]
 
@@ -826,14 +1082,21 @@ class TestRAGRetrieverBackfillContentSnippets:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
 
         merged = [
             MergedHit(
-                chunk_id="c1", source_type="herb", source_id="s1",
-                title="测试", content_snippet="",
-                vector_score=0.9, fulltext_score=0.0, is_primary=True,
+                chunk_id="c1",
+                source_type="herb",
+                source_id="s1",
+                title="测试",
+                content_snippet="",
+                vector_score=0.9,
+                fulltext_score=0.0,
+                is_primary=True,
             ),
         ]
 
@@ -854,26 +1117,50 @@ class TestRAGRetrieverHybridSearch:
 
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.2,
-              "entity": {"chunk_id": "chunk-1", "source_type": "herb",
-                         "source_id": "src-1", "title": "黄芪", "content_hash": "abc"}}]
+            [
+                {
+                    "id": "v1",
+                    "distance": 0.2,
+                    "entity": {
+                        "chunk_id": "chunk-1",
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "黄芪",
+                        "content_hash": "abc",
+                    },
+                }
+            ]
         ]
 
         # PG: 全文命中同一个 chunk（提供 content）
-        mock_session = _make_mock_session([
-            [MagicMock(id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
-                       source_type="herb", source_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
-                       title="黄芪", content="黄芪，补气固表，升阳举陷", ts_rank=1.0)],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [
+                    MagicMock(
+                        id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                        source_type="herb",
+                        source_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
+                        title="黄芪",
+                        content="黄芪，补气固表，升阳举陷",
+                        ts_rank=1.0,
+                    )
+                ],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
 
         evidences = await retriever.hybrid_search(
-            "黄芪", sources=["herb"], primary_sources={"herb"}, top_k=5,
+            "黄芪",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=5,
         )
         assert len(evidences) >= 1
         # 同一 chunk 合并后只有 1 条
@@ -890,25 +1177,42 @@ class TestRAGRetrieverHybridSearch:
         chunk_uuid = uuid.uuid4()
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.2,
-              "entity": {"chunk_id": str(chunk_uuid), "source_type": "herb",
-                         "source_id": "src-1", "title": "黄芪", "content_hash": "abc"}}]
+            [
+                {
+                    "id": "v1",
+                    "distance": 0.2,
+                    "entity": {
+                        "chunk_id": str(chunk_uuid),
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "黄芪",
+                        "content_hash": "abc",
+                    },
+                }
+            ]
         ]
 
         # PG 全文检索无命中，但 _backfill_content_snippets 能查到 content
-        mock_session = _make_mock_session([
-            [],  # _fulltext_search 无结果
-            [MagicMock(id=chunk_uuid, content="黄芪，补气固表，升阳举陷，利水消肿")],  # _backfill 有结果
-        ])
+        mock_session = _make_mock_session(
+            [
+                [],  # _fulltext_search 无结果
+                [MagicMock(id=chunk_uuid, content="黄芪，补气固表，升阳举陷，利水消肿")],  # _backfill 有结果
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
 
         evidences = await retriever.hybrid_search(
-            "zzzz-not-in-text", sources=["herb"], primary_sources={"herb"}, top_k=5,
+            "zzzz-not-in-text",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=5,
         )
 
         assert len(evidences) == 1
@@ -921,18 +1225,32 @@ class TestRAGRetrieverHybridSearch:
         gateway = MagicMock(spec=[])
         gateway.embed = AsyncMock(side_effect=Exception("Milvus down"))
 
-        mock_session = _make_mock_session([
-            [MagicMock(id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
-                       source_type="herb", source_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
-                       title="黄芪", content="黄芪，补气固表", ts_rank=1.0)],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [
+                    MagicMock(
+                        id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                        source_type="herb",
+                        source_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
+                        title="黄芪",
+                        content="黄芪，补气固表",
+                        ts_rank=1.0,
+                    )
+                ],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            session_factory=mock_sf,
         )
         evidences = await retriever.hybrid_search(
-            "黄芪", sources=["herb"], primary_sources={"herb"}, top_k=5,
+            "黄芪",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=5,
         )
         assert len(evidences) >= 1
 
@@ -944,18 +1262,32 @@ class TestRAGRetrieverHybridSearch:
         gateway = MagicMock(spec=[])
         gateway.embed = AsyncMock(side_effect=EmbeddingUnavailableError("服务不可用"))
 
-        mock_session = _make_mock_session([
-            [MagicMock(id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
-                       source_type="formula", source_id=uuid.UUID("00000000-0000-0000-0000-000000000020"),
-                       title="四君子汤", content="四君子汤，益气健脾", ts_rank=1.0)],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [
+                    MagicMock(
+                        id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                        source_type="formula",
+                        source_id=uuid.UUID("00000000-0000-0000-0000-000000000020"),
+                        title="四君子汤",
+                        content="四君子汤，益气健脾",
+                        ts_rank=1.0,
+                    )
+                ],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            session_factory=mock_sf,
         )
         evidences = await retriever.hybrid_search(
-            "四君子汤", sources=["formula"], primary_sources={"formula"}, top_k=5,
+            "四君子汤",
+            sources=["formula"],
+            primary_sources={"formula"},
+            top_k=5,
         )
         assert len(evidences) >= 1
 
@@ -975,8 +1307,10 @@ class TestRAGRetrieverHybridSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         with pytest.raises(RAGUnavailableError):
             await retriever.hybrid_search("测试", sources=["herb"])
@@ -993,8 +1327,10 @@ class TestRAGRetrieverHybridSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         evidences = await retriever.hybrid_search("不存在的查询", sources=["herb"])
         assert evidences == []
@@ -1007,9 +1343,17 @@ class TestRAGRetrieverHybridSearch:
 
         # 生成 5 个不同 chunk 的向量命中
         chunks = [
-            {"id": f"v{i}", "distance": 0.1 * i,
-             "entity": {"chunk_id": f"chunk-{i}", "source_type": "herb",
-                        "source_id": f"src-{i}", "title": f"标题{i}", "content_hash": "abc"}}
+            {
+                "id": f"v{i}",
+                "distance": 0.1 * i,
+                "entity": {
+                    "chunk_id": f"chunk-{i}",
+                    "source_type": "herb",
+                    "source_id": f"src-{i}",
+                    "title": f"标题{i}",
+                    "content_hash": "abc",
+                },
+            }
             for i in range(5)
         ]
         mock_milvus = MagicMock()
@@ -1020,11 +1364,16 @@ class TestRAGRetrieverHybridSearch:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         evidences = await retriever.hybrid_search(
-            "测试", sources=["herb"], primary_sources={"herb"}, top_k=3,
+            "测试",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=3,
         )
         assert len(evidences) == 3
 
@@ -1038,49 +1387,84 @@ class TestRAGRetrieverHybridSearch:
         # chunk-ft:  低向量分(0.4), 有全文命中(1.0)
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.8,
-              "entity": {"chunk_id": "chunk-vec", "source_type": "herb",
-                         "source_id": "src-1", "title": "向量高", "content_hash": "abc"}},
-             {"id": "v2", "distance": -0.2,
-              "entity": {"chunk_id": "chunk-ft", "source_type": "herb",
-                         "source_id": "src-2", "title": "全文高", "content_hash": "def"}}]
+            [
+                {
+                    "id": "v1",
+                    "distance": 0.8,
+                    "entity": {
+                        "chunk_id": "chunk-vec",
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "向量高",
+                        "content_hash": "abc",
+                    },
+                },
+                {
+                    "id": "v2",
+                    "distance": -0.2,
+                    "entity": {
+                        "chunk_id": "chunk-ft",
+                        "source_type": "herb",
+                        "source_id": "src-2",
+                        "title": "全文高",
+                        "content_hash": "def",
+                    },
+                },
+            ]
         ]
 
         # PG 全文给 chunk-ft 高 rank（chunk_id 需与 Milvus 一致才能合并），chunk-vec 无全文命中
         session_factory = MagicMock()
 
         def _make_fresh_session():
-            return _make_mock_session([
-                # _fulltext_search 只命中 chunk-ft
-                [MagicMock(id="chunk-ft", source_type="herb", source_id=uuid.uuid4(),
-                           title="全文高", content="全文高分内容", ts_rank=1.0)],
-                # _backfill 查询 chunk-vec 的内容
-                [MagicMock(id="chunk-vec", content="向量高内容"),
-                 MagicMock(id="chunk-ft", content="全文高内容")],
-            ])
+            return _make_mock_session(
+                [
+                    # _fulltext_search 只命中 chunk-ft
+                    [
+                        MagicMock(
+                            id="chunk-ft",
+                            source_type="herb",
+                            source_id=uuid.uuid4(),
+                            title="全文高",
+                            content="全文高分内容",
+                            ts_rank=1.0,
+                        )
+                    ],
+                    # _backfill 查询 chunk-vec 的内容
+                    [MagicMock(id="chunk-vec", content="向量高内容"), MagicMock(id="chunk-ft", content="全文高内容")],
+                ]
+            )
 
         session_factory.side_effect = _make_fresh_session
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=session_factory,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=session_factory,
         )
 
         # 默认权重：vector_score 主导 → chunk-vec 排第一
         default_ev = await retriever.hybrid_search(
-            "测试", sources=["herb"], primary_sources={"herb"}, top_k=5,
+            "测试",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=5,
         )
         # 全文权重调高：fulltext_score 主导 → chunk-ft 排第一
         ft_ev = await retriever.hybrid_search(
-            "测试", sources=["herb"], primary_sources={"herb"}, top_k=5,
-            vector_weight=0.2, fulltext_weight=0.7,
+            "测试",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=5,
+            vector_weight=0.2,
+            fulltext_weight=0.7,
         )
 
         assert len(default_ev) >= 2
         assert len(ft_ev) >= 2
         assert default_ev[0].chunk_id == "chunk-vec"
         assert ft_ev[0].chunk_id == "chunk-ft"
-
 
     async def test_hybrid_search_top_k_1_final_score_ordering(self) -> None:
         """top_k=1 时，最终加权分更高的候选应排第一（即使其 vector_score 更低）。
@@ -1102,35 +1486,70 @@ class TestRAGRetrieverHybridSearch:
         # similarity=-0.2 → vector_score=(-0.2+1.0)/2=0.4
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.0,
-              "entity": {"chunk_id": "chunk-vec", "source_type": "herb",
-                         "source_id": "src-1", "title": "向量项", "content_hash": "abc"}},
-             {"id": "v2", "distance": -0.2,
-              "entity": {"chunk_id": "chunk-ft", "source_type": "herb",
-                         "source_id": "src-2", "title": "全文项", "content_hash": "def"}}]
+            [
+                {
+                    "id": "v1",
+                    "distance": 0.0,
+                    "entity": {
+                        "chunk_id": "chunk-vec",
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "向量项",
+                        "content_hash": "abc",
+                    },
+                },
+                {
+                    "id": "v2",
+                    "distance": -0.2,
+                    "entity": {
+                        "chunk_id": "chunk-ft",
+                        "source_type": "herb",
+                        "source_id": "src-2",
+                        "title": "全文项",
+                        "content_hash": "def",
+                    },
+                },
+            ]
         ]
 
         session_factory = MagicMock()
 
         def _make_fresh_session() -> MagicMock:
-            return _make_mock_session([
-                # _fulltext_search: 只命中 chunk-ft (ts_rank=1.0，归一化后 fulltext_score=1.0)
-                [MagicMock(id="chunk-ft", source_type="herb", source_id=uuid.uuid4(),
-                           title="全文项", content="全文高分内容", ts_rank=1.0)],
-                # _backfill: 回填 chunk-vec 和 chunk-ft 的内容
-                [MagicMock(id="chunk-vec", content="向量项内容——这段内容较长"),
-                 MagicMock(id="chunk-ft", content="全文项内容——全文命中高分内容")],
-            ])
+            return _make_mock_session(
+                [
+                    # _fulltext_search: 只命中 chunk-ft (ts_rank=1.0，归一化后 fulltext_score=1.0)
+                    [
+                        MagicMock(
+                            id="chunk-ft",
+                            source_type="herb",
+                            source_id=uuid.uuid4(),
+                            title="全文项",
+                            content="全文高分内容",
+                            ts_rank=1.0,
+                        )
+                    ],
+                    # _backfill: 回填 chunk-vec 和 chunk-ft 的内容
+                    [
+                        MagicMock(id="chunk-vec", content="向量项内容——这段内容较长"),
+                        MagicMock(id="chunk-ft", content="全文项内容——全文命中高分内容"),
+                    ],
+                ]
+            )
 
         session_factory.side_effect = _make_fresh_session
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=session_factory,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=session_factory,
         )
 
         evidences = await retriever.hybrid_search(
-            "测试", sources=["herb"], primary_sources={"herb"}, top_k=1,
+            "测试",
+            sources=["herb"],
+            primary_sources={"herb"},
+            top_k=1,
         )
         assert len(evidences) == 1
         # chunk-ft 最终加权分 0.61 > chunk-vec 的 0.425，应排第一
@@ -1155,8 +1574,10 @@ class TestRAGRetrieverRetrieve:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         await retriever.retrieve("黄芪", primary_sources=["herb"], allow_cross_source=False)
 
@@ -1176,8 +1597,10 @@ class TestRAGRetrieverRetrieve:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         await retriever.retrieve("黄芪", primary_sources=["herb"], allow_cross_source=True)
 
@@ -1188,7 +1611,9 @@ class TestRAGRetrieverRetrieve:
     async def test_retrieve_invalid_source_raises(self) -> None:
         settings = _make_settings()
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=MagicMock(),
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=MagicMock(),
         )
         with pytest.raises(ValueError, match="无效的 source_type"):
             await retriever.retrieve("测试", primary_sources=["invalid"])
@@ -1205,15 +1630,63 @@ class TestRAGRetrieverRetrieve:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         await retriever.retrieve(
-            "测试", primary_sources=["herb"], filters={"source_id": "filtered-123"},
+            "测试",
+            primary_sources=["herb"],
+            filters={"source_id": "filtered-123"},
         )
 
         filter_expr = mock_milvus.search.call_args.kwargs["filter"]
         assert "filtered-123" in filter_expr
+
+    async def test_dual_query_fuses_candidates_before_one_shared_rerank(self) -> None:
+        settings = _make_settings(
+            rag_dual_query_enabled=True,
+            rag_dual_query_rrf_k=60,
+        )
+        retriever = RAGRetriever(settings=settings, gateway_client=MagicMock(), session_factory=MagicMock())
+        retriever.dual_query_hybrid_search = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        evidences = await retriever.retrieve_dual_query(
+            "chief_complaint.symptom=咳嗽",
+            "咳嗽痰白，夜间加重",
+            ["case"],
+            allow_cross_source=False,
+            top_k=8,
+        )
+
+        assert evidences == []
+        retriever.dual_query_hybrid_search.assert_awaited_once_with(
+            ["chief_complaint.symptom=咳嗽", "咳嗽痰白，夜间加重"],
+            sources=["case"],
+            primary_sources={"case"},
+            vector_top_k=12,
+            fulltext_top_k=12,
+            top_k=8,
+            rrf_k=60,
+            reranker_query="咳嗽痰白，夜间加重",
+            filters=None,
+        )
+
+    async def test_dual_query_falls_back_to_single_view_when_disabled(self) -> None:
+        settings = _make_settings(rag_dual_query_enabled=False)
+        retriever = RAGRetriever(settings=settings, gateway_client=MagicMock(), session_factory=MagicMock())
+        retriever.retrieve = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        await retriever.retrieve_dual_query("问诊键", "医案改写", ["case"], allow_cross_source=False, top_k=8)
+
+        retriever.retrieve.assert_awaited_once_with(
+            "医案改写",
+            ["case"],
+            allow_cross_source=False,
+            top_k=8,
+            filters=None,
+        )
 
 
 class TestRAGRetrieverRerankOrder:
@@ -1227,28 +1700,52 @@ class TestRAGRetrieverRerankOrder:
 
         mock_milvus = MagicMock()
         mock_milvus.search.return_value = [
-            [{"id": "v1", "distance": 0.2,
-              "entity": {"chunk_id": "primary-chunk", "source_type": "herb",
-                         "source_id": "src-1", "title": "主查库命中", "content_hash": "abc"}},
-             {"id": "v2", "distance": 0.2,
-              "entity": {"chunk_id": "cross-chunk", "source_type": "case",
-                         "source_id": "src-2", "title": "跨库命中", "content_hash": "def"}}]
+            [
+                {
+                    "id": "v1",
+                    "distance": 0.2,
+                    "entity": {
+                        "chunk_id": "primary-chunk",
+                        "source_type": "herb",
+                        "source_id": "src-1",
+                        "title": "主查库命中",
+                        "content_hash": "abc",
+                    },
+                },
+                {
+                    "id": "v2",
+                    "distance": 0.2,
+                    "entity": {
+                        "chunk_id": "cross-chunk",
+                        "source_type": "case",
+                        "source_id": "src-2",
+                        "title": "跨库命中",
+                        "content_hash": "def",
+                    },
+                },
+            ]
         ]
 
         # PG 无命中，backfill 有内容
-        mock_session = _make_mock_session([
-            [],
-            [MagicMock(id=uuid.uuid4(), content="主查内容"),
-             MagicMock(id=uuid.uuid4(), content="跨库内容")],
-        ])
+        mock_session = _make_mock_session(
+            [
+                [],
+                [MagicMock(id=uuid.uuid4(), content="主查内容"), MagicMock(id=uuid.uuid4(), content="跨库内容")],
+            ]
+        )
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=gateway,
-            milvus_client=mock_milvus, session_factory=mock_sf,
+            settings=settings,
+            gateway_client=gateway,
+            milvus_client=mock_milvus,
+            session_factory=mock_sf,
         )
         evidences = await retriever.hybrid_search(
-            "测试", sources=["herb", "case"], primary_sources={"herb"}, top_k=5,
+            "测试",
+            sources=["herb", "case"],
+            primary_sources={"herb"},
+            top_k=5,
         )
         assert len(evidences) == 2
         assert evidences[0].source_type == "herb"
@@ -1261,9 +1758,14 @@ class TestEvidenceTraceability:
 
     def test_evidence_required_fields(self) -> None:
         e = Evidence(
-            evidence_id="test-id", source_type="herb", source_id="src-1",
-            chunk_id="chunk-1", title="黄芪", content_snippet="补气固表",
-            score=0.85, rank=1,
+            evidence_id="test-id",
+            source_type="herb",
+            source_id="src-1",
+            chunk_id="chunk-1",
+            title="黄芪",
+            content_snippet="补气固表",
+            score=0.85,
+            rank=1,
         )
         assert e.evidence_id == "test-id"
         assert e.source_type == "herb"
@@ -1276,22 +1778,34 @@ class TestEvidenceTraceability:
 
     def test_evidence_auto_generates_id(self) -> None:
         e = Evidence(
-            source_type="herb", source_id="src-1", title="标题",
-            content_snippet="内容", score=0.5, rank=1,
+            source_type="herb",
+            source_id="src-1",
+            title="标题",
+            content_snippet="内容",
+            score=0.5,
+            rank=1,
         )
         assert len(e.evidence_id) == 32
 
     def test_evidence_metadata_optional(self) -> None:
         e = Evidence(
-            source_type="herb", source_id="src-1", title="标题",
-            content_snippet="内容", score=0.5, rank=1,
+            source_type="herb",
+            source_id="src-1",
+            title="标题",
+            content_snippet="内容",
+            score=0.5,
+            rank=1,
         )
         assert isinstance(e.metadata, dict)
 
     def test_evidence_metadata_preserves_scores(self) -> None:
         e = Evidence(
-            source_type="herb", source_id="src-1", title="标题",
-            content_snippet="内容", score=0.85, rank=1,
+            source_type="herb",
+            source_id="src-1",
+            title="标题",
+            content_snippet="内容",
+            score=0.85,
+            rank=1,
             metadata={"vector_score": 0.9, "fulltext_score": 0.8, "source_priority": 1.0},
         )
         assert e.metadata["vector_score"] == 0.9
@@ -1322,7 +1836,9 @@ class TestNoInformationLeak:
         mock_sf = MagicMock(return_value=mock_session)
 
         retriever = RAGRetriever(
-            settings=settings, gateway_client=MagicMock(), session_factory=mock_sf,
+            settings=settings,
+            gateway_client=MagicMock(),
+            session_factory=mock_sf,
         )
         with pytest.raises(RAGUnavailableError) as exc_info:
             await retriever._fulltext_search("测试", ["herb"])
