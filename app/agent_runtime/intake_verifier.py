@@ -341,7 +341,12 @@ def _verify_coverage_binding(
         for span in item.evidence:
             if span.source_message_id != candidate.answer_message_id:
                 return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
-            if span.end_char > len(answer_content) or answer_content[span.start_char : span.end_char] != span.quote:
+            # Grounding contract: the quote must be a genuine substring of the
+            # bound answer (fabricated text is rejected).  Offsets are advisory
+            # — a model that miscounts Unicode code points but quotes the real
+            # answer is repaired deterministically by ``build_coverage_event``
+            # (真实后端复盘 2026-08: 模型对中文回答反复产出偏移偏差 span)。
+            if span.quote not in answer_content:
                 return IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
     return None
 

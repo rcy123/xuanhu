@@ -490,10 +490,19 @@ def build_coverage_event(
         for span in item.evidence:
             if span.source_message_id != candidate.answer_message_id:
                 raise ValueError("coverage evidence may reference only the current bound answer")
-            if span.end_char > len(answer_content):
-                raise ValueError("coverage evidence range exceeds the current answer")
-            if answer_content[span.start_char : span.end_char] != span.quote:
-                raise ValueError("coverage evidence quote is not grounded in the current answer")
+            raw = answer_content[span.start_char : span.end_char]
+            if span.end_char > len(answer_content) or raw != span.quote:
+                # Offset repair: the quote is a genuine substring of the answer
+                # (the verifier already enforced this), but the model may have
+                # miscounted Unicode code points.  Re-anchor deterministically
+                # on the first occurrence so the persisted evidence locator is
+                # always correct (真实后端复盘 2026-08)。
+                position = answer_content.find(span.quote)
+                if position == -1:
+                    raise ValueError("coverage evidence quote is not grounded in the current answer")
+                span = span.model_copy(
+                    update={"start_char": position, "end_char": position + len(span.quote)}
+                )
             refs.append(
                 EvidenceRef(
                     source_message_id=span.source_message_id,

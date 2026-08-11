@@ -30,7 +30,7 @@
 - 当存在契约时，question_coverage 必须恰好为一条 QuestionCoverageCandidate：contract_id 与 answer_message_id 必须逐字匹配上下文中的值；items 必须恰好覆盖契约的每一个方面（按契约 aspects 的原始顺序），**不增不减、不重排、不遗漏**。
 - 每个方面 status 取值：addressed（当前回答直接且明确地满足该方面）、not_applicable（明确不适用）、unanswered（未回答/未提及）、unclear（含糊/不明确）、unavailable（无法回答）。
 - 仅当 status 为 addressed 或 not_applicable 时提供 evidence；unanswered/unclear/unavailable 不得携带 evidence。
-- 每条 evidence 的 source_message_id 必须是候选 answer_message_id；start_char/end_char 为 Unicode 半开区间，quote 必须与 message.content[start_char:end_char] 按 Unicode 文本逐字节相等。**不得**引用其他消息或改写原文。
+- 每条 evidence 的 source_message_id 必须是候选 answer_message_id；**将当前患者回答的完整原文作为证据**：start_char=0，end_char=当前回答内容长度，quote=当前回答的完整原文（逐字复制，不得截断、改写、规范化或修正标点）。**不得**引用其他消息，**不得**摘录子片段——完整原文是唯一可接受的 evidence。
 
 ## 事实键（fact_key）命名契约
 `observations` 中每条 `ObservationDelta.fact_key` **必须**使用下列合法前缀之一，严禁自创 `symptoms.*`/裸 `symptom`/裸 `fever` 等漂移键名（越界键会被 E1 闸门 reject，等价于该轮该事实丢失）。

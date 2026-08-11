@@ -168,7 +168,9 @@ def test_quote_mismatch_fails_span() -> None:
     )
 
 
-def test_range_exceeding_message_fails_span() -> None:
+def test_range_exceeding_message_is_repaired_not_rejected() -> None:
+    """R9-B: a quote that is a genuine substring of the answer passes even when
+    the model miscounted offsets; ``build_coverage_event`` re-anchors them."""
     contract = _contract()
     answer_id = uuid4()
     content = "有痰"
@@ -176,7 +178,7 @@ def test_range_exceeding_message_fails_span() -> None:
     span = CoverageEvidenceCandidate(
         source_message_id=answer_id,
         start_char=0,
-        end_char=len(content) + 1,
+        end_char=len(content) + 1,  # model over-counted the end offset
         quote="有痰",
     )
     candidate = QuestionCoverageCandidate(
@@ -189,10 +191,13 @@ def test_range_exceeding_message_fails_span() -> None:
     )
     output = _output(candidate)
     payload = _input(context=_context(contract, answer_id), answer_id=answer_id, content=content)
-    assert (
-        _verify_coverage_binding(output, payload)
-        is IntakeVerificationFailureCode.COVERAGE_SPAN_INVALID
-    )
+    assert _verify_coverage_binding(output, payload) is None
+    from app.schemas.question_contract import build_coverage_event
+
+    event = build_coverage_event(contract=contract, candidate=candidate, message_contents={answer_id: content})
+    repaired = event.items[0].evidence[0]
+    assert repaired.start_char == 0
+    assert repaired.end_char == len(content)
 
 
 def test_span_from_wrong_message_fails_span() -> None:

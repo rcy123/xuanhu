@@ -917,6 +917,24 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                     or graph_run.input_state_version != delta.expected_state_version
                 ):
                     raise RepositoryError(RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED)
+                # R9: question contracts reference the asked question message
+                # (FK question_message_id -> consult_messages), so the question
+                # rows must enter the unit of work *before* _persist_state can
+                # flush contract rows in its artifact phase.  Inserting the
+                # messages first keeps the explicit-flush FK ordering sound.
+                for message in consult_messages:
+                    session.add(
+                        ConsultMessage(
+                            id=message.message_id,
+                            session_id=delta.session_id,
+                            role=message.role,
+                            stage=message.stage,
+                            agent_name=message.agent_name,
+                            content=message.content,
+                            structured_delta=message.structured_delta,
+                            trace_id=message.trace_id,
+                        )
+                    )
                 await self._persist_state(session, state, next_state, delta, artifact_payloads=artifact_payloads)
                 await self._persist_product_projections(
                     session,
@@ -980,19 +998,6 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                             input_state_version=gate.input_state_version,
                             decision=gate.decision.value,
                             details=gate.details,
-                        )
-                    )
-                for message in consult_messages:
-                    session.add(
-                        ConsultMessage(
-                            id=message.message_id,
-                            session_id=delta.session_id,
-                            role=message.role,
-                            stage=message.stage,
-                            agent_name=message.agent_name,
-                            content=message.content,
-                            structured_delta=message.structured_delta,
-                            trace_id=message.trace_id,
                         )
                     )
                 await self._persist_safety_fact_assertions(

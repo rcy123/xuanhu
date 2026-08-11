@@ -271,6 +271,14 @@ _INTAKE_SILENT_DEGRADE_CODES = frozenset(
         # 幻觉 CORRECT 目标:整轮退回 ABSTAINED(不落事实),completeness 驱动下一问,
         # 避免安全项采集被模型随机性卡死(真实 7816d394 503 复盘)。
         "INTAKE_CORRECTION_TARGET_INVALID",
+        # R9 覆盖候选质量失败(2026-08 真实后端复盘): 模型产出的 question_coverage
+        # span 未对质原文/方面集不匹配/幻觉契约等,均属单轮可退让的模型输出问题——
+        # 硬失败会整轮丢失患者回答;降级后本轮不落覆盖事件,契约保持 open 有界重问。
+        "INTAKE_COVERAGE_WITHOUT_CONTRACT",
+        "INTAKE_COVERAGE_CONTRACT_MISMATCH",
+        "INTAKE_COVERAGE_ASPECT_MISMATCH",
+        "INTAKE_COVERAGE_SOURCE_NOT_ALLOWED",
+        "INTAKE_COVERAGE_SPAN_INVALID",
     }
 )
 # 模型质量类失败：同输入重放一次大概率成功(输出随机)，两次仍失败再降级。
@@ -287,6 +295,12 @@ _INTAKE_RETRYABLE_MODEL_CODES = frozenset(
         "INTAKE_AUTHORITY_FIELD_FORBIDDEN",
         "INTAKE_HISTORICAL_FACT_REEXTRACTED",
         "INTAKE_CORRECTION_TARGET_INVALID",
+        # R9 覆盖候选质量失败: 与 grounding span 同类——重放一次大概率输出正确 span。
+        "INTAKE_COVERAGE_WITHOUT_CONTRACT",
+        "INTAKE_COVERAGE_CONTRACT_MISMATCH",
+        "INTAKE_COVERAGE_ASPECT_MISMATCH",
+        "INTAKE_COVERAGE_SOURCE_NOT_ALLOWED",
+        "INTAKE_COVERAGE_SPAN_INVALID",
     }
 )
 INTAKE_ROUTE_READY = "ready"
@@ -3035,7 +3049,15 @@ async def _compute_intake_from_claim(
         except ValueError:
             event = None
         if event is not None:
-            delta = delta.model_copy(update={"question_coverage_events": (event,)})
+            # 覆盖事件本身是状态变更（追加式账本），空提取时产出的 intake_noop
+            # 工件必须清掉——reducer 禁止事实变更与工件变更同 delta（
+            # MIXED_FACT_AND_ARTIFACT_CHANGE，真实后端 2026-08 复盘）。
+            delta = delta.model_copy(
+                update={
+                    "question_coverage_events": (event,),
+                    "artifact_revisions": () if not delta.observations else delta.artifact_revisions,
+                }
+            )
     if rejected_observations or normalized_observations:
         extraction_trace: dict[str, Any] = {}
         if rejected_observations:
@@ -4028,8 +4050,22 @@ def _delta_with_contract(
     delta: DomainDelta,
     contract: QuestionContract,
 ) -> DomainDelta:
-    """R9 接线点 A：把新契约并入 delta 的追加式契约账本。"""
-    return delta.model_copy(update={"question_contracts": delta.question_contracts + (contract,)})
+    """R9 接线点 A：把新契约并入 delta 的追加式契约账本。
+
+    契约为事实级变更：若本轮 intake 空提取（obs/事件均为空）产出了 intake_noop
+    工件，必须一并清掉——reducer 禁止事实变更与工件变更同 delta
+    （MIXED_FACT_AND_ARTIFACT_CHANGE，真实后端 2026-08 复盘）。
+    """
+    return delta.model_copy(
+        update={
+            "question_contracts": delta.question_contracts + (contract,),
+            "artifact_revisions": (
+                ()
+                if not delta.observations and not delta.question_coverage_events
+                else delta.artifact_revisions
+            ),
+        }
+    )
 
 
 def _attach_bound_coverage(
