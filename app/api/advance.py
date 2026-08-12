@@ -58,6 +58,7 @@ from app.core.exceptions import (
     SessionNotFoundError,
     StateRecoveryRequiredError,
 )
+from app.core.ratelimit import require_advance_rate_limit
 from app.db.session import get_db, get_session_factory
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultSession
@@ -1020,6 +1021,7 @@ async def advance_session(
     request: Request,
     body: AdvanceRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_advance_rate_limit),
     _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),

@@ -172,6 +172,29 @@ class _Counter:
             self._inner.inc()
 
 
+class _Gauge:
+    """Bounded gauge — wraps prometheus_client.Gauge if installed.
+
+    Mirrors ``_Counter``: no-op when prometheus_client is absent.  Callers
+    must never derive the value from PHI or high-cardinality data.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, name: str, description: str) -> None:
+        self._inner: Any = None
+        try:
+            import prometheus_client
+
+            self._inner = prometheus_client.Gauge(name, description)
+        except ImportError:
+            logger.debug("prometheus_client not available — metrics are no-ops")
+
+    def set(self, value: float) -> None:
+        if self._inner is not None:
+            self._inner.set(value)
+
+
 # ---------------------------------------------------------------------------
 # Declare all histograms
 # ---------------------------------------------------------------------------
@@ -307,6 +330,40 @@ question_contract_aspects = _Histogram(
 )
 
 
+# ---------------------------------------------------------------------------
+# M1 配置偏离告警指标
+# ---------------------------------------------------------------------------
+
+#: 参与启动快照对比的「安全开关类」关键项——只有这些项的变更才允许触发
+#: config.drift 告警，版本号等正常变更不告警（防告警风暴）。
+_CONFIG_DRIFT_TYPES = frozenset({"langgraph_product_ready", "agent_runtime_rollout_phase", "model_gateway_base_url"})
+
+#: 每次启动检测到关键配置偏离 +1。配合
+#: deploy/prometheus/rules/xuanhu-config-drift-alerts.yml 在 1h 窗口内告警。
+config_drift_total = _Counter(
+    "xuanhu_config_drift_total",
+    "Detected config drift events on startup by bounded key type",
+    labelnames=("type",),
+    allowlists={"type": _CONFIG_DRIFT_TYPES},
+)
+
+#: 生产密钥守卫失败即为 1（否则 0），prometheus 规则 > 0 立即告警。
+production_secrets_invalid = _Gauge(
+    "xuanhu_production_secrets_invalid",
+    "1 when production secret validation fails at startup, else 0",
+)
+
+
+def observe_config_drift(drift_type: str) -> None:
+    """Record one detected config drift of the given bounded key type."""
+    config_drift_total.inc(labels={"type": drift_type})
+
+
+def observe_production_secrets_validity(valid: bool) -> None:
+    """Record the current production secret validation outcome (M1 gauge)."""
+    production_secrets_invalid.set(0.0 if valid else 1.0)
+
+
 def observe_gateway_request(operation: str, outcome: str) -> None:
     """Record one bounded gateway request outcome (fail-closed on both labels).
 
@@ -332,9 +389,7 @@ def observe_gateway_structured_fallback(outcome: str) -> None:
     never alters gateway behavior.
     """
     try:
-        gateway_structured_fallback.inc(
-            {"outcome": _bounded(outcome, _FALLBACK_OUTCOMES)}
-        )
+        gateway_structured_fallback.inc({"outcome": _bounded(outcome, _FALLBACK_OUTCOMES)})
     except Exception:  # noqa: BLE001 - observation must never raise into the call path
         logger.warning("gateway structured-fallback metric observation failed")
 
@@ -360,9 +415,7 @@ def observe_question_contract(outcome: str, *, aspect_count: int | None = None) 
     """
 
     try:
-        question_contracts.inc(
-            {"outcome": _bounded(outcome, _QUESTION_CONTRACT_OUTCOMES)}
-        )
+        question_contracts.inc({"outcome": _bounded(outcome, _QUESTION_CONTRACT_OUTCOMES)})
     except Exception:  # noqa: BLE001 - observation must never alter intake
         logger.warning("question contract metric observation failed")
         return
@@ -377,9 +430,7 @@ def observe_question_coverage(outcome: str) -> None:
     """Record one bounded coverage-fold outcome without clinical labels."""
 
     try:
-        question_coverage_evaluations.inc(
-            {"outcome": _bounded(outcome, _QUESTION_COVERAGE_OUTCOMES)}
-        )
+        question_coverage_evaluations.inc({"outcome": _bounded(outcome, _QUESTION_COVERAGE_OUTCOMES)})
     except Exception:  # noqa: BLE001 - observation must never alter intake
         logger.warning("question coverage metric observation failed")
 
@@ -388,9 +439,7 @@ def observe_question_followup(outcome: str) -> None:
     """Record one bounded residual follow-up decision."""
 
     try:
-        question_contract_followups.inc(
-            {"outcome": _bounded(outcome, _QUESTION_FOLLOWUP_OUTCOMES)}
-        )
+        question_contract_followups.inc({"outcome": _bounded(outcome, _QUESTION_FOLLOWUP_OUTCOMES)})
     except Exception:  # noqa: BLE001 - observation must never alter intake
         logger.warning("question follow-up metric observation failed")
 
@@ -398,6 +447,7 @@ def observe_question_followup(outcome: str) -> None:
 # ---------------------------------------------------------------------------
 # Measure context manager
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class MeasureResult:
@@ -450,6 +500,7 @@ def _observe(stage: str, value: float, labels: dict[str, str] | None = None) -> 
 # ---------------------------------------------------------------------------
 # Render all histograms as Prometheus text format
 # ---------------------------------------------------------------------------
+
 
 def render_perf_metrics() -> str:
     """Render *all* performance histograms and the R5/R9 outcome counters.

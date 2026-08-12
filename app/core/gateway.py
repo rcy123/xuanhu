@@ -28,6 +28,7 @@ from app.core.exceptions import (
     ModelGatewayError,
     ModelGatewayTimeoutError,
     ModelGatewayUnavailableError,
+    ModelNotAllowedError,
 )
 from app.core.metrics import (
     measure,
@@ -53,6 +54,7 @@ def _observe_never_raise(fn: Callable[..., None], *args: Any) -> None:
         fn(*args)
     except Exception:  # noqa: BLE001 - metrics must never leak into the call path
         logger.warning("gateway metric observation failed")
+
 
 # Hosts whose thinking-mode models reject a forced ``tool_choice`` (HTTP 400)
 # and must therefore use the ``response_format=json_object`` transport with
@@ -124,6 +126,20 @@ class ModelGatewayClient:
         self._chat_model = settings.chat_model
         self._embedding_model = settings.embedding_model
         self._embedding_dim = settings.embedding_dim
+        # M5 模型白名单：配置非空后，任何不在白名单内的 model 名在发出请求
+        # 前即被拒绝（ModelNotAllowedError），防止模型名被篡改指向任意端点。
+        self._model_whitelist: frozenset[str] = frozenset(
+            item.strip() for item in getattr(settings, "model_whitelist", ()) if item and item.strip()
+        )
+        if self._model_whitelist:
+            # 配置的默认模型必须本身就在白名单内，否则是配置自相矛盾——
+            # 装配期即 fail-fast，而不是等第一次请求才暴露。
+            for _configured_model in (self._chat_model, self._embedding_model):
+                if _configured_model not in self._model_whitelist:
+                    raise ValueError(
+                        f"配置的模型 {_configured_model} 不在 MODEL_WHITELIST 内: "
+                        + ", ".join(sorted(self._model_whitelist))
+                    )
         self._structured_mode = self._resolve_structured_mode(settings)
         # DeepSeek and the dmxapi/Qwen proxy both expose thinking-mode models
         # that reject a forced ``tool_choice`` (HTTP 400); json_object mode
@@ -209,6 +225,11 @@ class ModelGatewayClient:
             return mode
         base_url = str(getattr(settings, "model_gateway_base_url", "")).lower()
         return "json_object" if any(hint in base_url for hint in _JSON_OBJECT_HOST_HINTS) else "tools"
+
+    def _assert_model_allowed(self, model: str) -> None:
+        """拒绝白名单之外的模型名（M5）；白名单未配置时为 no-op。"""
+        if self._model_whitelist and model not in self._model_whitelist:
+            raise ModelNotAllowedError(model)
 
     def _build_headers(self) -> dict[str, str]:
         """构建请求头，包含认证和路由信息。"""
@@ -439,6 +460,7 @@ class ModelGatewayClient:
             ModelGatewayTimeoutError: 请求超时。
         """
         model_name = model or self._chat_model
+        self._assert_model_allowed(model_name)
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": messages,
@@ -579,6 +601,7 @@ class ModelGatewayClient:
         if max_requests is not None and max_requests < 1:
             raise ValueError("max_requests must be at least 1")
         model_name = model or self._chat_model
+        self._assert_model_allowed(model_name)
         schema_dict = output_schema.model_json_schema()
         configured_attempts = 1 + self._max_retries
         max_attempts = configured_attempts if max_requests is None else min(configured_attempts, max_requests)
@@ -1002,6 +1025,7 @@ class ModelGatewayClient:
     ) -> list[list[float]]:
         """批量文本向量化实现（由 ``embed`` 包裹以记录 bounded outcome）。"""
         model_name = model or self._embedding_model
+        self._assert_model_allowed(model_name)
         payload: dict[str, Any] = {
             "model": model_name,
             "input": texts,

@@ -1,0 +1,67 @@
+# M1 关键配置偏离告警规则。
+#
+# 依赖：
+#   - xuanhu_config_drift_total{type=...}  — app/services/config_drift.py 启动快照偏离时 +1
+#   - xuanhu_production_secrets_invalid    — 生产密钥守卫失败置 1（app/core/config.py）
+#
+# 设计约束（见 docs/04_生产环境加固/04-运行态安全加固.md §7.3）：
+#   - 仅「安全开关类」关键项（langgraph_product_ready / rollout_phase /
+#     base_url）偏离才触发，版本号等正常变更不告警，避免告警风暴。
+groups:
+  - name: xuanhu-config-drift
+    interval: 30s
+    rules:
+      - alert: XuanhuConfigDriftLanggraphProductReady
+        expr: xuanhu_config_drift_total{type="langgraph_product_ready"} > 0
+        for: 1h
+        labels:
+          severity: warning
+          service: xuanhu
+          component: config-drift
+        annotations:
+          summary: Xuanhu langgraph_product_ready configuration drifted from the last startup snapshot
+          description: >
+            The langgraph_product_ready flag differs from the previous startup snapshot.
+            Verify that pushing this flag to this environment was intentional
+            (e.g. XUANHU_LANGGRAPH_PRODUCT_READY=true on production).
+
+      - alert: XuanhuConfigDriftRolloutPhase
+        expr: xuanhu_config_drift_total{type="agent_runtime_rollout_phase"} > 0
+        for: 1h
+        labels:
+          severity: warning
+          service: xuanhu
+          component: config-drift
+        annotations:
+          summary: Xuanhu agent_runtime_rollout_phase configuration drifted from the last startup snapshot
+          description: >
+            The agent runtime rollout phase differs from the previous startup snapshot.
+            Confirm the rollout phase change (rampup / full / rollback) was intentional.
+
+      - alert: XuanhuConfigDriftGatewayBaseUrl
+        expr: xuanhu_config_drift_total{type="model_gateway_base_url"} > 0
+        for: 1h
+        labels:
+          severity: critical
+          service: xuanhu
+          component: config-drift
+        annotations:
+          summary: Xuanhu model_gateway_base_url changed from the last startup snapshot
+          description: >
+            The model gateway base URL differs from the previous startup snapshot.
+            A changed model gateway endpoint may indicate tampering or a
+            misdirected configuration; treat as security-relevant.
+
+      - alert: XuanhuProductionSecretsInvalid
+        expr: xuanhu_production_secrets_invalid > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: xuanhu
+          component: config-drift
+        annotations:
+          summary: Xuanhu production secret guard failed
+          description: >
+            The production secret guard detected placeholder, default, or missing
+            credentials (or an empty MODEL_WHITELIST) at startup. The process must
+            not have started; investigate immediately.

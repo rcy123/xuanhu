@@ -1,0 +1,128 @@
+rule_files:
+  - ../rules/xuanhu-config-drift-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- langgraph_product_ready drift ----------------------------------------
+  - name: langgraph_product_ready drift fires after one hour
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="langgraph_product_ready"}'
+        values: '1x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftLanggraphProductReady
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: config-drift
+            exp_annotations:
+              summary: Xuanhu langgraph_product_ready configuration drifted from the last startup snapshot
+              description: >
+                The langgraph_product_ready flag differs from the previous startup snapshot.
+                Verify that pushing this flag to this environment was intentional
+                (e.g. XUANHU_LANGGRAPH_PRODUCT_READY=true on production).
+
+  - name: langgraph_product_ready drift stays quiet when no drift
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="langgraph_product_ready"}'
+        values: '0x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftLanggraphProductReady
+        exp_alerts: []
+
+  # --- rollout phase drift ----------------------------------------------------
+  - name: rollout phase drift fires after one hour
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="agent_runtime_rollout_phase"}'
+        values: '1x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftRolloutPhase
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: config-drift
+            exp_annotations:
+              summary: Xuanhu agent_runtime_rollout_phase configuration drifted from the last startup snapshot
+              description: >
+                The agent runtime rollout phase differs from the previous startup snapshot.
+                Confirm the rollout phase change (rampup / full / rollback) was intentional.
+
+  - name: rollout phase drift stays quiet when no drift
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="agent_runtime_rollout_phase"}'
+        values: '0x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftRolloutPhase
+        exp_alerts: []
+
+  # --- model gateway base_url drift ------------------------------------------
+  - name: gateway base_url drift fires after one hour
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="model_gateway_base_url"}'
+        values: '1x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftGatewayBaseUrl
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: config-drift
+            exp_annotations:
+              summary: Xuanhu model_gateway_base_url changed from the last startup snapshot
+              description: >
+                The model gateway base URL differs from the previous startup snapshot.
+                A changed model gateway endpoint may indicate tampering or a
+                misdirected configuration; treat as security-relevant.
+
+  - name: gateway base_url drift stays quiet when no drift
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_config_drift_total{type="model_gateway_base_url"}'
+        values: '0x75'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: XuanhuConfigDriftGatewayBaseUrl
+        exp_alerts: []
+
+  # --- production secrets invalid --------------------------------------------
+  - name: production secrets invalid fires immediately
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_production_secrets_invalid'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: XuanhuProductionSecretsInvalid
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: xuanhu
+              component: config-drift
+            exp_annotations:
+              summary: Xuanhu production secret guard failed
+              description: >
+                The production secret guard detected placeholder, default, or missing
+                credentials (or an empty MODEL_WHITELIST) at startup. The process must
+                not have started; investigate immediately.
+
+  - name: production secrets invalid stays quiet when valid
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_production_secrets_invalid'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: XuanhuProductionSecretsInvalid
+        exp_alerts: []

@@ -39,6 +39,7 @@ from app.core.exceptions import (
 from app.core.exceptions import (
     ValidationError as XuanhuValidationError,
 )
+from app.core.ratelimit import require_write_rate_limit
 from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.session import (
@@ -160,6 +161,7 @@ async def terminate_session(
     request: Request,
     body: SessionTerminateRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_write_rate_limit),
     _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),

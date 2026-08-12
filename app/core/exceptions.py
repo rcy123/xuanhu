@@ -238,6 +238,19 @@ class ModelGatewayTimeoutError(ModelGatewayError):
         super().__init__(message, retryable=retryable)
 
 
+class ModelNotAllowedError(ModelGatewayError):
+    """请求模型不在 MODEL_WHITELIST 白名单内（M5）。
+
+    配置白名单后，模型名白名单校验是纵深防御的最后一道闸：即使业务侧
+    model 参数被篡改/越权传入任意模型名，也不会被转发到网关端点。
+    不可重试——这是策略拒绝，不是瞬态故障。
+    """
+
+    def __init__(self, model: str) -> None:
+        super().__init__(f"模型不在白名单内: {model}", retryable=False)
+        self.model = model
+
+
 class EmbeddingUnavailableError(ModelGatewayError):
     """Embedding 服务不可用。"""
 

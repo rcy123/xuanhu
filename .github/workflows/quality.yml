@@ -168,6 +168,12 @@ jobs:
           docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
             prom/prometheus:v3.5.0 test rules \
             deploy/prometheus/tests/xuanhu-r9-alerts.test.yml
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 check rules \
+            deploy/prometheus/rules/xuanhu-config-drift-alerts.yml
+          docker run --rm --entrypoint=/bin/promtool -v "$PWD:/repo:ro" --workdir=/repo \
+            prom/prometheus:v3.5.0 test rules \
+            deploy/prometheus/tests/xuanhu-config-drift-alerts.test.yml
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:

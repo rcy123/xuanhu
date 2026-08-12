@@ -5,12 +5,14 @@
 
 import asyncio
 import logging
+import traceback
 import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.agent_runtime.lifecycle import (
@@ -41,7 +43,11 @@ from app.api.sessions import router as sessions_router
 from app.api.sessions import session_exception_handlers
 from app.api.stream import router as stream_router
 from app.core.config import ensure_production_secrets_ready, get_settings
-from app.core.exceptions import HttpCommandRecoveryRequiredError, HttpCommandReplayError
+from app.core.exceptions import (
+    HttpCommandRecoveryRequiredError,
+    HttpCommandReplayError,
+    RateLimitedError,
+)
 from app.core.gateway import ModelGatewayClient
 from app.core.log_filter import install_phi_redaction
 
@@ -59,6 +65,18 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # 生产密钥守卫：占位符 / 默认值 / 缺失 → fail-fast（T1.6/T3.3）。
     ensure_production_secrets_ready(settings)
     logger.info("应用启动，当前配置（已脱敏）: %s", settings.safe_dump())
+
+    # M1 启动快照：写 config.snapshot 审计事件并对比上一次快照，关键安全
+    # 开关（langgraph_product_ready / rollout_phase / base_url）偏离即告警。
+    # best-effort——审计库不可用只记 warning，不阻断启动。
+    try:
+        from app.db.session import get_session_factory
+        from app.services.config_drift import record_startup_config_snapshot
+
+        async with get_session_factory()() as db:
+            await record_startup_config_snapshot(db, settings, trace_id=f"startup-{uuid.uuid4().hex}")
+    except Exception:  # noqa: BLE001 - best-effort
+        logger.warning("config.snapshot 启动留痕失败（best-effort 忽略）", exc_info=True)
 
     # ── shared ModelGatewayClient（lifespan 托管连接池） ──
     gateway = ModelGatewayClient()
@@ -207,13 +225,38 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                     await gateway.aclose()
 
 
+_settings = get_settings()
+
+
+def resolve_docs_url(app_env: str) -> str | None:
+    """T4.3 交互式文档暴露面收敛（H9）：生产环境关闭 /docs。
+
+    独立小函数便于单元测试；本地/staging 保留 /docs 供开发联调。
+    """
+    return None if app_env == "production" else "/docs"
+
+
 app = FastAPI(
     title="悬壶（Xuanhu）",
-    version=get_settings().app_version,
-    docs_url="/docs",
+    version=_settings.app_version,
+    # T4.3 生产关闭交互式文档（H9）：docs/redoc 暴露路由与 schema 属信息
+    # 泄露面，仅在 local/staging 环境保留 /docs 供开发联调。
+    docs_url=resolve_docs_url(_settings.app_env),
     redoc_url=None,
     lifespan=lifespan,
 )
+
+# T4.5 CORS 白名单（M2）：只允许显式配置的来源。通配符 * 已在
+# Settings 校验层直接禁止（cors_no_wildcard_origin fail-fast），
+# 从根上杜绝「通配来源 + 携带凭据」的非法组合。
+if _settings.cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_settings.cors_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 app.include_router(health_router)
 app.include_router(auth_router)
@@ -267,6 +310,58 @@ async def http_command_outcome_handler(
 
 app.add_exception_handler(HttpCommandReplayError, http_command_outcome_handler)
 app.add_exception_handler(HttpCommandRecoveryRequiredError, http_command_outcome_handler)
+
+
+@app.exception_handler(RateLimitedError)
+async def rate_limited_handler(request: Request, exc: RateLimitedError) -> JSONResponse:
+    """限流命中（H6）：429 + Retry-After，标准 envelope。
+
+    Redis 滑动窗口拒绝时携带重试等待秒数，供客户端退避。
+    """
+    trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": None,
+            "retryable": exc.retryable,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
+    response.headers["Retry-After"] = str(exc.retry_after)
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """兜底异常处理器（T4.4）：未预期异常统一收敛为标准 500 envelope。
+
+    完整堆栈只进服务端日志（含 trace_id 便于关联），响应体不携带任何
+    异常信息（M6 脱敏约束——异常字符串可能包含 PHI/内部路径）。
+    具体业务异常已在各路由级 handler 处理，此处仅捕获漏网之鱼。
+    """
+    trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
+    logger.error(
+        "unhandled exception trace_id=%s method=%s path=%s",
+        trace_id,
+        request.method,
+        request.url.path,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "INTERNAL_ERROR",
+            "message": "服务器内部错误",
+            "detail": None,
+            "retryable": True,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)

@@ -19,6 +19,7 @@ from app.api.request_context import (
 from app.core.access import require_session_owner, require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import SessionNotFoundError, ValidationError, XuanhuError
+from app.core.ratelimit import require_write_rate_limit
 from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.safety_confirmation import SafetyAssertionDecisionRequest, SafetyAssertionStatus
@@ -109,6 +110,7 @@ async def confirm_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_write_rate_limit),
     _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
@@ -130,6 +132,7 @@ async def reject_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_write_rate_limit),
     _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
@@ -151,6 +154,7 @@ async def retract_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_write_rate_limit),
     _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),

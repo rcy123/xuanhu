@@ -8,11 +8,13 @@ from __future__ import annotations
 import functools
 import os
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse, urlunparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from app.core.metrics import observe_production_secrets_validity
 
 # ---------------------------------------------------------------------------
 # 敏感字段检测
@@ -536,12 +538,12 @@ class Settings(BaseSettings):
         le=100,
         description="SSE 按医师并发连接上限",
     )
-    cors_allowed_origins: list[str] = Field(
+    cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"],
         validation_alias="CORS_ALLOWED_ORIGINS",
         description="CORS 允许来源（逗号分隔）；生产禁止通配符 *（allow_credentials=True 组合被浏览器规范禁止）",
     )
-    model_whitelist: list[str] = Field(
+    model_whitelist: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         validation_alias="MODEL_WHITELIST",
         description="允许的模型名白名单（逗号分隔）；生产为空即 fail-fast，防止模型名被篡改指向任意端点",
@@ -570,6 +572,19 @@ class Settings(BaseSettings):
         """Heartbeat must stay strictly below the lease for the R6-A worker."""
         if self.async_command_enabled and self.async_command_heartbeat_seconds >= self.async_command_lease_seconds:
             raise ValueError("async_command_heartbeat_seconds must be strictly less than async_command_lease_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def cors_no_wildcard_origin(self) -> Settings:
+        """M2：禁止通配来源 ``*``。
+
+        ``Access-Control-Allow-Origin: *`` 与 ``allow_credentials=True`` 的
+        组合被浏览器规范直接拒绝；即便未来改为不携带凭据，通配来源也会让
+        任何站点都能读取响应，破坏同源边界。因此无论是否携带凭据都禁止
+        ``*``——显式白名单是唯一合法形态。
+        """
+        if "*" in self.cors_allowed_origins:
+            raise ValueError("CORS_ALLOWED_ORIGINS must not contain '*' (wildcard origin is forbidden)")
         return self
 
     # -------------------------------------------------------------------
@@ -635,9 +650,10 @@ def _looks_like_placeholder(value: str) -> bool:
 def validate_production_secrets(settings: Settings) -> list[str]:
     """检查生产环境密钥合规性，返回不合规项列表（空列表=通过）。
 
-    覆盖 Settings 密钥字段（*_api_key / jwt_signing_key）与 Compose 中间件
-    凭据（POSTGRES_PASSWORD / REDIS_PASSWORD / MINIO_*）。生产环境任一为
-    空、占位符或已知默认值即启动失败；本地/测试环境不触发。
+    覆盖 Settings 密钥字段（*_api_key / jwt_signing_key）、Compose 中间件
+    凭据（POSTGRES_PASSWORD / REDIS_PASSWORD / MINIO_*）以及 M5 模型白名单
+    （MODEL_WHITELIST）。生产环境任一为空、占位符或已知默认值即启动失败；
+    本地/测试环境不触发。
     """
     violations: list[str] = []
     for field_name in _SETTINGS_SECRET_FIELDS:
@@ -648,6 +664,10 @@ def validate_production_secrets(settings: Settings) -> list[str]:
         value = os.environ.get(env_name, "")
         if _looks_like_placeholder(value):
             violations.append(env_name)
+    if settings.app_env == "production" and not settings.model_whitelist:
+        # M5：生产禁止空白名单——空列表等于「任何模型名都放行」，无法兜底
+        # 模型名被篡改指向任意端点。fail-fast 强制运维显式配置白名单。
+        violations.append("MODEL_WHITELIST")
     return violations
 
 
@@ -655,16 +675,21 @@ def ensure_production_secrets_ready(settings: Settings | None = None) -> None:
     """生产环境 fail-fast 守卫：任一密钥不合规即抛 RuntimeError。
 
     仅当 ``APP_ENV=production`` 且 ``XUANHU_PROD_SECRET_GUARD != false``
-    时生效；其余环境为 no-op。
+    时生效；其余环境为 no-op。守卫失败时先把 ``production_secrets_invalid``
+    指标置 1（Prometheus 立即告警），再抛异常终止启动。
     """
     effective = settings or get_settings()
     if effective.app_env != "production":
+        observe_production_secrets_validity(True)
         return
     if not effective.xuanhu_prod_secret_guard:
+        observe_production_secrets_validity(True)
         return
     violations = validate_production_secrets(effective)
     if violations:
+        observe_production_secrets_validity(False)
         raise RuntimeError("生产环境密钥守卫失败：以下密钥缺失/为占位符/为默认值，禁止启动 —— " + ", ".join(violations))
+    observe_production_secrets_validity(True)
 
 
 # ---------------------------------------------------------------------------

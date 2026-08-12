@@ -41,6 +41,11 @@ def _set_test_defaults() -> None:
     # 认证行为由 tests/test_auth_*.py 显式切换到 on/audit 验证。
     os.environ["XUANHU_AUTH_ENABLED"] = "off"
     os.environ["XUANHU_ACCESS_ENABLED"] = "off"
+    # 阶段 4 限流总开关默认关闭：既有测试套件不受 Redis 计数干扰；
+    # 限流行为由 tests/test_ratelimit.py 显式开启验证。
+    os.environ["XUANHU_RATELIMIT_ENABLED"] = "false"
+    # M2：固定 CORS 白名单，保证 app 装配期的 CORSMiddleware 行为可预测。
+    os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost:5173"
     os.environ["JWT_SIGNING_KEY"] = "unit-test-signing-key-not-for-production"
     # 3d: 统一后端后测试会话一律 langgraph(legacy 不再创建);
     # 本地 shell/.env 不得把测试环境切回 legacy 路径。

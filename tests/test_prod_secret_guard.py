@@ -31,6 +31,8 @@ def _prod_settings(**overrides) -> Settings:
         "jwt_signing_key_previous": "",
         "model_gateway_timeout_seconds": 60,
         "xuanhu_prod_secret_guard": True,
+        # 字段带 validation_alias=MODEL_WHITELIST，构造时必须用 alias 名。
+        "MODEL_WHITELIST": ["mimo-7b", "bge-m3"],
     }
     values.update(overrides)
     return Settings(**values)
@@ -69,6 +71,21 @@ def test_strong_secrets_pass() -> None:
         assert validate_production_secrets(_prod_settings()) == []
     finally:
         monkeypatch.undo()
+
+
+def test_production_empty_model_whitelist_detected() -> None:
+    """M5：生产空白名单视为不合规（防止模型名被篡改指向任意端点）。"""
+    s = _prod_settings(**{"MODEL_WHITELIST": []})
+    assert "MODEL_WHITELIST" in validate_production_secrets(s)
+    with pytest.raises(RuntimeError, match="MODEL_WHITELIST"):
+        ensure_production_secrets_ready(s)
+
+
+def test_non_production_empty_whitelist_is_noop() -> None:
+    """非生产环境空白名单不触发 fail-fast（local/staging 由 gateway 层校验）。"""
+    s = _prod_settings(app_env="staging", **{"MODEL_WHITELIST": []})
+    assert "MODEL_WHITELIST" not in validate_production_secrets(s)
+    ensure_production_secrets_ready(s)
 
 
 def test_ensure_production_raises_on_violation() -> None:

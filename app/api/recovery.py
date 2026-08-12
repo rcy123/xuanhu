@@ -36,6 +36,7 @@ from app.core.exceptions import (
     StateRecoveryRequiredError,
     ValidationError,
 )
+from app.core.ratelimit import require_write_rate_limit
 from app.db.session import get_db
 from app.schemas.common import success_response
 from app.schemas.recovery import RecoveryRequest
@@ -55,6 +56,7 @@ async def recover_session(
     request: Request,
     body: RecoveryRequest,
     session_id: str = Depends(validate_session_id),
+    _rl: None = Depends(require_write_rate_limit),
     _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
