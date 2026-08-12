@@ -34,9 +34,22 @@ from app.core.exceptions import (
 )
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
-from app.models.domain import Observation, SafetyFactAssertion, SafetyProfile
+from app.models.domain import (
+    GateResult,
+    GraphRun,
+    Observation,
+    SafetyFactAssertion,
+    SafetyProfile,
+)
 from app.models.question_contract import QuestionContractRecord, QuestionCoverageEventRecord
+from app.schemas.domain import (
+    CollectionStatus,
+    ObservationSchema,
+    ObservationStatus,
+    SafetyProfileSchema,
+)
 from app.schemas.message import MessageRollbackData
+from app.schemas.triage import TriageGateDetails, TriageGateResult, TriageDisposition
 
 #: safety_fact_assertions.field_name -> (safety_profiles status 列, value 列)
 _SAFETY_PROFILE_FIELDS: dict[str, tuple[str, str]] = {
@@ -59,6 +72,177 @@ def _safe_ref(prefix: str, value: str) -> str:
     if safe and len(safe) <= 96:
         return f"{prefix}:{safe}"
     return f"{prefix}:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+async def _recompute_intake_gates(
+    db: AsyncSession,
+    *,
+    session: ConsultSession,
+    trace_id: str,
+) -> None:
+    """回退后用剩余事实重算 completeness gate，使读模型/前端反映真实完整性。
+
+    背景（REAL-SESSION 4292b0b4）：回退删除了消息与事实，但旧的 completeness
+    gate（disposition=ready/stagnated）仍被读模型投影为最新版本 → 前端误判
+    "问诊已完整/已停滞"而禁用输入或提示恢复。此处以剩余 active observations
+    重算 completeness 并写入一条新 gate（input_state_version=回退后版本），
+    triage 保守沿用最近一条 triage gate（红旗状态不因回退被重估放宽）。
+    """
+
+    from app.agent_runtime.completeness_policy import (
+        CompletenessPolicyInput,
+        CompletenessProgress,
+        completeness_to_gate_result_schema,
+        evaluate_completeness_policy,
+    )
+    from app.agent_runtime.reducer import DomainState
+    from app.agent_runtime.triage_policy import (
+        TRIAGE_POLICY_VERSION,
+        to_gate_result_schema as triage_gate_schema,
+    )
+    from app.core.config import get_settings
+    from app.services.langgraph_intake import _completeness_snapshot
+
+    # 1. 剩余 observations → ObservationSchema（含修正链，投影层取链头）
+    obs_rows = (
+        await db.scalars(select(Observation).where(Observation.session_id == session.id))
+    ).all()
+    observation_schemas = tuple(
+        ObservationSchema(
+            observation_id=row.id,
+            session_id=row.session_id,
+            fact_key=row.fact_key,
+            value=row.value,
+            normalized_value=row.normalized_value,
+            source_message_id=row.source_message_id,
+            status=ObservationStatus(row.status),
+            confidence=row.confidence,
+            supersedes_observation_id=row.supersedes_observation_id,
+            created_at=row.created_at,
+        )
+        for row in obs_rows
+    )
+
+    # 2. safety profile → SafetyProfileSchema
+    safety_profile_schema: SafetyProfileSchema | None = None
+    profile_row = await db.scalar(
+        select(SafetyProfile).where(SafetyProfile.session_id == session.id)
+    )
+    if profile_row is not None:
+        safety_profile_schema = SafetyProfileSchema(
+            session_id=session.id,
+            allergy_collection_status=CollectionStatus(profile_row.allergy_collection_status),
+            allergens=profile_row.allergens,
+            pregnancy_collection_status=CollectionStatus(profile_row.pregnancy_collection_status),
+            pregnancy_value=profile_row.pregnancy_value,
+            lactation_collection_status=CollectionStatus(profile_row.lactation_collection_status),
+            lactation_value=profile_row.lactation_value,
+            medications_collection_status=CollectionStatus(profile_row.medications_collection_status),
+            medications=profile_row.medications,
+            major_conditions_collection_status=CollectionStatus(profile_row.major_conditions_collection_status),
+            major_conditions=profile_row.major_conditions,
+            contraindications_collection_status=CollectionStatus(profile_row.contraindications_collection_status),
+            contraindications=profile_row.contraindications,
+        )
+
+    # 3. triage 保守沿用最近一次 triage gate（红旗状态不因回退重估放宽）
+    latest_triage = await db.scalar(
+        select(GateResult)
+        .where(
+            GateResult.session_id == session.id,
+            GateResult.gate_name == "triage",
+        )
+        .order_by(GateResult.input_state_version.desc(), GateResult.created_at.desc())
+        .limit(1)
+    )
+    triage_details = TriageGateDetails(
+        disposition=TriageDisposition.CONTINUE,
+        candidate_count=0,
+        category_counts=(),
+        rule_ids=(),
+        rules=(),
+        source_message_ids=(),
+        risk_level="none",
+    )
+    if latest_triage is not None and isinstance(latest_triage.details, dict):
+        details = latest_triage.details
+        try:
+            disposition = TriageDisposition(details.get("disposition", TriageDisposition.CONTINUE.value))
+            triage_details = TriageGateDetails.model_validate(
+                {
+                    "disposition": disposition,
+                    "candidate_count": details.get("candidate_count", 0),
+                    "category_counts": details.get("category_counts", []),
+                    "rule_ids": details.get("rule_ids", []),
+                    "rules": details.get("rules", []),
+                    "source_message_ids": details.get("source_message_ids", []),
+                    "risk_level": details.get("risk_level", "none"),
+                }
+            )
+        except Exception:
+            triage_details = TriageGateDetails(
+                disposition=TriageDisposition.CONTINUE,
+                candidate_count=0,
+                category_counts=(),
+                rule_ids=(),
+                rules=(),
+                source_message_ids=(),
+                risk_level="none",
+            )
+
+    triage_gate = TriageGateResult(
+        gate_name="triage",
+        policy_version=TRIAGE_POLICY_VERSION,
+        input_state_version=session.state_version,
+        decision="passed" if triage_details.disposition is TriageDisposition.CONTINUE else "blocked",
+        details=triage_details,
+    )
+
+    # 4. completeness 重算（剩余事实 + 重置 progress）
+    state = DomainState(
+        session_id=session.id,
+        state_version=session.state_version,
+        observations=observation_schemas,
+        safety_profile=safety_profile_schema,
+    )
+    domain_snapshot = _completeness_snapshot(state)
+    completeness_result = evaluate_completeness_policy(
+        CompletenessPolicyInput(
+            input_state_version=session.state_version,
+            domain_snapshot=domain_snapshot,
+            triage_gate=triage_gate,
+            progress=CompletenessProgress(),
+            slot_based=get_settings().intake_slot_path_enabled,
+        )
+    )
+
+    # 5. 写入 graph_run + gate_results（读模型按 input_state_version 选最新组）
+    run_id = uuid.uuid4()
+    db.add(
+        GraphRun(
+            id=run_id,
+            session_id=session.id,
+            graph_version="v1",
+            command_id=_safe_ref("rollback", trace_id),
+            input_state_version=session.state_version,
+            status="completed",
+            completed_at=datetime.now(UTC),
+        )
+    )
+    await db.flush()  # 先落 run，保证 gate_results.graph_run_id 外键可解析
+    for gate_schema in (triage_gate_schema(triage_gate), completeness_to_gate_result_schema(completeness_result)):
+        db.add(
+            GateResult(
+                id=uuid.uuid4(),
+                session_id=session.id,
+                graph_run_id=run_id,
+                gate_name=gate_schema.gate_name,
+                policy_version=gate_schema.policy_version,
+                input_state_version=session.state_version,
+                decision=gate_schema.decision.value,
+                details=gate_schema.details,
+            )
+        )
 
 
 async def rollback_messages_to(
@@ -226,6 +410,10 @@ async def rollback_messages_to(
         "at": datetime.now(UTC).isoformat(),
     }
     session.state_snapshot = snapshot
+
+    # ---- 7.5 重算 completeness gate：回退后读模型/前端反映真实完整性 ----
+    # 否则旧 gate（ready/stagnated）仍被投影，前端误判"已完整/已停滞"而禁用输入。
+    await _recompute_intake_gates(db, session=session, trace_id=trace_id)
 
     # ---- 8. system 提示消息 ----
     if reason:

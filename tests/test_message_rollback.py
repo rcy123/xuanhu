@@ -377,3 +377,49 @@ async def test_rollback_cleans_question_contracts_and_coverage(db: AsyncSession,
     ).all()
     assert contract.id not in {row.id for row in remaining_contracts}
     assert coverage.id not in {row.id for row in remaining_coverage}
+
+
+async def test_rollback_recomputes_intake_gate(db: AsyncSession, http_client: AsyncClient) -> None:
+    """回退后 completeness gate 按剩余事实重算（新版本 gate，非旧 stale 状态）。"""
+    from app.models.domain import GateResult
+
+    session, messages = await _create_inquiry_session(db)
+    sid = str(session.id)
+    # 预置一条旧 completeness gate（模拟回退前"已就绪"状态）
+    old_gate = GateResult(
+        id=uuid.uuid4(),
+        session_id=session.id,
+        graph_run_id=None,
+        gate_name="completeness",
+        policy_version="completeness-policy.v1",
+        input_state_version=session.state_version,
+        decision="passed",
+        details={"disposition": "ready", "covered_dimensions": [], "missing_required": [], "missing_optional": []},
+    )
+    db.add(old_gate)
+    await db.commit()
+
+    before_version = session.state_version
+    response = await http_client.post(
+        f"/api/v1/consult/sessions/{sid}/messages/{messages[5].id}/rollback",
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["state_version"] == before_version + 1
+
+    gates = (
+        await db.scalars(
+            select(GateResult)
+            .where(GateResult.session_id == session.id)
+            .order_by(GateResult.input_state_version.desc(), GateResult.created_at.desc())
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    latest_completeness = next(gate for gate in gates if gate.gate_name == "completeness")
+    # 新 gate 版本=回退后版本，读模型会投影它而非旧 stale gate
+    assert latest_completeness.input_state_version == data["state_version"]
+    assert latest_completeness.details["disposition"] in {"incomplete", "ready", "conflict", "stagnated"}
+    # 新 gate 关联到回退专用 graph_run（外键有效）
+    assert latest_completeness.graph_run_id is not None
+    assert any(gate.gate_name == "triage" and gate.input_state_version == data["state_version"] for gate in gates)
