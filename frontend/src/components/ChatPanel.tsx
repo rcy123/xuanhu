@@ -261,6 +261,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
       setRollbackError(null)
       try {
         await rollbackMessages(sessionId, messageId, {}, { stateVersion: detail?.state_version })
+        // 回退撤销了未决提交：清除 pendingSubmission 与命令对账，否则残留状态
+        // 会禁用输入栏（"上一条消息结果尚未确认"），用户无法继续回答。
+        commandReconciler.clear()
+        clear()
         await refreshDetail()
         await loadMessages(sessionId)
       } catch (err) {
@@ -276,7 +280,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
         setRollbackPending(false)
       }
     },
-    [sessionId, detail?.state_version, refreshDetail, loadMessages],
+    [sessionId, detail?.state_version, refreshDetail, loadMessages, clear, commandReconciler],
   )
 
   const canRollback = Boolean(
