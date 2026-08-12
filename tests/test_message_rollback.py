@@ -122,6 +122,12 @@ async def _create_inquiry_session(db: AsyncSession) -> ConsultSession:
             role=role,
             stage="inquiry",
             content=content,
+            agent_name="question_composer" if role == "agent" else None,
+            structured_delta=(
+                {"kind": "question", "selected_dimension": "ten_questions.stool_urine"}
+                if role == "agent"
+                else None
+            ),
             created_at=base.replace(minute=base.minute + index),
         )
         db.add(msg)
@@ -423,3 +429,94 @@ async def test_rollback_recomputes_intake_gate(db: AsyncSession, http_client: As
     # 新 gate 关联到回退专用 graph_run（外键有效）
     assert latest_completeness.graph_run_id is not None
     assert any(gate.gate_name == "triage" and gate.input_state_version == data["state_version"] for gate in gates)
+
+
+async def test_rollback_updates_intake_question_pointer(db: AsyncSession, http_client: AsyncClient) -> None:
+    """回退后 state_snapshot.langgraph_intake.last_question_message_id 指向保留的提问。"""
+    session, messages = await _create_inquiry_session(db)
+    sid = str(session.id)
+    # 预置 snapshot：last_question_message_id 指向将被删除的 agent 提问（messages[4]）
+    session.state_snapshot = {
+        "agent_runtime": "langgraph",
+        "langgraph_intake": {
+            "last_question_message_id": str(messages[4].id),
+            "last_patient_message_id": str(messages[3].id),
+            "dialogue_status": "questioning",
+        },
+    }
+    await db.commit()
+
+    # 回退到 messages[4]（agent 提问）→ 删除 msg4..msg5，保留 msg0..msg3
+    response = await http_client.post(
+        f"/api/v1/consult/sessions/{sid}/messages/{messages[4].id}/rollback",
+        json={},
+    )
+    assert response.status_code == 200, response.text
+
+    from app.db.session import get_session_factory as _gsf
+
+    async with _gsf()() as fresh_db:
+        fresh = await fresh_db.get(ConsultSession, session.id)
+        intake = fresh.state_snapshot["langgraph_intake"]
+    # 保留的最后一条 question_composer 提问 = messages[2]（agent）
+    assert intake["last_question_message_id"] == str(messages[2].id)
+    # 保留的最后一条 patient 消息 = messages[3]（doctor）
+    assert intake["last_patient_message_id"] == str(messages[3].id)
+
+
+async def test_rollback_clears_langgraph_checkpoints(db: AsyncSession, http_client: AsyncClient) -> None:
+    """回退后清理 LangGraph checkpoints，避免下一条消息 resume 已删数据失败。"""
+    from sqlalchemy import text as sa_text
+
+    session, messages = await _create_inquiry_session(db)
+    sid = str(session.id)
+    thread_id = f"v1:{sid}"
+    # 确保 langgraph 表存在（测试库未初始化 runtime，手动建表）
+    await db.execute(
+        sa_text(
+            "CREATE TABLE IF NOT EXISTS checkpoints ("
+            "thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL DEFAULT '', "
+            "checkpoint_id TEXT NOT NULL, parent_checkpoint_id TEXT, type TEXT, "
+            "checkpoint JSONB NOT NULL, metadata JSONB NOT NULL DEFAULT '{}', "
+            "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))"
+        )
+    )
+    await db.execute(
+        sa_text(
+            "CREATE TABLE IF NOT EXISTS checkpoint_writes ("
+            "thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL DEFAULT '', "
+            "checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, idx INTEGER NOT NULL, "
+            "channel TEXT NOT NULL, type TEXT, blob BYTEA NOT NULL, "
+            "task_path TEXT NOT NULL DEFAULT '', "
+            "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx))"
+        )
+    )
+    await db.commit()
+    # 预置 checkpoint 数据（模拟 pending interrupt 残留）
+    await db.execute(
+        sa_text(
+            "INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) "
+            "VALUES (:t, '', :c, NULL, 'tuple', '{}', '{}')"
+        ).bindparams(t=thread_id, c="00000000-0000-0000-0000-000000000001")
+    )
+    await db.execute(
+        sa_text(
+            "INSERT INTO checkpoint_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, blob) "
+            "VALUES (:t, '', :c, :tid, 0, 'channel', 'json', decode('7b7d','hex'))"
+        ).bindparams(t=thread_id, c="00000000-0000-0000-0000-000000000001", tid="task-1")
+    )
+    await db.commit()
+
+    response = await http_client.post(
+        f"/api/v1/consult/sessions/{sid}/messages/{messages[3].id}/rollback",
+        json={},
+    )
+    assert response.status_code == 200, response.text
+
+    from app.db.session import get_session_factory as _gsf
+
+    async with _gsf()() as fresh_db:
+        cp_count = await fresh_db.scalar(sa_text("SELECT count(*) FROM checkpoints WHERE thread_id=:t").bindparams(t=thread_id))
+        wr_count = await fresh_db.scalar(sa_text("SELECT count(*) FROM checkpoint_writes WHERE thread_id=:t").bindparams(t=thread_id))
+        assert cp_count == 0, f"checkpoints not cleared: {cp_count}"
+        assert wr_count == 0, f"checkpoint_writes not cleared: {wr_count}"

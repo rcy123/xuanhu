@@ -24,6 +24,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import select as sa_select
+from sqlalchemy import text as sa_text
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +53,31 @@ from app.schemas.domain import (
 )
 from app.schemas.message import MessageRollbackData
 from app.schemas.triage import TriageGateDetails, TriageGateResult, TriageDisposition
+
+#: LangGraph checkpoint 持久化表（无 ORM 模型，仅用轻量 Table 定义做回退清理）
+from sqlalchemy import Column, MetaData, String, Table, Text
+
+_CP_METADATA = MetaData()
+CheckpointModel = Table(
+    "checkpoints",
+    _CP_METADATA,
+    Column("thread_id", String),
+    Column("checkpoint_ns", String),
+    Column("checkpoint_id", String),
+    extend_existing=True,
+)
+CheckpointWriteModel = Table(
+    "checkpoint_writes",
+    _CP_METADATA,
+    Column("thread_id", String),
+    extend_existing=True,
+)
+CheckpointBlobModel = Table(
+    "checkpoint_blobs",
+    _CP_METADATA,
+    Column("thread_id", String),
+    extend_existing=True,
+)
 
 #: safety_fact_assertions.field_name -> (safety_profiles status 列, value 列)
 _SAFETY_PROFILE_FIELDS: dict[str, tuple[str, str]] = {
@@ -404,6 +432,35 @@ async def rollback_messages_to(
         }
     else:
         snapshot.pop("last_message", None)
+    # 7.1 同步 langgraph_intake 的当前问题指针：回退后 reply binding 依赖
+    # last_question_message_id 判定"回复绑定的问题"——若不更新，用户回答保留的
+    # 提问（如"大小便情况"）会被 _resolve_reply_binding 判为"非当前问题"而拒绝
+    # （REAL-SESSION 4292b0b4：提交全部 HANDLER_REJECTED，消息不落库）。
+    intake = dict(snapshot.get("langgraph_intake") or {})
+    latest_question = next(
+        (
+            row
+            for row in reversed(kept)
+            if row.role == "agent"
+            and row.agent_name == "question_composer"
+            and not (isinstance(row.structured_delta, dict) and row.structured_delta.get("kind") == "completion_notice")
+        ),
+        None,
+    )
+    if latest_question is not None:
+        intake["last_question_message_id"] = str(latest_question.id)
+    else:
+        intake.pop("last_question_message_id", None)
+    latest_patient = next(
+        (row for row in reversed(kept) if row.role in {"doctor", "patient_proxy"}),
+        None,
+    )
+    if latest_patient is not None:
+        intake["last_patient_message_id"] = str(latest_patient.id)
+    else:
+        intake.pop("last_patient_message_id", None)
+    if intake:
+        snapshot["langgraph_intake"] = intake
     snapshot["rollback"] = {
         "target_message_id": str(target_message_id),
         "rolled_back_count": len(cutoff),
@@ -414,6 +471,22 @@ async def rollback_messages_to(
     # ---- 7.5 重算 completeness gate：回退后读模型/前端反映真实完整性 ----
     # 否则旧 gate（ready/stagnated）仍被投影，前端误判"已完整/已停滞"而禁用输入。
     await _recompute_intake_gates(db, session=session, trace_id=trace_id)
+
+    # ---- 7.6 清理 LangGraph checkpoints：回退后旧 pending interrupt 失效 ----
+    # 否则下一条消息提交会 resume 引用已删除消息的 interrupt →
+    # RUNNER_EXECUTION_FAILED（REAL-SESSION 4292b0b4：回退后所有提交失败，
+    # 消息落库但 agent 不回复）。回退是状态重置，checkpoint 一并清除，
+    # 下一条消息走全新 ainvoke。
+    thread_id = f"v1:{session.id}"
+    # 表由 LangGraph saver.setup() 在 runtime 启动时创建；先检查存在性避免误伤。
+    for checkpoint_table in (CheckpointWriteModel, CheckpointBlobModel, CheckpointModel):
+        exists = await db.scalar(
+            sa_text("SELECT to_regclass(:name)").bindparams(
+                name=f"public.{checkpoint_table.name}"
+            )
+        )
+        if exists is not None:
+            await db.execute(sa_delete(checkpoint_table).where(checkpoint_table.c.thread_id == thread_id))
 
     # ---- 8. system 提示消息 ----
     if reason:
