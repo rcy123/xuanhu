@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,7 @@ from app.api.request_context import (
     get_trace_id,
     write_request_context,
 )
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     LangGraphRecoveryNotImplementedError,
     ModelGatewayUnavailableError,
@@ -47,18 +48,13 @@ def _get_trace_id(request: Request) -> str:
     return get_trace_id(request)
 
 
-def _doctor_id(x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id")) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
-
-
 @router.post("/sessions/{session_id}/recover")
 async def recover_session(
     request: Request,
     session_id: str,
     body: RecoveryRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """使用持久化控制引用恢复中断会话。
@@ -99,14 +95,14 @@ async def recover_session(
         concurrency_scope=scope,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
         },
         success_status=200,
         success_message="ok",
         handler=lambda: service.recover(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
             idempotency_key=context.idempotency_key,
             shared_runtime=shared_runtime,

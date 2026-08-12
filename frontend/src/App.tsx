@@ -12,8 +12,10 @@
 
 import { Button, Typography } from 'antd'
 import { MenuOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
-import { Link, Route, Routes, useNavigate, useParams } from 'react-router-dom'
-import { useEffect, useMemo, useState } from 'react'
+import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { useEffect, useMemo, useState, type ReactElement } from 'react'
+import { isAuthenticated, setAuthExpiredHandler } from '@/api/auth'
+import { LoginPage } from '@/pages/LoginPage'
 import { useSessions } from '@/hooks/useSessions'
 import { useSessionDetail } from '@/hooks/useSessionDetail'
 import { useMessages } from '@/hooks/useMessages'
@@ -157,12 +159,46 @@ function PlaceholderHome() {
   )
 }
 
+/** 认证守卫：未登录跳转登录页。 */
+function RequireAuth({ children }: { children: ReactElement }) {
+  const location = useLocation()
+  if (!isAuthenticated()) {
+    return <Navigate to="/login" replace state={{ from: location.pathname }} />
+  }
+  return children
+}
+
 export default function App() {
+  useEffect(() => {
+    // 认证失效（401）时跳转登录页。
+    setAuthExpiredHandler(() => {
+      if (window.location.pathname !== '/login') {
+        window.location.assign('/login')
+      }
+    })
+    return () => setAuthExpiredHandler(null)
+  }, [])
+
   return (
     <Routes>
+      <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<PlaceholderHome />} />
-      <Route path="/workbench" element={<Workbench />} />
-      <Route path="/sessions/:id" element={<Workbench />} />
+      <Route
+        path="/workbench"
+        element={(
+          <RequireAuth>
+            <Workbench />
+          </RequireAuth>
+        )}
+      />
+      <Route
+        path="/sessions/:id"
+        element={(
+          <RequireAuth>
+            <Workbench />
+          </RequireAuth>
+        )}
+      />
     </Routes>
   )
 }

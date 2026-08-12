@@ -20,10 +20,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.request_context import get_trace_id
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     IdempotencyConflictError,
     SessionBusyError,
     SessionNotFoundError,
+)
+from app.core.exceptions import (
     ValidationError as XuanhuValidationError,
 )
 from app.db.session import get_db
@@ -39,11 +42,6 @@ router = APIRouter(prefix="/api/v1/consult", tags=["messages"])
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
     return get_trace_id(request)
-
-
-def _doctor_id(x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id")) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
 
 
 def _state_version(
@@ -69,7 +67,7 @@ async def rollback_messages(
     message_id: str,
     body: MessageRollbackRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
 ) -> JSONResponse:
     """回退到指定消息：删除该消息及其之后的所有问诊记录并重建事实状态。"""
@@ -83,7 +81,7 @@ async def rollback_messages(
         raise SessionBusyError(
             detail=f"session_id={session_id} session is busy with another write",
             retryable=True,
-        )
+        ) from None
     try:
         if db.in_transaction():
             await db.rollback()

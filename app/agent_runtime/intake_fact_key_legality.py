@@ -106,6 +106,7 @@ RejectionReason = Literal[
     "fact_key_outside_jurisdiction",  # 键不在合法集内
     "correct_target_missing",  # CORRECT 越界键但 target 不在 active，无法降级 retract
     "value_conflicts_active_fact",  # 2.8 ADD 与活跃事实同键不同值（模型重复提取漂移）
+    "value_incompatible_unknown",  # 2.8 ADD 与活跃事实同键不同值且语义无法判定 → 保守丢弃
 ]
 
 

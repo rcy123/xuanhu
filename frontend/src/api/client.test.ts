@@ -327,31 +327,36 @@ describe('request - HTTP 与传输错误', () => {
 // ---------------------------------------------------------------------------
 
 describe('request - 请求头注入', () => {
-  it('注入 X-Doctor-Id / X-Idempotency-Key / X-State-Version', async () => {
+  it('注入 Authorization Bearer / X-Idempotency-Key / X-State-Version', async () => {
     const fn = mockFetch(() => mockResponse({ body: { code: 'SUCCESS', data: {}, trace_id: 't' } }))
+    window.sessionStorage.setItem('xuanhu.access_token', 'jwt-token-abc')
 
-    await request('consult/sessions', {
-      method: 'POST',
-      ctx: {
-        doctorId: 'doctor_001',
-        idempotencyKey: 'idem-1',
-        stateVersion: 7,
-      },
-    })
+    try {
+      await request('consult/sessions', {
+        method: 'POST',
+        ctx: {
+          idempotencyKey: 'idem-1',
+          stateVersion: 7,
+        },
+      })
 
-    const init = fn.mock.calls[0][1]
-    const headers = init.headers as Record<string, string>
-    expect(headers['X-Doctor-Id']).toBe('doctor_001')
-    expect(headers['X-Idempotency-Key']).toBe('idem-1')
-    expect(headers['X-State-Version']).toBe('7')
-    expect(headers['Content-Type']).toBe('application/json')
+      const init = fn.mock.calls[0][1]
+      const headers = init.headers as Record<string, string>
+      expect(headers['Authorization']).toBe('Bearer jwt-token-abc')
+      expect(headers['X-Doctor-Id']).toBeUndefined()
+      expect(headers['X-Idempotency-Key']).toBe('idem-1')
+      expect(headers['X-State-Version']).toBe('7')
+      expect(headers['Content-Type']).toBe('application/json')
+    } finally {
+      window.sessionStorage.removeItem('xuanhu.access_token')
+    }
   })
 
   it('不传 ctx 时不注入可选头', async () => {
     const fn = mockFetch(() => mockResponse({ body: { code: 'SUCCESS', data: {}, trace_id: 't' } }))
     await request('consult/sessions', { method: 'GET' })
     const headers = fn.mock.calls[0][1].headers as Record<string, string>
-    expect(headers['X-Doctor-Id']).toBeUndefined()
+    expect(headers['Authorization']).toBeUndefined()
     expect(headers['X-State-Version']).toBeUndefined()
   })
 })
@@ -686,7 +691,7 @@ describe('业务方法签名', () => {
         },
       }),
     )
-    await createSession({ chief_complaint: '头痛' }, { doctorId: 'd1', idempotencyKey: 'k1' })
+    await createSession({ chief_complaint: '头痛' }, { idempotencyKey: 'k1' })
     const init = fn.mock.calls[0][1]
     expect(init.method).toBe('POST')
     expect(JSON.parse(init.body as string)).toEqual({ chief_complaint: '头痛' })

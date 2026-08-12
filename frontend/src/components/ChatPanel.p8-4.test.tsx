@@ -153,7 +153,7 @@ describe('ChatPanel P8-4 集成', () => {
     expect(await screen.findByTestId('safety-confirmation-panel')).toBeInTheDocument()
     expect(screen.getByTestId('safety-confirmation-blocked-input')).toBeInTheDocument()
     expect(screen.getByTestId('message-input')).toBeDisabled()
-    expect(screen.getByTestId('safety-reviewer-id')).toHaveValue('')
+    expect(screen.queryByTestId('safety-reviewer-id')).not.toBeInTheDocument()
   })
 
   it('review 阶段且 pending_review=true 时显示 ReviewActionsBar', () => {

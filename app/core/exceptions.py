@@ -150,6 +150,28 @@ class IdempotencyConflictError(XuanhuError):
     retryable = False
 
 
+class RateLimitedError(XuanhuError):
+    """请求过于频繁（限流触发）。
+
+    阶段 4 运行态加固与登录接口限流共用；响应携带 Retry-After 头。
+    """
+
+    code = "RATE_LIMITED"
+    message = "请求过于频繁，请稍后重试"
+    status_code = 429
+    retryable = True
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        detail: str | None = None,
+        retry_after: int = 60,
+    ) -> None:
+        super().__init__(message, detail=detail, retryable=True)
+        self.retry_after = retry_after
+
+
 class HttpCommandRecoveryRequiredError(XuanhuError):
     """A prior owner vanished after the command may have changed durable state."""
 

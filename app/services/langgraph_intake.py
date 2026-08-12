@@ -44,6 +44,7 @@ from app.agent_runtime.graph import build_main_graph
 from app.agent_runtime.intake_fact_key_legality import (
     NormalizedObservation,
     RejectedObservation,
+    RejectionReason,
     filter_legal_observations,
     normalized_observations_to_payload,
     rejected_observations_to_payload,
@@ -4721,7 +4722,7 @@ def _drop_value_conflicting_adds(
     for active_item in _current_observations(state.observations):
         active_items_by_key.setdefault(active_item.fact_key, []).append(active_item)
 
-    def _reject(delta: ObservationDelta, reason: str) -> None:
+    def _reject(delta: ObservationDelta, reason: RejectionReason) -> None:
         if rejected_observations is None:
             return
         rejected_observations.append(

@@ -19,6 +19,7 @@
  */
 
 import type { EventType, SessionEvent } from '@/types/api'
+import { getAuthToken } from './auth'
 
 export interface SseHandlers {
   /** 收到事件。 */
@@ -57,8 +58,16 @@ export function connectSessionStream(
 
   // EventSource 不支持自定义 header，但浏览器会自动携带 Last-Event-ID。
   // 服务端 stream.py 同时支持 last_event_id 查询参数，这里也带上以便首次连接。
-  const sep = url.includes('?') ? '&' : '?'
-  const fullUrl = lastEventId ? `${url}${sep}last_event_id=${encodeURIComponent(lastEventId)}` : url
+  // 阶段 1 加固：SSE 鉴权 token 走 query string（仅此一处例外，见后端 auth.py）。
+  const params: string[] = []
+  if (lastEventId) {
+    params.push(`last_event_id=${encodeURIComponent(lastEventId)}`)
+  }
+  const token = getAuthToken()
+  if (token) {
+    params.push(`token=${encodeURIComponent(token)}`)
+  }
+  const fullUrl = params.length > 0 ? `${url}?${params.join('&')}` : url
 
   const source = new EventSource(fullUrl, { withCredentials: false })
 

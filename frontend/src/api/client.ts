@@ -13,6 +13,7 @@
  */
 
 import { ApiRequestError, TransportErrorCode } from './errors'
+import { getAuthToken, handleAuthExpired } from './auth'
 import type { ApiError, ApiSuccess } from '@/types/api'
 
 // ---------------------------------------------------------------------------
@@ -37,8 +38,6 @@ export function getBaseUrl(): string {
 
 /** 每次请求的上下文。 */
 export interface RequestContext {
-  /** 医师标识（可选，MVP 阶段） */
-  doctorId?: string
   /** 幂等键（创建会话、review 等写操作建议提供） */
   idempotencyKey?: string
   /** 客户端 state_version（写操作携带） */
@@ -95,8 +94,10 @@ export async function request<T>(
     ...(options.headers as Record<string, string> | undefined),
   }
 
-  if (ctx?.doctorId) {
-    headers['X-Doctor-Id'] = ctx.doctorId
+  // 阶段 1 加固：token 由可信 JWT 提供，X-Doctor-Id 不再作为授权依据。
+  const token = getAuthToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
   }
   if (ctx?.idempotencyKey) {
     headers['X-Idempotency-Key'] = ctx.idempotencyKey
@@ -157,6 +158,14 @@ export async function request<T>(
 
     if (env.code === 'SUCCESS') {
       return (env as ApiSuccess<T>).data as T
+    }
+
+    // 认证失效：清除本地 token 并跳转登录页（阶段 1 加固）。
+    if (
+      response.status === 401
+      && (env.code === 'UNAUTHENTICATED' || env.code === 'INVALID_TOKEN' || env.code === 'TOKEN_EXPIRED')
+    ) {
+      handleAuthExpired()
     }
 
     // 错误 envelope

@@ -15,6 +15,7 @@
 from app.models.agent import AgentEvidence, AgentRun
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
+from app.models.doctor import Doctor
 from app.models.knowledge import (
     Acupoint,
     DosageUnit,
@@ -31,6 +32,7 @@ from app.models.safety import SafetyRuleRun
 __all__ = [
     "ConsultSession",
     "ConsultMessage",
+    "Doctor",
     "AgentRun",
     "AgentEvidence",
     "SafetyRuleRun",

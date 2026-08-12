@@ -1,0 +1,34 @@
+#!/bin/sh
+# 悬壶 pre-commit：密钥泄露门禁（阶段 1 T1.8 / 文档 01 §3.1）
+#
+# 阻止把任何疑似密钥（sk- 开头的 API Key / 占位符密钥）提交进仓库。
+# 优先用 gitleaks 扫描；不可用时回退到轻量 grep（排除已归档的已知 fixture）。
+# 启用方式：git config core.hooksPath .githooks
+
+set -u
+
+RED='\033[0;31m'
+NC='\033[0m'
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --pre-commit --redact --staged || {
+    printf "${RED}✗ 检测到疑似密钥，提交已阻止。请将真实密钥移到 .env（不入库）。${NC}\n"
+    exit 1
+  }
+  exit 0
+fi
+
+# 回退：grep 扫描暂存文件中的 sk- 前缀密钥。
+# 已知 fixture（tests/test_sync_knowledge_chunks.py 的 synthetic credential）
+# 已在 .gitleaksignore 归档，此处同样豁免。
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -n "$staged" ]; then
+  if printf '%s\n' "$staged" | grep -v 'tests/test_sync_knowledge_chunks.py' | \
+    xargs grep -nE 'sk-[A-Za-z0-9]{16,}' 2>/dev/null | grep -q .; then
+    printf "${RED}✗ 检测到疑似 API 密钥（sk- 开头），提交已阻止。请改用 .env 存放密钥。${NC}\n"
+    exit 1
+  fi
+fi
+
+exit 0

@@ -70,5 +70,7 @@ docs/*
 !docs/dev-handoff/
 docs/dev-handoff/*
 !docs/dev-handoff/agent-refactor-*.md
+!docs/04_生产环境加固/
+!docs/04_生产环境加固/**
 
 /tmp

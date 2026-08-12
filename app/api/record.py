@@ -21,6 +21,7 @@ from app.api.request_context import (
     get_trace_id,
     write_request_context,
 )
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     InvalidStageTransitionError,
     InvalidStateVersionError,
@@ -47,13 +48,6 @@ router = APIRouter(prefix="/api/v1/consult", tags=["record"])
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
     return get_trace_id(request)
-
-
-def _doctor_id(
-    x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id"),
-) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
 
 
 def _state_version(
@@ -86,6 +80,7 @@ async def get_record(
         description="版本号（正整数）或 'latest'，默认 latest",
     ),
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """获取病历（latest 或指定 version）。
 
@@ -119,7 +114,7 @@ async def update_record(
     session_id: str,
     body: RecordUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
@@ -139,7 +134,7 @@ async def update_record(
         concurrency_scope=scope,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
         success_status=200,
@@ -147,7 +142,7 @@ async def update_record(
         handler=lambda: service.update_record(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
             x_state_version=state_version,
         ),
@@ -180,6 +175,7 @@ async def export_record(
         description="版本号（正整数）或 'latest'，默认 latest",
     ),
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> Response:
     """导出病历为指定格式。
 
@@ -200,10 +196,7 @@ async def export_record(
     ascii_fallback = f"medical_record.{format}"
     encoded_filename = quote(filename)
 
-    content_disposition = (
-        f'attachment; filename="{ascii_fallback}"; '
-        f"filename*=UTF-8''{encoded_filename}"
-    )
+    content_disposition = f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded_filename}"
 
     return Response(
         content=content,
@@ -220,9 +213,7 @@ async def export_record(
 # ---------------------------------------------------------------------------
 
 
-async def record_not_found_handler(
-    request: Request, exc: RecordNotFoundError
-) -> JSONResponse:
+async def record_not_found_handler(request: Request, exc: RecordNotFoundError) -> JSONResponse:
     """RECORD_NOT_FOUND 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -238,9 +229,7 @@ async def record_not_found_handler(
     )
 
 
-async def export_format_unsupported_handler(
-    request: Request, exc: ExportFormatUnsupportedError
-) -> JSONResponse:
+async def export_format_unsupported_handler(request: Request, exc: ExportFormatUnsupportedError) -> JSONResponse:
     """EXPORT_FORMAT_UNSUPPORTED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -256,9 +245,7 @@ async def export_format_unsupported_handler(
     )
 
 
-async def record_session_not_found_handler(
-    request: Request, exc: SessionNotFoundError
-) -> JSONResponse:
+async def record_session_not_found_handler(request: Request, exc: SessionNotFoundError) -> JSONResponse:
     """SESSION_NOT_FOUND 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -274,9 +261,7 @@ async def record_session_not_found_handler(
     )
 
 
-async def record_invalid_stage_handler(
-    request: Request, exc: InvalidStageTransitionError
-) -> JSONResponse:
+async def record_invalid_stage_handler(request: Request, exc: InvalidStageTransitionError) -> JSONResponse:
     """INVALID_STAGE_TRANSITION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -292,9 +277,7 @@ async def record_invalid_stage_handler(
     )
 
 
-async def record_invalid_state_version_handler(
-    request: Request, exc: InvalidStateVersionError
-) -> JSONResponse:
+async def record_invalid_state_version_handler(request: Request, exc: InvalidStateVersionError) -> JSONResponse:
     """INVALID_STATE_VERSION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -310,9 +293,7 @@ async def record_invalid_state_version_handler(
     )
 
 
-async def record_session_busy_handler(
-    request: Request, exc: SessionBusyError
-) -> JSONResponse:
+async def record_session_busy_handler(request: Request, exc: SessionBusyError) -> JSONResponse:
     """SESSION_BUSY 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -328,9 +309,7 @@ async def record_session_busy_handler(
     )
 
 
-async def record_session_terminated_handler(
-    request: Request, exc: SessionTerminatedError
-) -> JSONResponse:
+async def record_session_terminated_handler(request: Request, exc: SessionTerminatedError) -> JSONResponse:
     """SESSION_TERMINATED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -346,9 +325,7 @@ async def record_session_terminated_handler(
     )
 
 
-async def record_validation_error_handler(
-    request: Request, exc: XuanhuValidationError
-) -> JSONResponse:
+async def record_validation_error_handler(request: Request, exc: XuanhuValidationError) -> JSONResponse:
     """VALIDATION_ERROR 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(

@@ -34,7 +34,9 @@ _SID = uuid.uuid4()
 _MSG = uuid.uuid4()
 
 
-def _observation(fact_key: str, value: str, *, status: str = "active", supersedes: uuid.UUID | None = None) -> ObservationSchema:
+def _observation(
+    fact_key: str, value: str, *, status: str = "active", supersedes: uuid.UUID | None = None
+) -> ObservationSchema:
     return ObservationSchema(
         observation_id=uuid.uuid4(),
         session_id=_SID,
@@ -70,12 +72,23 @@ def _state(*observations: ObservationSchema) -> DomainState:
 
 def test_relation_cold_heat_same_direction_compatible() -> None:
     # 同向细化：怕冷 → 手脚也凉 → 总体怕冷，全部兼容
-    assert _semantic_value_relation("ten_questions.cold_heat", "平时手脚也容易发凉，整体体质偏怕冷", "胃部非常怕冷，不敢吃凉的") == "compatible"
-    assert _semantic_value_relation("ten_questions.cold_heat", "总体倾向是怕冷", "胃部非常怕冷，不敢吃凉的") == "compatible"
+    assert (
+        _semantic_value_relation(
+            "ten_questions.cold_heat", "平时手脚也容易发凉，整体体质偏怕冷", "胃部非常怕冷，不敢吃凉的"
+        )
+        == "compatible"
+    )
+    assert (
+        _semantic_value_relation("ten_questions.cold_heat", "总体倾向是怕冷", "胃部非常怕冷，不敢吃凉的")
+        == "compatible"
+    )
 
 
 def test_relation_cold_heat_opposite_direction_conflict() -> None:
-    assert _semantic_value_relation("ten_questions.cold_heat", "平时怕热，喜欢吹风扇", "胃部非常怕冷，不敢吃凉的") == "conflict"
+    assert (
+        _semantic_value_relation("ten_questions.cold_heat", "平时怕热，喜欢吹风扇", "胃部非常怕冷，不敢吃凉的")
+        == "conflict"
+    )
 
 
 def test_relation_unknown_dimension_falls_back() -> None:
@@ -107,7 +120,9 @@ def test_merge_dedupes_contained_text() -> None:
     # 新文本包含旧文本 → 取更完整者
     assert _merge_observation_texts("怕冷", "总体倾向是怕冷") == "总体倾向是怕冷"
     # 旧文本包含新文本 → 保留旧值
-    assert _merge_observation_texts("平时手脚也容易发凉，整体体质偏怕冷", "怕冷") == "平时手脚也容易发凉，整体体质偏怕冷"
+    assert (
+        _merge_observation_texts("平时手脚也容易发凉，整体体质偏怕冷", "怕冷") == "平时手脚也容易发凉，整体体质偏怕冷"
+    )
 
 
 def test_merge_non_string_returns_none() -> None:
@@ -140,7 +155,7 @@ def test_drop_conflicting_add_still_rejected() -> None:
     kept = _drop_value_conflicting_adds((delta,), state=state, rejected_observations=rejected)  # type: ignore[arg-type]
     assert kept == ()
     assert len(rejected) == 1
-    assert getattr(rejected[0], "reason") == "value_conflicts_active_fact"
+    assert rejected[0].reason == "value_conflicts_active_fact"
 
 
 def test_drop_unknown_dimension_conservatively_rejected() -> None:
@@ -151,7 +166,7 @@ def test_drop_unknown_dimension_conservatively_rejected() -> None:
     kept = _drop_value_conflicting_adds((delta,), state=state, rejected_observations=rejected)  # type: ignore[arg-type]
     assert kept == ()
     assert len(rejected) == 1
-    assert getattr(rejected[0], "reason") == "value_incompatible_unknown"
+    assert rejected[0].reason == "value_incompatible_unknown"
 
 
 def test_drop_same_literal_is_noop_kept() -> None:
@@ -169,7 +184,6 @@ def test_drop_same_literal_is_noop_kept() -> None:
 
 
 def test_stagnation_cleared_when_no_missing_required() -> None:
-    from app.schemas.completeness import InquiryDimension
 
     progress = CompletenessProgress(
         no_new_facts_rounds=COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold,

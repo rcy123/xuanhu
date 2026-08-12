@@ -12,13 +12,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from app.agent_runtime.async_command import (
     AsyncCommandStatus as RepoCommandStatus,
 )
 from app.agent_runtime.async_command import PostgresAsyncCommandRepository
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import SessionNotFoundError, XuanhuError
 from app.db.session import get_session_factory
 from app.schemas.async_command import (
@@ -43,11 +44,7 @@ class CommandNotFoundError(XuanhuError):
 
 
 def _request_trace_id(request: Request) -> str:
-    return (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-trace-id")
-        or str(uuid.uuid4())
-    )
+    return request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
 
 
 @router.get("/sessions/{session_id}/commands/{command_id}")
@@ -55,6 +52,7 @@ async def get_command_status(
     request: Request,
     session_id: str,
     command_id: str,
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """Read one session-scoped command's public status."""
     trace_id = _request_trace_id(request)

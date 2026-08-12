@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Input, Spin, Tag, Typography } from 'antd'
+import { Alert, Button, Spin, Tag, Typography } from 'antd'
 import {
   CheckOutlined,
   CloseOutlined,
@@ -75,7 +75,6 @@ interface PendingSafetyDecision {
   readonly sessionId: string
   readonly assertionId: string
   readonly action: 'confirm' | 'reject'
-  readonly reviewerId: string
   readonly idempotencyKey: string
 }
 
@@ -102,9 +101,8 @@ export interface SafetyConfirmationPanelProps {
 /**
  * Doctor-only boundary for model-extracted safety facts.
  *
- * The reviewer identifier is deliberately entered for every selected session;
- * it is never inferred or hard-coded because the backend writes it to audit
- * history as X-Doctor-Id.
+ * 阶段 1 加固：医师身份由 JWT 提供（Authorization: Bearer），后端从可信
+ * token 取 actor_id 写审计；前端不再录入/上报 X-Doctor-Id。
  */
 export function SafetyConfirmationPanel({
   sessionId,
@@ -116,7 +114,6 @@ export function SafetyConfirmationPanel({
   onChanged,
 }: SafetyConfirmationPanelProps) {
   const [items, setItems] = useState<SafetyFactAssertion[]>([])
-  const [reviewerId, setReviewerId] = useState('')
   const [loading, setLoading] = useState(false)
   const [actingId, setActingId] = useState<string | null>(null)
   const [error, setError] = useState<unknown>(null)
@@ -134,7 +131,6 @@ export function SafetyConfirmationPanel({
   }, [])
 
   useEffect(() => {
-    setReviewerId('')
     setItems([])
     setError(null)
     setSuccess(null)
@@ -176,8 +172,7 @@ export function SafetyConfirmationPanel({
   }, [enabled, onPendingChange, refreshKey, sessionId])
 
   const decide = async (assertion: SafetyFactAssertion, action: 'confirm' | 'reject') => {
-    const actor = reviewerId.trim()
-    if (!actor || actingId) return
+    if (actingId) return
     const targetSessionId = sessionId
     const isCurrentSession = () => (
       mounted.current && currentSessionId.current === targetSessionId
@@ -189,14 +184,12 @@ export function SafetyConfirmationPanel({
         existingDecision.sessionId !== targetSessionId
         || existingDecision.assertionId !== assertion.assertion_id
         || existingDecision.action !== action
-        || existingDecision.reviewerId !== actor
       )
     ) return
     const decision: PendingSafetyDecision = existingDecision ?? Object.freeze({
       sessionId: targetSessionId,
       assertionId: assertion.assertion_id,
       action,
-      reviewerId: actor,
       idempotencyKey: generateIdempotencyKey(),
     })
     if (!existingDecision) setPendingDecision(decision)
@@ -210,14 +203,14 @@ export function SafetyConfirmationPanel({
           targetSessionId,
           assertion.assertion_id,
           {},
-          { doctorId: actor, idempotencyKey: decision.idempotencyKey },
+          { idempotencyKey: decision.idempotencyKey },
         )
       } else {
         await rejectSafetyAssertion(
           targetSessionId,
           assertion.assertion_id,
           { reason_code: 'EXTRACTION_REJECTED' },
-          { doctorId: actor, idempotencyKey: decision.idempotencyKey },
+          { idempotencyKey: decision.idempotencyKey },
         )
       }
     } catch (caught: unknown) {
@@ -316,8 +309,6 @@ export function SafetyConfirmationPanel({
   }
   if (items.length === 0) return null
 
-  const hasReviewer = reviewerId.trim().length > 0
-
   return (
     <section
       className="xh-safety-confirmation"
@@ -346,21 +337,6 @@ export function SafetyConfirmationPanel({
         />
       ) : null}
 
-      <div className="xh-safety-reviewer-field">
-        <label htmlFor={`safety-reviewer-${sessionId}`}>复核医生标识（审计必填）</label>
-        <Input
-          id={`safety-reviewer-${sessionId}`}
-          value={reviewerId}
-          maxLength={128}
-          autoComplete="off"
-          placeholder="请输入工号或系统中的医生 ID"
-          onChange={(event) => setReviewerId(event.target.value)}
-          disabled={actingId != null || pendingDecision != null}
-          data-testid="safety-reviewer-id"
-        />
-        <Text type="secondary">该标识将随确认结果写入审计记录，不会由前端代填。</Text>
-      </div>
-
       <div className="xh-safety-assertion-list">
         {items.map((assertion) => {
           const busy = actingId === assertion.assertion_id
@@ -384,8 +360,7 @@ export function SafetyConfirmationPanel({
                   icon={<CheckOutlined />}
                   loading={busy}
                   disabled={
-                    !hasReviewer
-                    || (actingId != null && !busy)
+                    (actingId != null && !busy)
                     || !pendingThisAction('confirm')
                   }
                   onClick={() => void decide(assertion, 'confirm')}
@@ -398,8 +373,7 @@ export function SafetyConfirmationPanel({
                   size="small"
                   icon={<CloseOutlined />}
                   disabled={
-                    !hasReviewer
-                    || actingId != null
+                    actingId != null
                     || !pendingThisAction('reject')
                   }
                   onClick={() => void decide(assertion, 'reject')}

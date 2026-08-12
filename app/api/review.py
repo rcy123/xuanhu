@@ -29,6 +29,7 @@ from app.api.request_context import (
     get_trace_id,
     write_request_context,
 )
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     FormulaOverrideRequiredError,
     IdempotencyConflictError,
@@ -61,13 +62,6 @@ def _get_trace_id(request: Request) -> str:
     return get_trace_id(request)
 
 
-def _doctor_id(
-    x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id"),
-) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
-
-
 def _state_version(
     x_state_version: str | None = Header(default=None, alias="X-State-Version"),
 ) -> int | None:
@@ -93,7 +87,7 @@ async def review_prescription(
     session_id: str,
     body: ReviewRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
@@ -127,7 +121,7 @@ async def review_prescription(
         idempotency_key=context.idempotency_key,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
     )
@@ -136,15 +130,11 @@ async def review_prescription(
     is_langgraph = preflight.agent_runtime == "langgraph"
     runtime_state = getattr(request.app.state, "langgraph_runtime_state", None)
     shared_runtime: SharedLangGraphRuntime | None = (
-        runtime_state.runtime
-        if runtime_state is not None and runtime_state.status == "ready"
-        else None
+        runtime_state.runtime if runtime_state is not None and runtime_state.status == "ready" else None
     )
     test_runtime_fallback = allow_request_local_runtime_fallback(
         runtime_state,
-        test_fallback_enabled=bool(
-            getattr(request.app.state, "allow_request_local_langgraph_test_runtime", False)
-        ),
+        test_fallback_enabled=bool(getattr(request.app.state, "allow_request_local_langgraph_test_runtime", False)),
     )
     legacy_service = ReviewService(db)
     langgraph_service = LangGraphReviewService(db)
@@ -159,7 +149,7 @@ async def review_prescription(
             return await langgraph_service.review(
                 session_id,
                 body,
-                doctor_id=doctor_id,
+                doctor_id=doctor.doctor_id,
                 trace_id=trace_id,
                 x_state_version=state_version,
                 idempotency_key=context.idempotency_key,
@@ -169,7 +159,7 @@ async def review_prescription(
         return await legacy_service.review(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
             x_state_version=state_version,
         )
@@ -180,7 +170,7 @@ async def review_prescription(
         return await langgraph_service.resolve_durable_outcome(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             idempotency_key=context.idempotency_key,
             shared_runtime=shared_runtime,
             allow_request_local_runtime=test_runtime_fallback,
@@ -195,7 +185,7 @@ async def review_prescription(
         concurrency_scope=scope,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
         success_status=200,
@@ -218,9 +208,7 @@ async def review_prescription(
 # ---------------------------------------------------------------------------
 
 
-async def review_invalid_action_handler(
-    request: Request, exc: InvalidReviewActionError
-) -> JSONResponse:
+async def review_invalid_action_handler(request: Request, exc: InvalidReviewActionError) -> JSONResponse:
     """INVALID_REVIEW_ACTION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -236,9 +224,7 @@ async def review_invalid_action_handler(
     )
 
 
-async def review_formula_override_required_handler(
-    request: Request, exc: FormulaOverrideRequiredError
-) -> JSONResponse:
+async def review_formula_override_required_handler(request: Request, exc: FormulaOverrideRequiredError) -> JSONResponse:
     """FORMULA_OVERRIDE_REQUIRED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -254,9 +240,7 @@ async def review_formula_override_required_handler(
     )
 
 
-async def review_safety_blocked_handler(
-    request: Request, exc: SafetyReviewBlockedError
-) -> JSONResponse:
+async def review_safety_blocked_handler(request: Request, exc: SafetyReviewBlockedError) -> JSONResponse:
     """SAFETY_REVIEW_BLOCKED 异常处理。
 
     附加 issues 字段，供前端展示安全审核未通过的问题列表。
@@ -276,9 +260,7 @@ async def review_safety_blocked_handler(
     )
 
 
-async def review_safety_accept_risk_handler(
-    request: Request, exc: SafetyAcceptRiskUnsupportedError
-) -> JSONResponse:
+async def review_safety_accept_risk_handler(request: Request, exc: SafetyAcceptRiskUnsupportedError) -> JSONResponse:
     """SAFETY_ACCEPT_RISK_UNSUPPORTED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -294,9 +276,7 @@ async def review_safety_accept_risk_handler(
     )
 
 
-async def review_session_not_found_handler(
-    request: Request, exc: SessionNotFoundError
-) -> JSONResponse:
+async def review_session_not_found_handler(request: Request, exc: SessionNotFoundError) -> JSONResponse:
     """SESSION_NOT_FOUND 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -312,9 +292,7 @@ async def review_session_not_found_handler(
     )
 
 
-async def review_idempotency_conflict_handler(
-    request: Request, exc: IdempotencyConflictError
-) -> JSONResponse:
+async def review_idempotency_conflict_handler(request: Request, exc: IdempotencyConflictError) -> JSONResponse:
     """Return a stable conflict when one public key is reused for another payload."""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -330,9 +308,7 @@ async def review_idempotency_conflict_handler(
     )
 
 
-async def review_invalid_stage_handler(
-    request: Request, exc: InvalidStageTransitionError
-) -> JSONResponse:
+async def review_invalid_stage_handler(request: Request, exc: InvalidStageTransitionError) -> JSONResponse:
     """INVALID_STAGE_TRANSITION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -348,9 +324,7 @@ async def review_invalid_stage_handler(
     )
 
 
-async def review_invalid_state_version_handler(
-    request: Request, exc: InvalidStateVersionError
-) -> JSONResponse:
+async def review_invalid_state_version_handler(request: Request, exc: InvalidStateVersionError) -> JSONResponse:
     """INVALID_STATE_VERSION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -366,9 +340,7 @@ async def review_invalid_state_version_handler(
     )
 
 
-async def review_session_terminated_handler(
-    request: Request, exc: SessionTerminatedError
-) -> JSONResponse:
+async def review_session_terminated_handler(request: Request, exc: SessionTerminatedError) -> JSONResponse:
     """SESSION_TERMINATED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -384,9 +356,7 @@ async def review_session_terminated_handler(
     )
 
 
-async def review_session_busy_handler(
-    request: Request, exc: SessionBusyError
-) -> JSONResponse:
+async def review_session_busy_handler(request: Request, exc: SessionBusyError) -> JSONResponse:
     """SESSION_BUSY 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -402,9 +372,7 @@ async def review_session_busy_handler(
     )
 
 
-async def review_validation_error_handler(
-    request: Request, exc: XuanhuValidationError
-) -> JSONResponse:
+async def review_validation_error_handler(request: Request, exc: XuanhuValidationError) -> JSONResponse:
     """VALIDATION_ERROR 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(

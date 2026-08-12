@@ -43,6 +43,7 @@ from app.agent_runtime.lifecycle import (
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.state import default_state
 from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.config import get_settings
 from app.core.exceptions import (
     AgentTriggerFailedError,
@@ -83,13 +84,6 @@ _SYNDROME_ARTIFACT_TYPE = "syndrome_draft"
 def _get_trace_id(request: Request) -> str:
     """获取或生成 trace_id。"""
     return get_trace_id(request)
-
-
-def _doctor_id(
-    x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id"),
-) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
 
 
 def _state_version(
@@ -136,10 +130,7 @@ def _require_normal_recovery(session: ConsultSession) -> None:
     recovery_status = getattr(session, "recovery_status", "normal")
     if recovery_status != "normal":
         raise StateRecoveryRequiredError(
-            detail=(
-                f"session_id={session.id} recovery_status={recovery_status} "
-                "must be recovered before advance"
-            ),
+            detail=(f"session_id={session.id} recovery_status={recovery_status} must be recovered before advance"),
             retryable=False,
         )
 
@@ -188,17 +179,13 @@ async def _resolve_committed_advance_stage(
         if claim.payload_digest != payload_digest:
             raise IdempotencyConflictError(
                 message="相同幂等键不能用于不同的 advance 命令",
-                detail=(
-                    f"session_id={session_id} command_id={command_key} "
-                    "payload_digest_mismatch"
-                ),
+                detail=(f"session_id={session_id} command_id={command_key} payload_digest_mismatch"),
                 retryable=False,
             )
         if claim.status == "completed" and isinstance(claim.response_payload, dict):
             return dict(claim.response_payload)
         if claim.status == "failed" or (
-            claim.status == "running"
-            and (allow_running or await _claim_graph_is_terminal(db, claim.run_id))
+            claim.status == "running" and (allow_running or await _claim_graph_is_terminal(db, claim.run_id))
         ):
             pass
         else:
@@ -262,9 +249,7 @@ async def _resolve_committed_advance_stage(
                 {
                     "gate_name": "syndrome_verifier",
                     "decision": "passed",
-                    "policy_version": (
-                        gate.policy_version if gate is not None else "syndrome-verifier.v1"
-                    ),
+                    "policy_version": (gate.policy_version if gate is not None else "syndrome-verifier.v1"),
                 }
             ],
         }
@@ -311,10 +296,7 @@ async def _read_durable_advance_response(
         if claim.payload_digest != payload_digest:
             raise IdempotencyConflictError(
                 message="相同幂等键不能复用不同 advance 命令",
-                detail=(
-                    f"session_id={session_id} command_id={command_key} "
-                    "payload_digest_mismatch"
-                ),
+                detail=(f"session_id={session_id} command_id={command_key} payload_digest_mismatch"),
                 retryable=False,
             )
         if claim.status == "completed" and isinstance(claim.response_payload, dict):
@@ -343,10 +325,7 @@ async def _read_durable_advance_response(
         if exc.code is RepositoryErrorCode.IDEMPOTENCY_KEY_REUSED:
             raise IdempotencyConflictError(
                 message="相同幂等键不能复用不同 advance 命令",
-                detail=(
-                    f"session_id={session_id} command_id={command_key} "
-                    "payload_digest_mismatch"
-                ),
+                detail=(f"session_id={session_id} command_id={command_key} payload_digest_mismatch"),
                 retryable=False,
             ) from exc
         raise
@@ -435,7 +414,9 @@ async def _invoke_shared_reasoning_graph(
         run_id=str(run_id),
     )
     config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
-    await runtime.runner(timeout_seconds=get_settings().graph_runner_timeout_seconds).ainvoke(dict(graph_state), config=config)
+    await runtime.runner(timeout_seconds=get_settings().graph_runner_timeout_seconds).ainvoke(
+        dict(graph_state), config=config
+    )
 
 
 async def _completed_advance_response(
@@ -1005,11 +986,7 @@ async def run_langgraph_advance_flow(
 
     last_response: dict[str, Any] | None = None
     for attempt in range(MAX_SAFETY_REOPEN_ATTEMPTS + 1):
-        internal_key = (
-            idempotency_key
-            if attempt == 0
-            else f"{idempotency_key}:safety-reopen:{attempt}"
-        )
+        internal_key = idempotency_key if attempt == 0 else f"{idempotency_key}:safety-reopen:{attempt}"
         response = await _run_langgraph_advance(
             db,
             session,
@@ -1043,7 +1020,7 @@ async def advance_session(
     session_id: str,
     body: AdvanceRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
@@ -1080,7 +1057,7 @@ async def advance_session(
         idempotency_key=context.idempotency_key,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
     )
@@ -1140,7 +1117,7 @@ async def advance_session(
         is_idempotent=context.is_idempotent,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
         success_status=200,

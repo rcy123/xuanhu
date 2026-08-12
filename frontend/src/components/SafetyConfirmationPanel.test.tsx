@@ -39,7 +39,7 @@ describe('SafetyConfirmationPanel', () => {
     vi.restoreAllMocks()
   })
 
-  it('requires a manually entered reviewer ID and confirms with that audit identity', async () => {
+  it('confirms with the JWT identity (no manual reviewer entry)', async () => {
     const confirm = vi.spyOn(api, 'confirmSafetyAssertion').mockResolvedValue({
       ...assertion,
       status: 'confirmed',
@@ -66,14 +66,9 @@ describe('SafetyConfirmationPanel', () => {
     expect(await screen.findByTestId('safety-confirmation-panel')).toBeInTheDocument()
     expect(screen.getByText('明确回答：无')).toBeInTheDocument()
     expect(screen.getByTestId('safety-confirmation-blocked-input')).toBeInTheDocument()
+    expect(screen.queryByTestId('safety-reviewer-id')).not.toBeInTheDocument()
 
     const confirmButton = screen.getByTestId('safety-confirm-assertion-1')
-    expect(confirmButton).toBeDisabled()
-    expect(screen.getByTestId('safety-reviewer-id')).toHaveValue('')
-
-    fireEvent.change(screen.getByTestId('safety-reviewer-id'), {
-      target: { value: 'doctor-actual-42' },
-    })
     expect(confirmButton).toBeEnabled()
     fireEvent.click(confirmButton)
 
@@ -83,7 +78,6 @@ describe('SafetyConfirmationPanel', () => {
         'assertion-1',
         {},
         {
-          doctorId: 'doctor-actual-42',
           idempotencyKey: expect.any(String),
         },
       )
@@ -112,9 +106,6 @@ describe('SafetyConfirmationPanel', () => {
     )
 
     await screen.findByTestId('safety-confirmation-panel')
-    fireEvent.change(screen.getByTestId('safety-reviewer-id'), {
-      target: { value: 'doctor-reviewer' },
-    })
     fireEvent.click(screen.getByTestId('safety-reject-assertion-1'))
 
     await waitFor(() => {
@@ -123,7 +114,6 @@ describe('SafetyConfirmationPanel', () => {
         'assertion-1',
         { reason_code: 'EXTRACTION_REJECTED' },
         {
-          doctorId: 'doctor-reviewer',
           idempotencyKey: expect.any(String),
         },
       )
@@ -153,13 +143,9 @@ describe('SafetyConfirmationPanel', () => {
       />,
     )
     await screen.findByTestId('safety-confirmation-panel')
-    fireEvent.change(screen.getByTestId('safety-reviewer-id'), {
-      target: { value: 'doctor-retry' },
-    })
     fireEvent.click(screen.getByTestId('safety-confirm-assertion-1'))
     await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTestId('safety-confirm-assertion-1')).toBeEnabled())
-    expect(screen.getByTestId('safety-reviewer-id')).toBeDisabled()
 
     fireEvent.click(screen.getByTestId('safety-confirm-assertion-1'))
     await waitFor(() => expect(confirm).toHaveBeenCalledTimes(2))
@@ -235,9 +221,6 @@ describe('SafetyConfirmationPanel', () => {
     )
 
     await screen.findByTestId('safety-confirmation-panel')
-    fireEvent.change(screen.getByTestId('safety-reviewer-id'), {
-      target: { value: 'doctor-reviewer' },
-    })
     fireEvent.click(screen.getByTestId('safety-confirm-assertion-1'))
 
     rerender(

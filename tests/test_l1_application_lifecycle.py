@@ -288,6 +288,8 @@ async def test_fastapi_lifespan_shares_runtime_and_closes_on_failure(
             calls["close"] += 1
 
     settings = SimpleNamespace(
+        app_env="local",
+        xuanhu_prod_secret_guard=True,
         database_url="postgresql://must-not-be-logged",
         outbox_publisher_enabled=False,
         outbox_publisher_shutdown_grace_seconds=1.0,
@@ -333,6 +335,8 @@ async def test_fastapi_lifespan_startup_failure_is_degraded_and_sanitized(
         yield _runtime()  # pragma: no cover
 
     settings = SimpleNamespace(
+        app_env="local",
+        xuanhu_prod_secret_guard=True,
         database_url=secret,
         outbox_publisher_enabled=False,
         outbox_publisher_shutdown_grace_seconds=1.0,

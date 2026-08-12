@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
@@ -44,31 +44,17 @@ async def _cleanup_test_data() -> None:
     factory = get_session_factory()
     async with factory() as session:
         result = await session.execute(
-            select(ConsultSession.id).where(
-                ConsultSession.patient_ref.like(f"{_TEST_PATIENT_REF_PREFIX}%")
-            )
+            select(ConsultSession.id).where(ConsultSession.patient_ref.like(f"{_TEST_PATIENT_REF_PREFIX}%"))
         )
         test_session_ids = [row[0] for row in result.all()]
         if not test_session_ids:
             return
-        await session.execute(
-            delete(SafetyFactAssertion).where(SafetyFactAssertion.session_id.in_(test_session_ids))
-        )
-        await session.execute(
-            delete(SafetyProfile).where(SafetyProfile.session_id.in_(test_session_ids))
-        )
-        await session.execute(
-            delete(Observation).where(Observation.session_id.in_(test_session_ids))
-        )
-        await session.execute(
-            delete(ConsultMessage).where(ConsultMessage.session_id.in_(test_session_ids))
-        )
-        await session.execute(
-            delete(AuditEvent).where(AuditEvent.session_id.in_(test_session_ids))
-        )
-        await session.execute(
-            delete(ConsultSession).where(ConsultSession.id.in_(test_session_ids))
-        )
+        await session.execute(delete(SafetyFactAssertion).where(SafetyFactAssertion.session_id.in_(test_session_ids)))
+        await session.execute(delete(SafetyProfile).where(SafetyProfile.session_id.in_(test_session_ids)))
+        await session.execute(delete(Observation).where(Observation.session_id.in_(test_session_ids)))
+        await session.execute(delete(ConsultMessage).where(ConsultMessage.session_id.in_(test_session_ids)))
+        await session.execute(delete(AuditEvent).where(AuditEvent.session_id.in_(test_session_ids)))
+        await session.execute(delete(ConsultSession).where(ConsultSession.id.in_(test_session_ids)))
         await session.commit()
 
 
@@ -124,9 +110,7 @@ async def _create_inquiry_session(db: AsyncSession) -> ConsultSession:
             content=content,
             agent_name="question_composer" if role == "agent" else None,
             structured_delta=(
-                {"kind": "question", "selected_dimension": "ten_questions.stool_urine"}
-                if role == "agent"
-                else None
+                {"kind": "question", "selected_dimension": "ten_questions.stool_urine"} if role == "agent" else None
             ),
             created_at=base.replace(minute=base.minute + index),
         )
@@ -164,16 +148,16 @@ def _mk_observation(
     )
 
 
-async def test_rollback_truncates_messages_and_restores_correction_chain(db: AsyncSession, http_client: AsyncClient) -> None:
+async def test_rollback_truncates_messages_and_restores_correction_chain(
+    db: AsyncSession, http_client: AsyncClient
+) -> None:
     session, messages = await _create_inquiry_session(db)
     sid = str(session.id)
     # messages: [0]=agent [1]=doctor [2]=agent [3]=doctor [4]=agent [5]=doctor
     # 事实链：obs A(active) -> obs B 修正 A(corrected) -> obs C 修正 B(corrected)
     obs_a = _mk_observation(session.id, messages[1].id, "cold_heat", {"value": "怕冷"})
     await db.flush()
-    obs_b = _mk_observation(
-        session.id, messages[3].id, "cold_heat", {"value": "非常怕冷"}, "corrected", obs_a.id
-    )
+    obs_b = _mk_observation(session.id, messages[3].id, "cold_heat", {"value": "非常怕冷"}, "corrected", obs_a.id)
     await db.flush()
     obs_c = _mk_observation(
         session.id, messages[5].id, "cold_heat", {"value": "非常怕冷，手脚凉"}, "corrected", obs_b.id
@@ -202,9 +186,7 @@ async def test_rollback_truncates_messages_and_restores_correction_chain(db: Asy
     # 消息：0,1,2 保留 + 1 条 system 提示
     remaining = (
         await db.scalars(
-            select(ConsultMessage)
-            .where(ConsultMessage.session_id == session.id)
-            .order_by(ConsultMessage.created_at)
+            select(ConsultMessage).where(ConsultMessage.session_id == session.id).order_by(ConsultMessage.created_at)
         )
     ).all()
     assert [row.id for row in remaining[:3]] == [messages[0].id, messages[1].id, messages[2].id]
@@ -214,9 +196,7 @@ async def test_rollback_truncates_messages_and_restores_correction_chain(db: Asy
     # observations：obs_c 删除，obs_b 恢复为 active
     obs_rows = (
         await db.scalars(
-            select(Observation)
-            .where(Observation.session_id == session.id)
-            .execution_options(populate_existing=True)
+            select(Observation).where(Observation.session_id == session.id).execution_options(populate_existing=True)
         )
     ).all()
     assert obs_a.id in {row.id for row in obs_rows}  # 链头保留
@@ -306,9 +286,7 @@ async def test_rollback_resets_safety_profile(db: AsyncSession, http_client: Asy
     from app.db.session import get_session_factory
 
     async with get_session_factory()() as fresh_db:
-        profile_row = await fresh_db.scalar(
-            select(SafetyProfile).where(SafetyProfile.session_id == session.id)
-        )
+        profile_row = await fresh_db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session.id))
         assert profile_row.allergy_collection_status == "unknown"
         assert profile_row.allergens is None
 
@@ -516,7 +494,11 @@ async def test_rollback_clears_langgraph_checkpoints(db: AsyncSession, http_clie
     from app.db.session import get_session_factory as _gsf
 
     async with _gsf()() as fresh_db:
-        cp_count = await fresh_db.scalar(sa_text("SELECT count(*) FROM checkpoints WHERE thread_id=:t").bindparams(t=thread_id))
-        wr_count = await fresh_db.scalar(sa_text("SELECT count(*) FROM checkpoint_writes WHERE thread_id=:t").bindparams(t=thread_id))
+        cp_count = await fresh_db.scalar(
+            sa_text("SELECT count(*) FROM checkpoints WHERE thread_id=:t").bindparams(t=thread_id)
+        )
+        wr_count = await fresh_db.scalar(
+            sa_text("SELECT count(*) FROM checkpoint_writes WHERE thread_id=:t").bindparams(t=thread_id)
+        )
         assert cp_count == 0, f"checkpoints not cleared: {cp_count}"
         assert wr_count == 0, f"checkpoint_writes not cleared: {wr_count}"

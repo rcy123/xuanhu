@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import StreamingResponse
 
+from app.core.auth import DoctorPrincipal, get_current_doctor_from_query
 from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.services.events import EventService
@@ -17,8 +18,14 @@ async def stream_session_events(
     session_id: str,
     last_event_id: str | None = Query(default=None),
     last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
+    doctor: DoctorPrincipal = Depends(get_current_doctor_from_query),
 ) -> StreamingResponse:
-    """连接会话 SSE 事件流。"""
+    """连接会话 SSE 事件流。
+
+    鉴权走 query string 的 ``?token=<jwt>``（SSE 浏览器无法自定义 header，
+    仅此一处例外）。无效 token 在 ``on`` 模式建连即断（401，不产生任何事件）。
+    """
+    del doctor
     service = EventService()
 
     factory = get_session_factory()

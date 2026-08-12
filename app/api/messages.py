@@ -23,6 +23,7 @@ from app.agent_runtime.async_command_admission import (
 )
 from app.agent_runtime.lifecycle import allow_request_local_runtime_fallback
 from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     AgentTriggerFailedError,
     IdempotencyConflictError,
@@ -51,13 +52,6 @@ def _get_trace_id(request: Request) -> str:
     return get_trace_id(request)
 
 
-def _doctor_id(
-    x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id"),
-) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
-
-
 def _state_version(
     x_state_version: str | None = Header(default=None, alias="X-State-Version"),
 ) -> int | None:
@@ -83,7 +77,7 @@ async def create_message(
     session_id: str,
     body: MessageCreateRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
@@ -113,7 +107,7 @@ async def create_message(
         idempotency_key=context.idempotency_key,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
     )
@@ -135,7 +129,7 @@ async def create_message(
         data = await service.submit_message(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
             x_state_version=state_version,
             idempotency_key=context.idempotency_key,
@@ -162,7 +156,7 @@ async def create_message(
         is_idempotent=context.is_idempotent,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
             "state_version": state_version,
         },
         success_status=200,
@@ -188,6 +182,7 @@ async def get_messages(
     limit: int = Query(default=50, ge=1, le=100),
     stage: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """获取消息历史（游标分页）。"""
     trace_id = _get_trace_id(request)

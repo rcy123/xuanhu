@@ -20,13 +20,15 @@ from app.agent_runtime.lifecycle import (
 )
 from app.api.advance import advance_exception_handlers
 from app.api.advance import router as advance_router
+from app.api.auth import auth_exception_handlers
+from app.api.auth import router as auth_router
 from app.api.commands import command_exception_handlers
 from app.api.commands import router as commands_router
 from app.api.health import router as health_router
-from app.api.messages import message_exception_handlers
-from app.api.messages import router as messages_router
 from app.api.message_rollback import rollback_exception_handlers
 from app.api.message_rollback import router as message_rollback_router
+from app.api.messages import message_exception_handlers
+from app.api.messages import router as messages_router
 from app.api.record import record_exception_handlers
 from app.api.record import router as record_router
 from app.api.recovery import recovery_exception_handlers
@@ -38,7 +40,7 @@ from app.api.safety_confirmations import safety_confirmation_exception_handlers
 from app.api.sessions import router as sessions_router
 from app.api.sessions import session_exception_handlers
 from app.api.stream import router as stream_router
-from app.core.config import get_settings
+from app.core.config import ensure_production_secrets_ready, get_settings
 from app.core.exceptions import HttpCommandRecoveryRequiredError, HttpCommandReplayError
 from app.core.gateway import ModelGatewayClient
 
@@ -49,6 +51,8 @@ logger = logging.getLogger("xuanhu")
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     """Own process-scoped runtime resources and close them reliably."""
     settings = get_settings()
+    # 生产密钥守卫：占位符 / 默认值 / 缺失 → fail-fast（T1.6/T3.3）。
+    ensure_production_secrets_ready(settings)
     logger.info("应用启动，当前配置（已脱敏）: %s", settings.safe_dump())
 
     # ── shared ModelGatewayClient（lifespan 托管连接池） ──
@@ -64,9 +68,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         app.state.langgraph_runtime_state = LangGraphRuntimeState.ready(runtime)
     except Exception as exc:
         error_code = safe_runtime_error_code(exc)
-        app.state.langgraph_runtime_state = LangGraphRuntimeState.unavailable(
-            error_code=error_code
-        )
+        app.state.langgraph_runtime_state = LangGraphRuntimeState.unavailable(error_code=error_code)
         logger.error(
             "LangGraph 共享运行时启动失败，readiness 将保持 degraded: code=%s",
             error_code,
@@ -126,8 +128,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
             runtime_state = getattr(app.state, "langgraph_runtime_state", None)
             ready_runtime = (
                 runtime_state.runtime
-                if runtime_state is not None
-                and getattr(runtime_state, "status", "") == "ready"
+                if runtime_state is not None and getattr(runtime_state, "status", "") == "ready"
                 else None
             )
             handlers = build_async_command_handlers(ready_runtime)
@@ -196,9 +197,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                     if runtime_entered:
                         await runtime_cm.__aexit__(None, None, None)
                 finally:
-                    app.state.langgraph_runtime_state = LangGraphRuntimeState(
-                        status="closed"
-                    )
+                    app.state.langgraph_runtime_state = LangGraphRuntimeState(status="closed")
                     # 关闭 gateway 连接池
                     await gateway.aclose()
 
@@ -212,6 +211,7 @@ app = FastAPI(
 )
 
 app.include_router(health_router)
+app.include_router(auth_router)
 app.include_router(sessions_router)
 app.include_router(messages_router)
 app.include_router(message_rollback_router)
@@ -234,6 +234,7 @@ for exc_cls, handler in {
     **safety_confirmation_exception_handlers,
     **command_exception_handlers,
     **rollback_exception_handlers,
+    **auth_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
 
@@ -245,11 +246,7 @@ async def http_command_outcome_handler(
     """Render a persisted error replay or a fail-closed ambiguous command."""
 
     assert isinstance(exc, HttpCommandReplayError | HttpCommandRecoveryRequiredError)
-    trace_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-trace-id")
-        or str(uuid.uuid4())
-    )
+    trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
     payload = {
         "code": exc.code,
         "message": exc.message,
@@ -270,11 +267,7 @@ app.add_exception_handler(HttpCommandRecoveryRequiredError, http_command_outcome
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """将 FastAPI 请求校验失败转换为标准 envelope：VALIDATION_ERROR。"""
-    trace_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-trace-id")
-        or str(uuid.uuid4())
-    )
+    trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
     # 提取首条校验错误信息作为 detail
     detail_parts = []
     for err in exc.errors():

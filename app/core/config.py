@@ -6,18 +6,22 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
 # 敏感字段检测
 # ---------------------------------------------------------------------------
 
-_SENSITIVE_RE = re.compile(r"(api_key|password|secret|token)", re.IGNORECASE)
+# 命中 api_key / password / secret / token / signing_key 的字段在 safe_dump 中一律掩码。
+# 注意：Settings 中所有含 "key" 的字段均为密钥类（api_key / signing_key），
+# 不存在需明文展示的业务 key 字段。
+_SENSITIVE_RE = re.compile(r"(api_key|password|secret|token|key)", re.IGNORECASE)
 
 # 需对 URL 内嵌密码做掩码的字段名后缀
 _URL_FIELD_SUFFIXES = ("_url",)
@@ -437,18 +441,135 @@ class Settings(BaseSettings):
     session_lock_wait_seconds: int = Field(default=0, ge=0, description="会话锁等待超时（秒），0 表示不等待")
     export_file_ttl_seconds: int = Field(default=3600, ge=1, description="导出文件 TTL（秒）")
 
+    # ═══════════════════════════════════════════════════════════════
+    # 阶段 1：认证授权（docs/04_生产环境加固/01-认证授权与密钥轮换.md）
+    # ═══════════════════════════════════════════════════════════════
+    jwt_signing_key: str = Field(
+        default="",
+        description="JWT 签名密钥（HS256 对称密钥；生产环境缺失或占位符即 fail-fast）",
+    )
+    jwt_signing_key_previous: str = Field(
+        default="",
+        description="双密钥灰度期的旧签名密钥（可选；校验失败时回退尝试，颁发永远只用新 key）",
+    )
+    jwt_access_token_ttl_seconds: int = Field(
+        default=28_800,
+        ge=60,
+        le=86_400,
+        description="JWT access token 有效期（秒）；默认 8 小时，过期重新登录",
+    )
+    xuanhu_auth_enabled: Literal["off", "audit", "on"] = Field(
+        default="on",
+        validation_alias="XUANHU_AUTH_ENABLED",
+        description=(
+            "阶段 1 认证三态开关：off=不生效（灰度回退态）/ audit=校验但仅记审计不阻断"
+            "（观察期）/ on=生效且阻断（正式态）。生产稳定后必须移除 off/audit 分支"
+        ),
+    )
+    login_fail_lock_threshold: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="同一医师连续登录失败锁定阈值（计数存 Redis，key=auth:fail:{doctor_id}）",
+    )
+    login_fail_lock_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86_400,
+        description="登录失败锁定时长（秒）；默认 15 分钟",
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # 阶段 2：PHI 访问控制（docs/04_生产环境加固/02-PHI访问控制与日志脱敏.md）
+    # ═══════════════════════════════════════════════════════════════
+    xuanhu_access_enabled: Literal["off", "audit", "on"] = Field(
+        default="on",
+        validation_alias="XUANHU_ACCESS_ENABLED",
+        description=(
+            "阶段 2 会话所有权校验三态开关：off=不生效 / audit=校验但仅记审计不阻断 / "
+            "on=生效且阻断（403/404）。生产稳定后必须移除 off/audit 分支"
+        ),
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # 阶段 3：基础设施（docs/04_生产环境加固/03-基础设施与网络边界加固.md）
+    # ═══════════════════════════════════════════════════════════════
+    xuanhu_prod_secret_guard: bool = Field(
+        default=True,
+        validation_alias="XUANHU_PROD_SECRET_GUARD",
+        description="生产环境密钥占位符 fail-fast 守卫；紧急时可关闭但需事后审计",
+    )
+    milvus_use_tls: bool = Field(
+        default=False,
+        description="Milvus 使用 TLS（内网明文可接受，跨机部署再开启；默认 false）",
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # 阶段 4：运行态安全（docs/04_生产环境加固/04-运行态安全加固.md）
+    # ═══════════════════════════════════════════════════════════════
+    xuanhu_ratelimit_enabled: bool = Field(
+        default=True,
+        validation_alias="XUANHU_RATELIMIT_ENABLED",
+        description="阶段 4 限流总开关；紧急时可关闭但需事后审计",
+    )
+    login_rate_limit_per_minute: int = Field(
+        default=10,
+        ge=1,
+        le=600,
+        description="登录接口按 IP 限流（次/分钟）",
+    )
+    advance_rate_limit_per_minute: int = Field(
+        default=20,
+        ge=1,
+        le=600,
+        description="advance 接口按医师限流（次/分钟）",
+    )
+    write_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        le=600,
+        description="其余写接口按医师限流（次/分钟）",
+    )
+    stream_concurrent_limit: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="SSE 按医师并发连接上限",
+    )
+    cors_allowed_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:5173"],
+        validation_alias="CORS_ALLOWED_ORIGINS",
+        description="CORS 允许来源（逗号分隔）；生产禁止通配符 *（allow_credentials=True 组合被浏览器规范禁止）",
+    )
+    model_whitelist: list[str] = Field(
+        default_factory=list,
+        validation_alias="MODEL_WHITELIST",
+        description="允许的模型名白名单（逗号分隔）；生产为空即 fail-fast，防止模型名被篡改指向任意端点",
+    )
+
     # -------------------------------------------------------------------
     # 校验
     # -------------------------------------------------------------------
+
+    @field_validator("cors_allowed_origins", "model_whitelist", mode="before")
+    @classmethod
+    def _split_csv_lists(cls, value: Any) -> Any:
+        """把逗号分隔的 env 字符串解析为 list[str]。
+
+        pydantic-settings 对复杂类型默认尝试 JSON 解码；当 env 值是纯逗号
+        分隔串（如 ``a,b,c``）时 JSON 解码失败，这里在 before 阶段拆分为
+        list，两种形态（``'["a","b"]'`` 与 ``'a,b'``）都兼容。
+        """
+        if isinstance(value, str):
+            parts = [item.strip() for item in value.split(",") if item.strip()]
+            return parts or []
+        return value
 
     @model_validator(mode="after")
     def async_command_invariants(self) -> Settings:
         """Heartbeat must stay strictly below the lease for the R6-A worker."""
         if self.async_command_enabled and self.async_command_heartbeat_seconds >= self.async_command_lease_seconds:
-            raise ValueError(
-                "async_command_heartbeat_seconds must be strictly less than "
-                "async_command_lease_seconds"
-            )
+            raise ValueError("async_command_heartbeat_seconds must be strictly less than async_command_lease_seconds")
         return self
 
     # -------------------------------------------------------------------
@@ -473,6 +594,77 @@ class Settings(BaseSettings):
             else:
                 masked[field_name] = value
         return masked
+
+
+# ---------------------------------------------------------------------------
+# 生产环境密钥守卫（T1.6 / T3.3）
+# ---------------------------------------------------------------------------
+
+# 占位符 / 已知默认值：命中即视为不合规。生产环境命中任一即启动失败。
+_PLACEHOLDER_SECRET_MARKERS = re.compile(
+    r"(change-me|changeme|placeholder|your[-_]?(password|key|secret)|example|"
+    r"minioadmin|xuanhu_dev|sk-test|sk-ci|sk-change|^test$|^dev$|^secret$|^password$)",
+    re.IGNORECASE,
+)
+
+# Settings 中的密钥字段（safe_dump 会脱敏；守卫校验其值）
+_SETTINGS_SECRET_FIELDS = (
+    "model_gateway_api_key",
+    "embedding_gateway_api_key",
+    "reranker_gateway_api_key",
+    "rag_query_rewrite_gateway_api_key",
+    "jwt_signing_key",
+)
+
+# Compose 中间件凭据（不在 Settings 中，读取环境变量）
+_ENV_SECRET_FIELDS = (
+    "POSTGRES_PASSWORD",
+    "REDIS_PASSWORD",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+)
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """判定密钥值是否为占位符 / 已知默认值。"""
+    if not value:
+        return True
+    return bool(_PLACEHOLDER_SECRET_MARKERS.search(value))
+
+
+def validate_production_secrets(settings: Settings) -> list[str]:
+    """检查生产环境密钥合规性，返回不合规项列表（空列表=通过）。
+
+    覆盖 Settings 密钥字段（*_api_key / jwt_signing_key）与 Compose 中间件
+    凭据（POSTGRES_PASSWORD / REDIS_PASSWORD / MINIO_*）。生产环境任一为
+    空、占位符或已知默认值即启动失败；本地/测试环境不触发。
+    """
+    violations: list[str] = []
+    for field_name in _SETTINGS_SECRET_FIELDS:
+        value = getattr(settings, field_name) or ""
+        if _looks_like_placeholder(str(value)):
+            violations.append(field_name.upper())
+    for env_name in _ENV_SECRET_FIELDS:
+        value = os.environ.get(env_name, "")
+        if _looks_like_placeholder(value):
+            violations.append(env_name)
+    return violations
+
+
+def ensure_production_secrets_ready(settings: Settings | None = None) -> None:
+    """生产环境 fail-fast 守卫：任一密钥不合规即抛 RuntimeError。
+
+    仅当 ``APP_ENV=production`` 且 ``XUANHU_PROD_SECRET_GUARD != false``
+    时生效；其余环境为 no-op。
+    """
+    effective = settings or get_settings()
+    if effective.app_env != "production":
+        return
+    if not effective.xuanhu_prod_secret_guard:
+        return
+    violations = validate_production_secrets(effective)
+    if violations:
+        raise RuntimeError("生产环境密钥守卫失败：以下密钥缺失/为占位符/为默认值，禁止启动 —— " + ", ".join(violations))
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,11 @@ def _set_test_defaults() -> None:
     os.environ["DB_URL"] = "postgresql://unit:unit@127.0.0.1:1/xuanhu_unit_test"
     os.environ["REDIS_URL"] = "redis://:unit@127.0.0.1:1/15"
     os.environ["OUTBOX_PUBLISHER_ENABLED"] = "false"
+    # 生产加固：既有测试套件默认维持无认证回退态（XUANHU_AUTH_ENABLED=off），
+    # 认证行为由 tests/test_auth_*.py 显式切换到 on/audit 验证。
+    os.environ["XUANHU_AUTH_ENABLED"] = "off"
+    os.environ["XUANHU_ACCESS_ENABLED"] = "off"
+    os.environ["JWT_SIGNING_KEY"] = "unit-test-signing-key-not-for-production"
     # 3d: 统一后端后测试会话一律 langgraph(legacy 不再创建);
     # 本地 shell/.env 不得把测试环境切回 legacy 路径。
     os.environ["AGENT_RUNTIME_VERSION"] = "langgraph"

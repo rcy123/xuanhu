@@ -10,6 +10,14 @@ export { ApiRequestError, TransportErrorCode, shouldRetry } from './errors'
 export { connectSessionStream } from './sse'
 export type { SseConnection, SseHandlers } from './sse'
 export {
+  getAuthToken,
+  setAuthToken,
+  clearAuthToken,
+  isAuthenticated,
+  setAuthExpiredHandler,
+  handleAuthExpired,
+} from './auth'
+export {
   createSession,
   listSessions,
   getSession,
@@ -28,8 +36,10 @@ export {
   updateRecord,
   exportRecord,
   getHealth,
+  login,
   toQuery,
 } from './index'
+export type { LoginResult } from './index'
 export {
   isAsyncCommandAccepted,
 } from '@/types/api'

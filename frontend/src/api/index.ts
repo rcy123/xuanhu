@@ -39,6 +39,25 @@ import type {
 } from '@/types/api'
 
 // ---------------------------------------------------------------------------
+// 认证（阶段 1 加固）
+// ---------------------------------------------------------------------------
+
+/** POST /auth/login —— 医师登录，换取 JWT。 */
+export function login(doctorId: string, password: string): Promise<LoginResult> {
+  return request<LoginResult>('auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ doctor_id: doctorId, password }),
+  })
+}
+
+/** 登录成功返回的 token 数据。 */
+export interface LoginResult {
+  access_token: string
+  token_type: 'Bearer'
+  expires_in: number
+}
+
+// ---------------------------------------------------------------------------
 // 会话
 // ---------------------------------------------------------------------------
 

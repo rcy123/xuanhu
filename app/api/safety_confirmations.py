@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,7 @@ from app.api.request_context import (
     get_trace_id,
     write_request_context,
 )
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import SessionNotFoundError, ValidationError, XuanhuError
 from app.db.session import get_db
 from app.schemas.common import success_response
@@ -32,8 +33,9 @@ def _uuid(value: str, *, kind: str) -> uuid.UUID:
         raise SessionNotFoundError(detail=f"{kind} is not a valid UUID") from exc
 
 
-def _doctor_id(value: str | None = Header(default=None, alias="X-Doctor-Id")) -> str:
-    actor = (value or "").strip()
+def _require_actor(doctor: DoctorPrincipal) -> str:
+    """取医师主体 ID；off/audit 回退态下缺失时维持原「必填」语义。"""
+    actor = (doctor.doctor_id or "").strip()
     if not actor or len(actor) > 128:
         raise ValidationError(detail="X-Doctor-Id is required and must be at most 128 characters")
     return actor
@@ -45,6 +47,7 @@ async def list_safety_assertions(
     session_id: str,
     status: SafetyAssertionStatus | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     result = await SafetyConfirmationService(db).list_assertions(
         _uuid(session_id, kind="session_id"),
@@ -104,7 +107,7 @@ async def confirm_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     context: WriteRequestContext = Depends(write_request_context),
-    doctor_id: str = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     return await _decide(
@@ -113,7 +116,7 @@ async def confirm_safety_assertion(
         action="confirm",
         body=body,
         context=context,
-        doctor_id=doctor_id,
+        doctor_id=_require_actor(doctor),
         db=db,
     )
 
@@ -124,7 +127,7 @@ async def reject_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     context: WriteRequestContext = Depends(write_request_context),
-    doctor_id: str = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     return await _decide(
@@ -133,7 +136,7 @@ async def reject_safety_assertion(
         action="reject",
         body=body,
         context=context,
-        doctor_id=doctor_id,
+        doctor_id=_require_actor(doctor),
         db=db,
     )
 
@@ -144,7 +147,7 @@ async def retract_safety_assertion(
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
     context: WriteRequestContext = Depends(write_request_context),
-    doctor_id: str = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     return await _decide(
@@ -153,7 +156,7 @@ async def retract_safety_assertion(
         action="retract",
         body=body,
         context=context,
-        doctor_id=doctor_id,
+        doctor_id=_require_actor(doctor),
         db=db,
     )
 

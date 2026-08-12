@@ -227,6 +227,8 @@ async def test_disable_helper_fails_closed() -> None:
 
 def _settings(async_command_enabled: bool) -> SimpleNamespace:
     return SimpleNamespace(
+        app_env="local",
+        xuanhu_prod_secret_guard=True,
         database_url="postgresql://must-not-be-logged",
         outbox_publisher_enabled=False,
         outbox_publisher_shutdown_grace_seconds=1.0,

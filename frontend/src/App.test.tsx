@@ -5,7 +5,7 @@
  * mock API 模块避免单测发起真实网络请求。
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { ConfigProvider, App as AntdApp } from 'antd'
@@ -59,6 +59,14 @@ function renderAppAt(path: string) {
 }
 
 describe('App Shell', () => {
+  beforeEach(() => {
+    // 阶段 1 加固：工作台路由需要登录态；默认注入测试 token。
+    window.sessionStorage.setItem('xuanhu.access_token', 'test-token')
+  })
+  afterEach(() => {
+    window.sessionStorage.removeItem('xuanhu.access_token')
+  })
+
   it('首页渲染品牌标题与引导文案', () => {
     renderAppAt('/')
     expect(screen.getByText('悬壶工作台')).toBeInTheDocument()
@@ -76,6 +84,20 @@ describe('App Shell', () => {
     renderAppAt('/workbench')
     const headings = screen.getAllByText('开始一次问诊')
     expect(headings.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('未登录访问工作台重定向到登录页', () => {
+    window.sessionStorage.removeItem('xuanhu.access_token')
+    renderAppAt('/workbench')
+    expect(screen.getByTestId('login-page')).toBeInTheDocument()
+  })
+
+  it('登录页渲染医师标识/密码输入与提交按钮', () => {
+    window.sessionStorage.removeItem('xuanhu.access_token')
+    renderAppAt('/login')
+    expect(screen.getAllByTestId('login-doctor-id').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('login-password').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('login-submit').length).toBeGreaterThan(0)
   })
 
   it('工作台渲染步骤条节点', () => {

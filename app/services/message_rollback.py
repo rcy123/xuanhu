@@ -24,10 +24,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+#: LangGraph checkpoint 持久化表（无 ORM 模型，仅用轻量 Table 定义做回退清理）
+from sqlalchemy import Column, MetaData, String, Table, select
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select as sa_select
 from sqlalchemy import text as sa_text
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
@@ -45,17 +45,18 @@ from app.models.domain import (
     SafetyProfile,
 )
 from app.models.question_contract import QuestionContractRecord, QuestionCoverageEventRecord
+from app.schemas.completeness import CompletenessPolicyInput, CompletenessProgress
 from app.schemas.domain import (
     CollectionStatus,
+    GateDecision,
+    LactationValue,
     ObservationSchema,
     ObservationStatus,
+    PregnancyValue,
     SafetyProfileSchema,
 )
 from app.schemas.message import MessageRollbackData
-from app.schemas.triage import TriageGateDetails, TriageGateResult, TriageDisposition
-
-#: LangGraph checkpoint 持久化表（无 ORM 模型，仅用轻量 Table 定义做回退清理）
-from sqlalchemy import Column, MetaData, String, Table, Text
+from app.schemas.triage import TRIAGE_POLICY_VERSION, TriageDisposition, TriageGateDetails, TriageGateResult
 
 _CP_METADATA = MetaData()
 CheckpointModel = Table(
@@ -118,23 +119,18 @@ async def _recompute_intake_gates(
     """
 
     from app.agent_runtime.completeness_policy import (
-        CompletenessPolicyInput,
-        CompletenessProgress,
         completeness_to_gate_result_schema,
         evaluate_completeness_policy,
     )
     from app.agent_runtime.reducer import DomainState
     from app.agent_runtime.triage_policy import (
-        TRIAGE_POLICY_VERSION,
         to_gate_result_schema as triage_gate_schema,
     )
     from app.core.config import get_settings
     from app.services.langgraph_intake import _completeness_snapshot
 
     # 1. 剩余 observations → ObservationSchema（含修正链，投影层取链头）
-    obs_rows = (
-        await db.scalars(select(Observation).where(Observation.session_id == session.id))
-    ).all()
+    obs_rows = (await db.scalars(select(Observation).where(Observation.session_id == session.id))).all()
     observation_schemas = tuple(
         ObservationSchema(
             observation_id=row.id,
@@ -153,18 +149,20 @@ async def _recompute_intake_gates(
 
     # 2. safety profile → SafetyProfileSchema
     safety_profile_schema: SafetyProfileSchema | None = None
-    profile_row = await db.scalar(
-        select(SafetyProfile).where(SafetyProfile.session_id == session.id)
-    )
+    profile_row = await db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session.id))
     if profile_row is not None:
         safety_profile_schema = SafetyProfileSchema(
             session_id=session.id,
             allergy_collection_status=CollectionStatus(profile_row.allergy_collection_status),
             allergens=profile_row.allergens,
             pregnancy_collection_status=CollectionStatus(profile_row.pregnancy_collection_status),
-            pregnancy_value=profile_row.pregnancy_value,
+            pregnancy_value=(
+                PregnancyValue(profile_row.pregnancy_value) if profile_row.pregnancy_value else None
+            ),
             lactation_collection_status=CollectionStatus(profile_row.lactation_collection_status),
-            lactation_value=profile_row.lactation_value,
+            lactation_value=(
+                LactationValue(profile_row.lactation_value) if profile_row.lactation_value else None
+            ),
             medications_collection_status=CollectionStatus(profile_row.medications_collection_status),
             medications=profile_row.medications,
             major_conditions_collection_status=CollectionStatus(profile_row.major_conditions_collection_status),
@@ -222,7 +220,11 @@ async def _recompute_intake_gates(
         gate_name="triage",
         policy_version=TRIAGE_POLICY_VERSION,
         input_state_version=session.state_version,
-        decision="passed" if triage_details.disposition is TriageDisposition.CONTINUE else "blocked",
+        decision=(
+            GateDecision.PASSED
+            if triage_details.disposition is TriageDisposition.CONTINUE
+            else GateDecision.BLOCKED
+        ),
         details=triage_details,
     )
 
@@ -328,40 +330,28 @@ async def rollback_messages_to(
     # 均为 RESTRICT 外键；contract 删除会级联清理其 root/parent 子契约与 coverage。
     deleted_coverage = (
         await db.scalars(
-            select(QuestionCoverageEventRecord).where(
-                QuestionCoverageEventRecord.answer_message_id.in_(cutoff_ids)
-            )
+            select(QuestionCoverageEventRecord).where(QuestionCoverageEventRecord.answer_message_id.in_(cutoff_ids))
         )
     ).all()
     for coverage in deleted_coverage:
         await db.delete(coverage)
     deleted_contracts = (
         await db.scalars(
-            select(QuestionContractRecord).where(
-                QuestionContractRecord.question_message_id.in_(cutoff_ids)
-            )
+            select(QuestionContractRecord).where(QuestionContractRecord.question_message_id.in_(cutoff_ids))
         )
     ).all()
     for contract in deleted_contracts:
         await db.delete(contract)
 
     # ---- 3. observations：删除 + 恢复 supersede 链 ----
-    deleted_obs = (
-        await db.scalars(
-            select(Observation).where(Observation.source_message_id.in_(cutoff_ids))
-        )
-    ).all()
+    deleted_obs = (await db.scalars(select(Observation).where(Observation.source_message_id.in_(cutoff_ids)))).all()
     restore_obs_ids = {
-        obs.supersedes_observation_id
-        for obs in deleted_obs
-        if obs.supersedes_observation_id is not None
+        obs.supersedes_observation_id for obs in deleted_obs if obs.supersedes_observation_id is not None
     }
     for obs in deleted_obs:
         await db.delete(obs)
     if restore_obs_ids:
-        restore_obs = (
-            await db.scalars(select(Observation).where(Observation.id.in_(restore_obs_ids)))
-        ).all()
+        restore_obs = (await db.scalars(select(Observation).where(Observation.id.in_(restore_obs_ids)))).all()
         for obs in restore_obs:
             # 被删除行 supersede 的目标必然更早且在同一事实链上；恢复为唯一 current truth。
             obs.status = "active"
@@ -369,11 +359,7 @@ async def rollback_messages_to(
 
     # ---- 4. safety assertions：删除 + 恢复被 supersede 的 confirmed 断言 ----
     deleted_assertions = (
-        await db.scalars(
-            select(SafetyFactAssertion).where(
-                SafetyFactAssertion.source_message_id.in_(cutoff_ids)
-            )
-        )
+        await db.scalars(select(SafetyFactAssertion).where(SafetyFactAssertion.source_message_id.in_(cutoff_ids)))
     ).all()
     restore_assertion_ids = {
         assertion.supersedes_assertion_id
@@ -385,11 +371,7 @@ async def rollback_messages_to(
         await db.delete(assertion)
     if restore_assertion_ids:
         restore_assertions = (
-            await db.scalars(
-                select(SafetyFactAssertion).where(
-                    SafetyFactAssertion.id.in_(restore_assertion_ids)
-                )
-            )
+            await db.scalars(select(SafetyFactAssertion).where(SafetyFactAssertion.id.in_(restore_assertion_ids)))
         ).all()
         for assertion in restore_assertions:
             # supersede 只发生在确认流程，被覆盖的旧断言此前必为 confirmed。
@@ -400,9 +382,7 @@ async def rollback_messages_to(
 
     # ---- 5. safety profile：受影响字段保守重置为 unknown ----
     if affected_fields:
-        profile = await db.scalar(
-            select(SafetyProfile).where(SafetyProfile.session_id == session.id)
-        )
+        profile = await db.scalar(select(SafetyProfile).where(SafetyProfile.session_id == session.id))
         if profile is not None:
             for field in affected_fields:
                 mapping = _SAFETY_PROFILE_FIELDS.get(field)
@@ -481,9 +461,7 @@ async def rollback_messages_to(
     # 表由 LangGraph saver.setup() 在 runtime 启动时创建；先检查存在性避免误伤。
     for checkpoint_table in (CheckpointWriteModel, CheckpointBlobModel, CheckpointModel):
         exists = await db.scalar(
-            sa_text("SELECT to_regclass(:name)").bindparams(
-                name=f"public.{checkpoint_table.name}"
-            )
+            sa_text("SELECT to_regclass(:name)").bindparams(name=f"public.{checkpoint_table.name}")
         )
         if exists is not None:
             await db.execute(sa_delete(checkpoint_table).where(checkpoint_table.c.thread_id == thread_id))

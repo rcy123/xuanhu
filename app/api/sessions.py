@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,7 @@ from app.api.request_context import (
     get_trace_id,
     write_request_context,
 )
+from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.config import get_settings
 from app.core.exceptions import (
     InvalidStageTransitionError,
@@ -57,17 +58,12 @@ def _get_trace_id(request: Request) -> str:
     return get_trace_id(request)
 
 
-def _doctor_id(x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id")) -> str | None:
-    """读取医师标识请求头（MVP 可选）。"""
-    return x_doctor_id or None
-
-
 @router.post("/sessions", status_code=201)
 async def create_session(
     request: Request,
     body: SessionCreateRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """创建问诊会话。"""
@@ -91,17 +87,15 @@ async def create_session(
         concurrency_scope=None,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
         },
         success_status=201,
         success_message="ok",
         handler=lambda: service.create_session(
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
-            require_runtime_audit=(
-                settings.agent_runtime_rollout_phase in {"full", "rollback"}
-            ),
+            require_runtime_audit=(settings.agent_runtime_rollout_phase in {"full", "rollback"}),
         ),
     )
     return JSONResponse(
@@ -122,6 +116,7 @@ async def list_sessions(
     page_size: int = Query(default=20, ge=1, le=100),
     sort: str = Query(default="created_at:desc", pattern=r"^(created_at|updated_at):desc$"),
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """查询会话列表。"""
     trace_id = _get_trace_id(request)
@@ -144,6 +139,7 @@ async def get_session(
     request: Request,
     session_id: str,
     db: AsyncSession = Depends(get_db),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """获取会话详情。"""
     trace_id = _get_trace_id(request)
@@ -161,7 +157,7 @@ async def terminate_session(
     session_id: str,
     body: SessionTerminateRequest,
     db: AsyncSession = Depends(get_db),
-    doctor_id: str | None = Depends(_doctor_id),
+    doctor: DoctorPrincipal = Depends(get_current_doctor),
     context: WriteRequestContext = Depends(write_request_context),
 ) -> JSONResponse:
     """终止会话。"""
@@ -177,14 +173,14 @@ async def terminate_session(
         concurrency_scope=scope,
         request_payload={
             "body": body.model_dump(mode="json"),
-            "doctor_id": doctor_id,
+            "doctor_id": doctor.doctor_id,
         },
         success_status=200,
         success_message="会话已终止",
         handler=lambda: service.terminate_session(
             session_id,
             body,
-            doctor_id=doctor_id,
+            doctor_id=doctor.doctor_id,
             trace_id=trace_id,
         ),
     )
@@ -219,9 +215,7 @@ async def session_not_found_handler(request: Request, exc: SessionNotFoundError)
     )
 
 
-async def invalid_stage_transition_handler(
-    request: Request, exc: InvalidStageTransitionError
-) -> JSONResponse:
+async def invalid_stage_transition_handler(request: Request, exc: InvalidStageTransitionError) -> JSONResponse:
     """INVALID_STAGE_TRANSITION 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -237,9 +231,7 @@ async def invalid_stage_transition_handler(
     )
 
 
-async def validation_error_handler(
-    request: Request, exc: XuanhuValidationError
-) -> JSONResponse:
+async def validation_error_handler(request: Request, exc: XuanhuValidationError) -> JSONResponse:
     """VALIDATION_ERROR 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -255,9 +247,7 @@ async def validation_error_handler(
     )
 
 
-async def langgraph_public_disabled_handler(
-    request: Request, exc: LangGraphPublicDisabledError
-) -> JSONResponse:
+async def langgraph_public_disabled_handler(request: Request, exc: LangGraphPublicDisabledError) -> JSONResponse:
     """LANGGRAPH_PUBLIC_DISABLED 异常处理。"""
     trace_id = _get_trace_id(request)
     return JSONResponse(
@@ -273,9 +263,7 @@ async def langgraph_public_disabled_handler(
     )
 
 
-async def runtime_switch_audit_mismatch_handler(
-    request: Request, exc: RuntimeSwitchAuditMismatchError
-) -> JSONResponse:
+async def runtime_switch_audit_mismatch_handler(request: Request, exc: RuntimeSwitchAuditMismatchError) -> JSONResponse:
     """Render a sanitized fail-closed deployment-audit mismatch."""
 
     trace_id = _get_trace_id(request)
@@ -292,9 +280,7 @@ async def runtime_switch_audit_mismatch_handler(
     )
 
 
-async def runtime_rollout_not_ready_handler(
-    request: Request, exc: RuntimeRolloutNotReadyError
-) -> JSONResponse:
+async def runtime_rollout_not_ready_handler(request: Request, exc: RuntimeRolloutNotReadyError) -> JSONResponse:
     """Render a sanitized fail-closed rollout policy error."""
 
     trace_id = _get_trace_id(request)

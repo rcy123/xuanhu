@@ -44,27 +44,33 @@ describe('safety assertion API', () => {
     expect(fetchMock.mock.calls[0][1].method).toBe('GET')
   })
 
-  it('confirms with the caller-supplied doctor ID and an idempotency key', async () => {
+  it('confirms with the caller-supplied idempotency key and no X-Doctor-Id', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({ status: 'confirmed' }))
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+    window.sessionStorage.setItem('xuanhu.access_token', 'jwt-token-abc')
 
-    await confirmSafetyAssertion(
-      'session-1',
-      'assertion-1',
-      {},
-      { doctorId: 'doctor-entered', idempotencyKey: 'decision-1' },
-    )
+    try {
+      await confirmSafetyAssertion(
+        'session-1',
+        'assertion-1',
+        {},
+        { idempotencyKey: 'decision-1' },
+      )
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(url).toBe(
-      `${BASE}/consult/sessions/session-1/safety-assertions/assertion-1/confirm`,
-    )
-    expect(init.method).toBe('POST')
-    expect(JSON.parse(init.body as string)).toEqual({})
-    expect(init.headers).toMatchObject({
-      'X-Doctor-Id': 'doctor-entered',
-      'X-Idempotency-Key': 'decision-1',
-    })
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+      expect(url).toBe(
+        `${BASE}/consult/sessions/session-1/safety-assertions/assertion-1/confirm`,
+      )
+      expect(init.method).toBe('POST')
+      expect(JSON.parse(init.body as string)).toEqual({})
+      expect(init.headers).toMatchObject({
+        'Authorization': 'Bearer jwt-token-abc',
+        'X-Idempotency-Key': 'decision-1',
+      })
+      expect((init.headers as Record<string, string>)['X-Doctor-Id']).toBeUndefined()
+    } finally {
+      window.sessionStorage.removeItem('xuanhu.access_token')
+    }
   })
 
   it('sends the rejection reason without inventing a doctor identity', async () => {
@@ -75,12 +81,12 @@ describe('safety assertion API', () => {
       'session-1',
       'assertion-1',
       { reason_code: 'EXTRACTION_REJECTED' },
-      { doctorId: 'doctor-entered' },
+      {},
     )
 
     const init = fetchMock.mock.calls[0][1] as RequestInit
     expect(JSON.parse(init.body as string)).toEqual({ reason_code: 'EXTRACTION_REJECTED' })
-    expect((init.headers as Record<string, string>)['X-Doctor-Id']).toBe('doctor-entered')
+    expect((init.headers as Record<string, string>)['X-Doctor-Id']).toBeUndefined()
     expect((init.headers as Record<string, string>)['X-Idempotency-Key']).toBeTruthy()
   })
 })
