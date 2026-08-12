@@ -43,8 +43,13 @@ from app.api.stream import router as stream_router
 from app.core.config import ensure_production_secrets_ready, get_settings
 from app.core.exceptions import HttpCommandRecoveryRequiredError, HttpCommandReplayError
 from app.core.gateway import ModelGatewayClient
+from app.core.log_filter import install_phi_redaction
 
 logger = logging.getLogger("xuanhu")
+
+# 阶段 2 加固：全进程日志 PHI 脱敏（挂 xuanhu 命名空间 + root logger，
+# 覆盖 uvicorn 等第三方日志路径；幂等安装）。
+install_phi_redaction(root=True)
 
 
 @asynccontextmanager
@@ -250,7 +255,7 @@ async def http_command_outcome_handler(
     payload = {
         "code": exc.code,
         "message": exc.message,
-        "detail": exc.detail,
+        "detail": None,
         "retryable": exc.retryable,
         "stage": None,
         "trace_id": trace_id,
@@ -266,22 +271,20 @@ app.add_exception_handler(HttpCommandRecoveryRequiredError, http_command_outcome
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """将 FastAPI 请求校验失败转换为标准 envelope：VALIDATION_ERROR。"""
+    """将 FastAPI 请求校验失败转换为标准 envelope：VALIDATION_ERROR。
+
+    阶段 2 加固（M6）：校验错误 detail 可能回显请求体输入（含 PHI），
+    从响应体移除，仅保留 code/message/trace_id 给客户端排查。
+    """
+    del exc
     trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
-    # 提取首条校验错误信息作为 detail
-    detail_parts = []
-    for err in exc.errors():
-        loc = ".".join(str(loc) for loc in err.get("loc", []))
-        msg = err.get("msg", "")
-        detail_parts.append(f"{loc}: {msg}" if loc else msg)
-    detail = "; ".join(detail_parts[:3]) if detail_parts else None
 
     return JSONResponse(
         status_code=422,
         content={
             "code": "VALIDATION_ERROR",
             "message": "请求参数校验失败",
-            "detail": detail,
+            "detail": None,
             "retryable": False,
             "stage": None,
             "trace_id": trace_id,

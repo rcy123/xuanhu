@@ -42,7 +42,8 @@ from app.agent_runtime.lifecycle import (
 )
 from app.agent_runtime.runner import GraphRunner
 from app.agent_runtime.state import default_state
-from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
+from app.api.request_context import WriteRequestContext, get_trace_id, validate_session_id, write_request_context
+from app.core.access import require_session_owner
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.config import get_settings
 from app.core.exceptions import (
@@ -1017,8 +1018,9 @@ async def run_langgraph_advance_flow(
 @router.post("/sessions/{session_id}/advance")
 async def advance_session(
     request: Request,
-    session_id: str,
     body: AdvanceRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),

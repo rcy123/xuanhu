@@ -48,6 +48,16 @@ _TERMINATABLE_STATUSES = {"active", "pending_review", "blocked"}
 _TERMINATED_BLOCKED_REASON = "terminated_by_doctor"
 
 
+def _coerce_doctor_uuid(doctor_id: str | None) -> uuid.UUID | None:
+    """把 JWT claim 的 doctor_id 字符串转为 UUID；非法/缺失返回 None。"""
+    if not doctor_id:
+        return None
+    try:
+        return uuid.UUID(doctor_id)
+    except ValueError:
+        return None
+
+
 def _now() -> datetime:
     """返回当前 UTC 时间（naive，与模型 blocked_at 列类型保持一致）。"""
     return datetime.now(UTC).replace(tzinfo=None)
@@ -120,6 +130,9 @@ class SessionService:
             state_version=1,
             rollback_counts={},
             created_by=doctor_id,
+            # 阶段 2 加固：会话负责医师由 JWT claim 写入；非 UUID（遗留测试/无
+            # 认证回退态）置 NULL，保持过渡期语义（见 app/core/access.py）。
+            doctor_id=_coerce_doctor_uuid(doctor_id),
         )
         self._db.add(session)
         await self._db.flush()
@@ -175,9 +188,21 @@ class SessionService:
         page: int,
         page_size: int,
         sort: str,
+        doctor_id: str | None = None,
     ) -> SessionListResponse:
-        """查询会话列表，支持状态过滤、patient_ref 模糊搜索与分页排序。"""
+        """查询会话列表，支持状态过滤、patient_ref 模糊搜索与分页排序。
+
+        阶段 2 加固：``on`` 模式下列表强制按当前医师过滤（``doctor_id = :me
+        OR doctor_id IS NULL`` 遗留无主会话过渡期可见），不靠客户端自觉。
+        """
         stmt = select(ConsultSession)
+
+        if doctor_id and get_settings().xuanhu_access_enabled == "on":
+            owner = _coerce_doctor_uuid(doctor_id)
+            if owner is not None:
+                stmt = stmt.where(
+                    (ConsultSession.doctor_id == owner) | (ConsultSession.doctor_id.is_(None))
+                )
 
         if status is not None:
             stmt = stmt.where(ConsultSession.status == status)

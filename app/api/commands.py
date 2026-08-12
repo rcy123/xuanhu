@@ -19,6 +19,8 @@ from app.agent_runtime.async_command import (
     AsyncCommandStatus as RepoCommandStatus,
 )
 from app.agent_runtime.async_command import PostgresAsyncCommandRepository
+from app.api.request_context import validate_session_id
+from app.core.access import require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import SessionNotFoundError, XuanhuError
 from app.db.session import get_session_factory
@@ -50,8 +52,9 @@ def _request_trace_id(request: Request) -> str:
 @router.get("/sessions/{session_id}/commands/{command_id}")
 async def get_command_status(
     request: Request,
-    session_id: str,
     command_id: str,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_reader),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
     """Read one session-scoped command's public status."""

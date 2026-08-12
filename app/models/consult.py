@@ -45,6 +45,11 @@ class ConsultSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     blocked_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
     blocked_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 阶段 2 加固：会话负责医师（JWT claim 写入，非客户端可改）。
+    # NULL=遗留无主会话（灰度过渡期任一登录医师可访问，见 app/core/access.py）。
+    doctor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("doctors.id", ondelete="RESTRICT"), nullable=True
+    )
 
     # -- relationships --
     messages: Mapped[list[ConsultMessage]] = relationship(

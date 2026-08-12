@@ -76,6 +76,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "scripts/*.py" = ["T20"]  # scripts are CLI tools, print is expected
 "app/api/*.py" = ["B008"]  # FastAPI Depends() in default args is idiomatic
+"app/core/access.py" = ["B008"]  # FastAPI Depends() in default args is idiomatic
 "tests/_l1_3_subprocess.py" = ["T20"]  # subprocess helper uses print for JSON output
 
 [tool.ruff.format]

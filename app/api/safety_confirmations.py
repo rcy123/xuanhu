@@ -13,8 +13,10 @@ from app.api.request_context import (
     WriteRequestContext,
     execute_model_write,
     get_trace_id,
+    validate_session_id,
     write_request_context,
 )
+from app.core.access import require_session_owner, require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import SessionNotFoundError, ValidationError, XuanhuError
 from app.db.session import get_db
@@ -44,8 +46,9 @@ def _require_actor(doctor: DoctorPrincipal) -> str:
 @router.get("/sessions/{session_id}/safety-assertions")
 async def list_safety_assertions(
     request: Request,
-    session_id: str,
+    session_id: str = Depends(validate_session_id),
     status: SafetyAssertionStatus | None = Query(default=None),
+    _: None = Depends(require_session_reader),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
@@ -103,9 +106,10 @@ async def _decide(
 
 @router.post("/sessions/{session_id}/safety-assertions/{assertion_id}/confirm")
 async def confirm_safety_assertion(
-    session_id: str,
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),
@@ -123,9 +127,10 @@ async def confirm_safety_assertion(
 
 @router.post("/sessions/{session_id}/safety-assertions/{assertion_id}/reject")
 async def reject_safety_assertion(
-    session_id: str,
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),
@@ -143,9 +148,10 @@ async def reject_safety_assertion(
 
 @router.post("/sessions/{session_id}/safety-assertions/{assertion_id}/retract")
 async def retract_safety_assertion(
-    session_id: str,
     assertion_id: str,
     body: SafetyAssertionDecisionRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     context: WriteRequestContext = Depends(write_request_context),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     db: AsyncSession = Depends(get_db),

@@ -41,6 +41,23 @@ def get_trace_id(request: Request) -> str:
     return request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
 
 
+def validate_session_id(session_id: str) -> str:
+    """校验 ``{session_id}`` 路径参数为合法 UUID（阶段 2 T2.8 / H7）。
+
+    非法格式 → 400 VALIDATION_ERROR。统一全项目 session_id 校验口径，
+    堵住 SSE 等路径的 SSRF / 路径遍历输入。
+    """
+    try:
+        uuid.UUID(session_id)
+    except ValueError as exc:
+        raise ValidationError(
+            message="session_id 格式非法",
+            detail=None,
+            retryable=False,
+        ) from exc
+    return session_id
+
+
 def validate_idempotency_key(value: str) -> str:
     """Validate an externally supplied idempotency key without normalising it.
 

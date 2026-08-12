@@ -85,11 +85,12 @@ def test_queued_status_returns_200_with_envelope(monkeypatch: Any) -> None:
 
 
 def test_malformed_session_uses_session_not_found_envelope(monkeypatch: Any) -> None:
+    """阶段 2（H7）：非法 session_id 格式 → 400 VALIDATION_ERROR（统一口径）。"""
     fake = _FakeRepository()
     _patch_repo(monkeypatch, fake)
     response = client.get("/api/v1/consult/sessions/not-a-uuid/commands/not-a-uuid")
-    assert response.status_code == 404
-    assert response.json()["code"] == "SESSION_NOT_FOUND"
+    assert response.status_code == 422
+    assert response.json()["code"] == "VALIDATION_ERROR"
 
 
 def test_malformed_command_id_is_command_not_found(monkeypatch: Any) -> None:

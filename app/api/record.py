@@ -19,8 +19,10 @@ from app.api.request_context import (
     WriteRequestContext,
     execute_model_write,
     get_trace_id,
+    validate_session_id,
     write_request_context,
 )
+from app.core.access import require_session_owner, require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     InvalidStageTransitionError,
@@ -74,11 +76,12 @@ def _state_version(
 @router.get("/sessions/{session_id}/record")
 async def get_record(
     request: Request,
-    session_id: str,
     version: str | None = Query(
         default=None,
         description="版本号（正整数）或 'latest'，默认 latest",
     ),
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_reader),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
@@ -111,8 +114,9 @@ async def get_record(
 @router.put("/sessions/{session_id}/record")
 async def update_record(
     request: Request,
-    session_id: str,
     body: RecordUpdateRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
@@ -165,7 +169,6 @@ async def update_record(
 @router.get("/sessions/{session_id}/record/export")
 async def export_record(
     request: Request,
-    session_id: str,
     format: str = Query(
         ...,  # 必填
         description="导出格式: txt / json / md",
@@ -174,6 +177,8 @@ async def export_record(
         default=None,
         description="版本号（正整数）或 'latest'，默认 latest",
     ),
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_reader),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> Response:

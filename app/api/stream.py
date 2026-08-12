@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import StreamingResponse
 
+from app.api.request_context import validate_session_id
+from app.core.access import require_stream_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor_from_query
 from app.core.config import get_settings
 from app.db.session import get_session_factory
@@ -15,9 +17,10 @@ router = APIRouter(prefix="/api/v1/consult", tags=["events"])
 
 @router.get("/sessions/{session_id}/stream")
 async def stream_session_events(
-    session_id: str,
+    session_id: str = Depends(validate_session_id),
     last_event_id: str | None = Query(default=None),
     last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
+    _: None = Depends(require_stream_session_reader),
     doctor: DoctorPrincipal = Depends(get_current_doctor_from_query),
 ) -> StreamingResponse:
     """连接会话 SSE 事件流。

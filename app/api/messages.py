@@ -22,7 +22,8 @@ from app.agent_runtime.async_command_admission import (
     try_rollout_async_admission,
 )
 from app.agent_runtime.lifecycle import allow_request_local_runtime_fallback
-from app.api.request_context import WriteRequestContext, get_trace_id, write_request_context
+from app.api.request_context import WriteRequestContext, get_trace_id, validate_session_id, write_request_context
+from app.core.access import require_session_owner, require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     AgentTriggerFailedError,
@@ -74,8 +75,9 @@ def _state_version(
 @router.post("/sessions/{session_id}/messages")
 async def create_message(
     request: Request,
-    session_id: str,
     body: MessageCreateRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
@@ -177,10 +179,11 @@ async def create_message(
 @router.get("/sessions/{session_id}/messages")
 async def get_messages(
     request: Request,
-    session_id: str,
+    session_id: str = Depends(validate_session_id),
     before: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
     stage: str | None = Query(default=None),
+    _: None = Depends(require_session_reader),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:

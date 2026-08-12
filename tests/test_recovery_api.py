@@ -276,14 +276,14 @@ async def test_recover_session_not_found(client: AsyncClient) -> None:
 
 
 async def test_recover_invalid_uuid_format(client: AsyncClient) -> None:
-    """非法 UUID 格式 session_id 返回 404 SESSION_NOT_FOUND。"""
+    """非法 UUID 格式 session_id 返回 422 VALIDATION_ERROR（阶段 2 H7 统一口径）。"""
     response = await client.post(
         "/api/v1/consult/sessions/not-a-uuid/recover",
         json={"action": "retry_current_stage"},
     )
-    assert response.status_code == 404
+    assert response.status_code == 422
     body = response.json()
-    assert body["code"] == "SESSION_NOT_FOUND"
+    assert body["code"] == "VALIDATION_ERROR"
 
 
 # ---------------------------------------------------------------------------

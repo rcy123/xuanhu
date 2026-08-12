@@ -22,8 +22,10 @@ from app.api.request_context import (
     WriteRequestContext,
     execute_model_write,
     get_trace_id,
+    validate_session_id,
     write_request_context,
 )
+from app.core.access import require_session_owner, require_session_reader
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.config import get_settings
 from app.core.exceptions import (
@@ -127,6 +129,7 @@ async def list_sessions(
         page=page,
         page_size=page_size,
         sort=sort,
+        doctor_id=doctor.doctor_id,
     )
     return JSONResponse(
         status_code=200,
@@ -137,7 +140,8 @@ async def list_sessions(
 @router.get("/sessions/{session_id}")
 async def get_session(
     request: Request,
-    session_id: str,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_reader),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
 ) -> JSONResponse:
@@ -154,8 +158,9 @@ async def get_session(
 @router.post("/sessions/{session_id}/terminate")
 async def terminate_session(
     request: Request,
-    session_id: str,
     body: SessionTerminateRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     context: WriteRequestContext = Depends(write_request_context),

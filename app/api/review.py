@@ -27,8 +27,10 @@ from app.api.request_context import (
     WriteRequestContext,
     execute_model_write,
     get_trace_id,
+    validate_session_id,
     write_request_context,
 )
+from app.core.access import require_session_owner
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     FormulaOverrideRequiredError,
@@ -84,8 +86,9 @@ def _state_version(
 @router.post("/sessions/{session_id}/review")
 async def review_prescription(
     request: Request,
-    session_id: str,
     body: ReviewRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),

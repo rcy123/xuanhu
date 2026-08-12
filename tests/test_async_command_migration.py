@@ -35,7 +35,7 @@ def test_migration_module_importable() -> None:
 
 def test_migration_is_the_current_head() -> None:
     directory = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert directory.get_current_head() == "20260813_0018"
+    assert directory.get_current_head() == "20260813_0019"
 
 
 def test_chain_is_linear_to_previous_head() -> None:

@@ -19,7 +19,8 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.request_context import get_trace_id
+from app.api.request_context import get_trace_id, validate_session_id
+from app.core.access import require_session_owner
 from app.core.auth import DoctorPrincipal, get_current_doctor
 from app.core.exceptions import (
     IdempotencyConflictError,
@@ -63,9 +64,10 @@ def _state_version(
 @router.post("/sessions/{session_id}/messages/{message_id}/rollback")
 async def rollback_messages(
     request: Request,
-    session_id: str,
     message_id: str,
     body: MessageRollbackRequest,
+    session_id: str = Depends(validate_session_id),
+    _: None = Depends(require_session_owner),
     db: AsyncSession = Depends(get_db),
     doctor: DoctorPrincipal = Depends(get_current_doctor),
     state_version: int | None = Depends(_state_version),
