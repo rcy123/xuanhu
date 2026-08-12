@@ -180,6 +180,57 @@ async def test_read_events_after_missing_event_id_returns_resync() -> None:
     assert needs_resync is True
 
 
+@pytest.mark.asyncio
+async def test_iter_sse_fresh_connect_resyncs_without_replaying_history() -> None:
+    """全新连接（无游标）不重放历史事件，直接发 resync 并跳至最新。
+
+    历史重放会让客户端对每条 message.created/agent.finished 都触发一次全量
+    refetch（打开会话即请求风暴），且重放的是过期瞬态；修复后无游标连接只发
+    resync，客户端以 GET 权威读模型全量同步。
+    """
+    redis = FakeRedis()
+    service = EventService(redis)  # type: ignore[arg-type]
+    await service.append_session_event("sid-010", "message.created", {"message_id": "msg-001"})
+    await service.append_session_event("sid-010", "agent.finished", {"agent_name": "intake"})
+
+    stream = service.iter_sse(
+        "sid-010",
+        last_event_id=None,
+        heartbeat_interval_seconds=0.1,
+    )
+    first = await anext(stream)
+    assert first.startswith("event: resync\n")
+    assert "fresh_connect_full_sync" in first
+    # 历史事件不得重放：紧跟 resync 的应是 heartbeat（无新事件），而非 message.created。
+    second = await anext(stream)
+    assert second.startswith("event: heartbeat\n")
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_sse_with_cursor_still_replays_events_after_cursor() -> None:
+    """带游标的连接仍按既有语义补发游标之后的事件（断线重连增量补发）。"""
+    redis = FakeRedis()
+    service = EventService(redis)  # type: ignore[arg-type]
+    first = await service.append_session_event(
+        "sid-011",
+        "message.created",
+        {"message_id": "msg-001"},
+    )
+    await service.append_session_event("sid-011", "agent.finished", {"agent_name": "intake"})
+
+    stream = service.iter_sse(
+        "sid-011",
+        last_event_id=first.event_id,
+        heartbeat_interval_seconds=0.1,
+    )
+    second = await anext(stream)
+    assert second.startswith("event: agent.finished\n")
+    assert "intake" in second
+    await stream.aclose()
+
+
+
 def test_format_sse_event_includes_event_id_and_data() -> None:
     """SSE 格式包含 event/id/data 三段。"""
     service = EventService()

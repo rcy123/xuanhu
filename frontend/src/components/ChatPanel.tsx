@@ -152,14 +152,17 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
     [loadMessages, refreshDetail, sessionId],
   )
 
-  // SSE 回调：onResync — 流断裂后全量同步；同时对所有未决异步命令做一次对账
-  // （重连/断流后不能依赖 SSE 唤醒，需以 GET status 追平终态）。
+  // SSE 回调：onResync — 流断裂/全新连接后全量同步（以 GET 权威读模型为准）；
+  // 同时对所有未决异步命令做一次对账（重连/断流后不能依赖 SSE 唤醒，需以
+  // GET status 追平终态）。后端对全新连接（无游标）会直接发 resync 而非重放
+  // 历史事件，因此这里必须一并刷新消息历史，避免打开会话时漏掉已加载的消息。
   const handleResync = useCallback(
     (_reason: string) => {
       void refreshDetail()
+      if (sessionId) void loadMessages(sessionId)
       void commandReconciler.reconcileAll()
     },
-    [refreshDetail, commandReconciler],
+    [refreshDetail, loadMessages, sessionId, commandReconciler],
   )
 
   // SSE 回调：onReviewRequired — 使用 modified_formula 设置待确认处方

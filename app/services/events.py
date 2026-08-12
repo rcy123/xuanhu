@@ -343,16 +343,33 @@ class EventService:
         last_event_id: str | None,
         heartbeat_interval_seconds: float,
     ) -> AsyncIterator[str]:
-        """生成 SSE 文本流。"""
-        current_id = last_event_id or "0-0"
-        events, needs_resync = await self.read_events_after(session_id, last_event_id)
-        if needs_resync:
-            yield self.format_sse_event(self.resync_event(session_id, "last_event_id_not_found"))
+        """生成 SSE 文本流。
+
+        全新连接（无游标）不重放整条历史事件流——历史事件可能多达
+        EVENT_STREAM_MAXLEN 条，逐条重放会让客户端对每条 message.created /
+        agent.finished 都触发一次全量 refetch（打开会话即引发请求风暴，且
+        重放的是过期瞬态）。改为直接发 resync，让客户端以 GET 权威读模型全量
+        同步，游标跳到最新后只流式推送新事件。带游标的连接（断线重连）仍按
+        既有语义：游标仍可用则补发之后的事件，已裁剪则发 resync。
+        """
+        if not last_event_id:
+            # 全新连接：resync + 跳至最新，不重放历史。
+            yield self.format_sse_event(
+                self.resync_event(session_id, "fresh_connect_full_sync")
+            )
             current_id = await self.latest_event_id(session_id)
         else:
-            for event in events:
-                current_id = event.event_id
-                yield self.format_sse_event(event)
+            current_id = last_event_id
+            events, needs_resync = await self.read_events_after(session_id, last_event_id)
+            if needs_resync:
+                yield self.format_sse_event(
+                    self.resync_event(session_id, "last_event_id_not_found")
+                )
+                current_id = await self.latest_event_id(session_id)
+            else:
+                for event in events:
+                    current_id = event.event_id
+                    yield self.format_sse_event(event)
 
         heartbeat_ms = max(int(heartbeat_interval_seconds * 1000), 100)
         while True:

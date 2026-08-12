@@ -509,4 +509,42 @@ describe('ChatPanel P8-4 集成', () => {
     expect(loadMessages).toHaveBeenCalledWith('s1')
     },
   )
+
+  it('resync event performs a full sync: refresh detail, reload messages, reconcile commands', async () => {
+    // R7/SSE：后端对全新连接（无游标）直接发 resync 而非重放历史事件；
+    // 前端收到 resync 必须以 GET 权威读模型全量同步（含消息历史）。
+    let onResync: ((event: import('@/types/api').SessionEvent) => void) | undefined
+    vi.mocked(sse.connectSessionStream).mockImplementation((_id, handlers) => {
+      onResync = handlers.onResync
+      return { close: vi.fn(), closed: false, lastEventId: null }
+    })
+    const refreshDetail = vi.fn().mockResolvedValue(makeDetail({ state_version: 2 }))
+    const loadMessages = vi.fn().mockResolvedValue([])
+    const reconcileAll = vi.fn().mockResolvedValue(undefined)
+    const reconciler = makeCommandReconciler()
+    reconciler.reconcileAll = reconcileAll
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ refreshDetail })}
+        messagesHook={makeMessagesHook({ loadMessages })}
+        commandReconciler={reconciler}
+      />,
+    )
+    refreshDetail.mockClear()
+    loadMessages.mockClear()
+    reconcileAll.mockClear()
+
+    await act(async () => {
+      onResync?.({
+        event_id: 'resync-1',
+        event_type: 'resync',
+        payload: { session_id: 's1', reason: 'fresh_connect_full_sync' },
+      })
+    })
+
+    await waitFor(() => expect(refreshDetail).toHaveBeenCalledTimes(1))
+    expect(loadMessages).toHaveBeenCalledWith('s1')
+    expect(reconcileAll).toHaveBeenCalledTimes(1)
+  })
 })
