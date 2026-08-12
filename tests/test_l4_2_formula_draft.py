@@ -38,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 from app.agent_runtime.config import DEFAULT_GRAPH_VERSION, make_run_config
 from app.agent_runtime.formula_verifier import (
     FORMULA_AGENT_VERSION,
+    FORMULA_MODEL_TEMPERATURE,
     FORMULA_PROMPT_VERSION,
     FormulaGateAuthority,
     FormulaVerificationFailureCode,
@@ -602,7 +603,7 @@ async def test_completed_formula_passes_with_fixed_gateway_parameters() -> None:
     call = gateway.calls[0]
     assert call["output_schema"] is FormulaDraft
     assert call["agent_name"] == "formula_draft"
-    assert call["temperature"] == 0.1
+    assert call["temperature"] == FORMULA_MODEL_TEMPERATURE
     assert call["max_requests"] == 1
 
 

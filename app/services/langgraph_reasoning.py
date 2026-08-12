@@ -106,7 +106,7 @@ from app.agents.syndrome_draft import (
 from app.core.config import agent_model_timeout_seconds, get_settings
 from app.db.session import get_session_factory
 from app.models.consult import ConsultSession
-from app.models.domain import GraphRun, IntakeCommandClaim
+from app.models.domain import GraphRun, IntakeCommandClaim, OutboxEvent
 from app.rag.reasoning_retrieval import stage_rag_enabled
 from app.rag.schemas import Evidence
 from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus
@@ -1472,7 +1472,25 @@ async def run_reasoning_alternatives_ready_node(state: XuanhuGraphState) -> dict
         response["alternatives_ready"] = True
         formula_meta = (claim.intermediate_payload or {}).get("formula", {})
         response["alternatives_count"] = formula_meta.get("alternatives_count", 0)
-        await _complete_claim(claim.id, response, domain_state.state_version)
+        # 终点补发 reasoning.command_completed.v1（route=alternatives_ready）：
+        # 多候选路径不提交 formula artifact（方子只进 state_snapshot），天然不发
+        # completion 事件；浏览器端仅靠 command.succeeded 一条信号自动刷新，对账
+        # 预算耗尽或 SSE 唤醒丢失时界面就停住。这里显式广播完成事件，让 SSE 侧的
+        # agent.finished 唤醒前端以 GET 权威读模型刷新。
+        await _complete_claim(
+            claim.id,
+            response,
+            domain_state.state_version,
+            outbox_event_type=REASONING_COMMAND_COMPLETED,
+            outbox_payload={
+                "session_id": str(claim.session_id),
+                "command_id": claim.idempotency_key,
+                "route": "alternatives_ready",
+                "input_state_version": domain_state.state_version,
+                "output_state_version": domain_state.state_version,
+                "alternatives_count": formula_meta.get("alternatives_count", 0),
+            },
+        )
         return {
             "route": NODE_REASONING_SUBGRAPH_V1,
             "reasoning_route": ROUTE_ALTERNATIVES_READY,
@@ -2417,7 +2435,23 @@ def _response_payload(
     return payload
 
 
-async def _complete_claim(claim_id: uuid.UUID, response_payload: dict[str, Any], output_state_version: int) -> None:
+async def _complete_claim(
+    claim_id: uuid.UUID,
+    response_payload: dict[str, Any],
+    output_state_version: int,
+    *,
+    outbox_event_type: str | None = None,
+    outbox_payload: dict[str, object] | None = None,
+) -> None:
+    """Complete the claim (and its graph run) in one transaction.
+
+    ``outbox_event_type``/``outbox_payload`` optionally append a durable outbox
+    event in the same unit of work.  Only terminal nodes that do not already
+    emit a completion event through ``repository.commit`` pass them — otherwise
+    the same logical completion would be broadcast twice (e.g.
+    ``ready_for_safety`` / ``manual_required`` already emit
+    ``reasoning.command_completed.v1`` inside their commit).
+    """
     try:
         factory = get_session_factory()
         async with factory() as db:
@@ -2435,6 +2469,18 @@ async def _complete_claim(claim_id: uuid.UUID, response_payload: dict[str, Any],
                 if graph_run is not None:
                     graph_run.status = "completed"
                     graph_run.completed_at = func.now()
+                if outbox_event_type is not None:
+                    db.add(
+                        OutboxEvent(
+                            id=uuid.uuid4(),
+                            event_type=outbox_event_type,
+                            session_id=claim.session_id,
+                            graph_run_id=claim.run_id,
+                            state_version=output_state_version,
+                            trace_id=str(response_payload.get("trace_id") or "reasoning"),
+                            payload=outbox_payload or {},
+                        )
+                    )
     finally:
         _SYNDROME_RESULT_CACHE.pop(claim_id, None)
         _FORMULA_ROUTE_CACHE.pop(claim_id, None)

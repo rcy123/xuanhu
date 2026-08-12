@@ -326,12 +326,12 @@ def verify_formula_artifact(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-FORMULA_MODEL_TEMPERATURE = 0.1
+FORMULA_MODEL_TEMPERATURE = 0.2
 # 2026-08 真实会话（714b8cf7）：formula 输出含 base_formula + candidate_formula +
 # modifications + rationale + 各 basis claim（槽位投影上下文使输出更长），
 # 2000 token 常被截断（MODEL_OUTPUT_TRUNCATED → manual_required 死路）。
 # 提到 4096 给完整处方留足预算；json_object 网关模式另有 max(2048, …) 下限。
-FORMULA_MODEL_MAX_TOKENS = 4_096
+FORMULA_MODEL_MAX_TOKENS = 8192
 FORMULA_MODEL_TIMEOUT_SECONDS = agent_model_timeout_seconds()  # 网关超时 + 余量（runtime 前置守卫要求严格大于网关超时）
 
 

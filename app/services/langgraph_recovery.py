@@ -769,7 +769,7 @@ class LangGraphRecoveryService:
         if shared_runtime is not None:
             return await self._recover_with_graph(
                 graph=shared_runtime.graph,
-                runner=shared_runtime.runner(timeout_seconds=120),
+                runner=shared_runtime.runner(timeout_seconds=get_settings().graph_runner_timeout_seconds),
                 config=config,
                 meta=meta,
                 request=request,
@@ -787,7 +787,7 @@ class LangGraphRecoveryService:
             graph = build_main_graph(checkpointer=saver)
             return await self._recover_with_graph(
                 graph=graph,
-                runner=GraphRunner(graph, timeout_seconds=120),
+                runner=GraphRunner(graph, timeout_seconds=get_settings().graph_runner_timeout_seconds),
                 config=config,
                 meta=meta,
                 request=request,

@@ -206,6 +206,11 @@ def test_versioned_mapper_projects_only_safe_fields() -> None:
         ),
         (
             "reasoning.command_completed.v1",
+            {"route": "alternatives_ready", "alternatives_count": 2},
+            ["agent.finished"],
+        ),
+        (
+            "reasoning.command_completed.v1",
             {"artifact_type": "formula_draft"},
             ["agent.finished", "stage.changed"],
         ),
@@ -224,6 +229,43 @@ def test_versioned_mapper_rejects_unknown_contract() -> None:
     with pytest.raises(OutboxMappingError):
         map_outbox_event(_message("future.event.v2", payload={"content": "unsafe"}))
 
+
+def test_reasoning_completed_alternatives_ready_broadcasts_finished_without_fake_stage_change() -> None:
+    """医师选方暂停点：只广播 agent.finished(reasoning)，绝不伪造 stage.changed→safety。
+
+    多候选路径不提交 formula artifact、会话仍停留在 syndrome；若按无 route 的
+    else 分支广播 stage.changed(syndrome→safety)，前端会误判已进入安全审核。
+    """
+    payload: dict[str, object] = {
+        "session_id": str(uuid4()),
+        "command_id": "advance:deadbeef",
+        "route": "alternatives_ready",
+        "input_state_version": 45,
+        "output_state_version": 45,
+        "alternatives_count": 2,
+    }
+
+    mapped = map_outbox_event(_message("reasoning.command_completed.v1", payload=payload))
+
+    assert [item.event_type for item in mapped] == ["agent.finished"]
+    finished = mapped[0]
+    assert finished.payload["agent_name"] == "reasoning"
+    assert finished.payload["alternatives_count"] == 2
+    assert "from_stage" not in finished.payload
+    assert "to_stage" not in finished.payload
+
+
+def test_reasoning_completed_alternatives_ready_ignores_non_int_count() -> None:
+    """alternatives_count 非正整数时静默丢弃，不破坏完成事件。"""
+    mapped = map_outbox_event(
+        _message(
+            "reasoning.command_completed.v1",
+            payload={"route": "alternatives_ready", "alternatives_count": "2"},
+        )
+    )
+
+    assert [item.event_type for item in mapped] == ["agent.finished"]
+    assert "alternatives_count" not in mapped[0].payload
 
 def test_safety_recompute_mapper_is_privacy_minimal_and_question_is_optional() -> None:
     question_id = str(uuid4())

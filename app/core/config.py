@@ -418,6 +418,20 @@ class Settings(BaseSettings):
     async_command_poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
     async_command_shutdown_grace_seconds: float = Field(default=10, gt=0, le=120)
 
+    # ---- LangGraph 图执行总超时 ----
+    # 一次 advance 串行执行 辨证(≤网关超时+15s) + 基础方(≤网关超时+15s)，
+    # 最坏 ≈ 2×(MODEL_GATEWAY_TIMEOUT_SECONDS+15)。默认 300s 覆盖 90s 网关下的
+    # 最坏 210s 并留余量；所有 GraphRunner 调用（advance/recovery/review 的
+    # shared 与 request-local 路径）必须统一读此配置，避免单点 120s 硬编码
+    # 在慢模型下把方剂生成拦腰截断（会话停留在 syndrome 且方剂缺失）。
+    graph_runner_timeout_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=3600,
+        validation_alias="XUANHU_GRAPH_RUNNER_TIMEOUT_SECONDS",
+        description="LangGraph GraphRunner 单次执行总超时（秒）；默认 300",
+    )
+
     # ---- 会话锁与导出 ----
     session_lock_ttl_seconds: int = Field(default=90, ge=1, description="会话锁 TTL（秒）")
     session_lock_wait_seconds: int = Field(default=0, ge=0, description="会话锁等待超时（秒），0 表示不等待")

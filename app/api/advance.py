@@ -413,7 +413,7 @@ async def _invoke_reasoning_graph(
     config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
     async with postgres_checkpointer(get_settings().database_url) as saver:
         graph = build_main_graph(checkpointer=saver)
-        runner = GraphRunner(graph, timeout_seconds=120)
+        runner = GraphRunner(graph, timeout_seconds=get_settings().graph_runner_timeout_seconds)
         await runner.ainvoke(dict(graph_state), config=config)
 
 
@@ -435,7 +435,7 @@ async def _invoke_shared_reasoning_graph(
         run_id=str(run_id),
     )
     config = make_run_config(session_id, graph_version=DEFAULT_GRAPH_VERSION)
-    await runtime.runner(timeout_seconds=120).ainvoke(dict(graph_state), config=config)
+    await runtime.runner(timeout_seconds=get_settings().graph_runner_timeout_seconds).ainvoke(dict(graph_state), config=config)
 
 
 async def _completed_advance_response(

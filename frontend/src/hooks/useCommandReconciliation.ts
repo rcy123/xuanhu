@@ -70,9 +70,9 @@ export interface UseCommandReconciliationOptions {
   onAttention?: (entry: CommandReconciliationEntry) => void
   /** 有界轮询间隔；SSE 丢失时兜底。 */
   pollIntervalMs?: number
-  /** 自动对账最大次数预算（默认 30 次）。测试可注入小值。 */
+  /** 自动对账最大次数预算（默认 75 次）。测试可注入小值。 */
   maxPollAttempts?: number
-  /** 自动对账最大时限（毫秒）；0 = 不启用时限（仅按次数）。默认 120s。 */
+  /** 自动对账最大时限（毫秒）；0 = 不启用时限（仅按次数）。默认 300s。 */
   pollDeadlineMs?: number
   /** 测试注入：覆盖状态获取。缺省用真实 getCommandStatus。 */
   fetchStatus?: (sessionId: string, commandId: string) => Promise<AsyncCommandStatus>
@@ -118,8 +118,13 @@ export interface UseCommandReconciliationResult {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 4000
-const DEFAULT_MAX_POLL_ATTEMPTS = 30
-const DEFAULT_POLL_DEADLINE_MS = 120_000
+// 对账预算必须显著大于后端最坏命令时长：推进（advance）一次可能串行跑
+// 辨证+基础方+重试退避，实测可达 85–120s+（见 REAL-SESSION 9510d47a 复盘）。
+// 120s 预算与命令时长同量级，预算耗尽会停掉自动轮询导致界面停在旧状态，
+// 必须手动刷新才能看到结果。这里放宽到 300s（75 次 × 4s）后重试预算才真正
+// 覆盖最坏情况。
+const DEFAULT_MAX_POLL_ATTEMPTS = 75
+const DEFAULT_POLL_DEADLINE_MS = 300_000
 
 function entryKey(entry: CommandReconciliationEntry): string {
   return `${entry.commandId}:${entry.state}:${entry.errorCode ?? ''}`

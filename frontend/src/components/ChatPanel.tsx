@@ -128,9 +128,13 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
     [sessionId, loadMessages],
   )
 
+  // SSE 回调：onAgentFinished — 任意 agent 完成都刷新详情与消息，以 GET 为权威。
+  // 过去只刷 intake/safety_confirmation：推进（advance）流的多候选终点补发的
+  // agent.finished(reasoning) 被忽略，界面只能靠命令对账轮询刷新；SSE 唤醒或
+  // 对账预算任一断掉就需要手动刷新。这里对全部 agent 一视同仁（读模型 GET 便宜，
+  // 多刷几次无害），保证 reasoning 完成事件真正触发 UI 刷新。
   const handleAgentFinished = useCallback(
-    (agentName: string) => {
-      if (agentName !== 'intake' && agentName !== 'safety_confirmation') return
+    (_agentName: string) => {
       void refreshDetail()
       if (sessionId) void loadMessages(sessionId)
     },

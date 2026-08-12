@@ -441,7 +441,7 @@ describe('ChatPanel P8-4 集成', () => {
     expect(submit).not.toHaveBeenCalled()
   })
 
-  it.each(['intake', 'safety_confirmation'])(
+  it.each(['intake', 'safety_confirmation', 'reasoning'])(
     'refreshes detail and messages when another window finishes %s',
     async (agentName) => {
     let onEvent: ((event: import('@/types/api').SessionEvent) => void) | undefined

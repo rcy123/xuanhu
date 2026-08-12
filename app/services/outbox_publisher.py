@@ -304,6 +304,15 @@ def map_outbox_event(message: OutboxMessage) -> tuple[MappedSessionEvent, ...]:
                     {**common, "blocked_reason": "reasoning_manual_required"},
                 )
             )
+        elif route == "alternatives_ready":
+            # 医师选方暂停点：会话仍停留在 syndrome 阶段，多候选方子已就绪等待选择。
+            # 只广播 agent.finished 唤醒前端刷新——绝不伪造 stage.changed→safety
+            # （会话并未推进到 safety）。alternatives_count 一并透传供 UI 展示。
+            finished = dict(events[0].payload)
+            alternatives_count = payload.get("alternatives_count")
+            if isinstance(alternatives_count, int) and not isinstance(alternatives_count, bool) and alternatives_count >= 0:
+                finished["alternatives_count"] = alternatives_count
+            events[0] = MappedSessionEvent(events[0].event_type, finished)
         else:
             events.append(
                 MappedSessionEvent(

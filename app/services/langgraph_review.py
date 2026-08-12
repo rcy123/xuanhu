@@ -2057,7 +2057,7 @@ class LangGraphReviewService:
             await self._drive_checkpoint_resume(
                 session_id=session_id,
                 submission_id=submission_id,
-                runner=shared_runtime.runner(timeout_seconds=120),
+                runner=shared_runtime.runner(timeout_seconds=get_settings().graph_runner_timeout_seconds),
                 graph=shared_runtime.graph,
                 config=config,
             )
@@ -2069,7 +2069,7 @@ class LangGraphReviewService:
             await self._drive_checkpoint_resume(
                 session_id=session_id,
                 submission_id=submission_id,
-                runner=GraphRunner(graph, timeout_seconds=120),
+                runner=GraphRunner(graph, timeout_seconds=get_settings().graph_runner_timeout_seconds),
                 graph=graph,
                 config=config,
             )
