@@ -17,8 +17,10 @@ from alembic.config import Config
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.agent_runtime.config import DEFAULT_GRAPH_VERSION
 from app.agent_runtime.reducer import DomainDelta, DomainState
 from app.agent_runtime.repository import (
+    ConsultMessageSpec,
     PostgresDomainRepository,
     RepositoryError,
     RepositoryErrorCode,
@@ -211,6 +213,17 @@ async def _event_row_count(factory: async_sessionmaker[AsyncSession]) -> int:
         return (await db.scalar(select(func.count()).select_from(QuestionCoverageEventRecord))) or 0
 
 
+def _message(message_id: UUID, content: str = "有痰") -> ConsultMessageSpec:
+    """覆盖事件 / 追问契约引用的消息行（FK: consult_messages 必须存在）。"""
+    return ConsultMessageSpec(
+        message_id=message_id,
+        role="patient_proxy",
+        stage="inquiry",
+        content=content,
+        trace_id=f"trace-{message_id}",
+    )
+
+
 async def test_contract_and_coverage_commit_persists_and_reloads(
     store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
 ) -> None:
@@ -219,7 +232,11 @@ async def test_contract_and_coverage_commit_persists_and_reloads(
     contract = _contract(session_id=session_id, question_message_id=question_message_id)
     state = await repository.get_state(session_id)
     contract_delta = _delta(state=state, sources=(), contracts=(contract,))
-    await repository.commit(contract_delta, _context(state, contract_delta, idempotency_key="r9-contract"))
+    await repository.commit(
+        contract_delta,
+        _context(state, contract_delta, idempotency_key="r9-contract"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+    )
 
     after_contract = await repository.get_state(session_id)
     assert after_contract.state_version == 2
@@ -229,7 +246,12 @@ async def test_contract_and_coverage_commit_persists_and_reloads(
     answer_id = uuid4()
     event = _answered_event(contract, answer_id=answer_id)
     event_delta = _delta(state=after_contract, sources=(answer_id,), events=(event,))
-    await repository.commit(event_delta, _context(after_contract, event_delta, idempotency_key="r9-coverage"))
+    await repository.commit(
+        event_delta,
+        _context(after_contract, event_delta, idempotency_key="r9-coverage"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+        consult_messages=(_message(answer_id),),
+    )
 
     after_event = await repository.get_state(session_id)
     assert after_event.state_version == 3
@@ -252,10 +274,16 @@ async def test_idempotent_replay_does_not_insert_rows_or_bump_version(
     contract = _contract(session_id=session_id, question_message_id=question_message_id)
     state = await repository.get_state(session_id)
     delta = _delta(state=state, sources=(), contracts=(contract,))
-    first = await repository.commit(delta, _context(state, delta, idempotency_key="r9-replay"))
+    first = await repository.commit(
+        delta, _context(state, delta, idempotency_key="r9-replay"), graph_version=DEFAULT_GRAPH_VERSION
+    )
 
-    replayed = await repository.commit(delta, _context(state, delta, idempotency_key="r9-replay"))
-    assert replayed.changed is False
+    replayed = await repository.commit(
+        delta, _context(state, delta, idempotency_key="r9-replay"), graph_version=DEFAULT_GRAPH_VERSION
+    )
+    # changed 是原命令的持久化效果标志（langgraph_record 依赖其稳定语义），
+    # 幂等重放不改变它；幂等性保证的是不重复插行、版本不推进。
+    assert replayed.changed == first.changed
     assert replayed.output_state_version == first.output_state_version
     assert await _contract_row_count(factory) == 1
 
@@ -268,7 +296,9 @@ async def test_tampered_stored_contract_fails_closed_on_load(
     contract = _contract(session_id=session_id, question_message_id=question_message_id)
     state = await repository.get_state(session_id)
     delta = _delta(state=state, sources=(), contracts=(contract,))
-    await repository.commit(delta, _context(state, delta, idempotency_key="r9-tamper"))
+    await repository.commit(
+        delta, _context(state, delta, idempotency_key="r9-tamper"), graph_version=DEFAULT_GRAPH_VERSION
+    )
 
     async with factory() as db, db.begin():
         row = await db.get(QuestionContractRecord, contract.contract_id)
@@ -288,13 +318,22 @@ async def test_tampered_stored_event_fails_closed_on_load(
     contract = _contract(session_id=session_id, question_message_id=question_message_id)
     state = await repository.get_state(session_id)
     contract_delta = _delta(state=state, sources=(), contracts=(contract,))
-    await repository.commit(contract_delta, _context(state, contract_delta, idempotency_key="r9-tamper-c"))
+    await repository.commit(
+        contract_delta,
+        _context(state, contract_delta, idempotency_key="r9-tamper-c"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+    )
 
     answer_id = uuid4()
     event = _answered_event(contract, answer_id=answer_id)
     after_contract = await repository.get_state(session_id)
     event_delta = _delta(state=after_contract, sources=(answer_id,), events=(event,))
-    await repository.commit(event_delta, _context(after_contract, event_delta, idempotency_key="r9-tamper-e"))
+    await repository.commit(
+        event_delta,
+        _context(after_contract, event_delta, idempotency_key="r9-tamper-e"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+        consult_messages=(_message(answer_id),),
+    )
 
     async with factory() as db, db.begin():
         row = await db.get(QuestionCoverageEventRecord, event.event_id)
@@ -320,14 +359,19 @@ async def test_deleted_intermediate_event_fails_closed_with_envelope(
     contract = _contract(session_id=session_id, question_message_id=question_message_id)
     state = await repository.get_state(session_id)
     contract_delta = _delta(state=state, sources=(), contracts=(contract,))
-    await repository.commit(contract_delta, _context(state, contract_delta, idempotency_key="r9-d2-root"))
+    await repository.commit(
+        contract_delta,
+        _context(state, contract_delta, idempotency_key="r9-d2-root"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+    )
 
     after_root = await repository.get_state(session_id)
     answer_id = uuid4()
     event = _answered_event(contract, answer_id=answer_id)  # partial: aspect0 addressed
+    followup_qid = uuid4()
     followup = build_question_contract(
         session_id=session_id,
-        question_message_id=uuid4(),
+        question_message_id=followup_qid,
         question_text="剩余两项能确认吗？",
         parent_contract=contract,
         residual_aspects=tuple(contract.aspects[1:]),
@@ -338,7 +382,12 @@ async def test_deleted_intermediate_event_fails_closed_with_envelope(
         contracts=(followup,),
         events=(event,),
     )
-    await repository.commit(chain_delta, _context(after_root, chain_delta, idempotency_key="r9-d2-chain"))
+    await repository.commit(
+        chain_delta,
+        _context(after_root, chain_delta, idempotency_key="r9-d2-chain"),
+        graph_version=DEFAULT_GRAPH_VERSION,
+        consult_messages=(_message(answer_id), _message(followup_qid, content="剩余两项能确认吗？")),
+    )
 
     async with factory() as db, db.begin():
         row = await db.get(QuestionCoverageEventRecord, event.event_id)
