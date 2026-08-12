@@ -343,16 +343,19 @@ describe('LangGraphAdvanceBar', () => {
     expect(screen.getByTestId('langgraph-advance-button')).toBeEnabled()
     expect(screen.getByTestId('langgraph-advance-button')).toHaveTextContent('进入辨证开方')
   })
-})
 
-  it('locks the button with a spinner through the async 202 reconciliation window', async () => {
+  it('hides the button and shows staged progress while advance is running', async () => {
     const advance = vi.spyOn(api, 'advanceSession').mockResolvedValue({
       command_id: 'cmd-1',
       operation: 'session.advance',
       status: 'queued',
       replayed: false,
       attempt_count: 0,
-      links: {},
+      links: {
+        self: '/api/sessions/session-1/commands/cmd-1',
+        session: '/api/sessions/session-1',
+        stream: '/api/sessions/session-1/events',
+      },
     })
     const onCommandAccepted = vi.fn()
     const { rerender } = render(
@@ -364,39 +367,42 @@ describe('LangGraphAdvanceBar', () => {
       />,
     )
 
+    // 初始：按钮可见
+    expect(screen.getByTestId('langgraph-advance-button')).toBeInTheDocument()
+
+    // 点击 → 202 接受：按钮消失，展示进行中提示（settling 保持）
     fireEvent.click(screen.getByTestId('langgraph-advance-button'))
     await waitFor(() => expect(onCommandAccepted).toHaveBeenCalledOnce())
+    expect(advance).toHaveBeenCalledOnce()
+    expect(screen.queryByTestId('langgraph-advance-button')).not.toBeInTheDocument()
+    const progress = screen.getByTestId('langgraph-advance-progress')
+    expect(progress.textContent).toContain('正在辨证')
 
-    // 202 已接受但命令仍在处理：按钮必须锁定并转圈（settling 保持）
-    let btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
-    expect(btn.disabled).toBe(true)
-    expect(btn.classList.contains('ant-btn-loading')).toBe(true)
-
-    // 对账窗口（pending=true）：继续锁定 + 转圈
+    // 辨证完成、方剂未出：提示切换为开方阶段
+    const syndromeDone = detail()
+    syndromeDone.syndrome_result = { syndrome: 'test' }
     rerender(
       <LangGraphAdvanceBar
-        detail={detail()}
+        detail={syndromeDone}
         onAdvanced={() => {}}
         pending
         onCommandAccepted={onCommandAccepted}
       />,
     )
-    btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
-    expect(btn.disabled).toBe(true)
-    expect(btn.classList.contains('ant-btn-loading')).toBe(true)
+    expect(screen.getByTestId('langgraph-advance-progress').textContent).toContain('正在开方')
 
-    // 对账终态（pending 回落 false）：解除锁定，停止转圈
+    // 对账终态（pending 回落 false）：按钮恢复，提示消失
     rerender(
       <LangGraphAdvanceBar
-        detail={detail()}
+        detail={syndromeDone}
         onAdvanced={() => {}}
         pending={false}
         onCommandAccepted={onCommandAccepted}
       />,
     )
     await waitFor(() => {
-      btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
-      expect(btn.disabled).toBe(false)
-      expect(btn.classList.contains('ant-btn-loading')).toBe(false)
+      expect(screen.getByTestId('langgraph-advance-button')).toBeInTheDocument()
+      expect(screen.queryByTestId('langgraph-advance-progress')).not.toBeInTheDocument()
     })
   })
+})

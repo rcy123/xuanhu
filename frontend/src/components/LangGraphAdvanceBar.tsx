@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Space, Typography } from 'antd'
+import { Alert, Button, Space, Spin, Typography } from 'antd'
 import { ArrowRightOutlined, ReloadOutlined } from '@ant-design/icons'
 import { advanceSession, recoverSession } from '@/api'
 import { ApiRequestError } from '@/api/errors'
@@ -186,6 +186,21 @@ export function LangGraphAdvanceBar({
       ? '生成病历'
       : '进入辨证开方'
 
+  // 命令进行中（请求在途 + 对账窗口）：按钮隐藏，显示分阶段进行中提示。
+  const advanceBusy = settling || pending
+  // 分阶段文案：辨证 → 开方 → 生成完成
+  const hasSyndrome = detail.syndrome_result != null
+  const hasFormula = (
+    detail.base_formula != null
+    || detail.modified_formula != null
+    || (detail.base_formula_alternatives != null && detail.base_formula_alternatives.length > 0)
+  )
+  const progressText = !hasSyndrome
+    ? '正在辨证…'
+    : !hasFormula
+      ? '辨证完成，正在开方…'
+      : '正在生成诊疗结果…'
+
   return (
     <div data-testid="langgraph-advance-bar" className="xh-runtime-control">
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
@@ -216,26 +231,30 @@ export function LangGraphAdvanceBar({
           />
         ) : null}
         {detail.current_stage === 'inquiry' || canRestartReasoning || isProductStageAction ? (
-          <Button
-            type="primary"
-            icon={<ArrowRightOutlined />}
-            disabled={
-              settling
-              || pending
-              || (
+          advanceBusy ? (
+            // 生成中：按钮隐藏，仅展示进行中提示，避免重复点击。
+            <div className="xh-advance-progress" data-testid="langgraph-advance-progress">
+              <Spin size="small" />
+              <Text type="secondary">{progressText}</Text>
+            </div>
+          ) : (
+            <Button
+              type="primary"
+              icon={<ArrowRightOutlined />}
+              disabled={
                 detail.current_stage === 'inquiry'
                   ? !canAdvance
                   : canRestartReasoning
                     ? detail.status !== 'active' || detail.recovery_status !== 'normal'
                     : !canRunStageAction
-              )
-            }
-            loading={submitting || settling || pending}
-            onClick={() => void handleAdvance()}
-            data-testid="langgraph-advance-button"
-          >
-            {actionLabel}
-          </Button>
+              }
+              loading={submitting}
+              onClick={() => void handleAdvance()}
+              data-testid="langgraph-advance-button"
+            >
+              {actionLabel}
+            </Button>
+          )
         ) : null}
       </Space>
     </div>

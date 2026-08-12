@@ -441,6 +441,42 @@ describe('ChatPanel P8-4 集成', () => {
     expect(submit).not.toHaveBeenCalled()
   })
 
+  it('does not clear pending command reconciliation when the reconciler identity changes on the same session', () => {
+    // R7 回归：commandReconciler 的引用在未决命令集合变化（registerAccepted 引起
+    // outstanding 更新）时也会变化；会话级 effect 若把它当作「会话变化」触发源，
+    // 会在登记新命令后立刻 clear() 抹掉未决命令，导致「进入辨证开方」按钮闪回
+    // 可点击、转圈中断。同一 session 内 reconciler 引用变化不得触发清空。
+    const clearSpy = vi.fn()
+    const recon1 = makeCommandReconciler()
+    recon1.clear = clearSpy
+    const sharedProps = {
+      sessionId: 's1',
+      detailHook: makeDetailHook(),
+      messagesHook: makeMessagesHook(),
+    }
+    const { rerender } = render(<ChatPanel {...sharedProps} commandReconciler={recon1} />)
+    // 挂载（session 确立）时清空一次，属预期。
+    expect(clearSpy).toHaveBeenCalledTimes(1)
+
+    // 模拟 202 登记后 reconciler 引用变化（useMemo 依赖 outstanding）：
+    // 同一 session 下不得再次 clear。
+    const recon2 = makeCommandReconciler()
+    recon2.clear = clearSpy
+    rerender(<ChatPanel {...sharedProps} commandReconciler={recon2} />)
+    expect(clearSpy).toHaveBeenCalledTimes(1)
+
+    // 会话真正切换时仍须清空，避免上一个会话的未决命令污染当前 UI。
+    rerender(
+      <ChatPanel
+        sessionId="s2"
+        detailHook={makeDetailHook({ sessionId: 's2', detail: null })}
+        messagesHook={makeMessagesHook()}
+        commandReconciler={recon2}
+      />,
+    )
+    expect(clearSpy).toHaveBeenCalledTimes(2)
+  })
+
   it.each(['intake', 'safety_confirmation', 'reasoning'])(
     'refreshes detail and messages when another window finishes %s',
     async (agentName) => {

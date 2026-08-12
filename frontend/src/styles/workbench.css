@@ -1899,6 +1899,21 @@
   background: color-mix(in srgb, var(--xh-success) 8%, transparent);
 }
 
+/* 辨证开方生成中：按钮隐藏，展示分阶段进行中提示 */
+.xh-advance-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px dashed var(--xh-border);
+  border-radius: 9px;
+  background: var(--xh-secondary-soft);
+}
+
+.xh-advance-progress .ant-typography {
+  font-size: 13px;
+}
+
 .xh-next-action-hint.is-triage_hold {
   border-left-color: var(--xh-error);
   background: color-mix(in srgb, var(--xh-error) 7%, transparent);

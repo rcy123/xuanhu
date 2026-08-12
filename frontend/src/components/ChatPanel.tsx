@@ -10,7 +10,7 @@
  * SSE 事件：触发 refreshDetail() / loadMessages() 以 GET 为权威来源。
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Spin, Typography } from 'antd'
 import {
   CloseOutlined,
@@ -92,7 +92,16 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
   // 选中会话变化时加载消息历史；离开时清空
   // 同时清空 SSE 衍生的本地状态（pendingReviewFormula/blockedIssues/rollbackTarget）
   // R7：切换会话 / 离开时清空未决异步命令对账，避免上一个会话的命令污染当前 UI。
+  //
+  // 注意：commandReconciler 的引用在未决命令集合变化时也会更新（useMemo 依赖
+  // outstanding），因此不能把它当作「会话变化」的触发源——否则登记新命令（202
+  // 登记对账引起 outstanding 变化）会立刻重跑本 effect 并 clear() 抹掉刚登记的
+  // 命令，导致按钮闪回可点击、转圈中断。这里用 prevSessionIdRef 守卫：仅当
+  // sessionId 真正变化时才清空/重置；effect 因 reconciler 引用变化重跑时直接跳过。
+  const prevSessionIdRef = useRef<string | null | undefined>(undefined)
   useEffect(() => {
+    if (prevSessionIdRef.current === sessionId) return
+    prevSessionIdRef.current = sessionId
     commandReconciler.clear()
     if (!sessionId) {
       clear()
