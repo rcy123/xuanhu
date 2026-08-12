@@ -305,3 +305,75 @@ async def test_rollback_resets_safety_profile(db: AsyncSession, http_client: Asy
         )
         assert profile_row.allergy_collection_status == "unknown"
         assert profile_row.allergens is None
+
+
+async def test_rollback_cleans_question_contracts_and_coverage(db: AsyncSession, http_client: AsyncClient) -> None:
+    """回退删除消息时同步清理引用它的 R9 question contracts / coverage events。"""
+    session, messages = await _create_inquiry_session(db)
+    sid = str(session.id)
+    # 在 msg4（agent 提问）上建契约，msg5（doctor 回答）上建 coverage 事件
+    from app.models.question_contract import (
+        QuestionContractRecord,
+        QuestionCoverageEventRecord,
+    )
+
+    contract = QuestionContractRecord(
+        id=uuid.uuid4(),
+        schema_version="question-contract.v1",
+        session_id=session.id,
+        question_message_id=messages[4].id,
+        root_contract_id=messages[4].id,  # placeholder, replaced below
+        parent_contract_id=None,
+        revision=1,
+        dimension="ten_questions.sleep",
+        selection_kind="required",
+        safety_critical=False,
+        max_followups=1,
+        question_digest="0" * 64,
+        aspects=[{"aspect": "入睡困难", "covered": False}],
+        contract_digest="0" * 64,
+    )
+    # root_contract_id 必须指向自身（revision=1 且 root=id）
+    contract.root_contract_id = contract.id
+    db.add(contract)
+    await db.flush()
+    coverage = QuestionCoverageEventRecord(
+        id=uuid.uuid4(),
+        schema_version="question-coverage-event.v1",
+        session_id=session.id,
+        contract_id=contract.id,
+        root_contract_id=contract.id,
+        answer_message_id=messages[5].id,
+        items=[{"aspect": "入睡困难", "covered": True}],
+        event_digest="0" * 64,
+    )
+    db.add(coverage)
+    await db.commit()
+
+    # 回退到 msg4（agent 提问）→ 删除 msg4..msg5
+    response = await http_client.post(
+        f"/api/v1/consult/sessions/{sid}/messages/{messages[4].id}/rollback",
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    assert set(response.json()["data"]["rolled_back_message_ids"]) == {
+        str(messages[4].id),
+        str(messages[5].id),
+    }
+
+    remaining_contracts = (
+        await db.scalars(
+            select(QuestionContractRecord)
+            .where(QuestionContractRecord.session_id == session.id)
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    remaining_coverage = (
+        await db.scalars(
+            select(QuestionCoverageEventRecord)
+            .where(QuestionCoverageEventRecord.session_id == session.id)
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    assert contract.id not in {row.id for row in remaining_contracts}
+    assert coverage.id not in {row.id for row in remaining_coverage}

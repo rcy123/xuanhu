@@ -35,6 +35,7 @@ from app.core.exceptions import (
 from app.models.audit import AuditEvent
 from app.models.consult import ConsultMessage, ConsultSession
 from app.models.domain import Observation, SafetyFactAssertion, SafetyProfile
+from app.models.question_contract import QuestionContractRecord, QuestionCoverageEventRecord
 from app.schemas.message import MessageRollbackData
 
 #: safety_fact_assertions.field_name -> (safety_profiles status 列, value 列)
@@ -110,7 +111,29 @@ async def rollback_messages_to(
     cutoff_ids = {row.id for row in cutoff}
     kept = [row for row in rows if row.id not in cutoff_ids]
 
-    # ---- 2. observations：删除 + 恢复 supersede 链 ----
+    # ---- 2. R9 提问契约：删除引用截断集内消息的 coverage 事件与契约 ----
+    # question_coverage_events.answer_message_id / question_contracts.question_message_id
+    # 均为 RESTRICT 外键；contract 删除会级联清理其 root/parent 子契约与 coverage。
+    deleted_coverage = (
+        await db.scalars(
+            select(QuestionCoverageEventRecord).where(
+                QuestionCoverageEventRecord.answer_message_id.in_(cutoff_ids)
+            )
+        )
+    ).all()
+    for coverage in deleted_coverage:
+        await db.delete(coverage)
+    deleted_contracts = (
+        await db.scalars(
+            select(QuestionContractRecord).where(
+                QuestionContractRecord.question_message_id.in_(cutoff_ids)
+            )
+        )
+    ).all()
+    for contract in deleted_contracts:
+        await db.delete(contract)
+
+    # ---- 3. observations：删除 + 恢复 supersede 链 ----
     deleted_obs = (
         await db.scalars(
             select(Observation).where(Observation.source_message_id.in_(cutoff_ids))
@@ -132,7 +155,7 @@ async def rollback_messages_to(
             obs.status = "active"
             obs.supersedes_observation_id = None
 
-    # ---- 3. safety assertions：删除 + 恢复被 supersede 的 confirmed 断言 ----
+    # ---- 4. safety assertions：删除 + 恢复被 supersede 的 confirmed 断言 ----
     deleted_assertions = (
         await db.scalars(
             select(SafetyFactAssertion).where(
@@ -163,7 +186,7 @@ async def rollback_messages_to(
                 assertion.supersedes_assertion_id = None
                 assertion.superseded_at = None
 
-    # ---- 4. safety profile：受影响字段保守重置为 unknown ----
+    # ---- 5. safety profile：受影响字段保守重置为 unknown ----
     if affected_fields:
         profile = await db.scalar(
             select(SafetyProfile).where(SafetyProfile.session_id == session.id)
@@ -177,12 +200,12 @@ async def rollback_messages_to(
                 setattr(profile, status_col, "unknown")
                 setattr(profile, value_col, None)
 
-    # ---- 5. 删除截断集内的消息 ----
+    # ---- 6. 删除截断集内的消息 ----
     for row in cutoff:
         await db.delete(row)
     await db.flush()
 
-    # ---- 6. 会话状态推进 ----
+    # ---- 7. 会话状态推进 ----
     session.state_version += 1
     snapshot = dict(session.state_snapshot or {})
     snapshot["agent_runtime"] = "langgraph"
@@ -204,7 +227,7 @@ async def rollback_messages_to(
     }
     session.state_snapshot = snapshot
 
-    # ---- 7. system 提示消息 ----
+    # ---- 8. system 提示消息 ----
     if reason:
         notice = f"{_ROLLBACK_NOTICE_PREFIX}，共撤销 {len(cutoff)} 条。原因：{reason[:200]}"
     else:
@@ -220,7 +243,7 @@ async def rollback_messages_to(
         )
     )
 
-    # ---- 8. 审计 ----
+    # ---- 9. 审计 ----
     db.add(
         AuditEvent(
             session_id=session.id,
