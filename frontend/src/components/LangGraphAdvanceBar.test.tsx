@@ -344,3 +344,59 @@ describe('LangGraphAdvanceBar', () => {
     expect(screen.getByTestId('langgraph-advance-button')).toHaveTextContent('进入辨证开方')
   })
 })
+
+  it('locks the button with a spinner through the async 202 reconciliation window', async () => {
+    const advance = vi.spyOn(api, 'advanceSession').mockResolvedValue({
+      command_id: 'cmd-1',
+      operation: 'session.advance',
+      status: 'queued',
+      replayed: false,
+      attempt_count: 0,
+      links: {},
+    })
+    const onCommandAccepted = vi.fn()
+    const { rerender } = render(
+      <LangGraphAdvanceBar
+        detail={detail()}
+        onAdvanced={() => {}}
+        pending={false}
+        onCommandAccepted={onCommandAccepted}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('langgraph-advance-button'))
+    await waitFor(() => expect(onCommandAccepted).toHaveBeenCalledOnce())
+
+    // 202 已接受但命令仍在处理：按钮必须锁定并转圈（settling 保持）
+    let btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    expect(btn.classList.contains('ant-btn-loading')).toBe(true)
+
+    // 对账窗口（pending=true）：继续锁定 + 转圈
+    rerender(
+      <LangGraphAdvanceBar
+        detail={detail()}
+        onAdvanced={() => {}}
+        pending
+        onCommandAccepted={onCommandAccepted}
+      />,
+    )
+    btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    expect(btn.classList.contains('ant-btn-loading')).toBe(true)
+
+    // 对账终态（pending 回落 false）：解除锁定，停止转圈
+    rerender(
+      <LangGraphAdvanceBar
+        detail={detail()}
+        onAdvanced={() => {}}
+        pending={false}
+        onCommandAccepted={onCommandAccepted}
+      />,
+    )
+    await waitFor(() => {
+      btn = screen.getByTestId('langgraph-advance-button') as HTMLButtonElement
+      expect(btn.disabled).toBe(false)
+      expect(btn.classList.contains('ant-btn-loading')).toBe(false)
+    })
+  })

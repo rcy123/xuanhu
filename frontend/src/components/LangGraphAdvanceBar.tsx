@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Space, Typography } from 'antd'
 import { ArrowRightOutlined, ReloadOutlined } from '@ant-design/icons'
 import { advanceSession, recoverSession } from '@/api'
@@ -50,8 +50,22 @@ export function LangGraphAdvanceBar({
   const [submitting, setSubmitting] = useState(false)
   const [recoverySubmitting, setRecoverySubmitting] = useState(false)
   const [error, setError] = useState<ApiRequestError | null>(null)
+  // 推进命令「从点击到终态」的持续锁定：202 仅表示已接受，命令仍在处理。
+  // submitting 只覆盖请求在途（finally 即清）；settling 覆盖整个对账窗口，
+  // 直到上层 pending（reconciler 未决命令）从 true 回落为 false（终态/预算耗尽）
+  // 才解除，避免 202 后按钮闪回可点击。
+  const [settling, setSettling] = useState(false)
   const pendingAdvance = useRef<PendingAdvanceRequest | null>(null)
   const pendingRecoveryKey = useRef<string | null>(null)
+  const prevPendingRef = useRef<boolean>(pending)
+
+  // 对账终态：pending 由 true → false 表示该命令已 settle，解除按钮锁定。
+  useEffect(() => {
+    if (prevPendingRef.current === true && pending === false) {
+      setSettling(false)
+    }
+    prevPendingRef.current = pending
+  }, [pending])
 
   if (detail.agent_runtime !== 'langgraph') return null
 
@@ -73,6 +87,7 @@ export function LangGraphAdvanceBar({
     const generatingRecord = detail.current_stage === 'record'
     if (generatingRecord) onRecordGenerationStart?.()
     setSubmitting(true)
+    setSettling(true)  // 点击即锁定按钮（含对账窗口）
     setError(null)
     if (pendingAdvance.current?.sessionId !== detail.session_id) {
       pendingAdvance.current = {
@@ -90,12 +105,13 @@ export function LangGraphAdvanceBar({
       )
       pendingAdvance.current = null
       if (isAsyncCommandAccepted(result)) {
-        // R7: 202 仅表示已接受，登记对账；不乐观刷新，终态由 reconciler 处理
-        // （成功刷新读模型；失败展示有界错误）。pending prop 保持按钮禁用。
+        // R7: 202 仅表示已接受，登记对账；不乐观刷新，终态由 reconciler 处理。
+        // settling 保持 true，按钮持续转圈锁定，直到上层 pending 回落（终态）。
         onCommandAccepted?.(result, request.idempotencyKey)
         return
       }
       await onAdvanced(result)
+      setSettling(false)
     } catch (caught: unknown) {
       const commandError = caught instanceof ApiRequestError ? caught : new ApiRequestError({
         code: 'ADVANCE_FAILED',
@@ -118,9 +134,9 @@ export function LangGraphAdvanceBar({
       }
       if (generatingRecord) onRecordGenerationFailed?.()
       setError(commandError)
+      setSettling(false)
     } finally {
-      // submitting 仅覆盖「请求在途」；已接受（202）后的对账窗口由 pending prop
-      // 负责禁用按钮，避免本组件局部 submitting 在对账终态后残留为 true。
+      // submitting 仅覆盖「请求在途」；202 后的对账窗口由 settling + pending 负责。
       setSubmitting(false)
     }
   }
@@ -204,7 +220,8 @@ export function LangGraphAdvanceBar({
             type="primary"
             icon={<ArrowRightOutlined />}
             disabled={
-              pending
+              settling
+              || pending
               || (
                 detail.current_stage === 'inquiry'
                   ? !canAdvance
@@ -213,7 +230,7 @@ export function LangGraphAdvanceBar({
                     : !canRunStageAction
               )
             }
-            loading={submitting || pending}
+            loading={submitting || settling || pending}
             onClick={() => void handleAdvance()}
             data-testid="langgraph-advance-button"
           >
