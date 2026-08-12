@@ -37,7 +37,7 @@ class RubricAspect(BaseModel):
     required: bool = False
     # Conditions of the form ``fact_key=value``; the criterion becomes mandatory
     # when any condition matches an active fact (value compared by containment).
-    conditional: tuple[str, ...] = Field(default=(), max_length=8)
+    conditional: tuple[str, ...] = Field(default=(), max_length=16)
 
 
 class DimensionRubric(BaseModel):
@@ -56,9 +56,18 @@ RESPIRATORY_RUBRIC_V1 = DimensionRubric(
     dimension=InquiryDimension.TEN_RESPIRATORY,
     aspects=(
         RubricAspect(criterion="说明咳嗽是否有痰（干咳/有痰）", required=True),
-        RubricAspect(criterion="说明痰的颜色", conditional=("present_illness.sputum=有痰",)),
-        RubricAspect(criterion="说明痰的量", conditional=("present_illness.sputum=有痰",)),
-        RubricAspect(criterion="说明痰的质地（稀/黏/泡沫等）", conditional=("present_illness.sputum=有痰",)),
+        RubricAspect(
+            criterion="说明痰的颜色",
+            conditional=("present_illness.sputum=有痰", "chief_complaint.symptom=有痰", "present_illness.change=有痰"),
+        ),
+        RubricAspect(
+            criterion="说明痰的量",
+            conditional=("present_illness.sputum=有痰", "chief_complaint.symptom=有痰", "present_illness.change=有痰"),
+        ),
+        RubricAspect(
+            criterion="说明痰的质地（稀/黏/泡沫等）",
+            conditional=("present_illness.sputum=有痰", "chief_complaint.symptom=有痰", "present_illness.change=有痰"),
+        ),
     ),
 )
 
@@ -78,6 +87,11 @@ COLD_HEAT_RUBRIC_V1 = DimensionRubric(
                 "present_illness.chills=怕冷",
                 "present_illness.chills=寒战",
                 "present_illness.fever=发烧",
+                "chief_complaint.symptom=热",
+                "chief_complaint.symptom=发烧",
+                "chief_complaint.symptom=怕冷",
+                "chief_complaint.symptom=恶寒",
+                "present_illness.change=热",
             ),
         ),
         RubricAspect(
@@ -87,6 +101,8 @@ COLD_HEAT_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.cold_heat=高热",
                 "present_illness.fever=低热",
                 "present_illness.fever=高热",
+                "chief_complaint.symptom=低热",
+                "chief_complaint.symptom=高热",
             ),
         ),
     ),
@@ -104,6 +120,8 @@ SWEAT_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.sweat=盗汗",
                 "present_illness.sweat=自汗",
                 "present_illness.sweat=盗汗",
+                "chief_complaint.symptom=自汗",
+                "chief_complaint.symptom=盗汗",
             ),
         ),
         RubricAspect(
@@ -113,6 +131,8 @@ SWEAT_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.sweat=盗汗",
                 "present_illness.sweat=自汗",
                 "present_illness.sweat=盗汗",
+                "chief_complaint.symptom=自汗",
+                "chief_complaint.symptom=盗汗",
             ),
         ),
     ),
@@ -132,6 +152,8 @@ HEAD_BODY_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.head_body=头重",
                 "present_illness.head_body=头痛",
                 "present_illness.head_body=头晕",
+                "chief_complaint.symptom=头痛",
+                "chief_complaint.symptom=头晕",
             ),
         ),
     ),
@@ -153,6 +175,9 @@ STOOL_URINE_RUBRIC_V1 = DimensionRubric(
                 "present_illness.stool=腹泻",
                 "present_illness.stool=便秘",
                 "present_illness.stool=便血",
+                "chief_complaint.symptom=腹泻",
+                "chief_complaint.symptom=便秘",
+                "chief_complaint.symptom=便血",
             ),
         ),
     ),
@@ -170,6 +195,8 @@ DIET_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.diet=纳差",
                 "ten_questions.diet=不振",
                 "present_illness.appetite=减退",
+                "chief_complaint.symptom=纳差",
+                "chief_complaint.symptom=没胃口",
             ),
         ),
     ),
@@ -188,6 +215,10 @@ CHEST_ABDOMEN_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.chest_abdomen=胸痛",
                 "ten_questions.chest_abdomen=腹胀",
                 "present_illness.abdomen=腹痛",
+                "chief_complaint.symptom=胸闷",
+                "chief_complaint.symptom=胸痛",
+                "chief_complaint.symptom=腹胀",
+                "chief_complaint.symptom=腹痛",
             ),
         ),
     ),
@@ -205,6 +236,8 @@ THIRST_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.thirst=口干",
                 "present_illness.thirst=口渴",
                 "present_illness.thirst=口干",
+                "chief_complaint.symptom=口渴",
+                "chief_complaint.symptom=口干",
             ),
         ),
     ),
@@ -225,6 +258,11 @@ SLEEP_RUBRIC_V1 = DimensionRubric(
                 "present_illness.sleep=失眠",
                 "present_illness.insomnia=失眠",
                 "present_illness.insomnia=难",
+                "present_illness.change=失眠",
+                "present_illness.change=多梦",
+                "present_illness.change=易醒",
+                "chief_complaint.symptom=失眠",
+                "chief_complaint.symptom=多梦",
             ),
         ),
         RubricAspect(
@@ -235,6 +273,10 @@ SLEEP_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.sleep=睡不着",
                 "present_illness.insomnia=失眠",
                 "present_illness.insomnia=难",
+                "present_illness.change=失眠",
+                "present_illness.change=入睡",
+                "chief_complaint.symptom=失眠",
+                "chief_complaint.symptom=入睡",
             ),
         ),
     ),
@@ -256,6 +298,7 @@ PAIN_RUBRIC_V1 = DimensionRubric(
                 "present_illness.pain=胀痛",
                 "present_illness.pain=酸痛",
                 "present_illness.body_ache=酸痛",
+                "chief_complaint.symptom=痛",
             ),
         ),
     ),
@@ -274,6 +317,8 @@ MENSES_LEUKORRHEA_RUBRIC_V1 = DimensionRubric(
                 "ten_questions.menses_leukorrhea=量少",
                 "ten_questions.menses_leukorrhea=淋漓",
                 "present_illness.pain=痛经",
+                "chief_complaint.symptom=月经",
+                "chief_complaint.symptom=痛经",
             ),
         ),
     ),

@@ -167,7 +167,7 @@ def test_registry_covers_all_ten_question_dimensions() -> None:
 
 def test_every_conditional_uses_contract_fact_keys() -> None:
     """Conditions reference only the intake contract's fact keys."""
-    valid_keys = {
+    valid_keys = {"chief_complaint.symptom", "present_illness.change"} | {
         "ten_questions." + d
         for d in (
             "cold_heat", "sweat", "head_body", "stool_urine", "diet",
@@ -310,3 +310,35 @@ def test_rubric_criteria_are_short_verifiable_statements() -> None:
             assert aspect.criterion.startswith("说明")
             assert "？" not in aspect.criterion
             assert len(aspect.criterion) <= 240
+
+
+def test_sleep_complaint_fact_freezes_conditionals() -> None:
+    """A chief complaint carrying 失眠 must freeze the sleep conditionals —
+    the complaint is the strongest signal and lands on chief_complaint.symptom."""
+    planned = plan_contract_aspects(
+        InquiryDimension.TEN_SLEEP,
+        _draft("说明睡眠质量"),
+        (_fact(fact_key="chief_complaint.symptom", value="失眠一周了"),),
+    )
+    assert "说明是否多梦或易醒" in planned
+    assert "说明入睡是否困难" in planned
+
+
+def test_cold_heat_complaint_fact_freezes_conjunction() -> None:
+    planned = plan_contract_aspects(
+        InquiryDimension.TEN_COLD_HEAT,
+        _draft("说明是否有发热"),
+        (_fact(fact_key="chief_complaint.symptom", value="发烧两天"),),
+    )
+    assert "说明怕冷与发热是否同时出现（寒热并见/但热不寒/往来寒热）" in planned
+
+
+def test_change_fact_carries_sleep_disturbance() -> None:
+    """Sleep disturbance mentioned incidentally in a change answer freezes the
+    conditionals (present_illness.change is where incidental symptoms land)."""
+    planned = plan_contract_aspects(
+        InquiryDimension.TEN_SLEEP,
+        _draft("说明睡眠质量"),
+        (_fact(fact_key="present_illness.change", value="睡眠不好，入睡困难"),),
+    )
+    assert "说明入睡是否困难" in planned
