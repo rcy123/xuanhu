@@ -1,11 +1,15 @@
 # ============================================================================
-# 悬壶（Xuanhu）— 本地/内网中间件编排
+# 悬壶（Xuanhu）— 生产/内网中间件编排（阶段 3 加固）
 # ============================================================================
-# 用途：提供 PostgreSQL、Redis、Milvus standalone 及必要依赖的本地开发环境。
-# 使用方式：cp .env.example .env && docker compose up -d
+# 安全边界：
+# 1. 中间件端口一律不映射到 host（仅 expose 容器网络内可达），只允许 API
+#    后端与反向代理容器访问（H5 修复）。
+# 2. 凭据一律 ${VAR} 强必填，无 :-默认值；生产用 scripts/gen-secrets.sh
+#    生成强随机凭据（H3 修复）。
+# 3. 所有服务加资源限制与日志轮转（防日志撑爆磁盘）。
 #
-# 注意：本 compose 只启动中间件，不包含 FastAPI 后端和前端。
-#       模型网关（MODEL_GATEWAY_BASE_URL）需由内网另行部署。
+# 本地开发：自动加载 docker-compose.override.yml 加回端口与默认凭据。
+# 生产部署：仅用本文件（docker compose -f docker-compose.yml up -d）。
 # ============================================================================
 
 services:
@@ -17,19 +21,28 @@ services:
     container_name: xuanhu-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-xuanhu}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xuanhu_dev}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-xuanhu}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xuanhu} -d ${POSTGRES_DB:-xuanhu}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-xuanhu}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
 
   # --------------------------------------------------------------------------
   # Redis 7 — checkpoint、会话锁、SSE 事件缓存（非权威缓存）
@@ -38,17 +51,26 @@ services:
     image: redis:7
     container_name: xuanhu-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-xuanhu_dev}
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-xuanhu_dev}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # --------------------------------------------------------------------------
   # etcd — Milvus 元数据存储
@@ -71,21 +93,30 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # --------------------------------------------------------------------------
-  # MinIO — Milvus 对象存储
+  # MinIO — Milvus 对象存储（凭据强必填，控制台不对外）
   # --------------------------------------------------------------------------
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     container_name: xuanhu-minio
     restart: unless-stopped
     environment:
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
     command: minio server /minio_data --console-address ":9001"
-    ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    expose:
+      - "9000"
+      - "9001"
     volumes:
       - minio_data:/minio_data
     healthcheck:
@@ -94,9 +125,18 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # --------------------------------------------------------------------------
-  # Milvus standalone — 知识库向量检索（可重建索引）
+  # Milvus standalone — 知识库向量检索（可重建索引；内网明文可接受）
   # --------------------------------------------------------------------------
   milvus:
     image: milvusdb/milvus:v2.5.4
@@ -106,9 +146,9 @@ services:
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-    ports:
-      - "${MILVUS_PORT:-19530}:19530"
-      - "${MILVUS_METRICS_PORT:-9091}:9091"
+    expose:
+      - "19530"
+      - "9091"
     volumes:
       - milvus_data:/var/lib/milvus
     depends_on:
@@ -122,6 +162,15 @@ services:
       timeout: 15s
       retries: 10
       start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
 
 # ============================================================================
 # 持久化卷

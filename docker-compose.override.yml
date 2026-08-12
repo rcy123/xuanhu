@@ -1,0 +1,33 @@
+# ============================================================================
+# 悬壶（Xuanhu）— 本地开发 override（自动被 docker compose 加载）
+# ============================================================================
+# 仅本地开发用：加回中间件端口映射与默认凭据，方便直连调试。
+# 生产部署务必使用 docker-compose.yml 本体（不带本文件）。
+# ============================================================================
+
+services:
+  postgres:
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xuanhu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xuanhu_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-xuanhu}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-xuanhu_dev}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  minio:
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  milvus:
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+      - "${MILVUS_METRICS_PORT:-9091}:9091"
