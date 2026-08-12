@@ -381,7 +381,11 @@ def evaluate_completeness_policy(input_payload: object) -> CompletenessPolicyRes
     missing_optional = _missing_optional_dimensions(covered)
     # 2d(决策 11): cap 到分流——缺安全维度 → 转人工(铁律 9),否则落 partial 推进。
     safety_missing = any(_is_safety_dimension(dim) for dim in missing_required)
-    stagnation = _stagnation(policy_input.progress, safety_missing=safety_missing)
+    stagnation = _stagnation(
+        policy_input.progress,
+        safety_missing=safety_missing,
+        missing_required=missing_required,
+    )
     rule_outcomes = _rule_outcomes(required, covered, conflicts)
     disposition = _disposition(
         policy_input,
@@ -699,12 +703,20 @@ def _stagnation(
     progress: CompletenessProgress,
     *,
     safety_missing: bool = False,
+    missing_required: tuple[InquiryDimension, ...] = (),
 ) -> CompletenessStagnationResult:
     reasons: list[StagnationReasonCode] = []
     if progress.no_new_facts_rounds >= COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold:
         reasons.append(StagnationReasonCode.NO_NEW_FACTS_THRESHOLD)
     if progress.followup_rounds >= COMPLETENESS_POLICY_CONFIG.max_followup_rounds:
         reasons.append(StagnationReasonCode.MAX_FOLLOWUP_ROUNDS)
+    # 2.8 增强（REAL-SESSION d5df99f0）：停滞只对"仍缺必需维度但追问无进展"
+    # 生效。若所有必需维度已 covered（missing_required 为空），后续轮次属于
+    # 已覆盖维度的确认/细化（如"总体倾向是怕冷"确认已记录的怕冷），无新事实
+    # 不构成空转——不应触发 manual_required 阻断。防呆仍保留：还有缺失维度且
+    # 连续无进展时照常转人工。
+    if reasons and not missing_required:
+        reasons = []
     stagnated = bool(reasons)
     # 2d(决策 11): cap 到后的分流——缺安全维度 → 转人工(铁律 9);
     # 缺非安全维度 → 落 partial 推进(A 为主)。

@@ -816,6 +816,24 @@ def test_no_new_facts_at_threshold_is_stagnated_and_blocked() -> None:
         )
     )
 
+    # 2.8 增强：必需维度全部覆盖后，无新事实的确认轮不再视为空转 → READY 不停滞
+    assert result.disposition is CompletenessDisposition.READY
+    assert result.stagnation.stagnated is False
+    assert result.stagnation.reason_codes == ()
+
+
+def test_no_new_facts_stagnates_when_required_dimension_still_missing() -> None:
+    # 仍有必需维度缺失（sleep）且连续无进展 → 停滞防护仍生效
+    facts = [f for f in complete_general_facts() if f.fact_key != "ten_questions.sleep"]
+    result = evaluate_completeness_policy(
+        policy_input(
+            *facts,
+            progress=CompletenessProgress(
+                no_new_facts_rounds=COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold,
+            ),
+        )
+    )
+
     assert result.disposition is CompletenessDisposition.PARTIAL
     assert result.gate_result.decision is GateDecision.PASSED
     assert result.stagnation.partial_required is True
@@ -837,6 +855,20 @@ def test_max_followup_rounds_boundary_behavior() -> None:
     )
 
     assert before.disposition is CompletenessDisposition.READY
+    # 2.8 增强：完备事实下追问轮上限不再触发停滞 → READY
+    assert at_threshold.disposition is CompletenessDisposition.READY
+    assert at_threshold.stagnation.partial_required is False
+
+
+def test_max_followup_rounds_stagnates_when_required_dimension_missing() -> None:
+    facts = [f for f in complete_general_facts() if f.fact_key != "ten_questions.sleep"]
+    at_threshold = evaluate_completeness_policy(
+        policy_input(
+            *facts,
+            progress=CompletenessProgress(followup_rounds=COMPLETENESS_POLICY_CONFIG.max_followup_rounds),
+        )
+    )
+
     # 2d(决策 11): cap 到且缺非安全维度 → PARTIAL(落库推进),不再一律 STAGNATED。
     assert at_threshold.disposition is CompletenessDisposition.PARTIAL
     assert at_threshold.stagnation.partial_required is True
@@ -846,6 +878,24 @@ def test_max_followup_rounds_boundary_behavior() -> None:
 def test_any_stagnation_condition_is_deterministic_and_auditable() -> None:
     payload = policy_input(
         *complete_general_facts(),
+        progress=CompletenessProgress(
+            no_new_facts_rounds=COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold,
+            followup_rounds=COMPLETENESS_POLICY_CONFIG.max_followup_rounds,
+        ),
+    )
+    first = evaluate_completeness_policy(payload)
+    second = evaluate_completeness_policy(payload)
+
+    assert first.model_dump(mode="json") == second.model_dump(mode="json")
+    # 2.8 增强：完备事实下两个停滞条件均不再触发
+    assert first.stagnation.reason_codes == ()
+    assert first.stagnation.stagnated is False
+
+
+def test_any_stagnation_condition_deterministic_when_required_dimension_missing() -> None:
+    facts = [f for f in complete_general_facts() if f.fact_key != "ten_questions.sleep"]
+    payload = policy_input(
+        *facts,
         progress=CompletenessProgress(
             no_new_facts_rounds=COMPLETENESS_POLICY_CONFIG.no_new_facts_round_threshold,
             followup_rounds=COMPLETENESS_POLICY_CONFIG.max_followup_rounds,

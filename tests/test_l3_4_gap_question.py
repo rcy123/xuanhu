@@ -424,8 +424,8 @@ def test_no_selection_paths_never_choose_optional_or_blocked_questions() -> None
         assert selection.selection_kind is GapSelectionKind.NONE
         assert selection.selected_dimension is None
     assert ready.source_completeness_disposition == "ready"
-    # 2d(决策 11): cap 到且缺非安全维度 → PARTIAL(落库推进)。
-    assert stagnated.source_completeness_disposition == "partial"
+    # 2.8 增强：完备事实下无新事实的确认轮不再停滞 → READY（不选问题）
+    assert stagnated.source_completeness_disposition == "ready"
     assert triage_blocked.source_completeness_disposition == "triage_blocked"
 
 

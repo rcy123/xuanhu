@@ -4559,45 +4559,216 @@ def _delta_value_key(delta: ObservationDelta) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+# ---------------------------------------------------------------------------
+# 同维度兼容值合并（2.8 增强）
+#
+# 背景（REAL-SESSION d5df99f0）：问诊中医生对同一枚举维度逐步细化回答，
+# 如 cold_heat 先答"胃部非常怕冷，不敢吃凉的"，再答"平时手脚也容易发凉，
+# 整体体质偏怕冷"、"总体倾向是怕冷"——三条信息同向（都属怕冷）且逐步完整，
+# 并非矛盾。旧的 _drop_value_conflicting_adds 只做字面 JSON 比较，把这类
+# 细化补充一律当作"值冲突"丢弃：既丢失信息，又因连续 no_new_facts 触发
+# 问诊停滞（intake_stagnated_manual_required）。
+#
+# 修复：对可枚举维度做语义规范化键判定（同向=兼容、互斥=矛盾、无法判定=保守），
+# 兼容回答不再丢弃，而是转换为 CORRECT 观察——值=旧值+新文本，supersedes 旧
+# 观察，完全复用 append-only 修正链（不破坏可追溯性），投影层取链头即为
+# 合并后完整文本。
+# ---------------------------------------------------------------------------
+
+#: 可枚举维度的语义规范化键表：fact_key -> ((规范化键, 触发词集合), ...)
+_ENUM_DIMENSION_NORMALIZERS: dict[str, tuple[tuple[str, frozenset[str]], ...]] = {
+    "ten_questions.cold_heat": (
+        (
+            "cold",
+            frozenset({
+                "怕冷", "畏寒", "怕风", "手脚凉", "手脚发凉", "发凉", "喜温", "喜热",
+                "怕凉", "不能吃凉", "不敢吃凉", "怕吃凉", "喜喝热", "温热水", "怕寒",
+            }),
+        ),
+        (
+            "hot",
+            frozenset({
+                "怕热", "发热", "五心烦热", "喜凉", "喜冷", "爱出汗", "易出汗", "盗汗",
+                "出虚汗", "手足心热", "喜喝凉", "怕热不怕冷",
+            }),
+        ),
+        (
+            "neutral",
+            frozenset({"不敏感", "不明显", "无明显", "正常", "都还好", "没有明显", "冷热不明显"}),
+        ),
+    ),
+    "ten_questions.sweat": (
+        ("increased", frozenset({"爱出汗", "易出汗", "多汗", "出汗多", "盗汗", "动则汗出", "出虚汗"})),
+        ("normal", frozenset({"正常", "不多", "不出汗", "不明显", "不怎么出汗", "汗不多", "没有汗"})),
+    ),
+    "ten_questions.sleep": (
+        (
+            "poor",
+            frozenset({"入睡困难", "难入睡", "睡不着", "失眠", "多梦", "易醒", "早醒", "睡不好", "睡眠差", "睡眠不佳"}),
+        ),
+        ("good", frozenset({"睡眠好", "睡得好", "正常", "良好", "尚可", "还可以", "睡得着"})),
+    ),
+    "ten_questions.thirst": (
+        ("thirsty", frozenset({"口渴", "想喝水", "爱喝水", "喜饮", "口干", "喝得多", "饮水量大"})),
+        (
+            "no_thirst",
+            frozenset({"不渴", "不想喝水", "不怎么喝", "不喜饮", "很少喝水", "不口渴", "不爱喝水"}),
+        ),
+    ),
+    "ten_questions.appetite": (
+        ("good", frozenset({"食欲好", "胃口好", "能吃", "正常", "良好", "胃口不错"})),
+        ("poor", frozenset({"食欲差", "胃口差", "不想吃", "没胃口", "食少", "饭量小", "食欲不振", "吃不下"})),
+    ),
+}
+
+
+#: 语义判定结果
+_SEMANTIC_COMPATIBLE = "compatible"
+_SEMANTIC_CONFLICT = "conflict"
+_SEMANTIC_UNKNOWN = "unknown"
+
+#: 触发词前的否定前缀（"不想喝水"不应命中"想喝水"）
+_NEGATION_PREFIXES = ("不", "没", "无", "很少", "不怎么", "不太")
+
+
+def _semantic_keys_of(text: str, normalizer: tuple[tuple[str, frozenset[str]], ...]) -> frozenset[str]:
+    """Return the normalized semantic keys hit by *text* (lowercased substring match).
+
+    A trigger word preceded by a negation prefix (不/没/无/很少/不怎么/不太) is not
+    considered a hit, so "不怎么想喝水" does not match the "想喝水" trigger.
+    """
+
+    lowered = text.lower()
+    keys: set[str] = set()
+    for key, words in normalizer:
+        for word in words:
+            w = word.lower()
+            for match in re.finditer(re.escape(w), lowered):
+                prefix = lowered[max(0, match.start() - 4): match.start()]
+                if any(neg in prefix for neg in _NEGATION_PREFIXES):
+                    continue
+                keys.add(key)
+                break
+    return frozenset(keys)
+
+
+def _semantic_value_relation(fact_key: str, new_value: Any, active_value: Any) -> str:
+    """Classify a same-key different-literal ADD against the active chain head.
+
+    - ``compatible``: both values hit the same normalized semantic key (refinement/
+      confirmation along the same direction) — safe to merge.
+    - ``conflict``: both values hit non-empty disjoint semantic keys (e.g. cold vs
+      hot) — keep rejecting to preserve factual consistency.
+    - ``unknown``: dimension not covered by the normalizer, or either value is not
+      plain text, or no key matched — conservative fallback (drop, as before).
+    """
+
+    normalizer = _ENUM_DIMENSION_NORMALIZERS.get(fact_key)
+    if normalizer is None or not isinstance(new_value, str) or not isinstance(active_value, str):
+        return _SEMANTIC_UNKNOWN
+    new_keys = _semantic_keys_of(new_value, normalizer)
+    active_keys = _semantic_keys_of(active_value, normalizer)
+    if not new_keys or not active_keys:
+        return _SEMANTIC_UNKNOWN
+    if new_keys & active_keys:
+        return _SEMANTIC_COMPATIBLE
+    return _SEMANTIC_CONFLICT
+
+
+def _merge_observation_texts(active_value: Any, new_value: Any) -> str | None:
+    """Merge a compatible refinement into the active observation's plain-text value.
+
+    Returns ``None`` when either value is not a string (cannot merge safely).
+    """
+
+    if not isinstance(active_value, str) or not isinstance(new_value, str):
+        return None
+    active = active_value.strip()
+    addition = new_value.strip()
+    if not active or not addition:
+        return None
+    if addition in active:
+        return active
+    if active in addition:
+        return addition
+    return f"{active}；{addition}"
+
+
 def _drop_value_conflicting_adds(
     observations: Sequence[ObservationDelta],
     *,
     state: DomainState,
     rejected_observations: list[RejectedObservation] | None,
 ) -> tuple[ObservationDelta, ...]:
-    """2.8：丢弃与活跃事实同键不同值的 ADD 候选（OBSERVATION_SOURCE_CONFLICT 根治）。
+    """2.8：同键不同值 ADD 的三分类处置（OBSERVATION_SOURCE_CONFLICT 根治）。
 
     模型偶发把已有活跃事实键以不同表述重新 ADD（REAL-SESSION b801423b）时，
-    reducer 的保守冲突保护会整轮 FAILED。此处在 delta 构造前丢弃这类候选：
+    reducer 的保守冲突保护会整轮 FAILED。此处按语义关系处置这类候选：
     - 仅对 operation=ADD 生效（显式 CORRECT/RETRACT 保留原 reducer 语义）；
     - 同键同值 → 保留（reducer 语义去重，无害）；
-    - 丢弃的候选写入 rejected_observations 留痕（reason=value_conflicts_active_fact），
-      旧活跃值保持不变，不丢任何已确认数据。
+    - 同键不同值 → 三分类：
+      · 语义兼容（同向细化/确认，见 _semantic_value_relation）→ 转换为
+        CORRECT 观察，值=旧值+新文本，supersedes 旧链头（REAL-SESSION
+        d5df99f0："胃部非常怕冷" + "平时手脚也容易发凉" + "总体倾向是怕冷"
+        逐步细化，合并而非丢弃，同时避免 no_new_facts 触发停滞）；
+      · 语义矛盾（怕冷 vs 怕热）→ 丢弃（保留旧值，不丢已确认数据）；
+      · 无法判定（维度未覆盖/非文本值）→ 丢弃（保守，不误伤矛盾检测）。
+    - 丢弃的候选写入 rejected_observations 留痕（reason=value_conflicts_active_fact
+      / value_incompatible_unknown）。
     """
 
-    active_values_by_key: dict[str, set[str]] = {}
+    active_items_by_key: dict[str, list[ObservationSchema]] = {}
     for active_item in _current_observations(state.observations):
-        active_values_by_key.setdefault(active_item.fact_key, set()).add(
-            _observation_value_key(active_item)
+        active_items_by_key.setdefault(active_item.fact_key, []).append(active_item)
+
+    def _reject(delta: ObservationDelta, reason: str) -> None:
+        if rejected_observations is None:
+            return
+        rejected_observations.append(
+            RejectedObservation(
+                fact_key=delta.fact_key,
+                operation=delta.operation.value,
+                reason=reason,
+                target_observation_id=str(delta.target_observation_id)
+                if delta.target_observation_id
+                else None,
+                value_preview=str(delta.value)[:80] if delta.value is not None else "",
+            )
         )
 
     kept: list[ObservationDelta] = []
     for delta in observations:
         if delta.operation is ObservationOperation.ADD:
-            active_values = active_values_by_key.get(delta.fact_key)
-            if active_values is not None and _delta_value_key(delta) not in active_values:
-                if rejected_observations is not None:
-                    rejected_observations.append(
-                        RejectedObservation(
-                            fact_key=delta.fact_key,
-                            operation=delta.operation.value,
-                            reason="value_conflicts_active_fact",
-                            target_observation_id=str(delta.target_observation_id)
-                            if delta.target_observation_id
-                            else None,
-                            value_preview=str(delta.value)[:80] if delta.value is not None else "",
+            active_items = active_items_by_key.get(delta.fact_key)
+            if active_items is not None and _delta_value_key(delta) not in {
+                _observation_value_key(item) for item in active_items
+            }:
+                active_head = active_items[-1]
+                relation = _semantic_value_relation(delta.fact_key, delta.value, active_head.value)
+                if relation == _SEMANTIC_COMPATIBLE:
+                    merged = _merge_observation_texts(active_head.value, delta.value)
+                    if merged is not None:
+                        kept.append(
+                            ObservationDelta(
+                                fact_key=delta.fact_key,
+                                value=merged,
+                                normalized_value=merged
+                                if delta.normalized_value is None
+                                else delta.normalized_value,
+                                source_message_id=delta.source_message_id,
+                                confidence=delta.confidence,
+                                operation=ObservationOperation.CORRECT,
+                                target_observation_id=active_head.observation_id,
+                            )
                         )
-                    )
+                        continue
+                # conflict / unknown / 合并失败 → 丢弃并留痕
+                _reject(
+                    delta,
+                    "value_conflicts_active_fact"
+                    if relation == _SEMANTIC_CONFLICT
+                    else "value_incompatible_unknown",
+                )
                 continue
         kept.append(delta)
     return tuple(kept)

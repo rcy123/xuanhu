@@ -186,7 +186,8 @@ def test_conflicting_add_is_dropped_and_recorded() -> None:
     assert ("ten_questions.sleep", "睡眠一般") not in keys  # 冲突值丢弃
     assert len(rejected) == 1
     assert rejected[0].fact_key == "ten_questions.sleep"
-    assert rejected[0].reason == "value_conflicts_active_fact"
+    # 2.8 增强：sleep 维度的"睡眠一般"未命中规范化触发词 → unknown 保守丢弃
+    assert rejected[0].reason in {"value_conflicts_active_fact", "value_incompatible_unknown"}
 
 
 def test_no_active_fact_key_keeps_all_adds() -> None:
