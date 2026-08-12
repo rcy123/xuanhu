@@ -16,6 +16,7 @@ import type {
   MessageCreateRequest,
   MessageItem,
   MessageListParams,
+  MessageRollbackData,
   MessageSubmitResult,
   PageData,
   RecordResponse,
@@ -162,6 +163,28 @@ export function listMessages(
     `consult/sessions/${encodeURIComponent(sessionId)}/messages?${toQuery(params as Record<string, unknown>)}`,
     {
       method: 'GET',
+      ctx,
+    },
+  )
+}
+
+/**
+ * POST /consult/sessions/{id}/messages/{messageId}/rollback —— 问诊回退。
+ *
+ * 删除目标消息及其之后的所有消息并重建事实状态（仅 inquiry 阶段可用）。
+ * 同步执行；调用方成功后应重新拉取消息与读模型。
+ */
+export function rollbackMessages(
+  sessionId: string,
+  messageId: string,
+  body: { reason?: string | null } = {},
+  ctx?: RequestContext,
+): Promise<MessageRollbackData> {
+  return request<MessageRollbackData>(
+    `consult/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/rollback`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
       ctx,
     },
   )

@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
 import { ConfigProvider, App as AntdApp } from 'antd'
 import { MessageList } from './MessageList'
 import type { MessageItem } from '@/types/api'
+
+afterEach(() => {
+  cleanup()
+})
 
 function wrap(node: React.ReactNode) {
   return render(
@@ -97,5 +101,75 @@ describe('MessageList', () => {
       />,
     )
     expect(screen.getAllByText('请问哪里不舒服').length).toBeGreaterThan(0)
+  })
+})
+
+describe('MessageList rollback', () => {
+  it('inquiry 阶段且允许回退时每条消息显示回退按钮', () => {
+    wrap(
+      <MessageList
+        messages={[makeMsg('m1', 'agent', '请问哪里不舒服'), makeMsg('m2', 'doctor', '头痛')]}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+        canRollback
+        rollbackPending={false}
+        onRollback={() => {}}
+      />,
+    )
+    const buttons = screen.getAllByRole('button', { name: /回退到此/ })
+    expect(buttons.length).toBe(2)
+    expect(screen.getByTestId('rollback-to-m1')).toBeInTheDocument()
+    expect(screen.getByTestId('rollback-to-m2')).toBeInTheDocument()
+  })
+
+  it('不允许回退时不渲染回退按钮', () => {
+    wrap(
+      <MessageList
+        messages={[makeMsg('m1', 'agent', '请问哪里不舒服')]}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /回退到此/ })).not.toBeInTheDocument()
+  })
+
+  it('回退进行中禁用按钮', () => {
+    wrap(
+      <MessageList
+        messages={[makeMsg('m1', 'agent', '请问哪里不舒服')]}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+        canRollback
+        rollbackPending
+        onRollback={() => {}}
+      />,
+    )
+    const button = screen.getByTestId('rollback-to-m1') as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+  })
+
+  it('确认弹窗确认后触发 onRollback', async () => {
+    const onRollback = vi.fn()
+    wrap(
+      <MessageList
+        messages={[makeMsg('m1', 'doctor', '头痛')]}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+        canRollback
+        rollbackPending={false}
+        onRollback={onRollback}
+      />,
+    )
+    const { userEvent } = await import('@testing-library/user-event')
+    const user = userEvent.setup()
+    await user.click(screen.getByTestId('rollback-to-m1'))
+    // Popconfirm 确认按钮
+    const confirm = await screen.findByRole('button', { name: '确认回退' })
+    await user.click(confirm)
+    expect(onRollback).toHaveBeenCalledWith('m1', '头痛')
   })
 })

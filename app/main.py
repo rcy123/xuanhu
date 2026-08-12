@@ -25,6 +25,8 @@ from app.api.commands import router as commands_router
 from app.api.health import router as health_router
 from app.api.messages import message_exception_handlers
 from app.api.messages import router as messages_router
+from app.api.message_rollback import rollback_exception_handlers
+from app.api.message_rollback import router as message_rollback_router
 from app.api.record import record_exception_handlers
 from app.api.record import router as record_router
 from app.api.recovery import recovery_exception_handlers
@@ -212,6 +214,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(sessions_router)
 app.include_router(messages_router)
+app.include_router(message_rollback_router)
 app.include_router(stream_router)
 app.include_router(recovery_router)
 app.include_router(review_router)
@@ -230,6 +233,7 @@ for exc_cls, handler in {
     **advance_exception_handlers,
     **safety_confirmation_exception_handlers,
     **command_exception_handlers,
+    **rollback_exception_handlers,
 }.items():
     app.add_exception_handler(exc_cls, handler)
 

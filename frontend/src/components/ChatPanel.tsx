@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Spin, Typography } from 'antd'
+import { Alert, Button, Spin, Typography } from 'antd'
 import {
   CloseOutlined,
   MessageOutlined,
@@ -40,7 +40,7 @@ import { SafetyConfirmationPanel } from './SafetyConfirmationPanel'
 import { ThinkingHint } from './ThinkingHint'
 import { pendingFormulaFromReadModel } from '@/utils/readModel'
 import { langGraphDisposition } from '@/utils/agent'
-import { reviewPrescription, getRecord, updateRecord, exportRecord, advanceSession } from '@/api/index'
+import { reviewPrescription, getRecord, updateRecord, exportRecord, advanceSession, rollbackMessages } from '@/api/index'
 import { downloadFileResponse } from '@/api/download'
 import { ApiRequestError, TransportErrorCode } from '@/api/errors'
 import { generateIdempotencyKey } from '@/utils/id'
@@ -59,6 +59,8 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
   const [pendingReviewFormula, setPendingReviewFormula] = useState<Formula | null>(null)
   const [blockedIssues, setBlockedIssues] = useState<SafetyIssue[] | null>(null)
   const [rollbackTarget, setRollbackTarget] = useState<string | null>(null)
+  const [rollbackPending, setRollbackPending] = useState(false)
+  const [rollbackError, setRollbackError] = useState<string | null>(null)
   const [contextOpen, setContextOpen] = useState(false)
   const [pendingSafetyCount, setPendingSafetyCount] = useState<number | null>(null)
   // P1 多方案：候选方案状态
@@ -250,6 +252,40 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
   const handleHoverAlternative = useCallback((_index: number | null) => {
     // 预留 hover 交互（如高亮对应药味对比）
   }, [])
+
+  // 问诊回退：删除目标消息及其之后的所有消息，重建事实状态后刷新权威数据。
+  const handleRollback = useCallback(
+    async (messageId: string, _content: string) => {
+      if (!sessionId) return
+      setRollbackPending(true)
+      setRollbackError(null)
+      try {
+        await rollbackMessages(sessionId, messageId, {}, { stateVersion: detail?.state_version })
+        await refreshDetail()
+        await loadMessages(sessionId)
+      } catch (err) {
+        const apiErr = err instanceof ApiRequestError ? err : null
+        if (apiErr?.code === 'INVALID_STATE_VERSION') {
+          // 版本已推进：以 GET 为权威刷新后让医师重试。
+          await refreshDetail()
+          setRollbackError('会话状态已更新，请重试回退。')
+        } else {
+          setRollbackError(apiErr?.message ?? '回退失败，请重试')
+        }
+      } finally {
+        setRollbackPending(false)
+      }
+    },
+    [sessionId, detail?.state_version, refreshDetail, loadMessages],
+  )
+
+  const canRollback = Boolean(
+    detail
+    && detail.agent_runtime === 'langgraph'
+    && detail.current_stage === 'inquiry'
+    && detail.status === 'active'
+    && detail.recovery_status === 'normal'
+  )
 
   const streamHook = useSessionStream({
     sessionId,
@@ -855,11 +891,19 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
               </div>
             ) : null}
             <div className="xh-message-surface">
+              {rollbackError ? (
+                <div className="xh-message-rollback-error" role="alert">
+                  <Alert type="error" showIcon message={rollbackError} onClose={() => setRollbackError(null)} closable />
+                </div>
+              ) : null}
               <MessageList
                 messages={messages}
                 loading={msgLoading}
                 error={msgError}
                 onRetry={() => sessionId && void loadMessages(sessionId)}
+                canRollback={canRollback}
+                rollbackPending={rollbackPending}
+                onRollback={handleRollback}
               />
               {detail ? (
                 <SafetyConfirmationPanel

@@ -1010,7 +1010,35 @@
 .xh-message-author {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 4px;
+}
+
+/* 问诊回退按钮：默认隐藏，hover 气泡时浮现 */
+.xh-message-rollback-btn {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  font-size: 12px;
+  padding-inline: 6px;
+}
+
+.xh-message-row:hover .xh-message-rollback-btn,
+.xh-message-row:focus-within .xh-message-rollback-btn {
+  opacity: 1;
+}
+
+.xh-message-row.is-clinician .xh-message-rollback-btn.ant-btn-text {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.xh-message-row.is-clinician .xh-message-rollback-btn.ant-btn-text:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.xh-message-rollback-error {
+  margin-bottom: 12px;
 }
 
 .xh-message-author span {

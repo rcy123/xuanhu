@@ -523,6 +523,15 @@ export interface MessageListParams {
   stage?: Stage
 }
 
+/** 消息回退响应 data（POST /messages/{id}/rollback）。 */
+export interface MessageRollbackData {
+  session_id: string
+  current_stage: string
+  state_version: number
+  rolled_back_message_ids: string[]
+  kept_last_message_id?: string | null
+}
+
 // ---------------------------------------------------------------------------
 // §4.3 阶段推进与恢复
 // ---------------------------------------------------------------------------

@@ -109,3 +109,27 @@ class MessageListResponse(BaseModel):
     items: list[MessageItem]
     has_more: bool
     next_cursor: str | None = None
+
+
+class MessageRollbackRequest(BaseModel):
+    """回退到指定消息的请求体。
+
+    - reason: 回退原因（医师备注，可选，写入审计）
+    """
+
+    reason: str | None = Field(default=None, max_length=500, description="回退原因")
+
+
+class MessageRollbackData(BaseModel):
+    """消息回退响应 data。
+
+    - rolled_back_message_ids: 被删除（含目标消息）的消息 id 列表
+    - kept_last_message_id: 回退后保留的最后一条消息 id（可为 None）
+    - state_version: 回退后的会话版本号
+    """
+
+    session_id: str
+    current_stage: str
+    state_version: int
+    rolled_back_message_ids: list[str]
+    kept_last_message_id: str | None = None
