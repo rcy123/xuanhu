@@ -43,7 +43,7 @@
 
 | 阶段 | 说明 |
 |---|---|
-| **问诊** | AI 辅助结构化问诊，自动追踪信息完备性，支持澄清恢复 |
+| **问诊** | AI 辅助结构化问诊，自动追踪信息完备性，支持澄清恢复 + 槽位级问题契约（R9） |
 | **辨证** | 多 Agent 协同辨证，RAG 证据支撑 + 校验链验证 |
 | **开方** | 两阶段生成：基础方选择 → 个性化加减方 |
 | **医师选方** | 多方案对比展示，含置信度评分——医师从 AI 候选中择优 |
@@ -61,6 +61,17 @@
 - **安全 Agent** — 处方安全审核门控，确定性规则引擎 + 回退指引
 - **恢复 Agent** — 异常处理与会话恢复，防死锁
 - **分诊策略** — 自动判断问诊充分性，带缓存的闸门计算
+
+### 🎯 问题契约——槽位级追问完整性（R9）
+
+通用契约层，保证任何问题都不会被"答一半"地静默跳过——系统精确记住自己问过什么，拒绝用粗糙回答关闭一个临床维度：
+
+- **契约冻结** — 每个问题将 1–4 个可核验的覆盖槽位（aspects）冻结为不可变契约；回答产出追加式覆盖事件账本
+- **确定性 Rubric 规划** — 全部 11 个十问维度（寒热/汗出/头身/二便/饮食/胸腹/口渴/睡眠/呼吸/疼痛/月经带下）均有版本化 Rubric：必问槽位总是冻结，条件槽位仅在**正性事实**出现时冻结（"睡眠正常"不会拉出多梦易醒；主诉"失眠一周"则会）
+- **残余追问链** — 不完整回答（"有痰"但不含颜色/量）强制追问缺失槽位，直到收敛或到达追问上限——不再有被跳过的子问
+- **语义充分性校验** — 31 条保守词表把证据不含必需词的过度宣称 `addressed` 降级为 `unclear`（如"有痰"不能满足痰色槽位），槽位留在残余追问中；降级不误伤、不 reject、不扩拒绝面
+- **隐私掩码证据** — 身份序列（手机号等）在模型输入前替换为等长 `█`；共享掩码通配匹配器保证引文验证对齐，持久化摘要一律基于**原始**文本而非掩码渲染
+- **可观测性** — 契约创建、覆盖折叠、追问决策的受限基数计数器/直方图，外加 6 条 Prometheus 告警规则（degraded / partial / manual-required / cap-reached / integrity-error / failure-rate）
 
 ### 🧠 智能 RAG 管线
 
@@ -187,6 +198,7 @@ uv run python scripts/prewarm_embedding_cache.py --stats
 - **权威快照缓存** — 推理 Agent 的权威快照在 commit 时缓存，写入时失效，DB 往返减少 60–70%
 - **三级 Embedding 缓存** — 实体 → 模板 → 运行时三级预热（Redis），~60% 命中率，~4ms 取回
 - **两阶段开方** — 基础方选择（多方案、医师选定）→ 个性化加减方（加减方），临床过程透明分离
+- **确定性问题契约（R9）** — 每个问题将可核验槽位冻结为不可变契约；回答折叠进追加式覆盖账本；残余追问只补问缺失槽位直至收敛——粗糙回答无法静默关闭临床维度
 - **租约守护的持久命令** — 持久异步命令 worker 与 HTTP 幂等执行器都在共享的单调租约守护（`app/services/lease_guard.py`）下运行 handler。只有能持续续租，handler 才能继续写入；一旦 owner token/状态丢失或本地截止时间耗尽，过期 handler 会被取消/排空，执行器安全失败（`HTTP_COMMAND_RECOVERY_REQUIRED`），绝不结算过期的临床写入。运维人员通过异步 worker 的环境设置（env/config）调整其租约/心跳时序（生产默认：心跳 20s / 租约 60s）。HTTP 执行器的租约/心跳时序在生产环境固定（20s / 90s），其构造参数仅作内部/测试注入，不是运维配置面。
 
 ---
@@ -204,10 +216,10 @@ uv run python scripts/prewarm_embedding_cache.py --stats
 | 业务数据库 | PostgreSQL 16 |
 | 缓存/锁 | Redis 7 |
 | 向量数据库 | Milvus 2.5（etcd + MinIO） |
-| 主 LLM 网关 | Mimo-v2.5（内网） |
-| Query 改写网关 | Qwen3.5-2B-free @ dmxapi |
-| Reranker | Jina Reranker M0（Cross-Encoder）+ LLM 降级 |
-| Embedding | BGE-M3，通过独立 Embedding 网关 |
+| 主 LLM 网关 | deepseek-v4-flash-0731 @ dmxapi（多网关独立配置） |
+| Query 改写网关 | 轻量模型（如 qwen3-8b）用于 RAG 查询改写 |
+| Reranker | Cross-Encoder（如 jina-reranker-m0）+ LLM 降级 |
+| Embedding | Qwen3-Embedding-8B，通过独立 Embedding 网关 |
 | 数据校验 | Pydantic v2 |
 | 代码质量 | Ruff + mypy（严格模式） |
 
@@ -228,7 +240,7 @@ uv run python scripts/prewarm_embedding_cache.py --stats
 | 工具 | 用途 |
 |---|---|
 | Docker Compose | 本地中间件编排 |
-| Prometheus | 监控（outbox 告警规则） |
+| Prometheus | 监控（15 条告警规则：outbox / R5 安全 / R9 问题契约） |
 | gitleaks | 密钥扫描 |
 
 ---
@@ -316,15 +328,23 @@ xuanhu/
 │   │   ├── runner.py             # 图执行器
 │   │   ├── state.py             # 全局状态定义
 │   │   ├── context_builder.py   # LLM 上下文组装
-│   │   ├── repository.py        # 领域仓储（CQRS + outbox）
+│   │   ├── repository.py        # 领域仓储（CQRS + outbox，fail-closed 信封）
 │   │   ├── checkpoint.py        # PostgreSQL 检查点持久化
-│   │   ├── syndrome_verifier.py # 辨证输出校验链
-│   │   ├── formula_verifier.py  # 开方输出校验链
-│   │   └── sandbox_*.py         # 沙箱评估模块
+│   │   ├── reducer.py           # 领域状态规约 & 追加式账本
+│   │   ├── question_contract.py # R9 问题契约折叠 & 残余追问链
+│   │   ├── question_rubric.py   # R9 维度 Rubric（11 个十问维度）
+│   │   ├── coverage_semantics.py# R9 语义充分性词表
+│   │   ├── contract_projection.py # R9 契约 → 维度投影
+│   │   ├── intake_verifier.py   # 采集输出校验链
+│   │   ├── intake_grounding.py  # 证据接地 & 隐私掩码处理
+│   │   ├── completeness_policy.py # 必填维度完备性评估
+│   │   ├── async_command*.py    # 持久化异步命令 worker 与生命周期
+│   │   ├── sandbox_*.py         # 沙箱评估模块
+│   │   └── verifiers.py         # 共享输出校验链
 │   ├── agents/                   # LLM Agent 提示词与逻辑
 │   │   ├── syndrome_draft.py    # 辨证草案 Agent（L4-1）
 │   │   ├── formula_draft.py     # 开方+加减 Agent（L4-2, 两阶段）
-│   │   ├── prompts/             # Jinja2 提示词模板（30+）
+│   │   ├── prompts/             # Jinja2 提示词模板（23）
 │   │   │   └── manifest.yaml    # 提示词注册表
 │   │   └── prompt_loader.py     # 提示词模板加载器
 │   ├── api/                      # REST API 路由
@@ -380,41 +400,34 @@ xuanhu/
 ├── data/                         # 知识库初始数据
 ├── deploy/                       # 部署配置
 │   └── prometheus/               # 监控告警规则
-├── docs/                         # 完整技术文档
+├── docs/                         # 完整技术文档（按主题归档 01–08/10）
 ├── scripts/                      # 工具脚本
 │   ├── prewarm_embedding_cache.py # Embedding 缓存预热 CLI
 │   ├── perf_benchmark.py         # 性能压测套件
 │   ├── test_p2_rewrite_gateway.py    # 改写网关端到端测试
 │   ├── test_reranker_conn.py     # Reranker 连通性测试
 │   └── seed_data.py              # 知识库初始数据导入
-├── tests/                        # 测试套件（2460+ 测试用例）
+├── tests/                        # 测试套件（3200+ 测试用例）
 ├── docker-compose.yml            # 中间件编排
 ├── pyproject.toml                # Python 项目配置
 └── .env.example                  # 环境变量模板
 ```
 
-### 📚 文档导航
+### 📚 文档
 
-| 文档 | 用途 |
+文档集位于 `docs/`，按主题归档（每个子目录自包含、带编号总览）：
+
+| 目录 | 主题 |
 |---|---|
-| [产品设计文档](docs/产品设计文档.md) | 产品定位、MVP 范围、交付清单 |
-| [PRD](docs/prds/xuanhu/PRD.md) | 阶段计划、用户故事、验收策略 |
-| [系统概设](docs/系统概设.md) | 总体架构、模块边界、部署形态 |
-| [多 Agent 架构设计](docs/多Agent架构设计.md) | Agent 职责、State、回退机制 |
-| [接口设计文档](docs/接口设计文档.md) | REST / SSE / 错误码 / 内部接口 |
-| [详细设计文档](docs/详细设计文档.md) | 代码结构、数据模型、核心流程 |
-| [数据库设计文档](docs/数据库设计文档.md) | PostgreSQL / Milvus / Redis 设计 |
-| [安全审核规则设计文档](docs/安全审核规则设计文档.md) | 禁忌、剂量、妊娠、阻断规则 |
-| [UI 设计文档](docs/UI设计文档.md) | 工作台页面、阶段展示、确认区 |
-| [部署指南](docs/部署指南.md) | 环境变量、Docker Compose、健康检查 |
-| [使用指南](docs/使用指南.md) | 医师使用流程与安全提示 |
-| [知识库数据说明](docs/知识库数据说明.md) | 数据文件、字段规范、导入校验 |
-| [性能：诊断报告](docs/03_agent性能优化/01-性能诊断报告.md) | 初始性能画像、瓶颈识别 |
-| [性能：网关与缓存](docs/03_agent性能优化/阶段优化记录-OP2网关池化与embedding缓存-2026-08-06.md) | OP2 优化：网关池化、Embedding 缓存、预热方案 |
-| [性能：Milvus 与状态缓存](docs/03_agent性能优化/阶段优化记录-OP3Milvus异步化与状态缓存-2026-08-06.md) | OP3 优化：Milvus 异步、共享检索器、权威缓存 |
-| [性能：三 Agent 管线](docs/03_agent性能优化/06-辨证开方加减方Agent逻辑优化方案.md) | 辨证→开方→加减方三 Agent 管线设计 |
-| [性能：实施评估报告](docs/03_agent性能优化/06-实施评估报告-2026-08-06.md) | 优化后评估、before/after 对比表、验收报告 |
-| [异步命令（R6/R7）](docs/async-command.md) | 持久化 202 异步路径：底层设施、Worker、状态 API、R7 默认异步接入与 Handler |
+| [01_agent部分优化](docs/01_agent部分优化/) | Agent 架构演进、LangGraph 大修、收敛性重写 |
+| [02_agent逻辑优化](docs/02_agent逻辑优化/) | 单一后端收敛、网关超时、柔性采集 |
+| [03_agent性能优化](docs/03_agent性能优化/) | OP1–OP4 性能画像与优化、Embedding 缓存预热 |
+| [04_生产环境加固](docs/04_生产环境加固/) | 认证授权、PHI 访问控制、网络边界、灰度上线 |
+| [05_RAG效果评测](docs/05_RAG效果评测/) | RAG 评测实验设计、指标合同、消融实验 |
+| [06_项目总结](docs/06_项目总结/) | 项目全貌：架构、Agent、RAG、性能、加固、测试 |
+| [07_面试宝典](docs/07_面试宝典/) | 面试视角的系统设计、RAG、Agent、性能叙事 |
+| [08_后续优化](docs/08_后续优化/) | R9 问题契约方案与实施记录 |
+| [async-command.md](docs/async-command.md) | 持久化异步命令（R6/R7）设计 |
 
 ---
 
@@ -440,8 +453,9 @@ Agent 运行时经过了四个维度（OP1–OP4）的系统性画像与优化�
 
 ### 可观测性
 
-- `GET /api/v1/metrics` — 84 条自定义 `xuanhu_*` 指标、8 个 Prometheus 直方图
-- 直方图：`rag_vector_search`、`rag_fulltext_search`、`rag_backfill`、`rag_embed`、`gateway_chat`、`gateway_embed`、`graph_node`、`reasoning_get_state`
+- `GET /api/v1/metrics` — 15 个受限基数 `xuanhu_*` 指标族（6 计数器 + 9 直方图），含 R9 问题契约计数器与槽位数直方图
+- 直方图：`rag_vector_search`、`rag_fulltext_search`、`rag_backfill`、`rag_embed`、`gateway_chat`、`gateway_embed`、`graph_node`、`reasoning_get_state`、`question_contract_aspects`
+- Prometheus 告警规则：共 15 条（outbox 积压 5、R5 安全 4、R9 问题契约 6），每条带最小样本量护栏，`promtool` 正反场景测试通过
 
 ### 压测
 
@@ -460,12 +474,14 @@ uv run python scripts/test_p2_rewrite_gateway.py
 
 ### 回归门禁（CI）
 
-- 完整 `pytest` 套件（2460+ 测试用例）— 无回归
+- 完整 `pytest` 套件（3200+ 测试用例，含 R9 问题契约单测）— 无回归
 - `tests/golden/test_langgraph_performance_baseline.py` — P95 < 5000ms
 - Embedding 缓存命中率 — ≥ 40%
 - 结构化解析成功率 — 不下降 ≥1pp
 - Milvus v4 collection 含 `content` 字段 — backfill ~0ms 已验证
 - Golden 测试断言覆盖真实推理流量 — after 数据已验证
+- `promtool check rules` / `test rules` — 告警规则正反场景验证
+- 严格 `mypy`（`app` + `scripts`）— 229 个源文件 0 问题
 
 > 📊 详细方法论、before/after 对比表及逐阶段分析：[Agent 性能优化](docs/03_agent性能优化/)
 
@@ -524,6 +540,7 @@ npm run typecheck
 ### 数据安全
 
 - 所有模型调用均通过内网模型网关，患者数据不接触外部 LLM 供应商
+- **模型输入前身份掩码** — 手机号、证件号等身份序列在 LLM 可见前替换为等长 `█`；证据摘要始终覆盖原始文本，掩码引文仍可验证（R9）
 - 会话数据按医师隔离
 - MVP 范围明确不接入 HIS/EMR
 

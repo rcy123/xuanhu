@@ -38,7 +38,7 @@ Navigate the full TCM consultation lifecycle in one seamless workspace:
 
 | Stage | Description |
 |---|---|
-| **Inquiry** (问诊) | AI-assisted structured patient interview with completeness tracking & clarification recovery |
+| **Inquiry** (问诊) | AI-assisted structured patient interview with completeness tracking, clarification recovery, and slot-level question contracts (R9) |
 | **Syndrome Differentiation** (辨证) | Multi-agent syndrome analysis with RAG evidence grounding and verifier chain |
 | **Formula Drafting** (开方) | Two-stage drafting: base formula selection → personalized modification (加减方) |
 | **Formula Selection** (医师选方) | Multi-alternative display with confidence scoring — doctor selects from AI-generated options |
@@ -56,6 +56,17 @@ Built on **LangGraph**, the agent orchestration layer manages:
 - **Safety Agent** — Prescription safety verification gate with deterministic rule engine and rollback guidance
 - **Recovery Agent** — Graceful error handling and state recovery with deadlock prevention
 - **Triage Policy** — Automated collection sufficiency determination with cached gate computation
+
+### 🎯 Question Contract — Slot-Level Inquiry Completeness (R9)
+
+A generic contract layer that guarantees no question is silently half-answered — the system remembers exactly what it asked and refuses to close a dimension on a coarse reply:
+
+- **Frozen contracts** — every question freezes 1–4 verifiable coverage aspects (slots) as an immutable contract; an answer produces an append-only coverage event ledger
+- **Deterministic Rubric planning** — all 11 ten-question dimensions (寒热/汗出/头身/二便/饮食/胸腹/口渴/睡眠/呼吸/疼痛/月经带下) ship versioned Rubrics: required slots always asked, conditional slots freeze only on *positive* facts (a "睡眠正常" fact never pulls 多梦易醒; a complaint "失眠一周" does)
+- **Residual follow-up chains** — a partial answer ("有痰" without color/amount) forces a follow-up that re-asks only the missing slots until the chain converges or the cap is reached — no more skipped questions
+- **Semantic sufficiency validation** — 31 conservative wordlists downgrade an over-claimed "addressed" to `unclear` when the evidence lacks the required terms (e.g. "有痰" cannot satisfy 痰色), keeping the slot in the residual loop; 降级不误伤、不 reject、不扩拒绝面
+- **Privacy-masked evidence** — identity sequences (phone numbers etc.) are masked with equal-length `█` before the model; a shared mask-wildcard matcher keeps evidence verification aligned while persisted digests always cover the **raw** text, never the masked rendering
+- **Observability** — bounded counters/histograms for contract creation, coverage folds, and follow-up decisions, plus 6 Prometheus alert rules (degraded / partial / manual-required / cap-reached / integrity-error / failure-rate)
 
 ### 🧠 Intelligent RAG Pipeline
 
@@ -183,6 +194,7 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 - **Authority Snapshot Caching** — reasoning agent authority snapshots cached at commit with invalidation on write, reducing DB round-trips by 60–70%
 - **Three-Tier Embedding Cache** — entity → template → runtime warming via Redis, achieving ~60% hit rate and ~4ms retrieval
 - **Two-Stage Formula Drafting** — base formula selection (multi-alternative, practitioner-chosen) → personalized modification (加减方), separated for clinical transparency
+- **Deterministic Question Contracts (R9)** — every question freezes verifiable aspects into an immutable contract; answers fold into an append-only coverage ledger; residual follow-ups re-ask only the missing slots until convergence, so a coarse reply can never silently close a clinical dimension
 - **Lease-fenced Durable Commands** — both the durable async-command worker and the HTTP idempotency executor run handlers under a shared monotonic lease guard (`app/services/lease_guard.py`). A handler may only keep writing while it can renew its lease; if the owner token/status is lost or the local deadline is exhausted, the stale handler is cancelled/drained and the executor fails closed (`HTTP_COMMAND_RECOVERY_REQUIRED`) instead of settling a stale clinical write. Operators tune the async worker's lease/heartbeat timing through its environment settings (production defaults: heartbeat 20s / lease 60s). The HTTP executor's lease/heartbeat timing is fixed in production (20s / 90s); its constructor kwargs are an internal/test injection seam, not an operator configuration surface.
 
 ---
@@ -200,10 +212,10 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 | Database | PostgreSQL 16 |
 | Cache / Locking | Redis 7 |
 | Vector Store | Milvus 2.5 (via etcd + MinIO) |
-| Main LLM Gateway | Mimo-v2.5 (internal) |
-| Rewrite Gateway | Qwen3.5-2B-free @ dmxapi |
-| Reranker | Jina Reranker M0 (Cross-Encoder) + LLM fallback |
-| Embedding | BGE-M3 via dedicated embedding gateway |
+| Main LLM Gateway | deepseek-v4-flash-0731 @ dmxapi (multi-gateway, independently configured) |
+| Rewrite Gateway | Lightweight LLM (e.g. qwen3-8b) for RAG query rewriting |
+| Reranker | Cross-Encoder (e.g. jina-reranker-m0) + LLM fallback |
+| Embedding | Qwen3-Embedding-8B via dedicated embedding gateway |
 | Validation | Pydantic v2 |
 | Linting | Ruff + mypy (strict mode) |
 
@@ -224,7 +236,7 @@ A comprehensive, LLM-free safety rule engine checks every prescription against:
 | Tool | Purpose |
 |---|---|
 | Docker Compose | Local middleware orchestration |
-| Prometheus | Monitoring (outbox alert rules) |
+| Prometheus | Monitoring (15 alert rules: outbox / R5 safety / R9 question-contract) |
 | gitleaks | Secret scanning |
 
 ---
@@ -312,15 +324,23 @@ xuanhu/
 │   │   ├── runner.py             # Graph execution runner
 │   │   ├── state.py             # Global graph state definition
 │   │   ├── context_builder.py   # LLM context assembly
-│   │   ├── repository.py        # Domain repository (CQRS + outbox)
+│   │   ├── repository.py        # Domain repository (CQRS + outbox, fail-closed envelope)
 │   │   ├── checkpoint.py        # PostgreSQL-backed checkpointer
-│   │   ├── syndrome_verifier.py # Syndrome output validation chain
-│   │   ├── formula_verifier.py  # Formula output validation chain
-│   │   └── sandbox_*.py         # Sandboxed evaluation modules
+│   │   ├── reducer.py           # Domain state reduction & append-only ledgers
+│   │   ├── question_contract.py # R9 question contract fold & residual chains
+│   │   ├── question_rubric.py   # R9 per-dimension Rubrics (11 ten-question dims)
+│   │   ├── coverage_semantics.py# R9 semantic sufficiency wordlists
+│   │   ├── contract_projection.py # R9 contract → dimension projection
+│   │   ├── intake_verifier.py   # Intake output verification chain
+│   │   ├── intake_grounding.py  # Evidence grounding & privacy mask handling
+│   │   ├── completeness_policy.py # Required-dimension completeness evaluation
+│   │   ├── async_command*.py    # Durable async command worker & lifecycle
+│   │   ├── sandbox_*.py         # Sandboxed evaluation modules
+│   │   └── verifiers.py         # Shared output validation chain
 │   ├── agents/                   # LLM agent prompts & logic
 │   │   ├── syndrome_draft.py    # 辨证草稿 Agent (L4-1)
 │   │   ├── formula_draft.py     # 开方+加减 Agent (L4-2, two-stage)
-│   │   ├── prompts/             # Jinja2 prompt templates (30+)
+│   │   ├── prompts/             # Jinja2 prompt templates (23)
 │   │   │   └── manifest.yaml    # Prompt registry
 │   │   └── prompt_loader.py     # Prompt template loader
 │   ├── api/                      # REST API routes
@@ -376,14 +396,14 @@ xuanhu/
 ├── data/                         # Knowledge base seed data
 ├── deploy/                       # Deployment configs
 │   └── prometheus/               # Monitoring rules
-├── docs/                         # Comprehensive documentation
+├── docs/                         # Documentation, reorganized by topic (01–08/10)
 ├── scripts/                      # Utility scripts
 │   ├── prewarm_embedding_cache.py # Embedding cache preheat CLI
 │   ├── perf_benchmark.py         # Performance benchmark suite
 │   ├── test_p2_rewrite_gateway.py    # Rewrite gateway E2E test
 │   ├── test_reranker_conn.py     # Reranker connectivity test
 │   └── seed_data.py              # Knowledge base seeding
-├── tests/                        # Test suite (2460+ tests)
+├── tests/                        # Test suite (3200+ tests)
 ├── docker-compose.yml            # Middleware orchestration
 ├── pyproject.toml                # Python project config
 └── .env.example                  # Environment template
@@ -391,24 +411,19 @@ xuanhu/
 
 ### 📚 Documentation
 
-| Document | Purpose |
+The documentation set lives under `docs/`, reorganized by topic (each directory is self-contained with a numbered overview):
+
+| Directory | Topic |
 |---|---|
-| [Product Design](docs/产品设计文档.md) | Product positioning, MVP scope, delivery checklist |
-| [PRD](docs/prds/xuanhu/PRD.md) | Phase plan, user stories, acceptance strategy |
-| [System Architecture](docs/系统概设.md) | Overall architecture, module boundaries, deployment |
-| [Multi-Agent Design](docs/多Agent架构设计.md) | Agent responsibilities, state management, fallback |
-| [API Design](docs/接口设计文档.md) | REST/SSE endpoints, error codes, internal interfaces |
-| [Detailed Design](docs/详细设计文档.md) | Code structure, data models, core flows |
-| [Database Design](docs/数据库设计文档.md) | PostgreSQL/Milvus/Redis schemas |
-| [Safety Rules](docs/安全审核规则设计文档.md) | Incompatibilities, dosage, pregnancy, blocking rules |
-| [UI Design](docs/UI设计文档.md) | Workspace pages, stage display, review area |
-| [Deployment Guide](docs/部署指南.md) | Environment variables, Docker Compose, health checks |
-| [Perf: Diagnosis](docs/03_agent性能优化/01-性能诊断报告.md) | Initial profiling, bottleneck identification |
-| [Perf: Gateway & Cache](docs/03_agent性能优化/阶段优化记录-OP2网关池化与embedding缓存-2026-08-06.md) | OP2 optimization: gateway pooling, embedding cache, preheat design |
-| [Perf: Milvus & State Cache](docs/03_agent性能优化/阶段优化记录-OP3Milvus异步化与状态缓存-2026-08-06.md) | OP3 optimization: Milvus async, shared retriever, authority cache |
-| [Perf: 三Agent Pipeline](docs/03_agent性能优化/06-辨证开方加减方Agent逻辑优化方案.md) | Three-agent reasoning pipeline design: Syndrome → Formula → Modification |
-| [Perf: Implementation Report](docs/03_agent性能优化/06-实施评估报告-2026-08-06.md) | Post-optimization evaluation, before/after tables, acceptance report |
-| [Async Commands (R6/R7)](docs/async-command.md) | Durable 202 async path: substrate, worker, status API, R7 default async admission & handlers |
+| [01_agent部分优化](docs/01_agent部分优化/) | Agent 架构演进、LangGraph 大修、收敛性重写 |
+| [02_agent逻辑优化](docs/02_agent逻辑优化/) | 单一后端收敛、网关超时、柔性采集 |
+| [03_agent性能优化](docs/03_agent性能优化/) | OP1–OP4 性能画像与优化、Embedding 缓存预热 |
+| [04_生产环境加固](docs/04_生产环境加固/) | 认证授权、PHI 访问控制、网络边界、灰度上线 |
+| [05_RAG效果评测](docs/05_RAG效果评测/) | RAG 评测实验设计、指标合同、消融实验 |
+| [06_项目总结](docs/06_项目总结/) | 项目全貌：架构、Agent、RAG、性能、加固、测试 |
+| [07_面试宝典](docs/07_面试宝典/) | 面试视角的系统设计、RAG、Agent、性能叙事 |
+| [08_后续优化](docs/08_后续优化/) | R9 问题契约方案与实施记录 |
+| [async-command.md](docs/async-command.md) | 持久化异步命令（R6/R7）设计 |
 
 ---
 
@@ -434,8 +449,9 @@ The agent runtime has been systematically profiled and optimized across four dim
 
 ### Observability
 
-- `GET /api/v1/metrics` — 84 custom `xuanhu_*` metric lines, 8 Prometheus histograms
-- Histograms: `rag_vector_search`, `rag_fulltext_search`, `rag_backfill`, `rag_embed`, `gateway_chat`, `gateway_embed`, `graph_node`, `reasoning_get_state`
+- `GET /api/v1/metrics` — 15 bounded `xuanhu_*` metric families (6 counters + 9 histograms), including R9 question-contract counters and the aspect-count histogram
+- Histograms: `rag_vector_search`, `rag_fulltext_search`, `rag_backfill`, `rag_embed`, `gateway_chat`, `gateway_embed`, `graph_node`, `reasoning_get_state`, `question_contract_aspects`
+- Prometheus alert rules: 15 total (outbox backlog 5, R5 safety 4, R9 question-contract 6), each with minimum-volume guards and `promtool` tested positive/negative scenarios
 
 ### Benchmarks
 
@@ -454,12 +470,14 @@ Results are written to `scripts/perf_results.json` and `scripts/prewarm_benchmar
 
 ### Regression Gates (CI)
 
-- Full `pytest` suite (2460+ tests) — no regressions
+- Full `pytest` suite (3200+ tests, incl. R9 question-contract unit tests) — no regressions
 - `tests/golden/test_langgraph_performance_baseline.py` — P95 < 5000ms
 - Embedding cache hit rate — ≥ 40%
 - Structured parse success rate — no ≥1pp drop
 - Milvus collection v4 with `content` field — backfill ~0ms verified
 - Golden test assertions for real reasoning traffic — after-data validated
+- `promtool check rules` / `test rules` — alert rules validated with firing & quiet scenarios
+- Strict `mypy` on `app` + `scripts` — 0 issues across 229 source files
 
 > 📊 Detailed methodology, before/after tables, and per-stage analysis: [Agent Performance Optimization](docs/03_agent性能优化/)
 
@@ -519,6 +537,7 @@ This project uses conventional commit messages. Before committing, ensure:
 ### Data Privacy
 
 - All model calls route through an internal model gateway — no patient data reaches external LLM providers
+- **Identity masking before model input** — phone numbers, ID numbers and other identity sequences are replaced with equal-length `█` before any LLM sees them; evidence digests always cover the raw text and masked quotes still verify (R9)
 - Session data is isolated per-practitioner
 - MVP scope explicitly excludes HIS/EMR integration
 
