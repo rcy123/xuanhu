@@ -153,7 +153,7 @@
 | **关键 Header** | `Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no` |
 | **错误码** | 404 `SESSION_NOT_FOUND`（会话不存在；terminated 会话允许连接 stream） |
 | **state_version** | 不适用（事件流，非请求-响应模式） |
-| **LangGraph 迁移后兼容要求** | SSE 格式完全不变。所有 13 种事件类型继续支持（见 SSE 事件表）。LangGraph 路径中，`agent.started`、`agent.finished`、`agent.failed`、`stage.changed` 等事件由 `astream()` 的图事件映射生成，事件类型不变。`heartbeat` 和 `resync` 机制不变。 |
+| **LangGraph 迁移后兼容要求** | SSE 格式完全不变。所有 14 种事件类型继续支持（见 SSE 事件表）。LangGraph 路径中，`agent.started`、`agent.finished`、`agent.failed`、`stage.changed` 等事件由 `astream()` 的图事件映射生成，事件类型不变。`heartbeat` 和 `resync` 机制不变。 |
 | **已知差异** | LangGraph 路径中 `agent.started`/`agent.finished` 可能包含额外的 `node_name` 字段（图节点标识），但保持向后兼容。`stage.changed` 事件的 `from_stage`/`to_stage` 值可能包含 `formula`（而非 `prescription`/`modification`）。 |
 | **L9 前是否允许变化** | 允许 payload 中增加字段（向后兼容），允许 `current_stage` 值集变化。禁止事件类型名称变化，禁止移除现有事件类型，禁止 SSE 格式变化。 |
 | **回滚预期行为** | Feature Flag 切回 Legacy：事件类型不变，`from_stage`/`to_stage` 恢复旧值集。 |
@@ -171,14 +171,15 @@
 | 3 | `agent.started` | 当前未发射（保留事件类型） | — | 兼容。LangGraph 路径中通过 `astream()` 事件映射发射 | L1 实现 LangGraph 骨架后启用。 |
 | 4 | `agent.finished` | 当前未发射（保留事件类型） | — | 兼容 | 同上。 |
 | 5 | `agent.failed` | `MessageService._record_agent_failed`（Agent 失败时 best-effort 审计） | `agent_name`, `error_code`, `retryable`, `trace_id` | 兼容 | Redis Stream 写入失败不阻断错误返回。 |
-| 6 | `review.required` | `Supervisor._advance_locked`（SAFETY 通过后进入 REVIEW） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `modified_formula`, `safety_review` | 兼容。`modified_formula` 在 LangGraph 路径中替换为 `formula_draft` 结构（向后兼容字段保留） | 必须包含 `modified_formula`，禁止包含 `base_formula`（P3-3 契约）。 |
-| 7 | `safety.blocked` | `Supervisor._advance_locked`（SAFETY 未通过且非 review/blocked 路径） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `safety_review`, `rollback_counts` | 兼容 | 仅 rollback 路径（回退到 PRESCRIPTION/MODIFICATION）时发射。 |
-| 8 | `session.blocked` | `Supervisor._enter_blocked` | `from_stage`, `blocked_reason`, `state_version`, `trace_id` | 兼容 | blocked 是终态之一，需通过 `/recover` 恢复。 |
-| 9 | `session.done` | `Supervisor._advance_locked`（RECORD → DONE） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `record_id` | 兼容 | 仅在成功生成 medical_records 后发射。 |
-| 10 | `session.terminated` | `RecoveryService._do_terminate` | `action: "terminate"`, `reason`, `previous_status`, `previous_stage`, `terminated_at`, `terminated_by` | 兼容 | |
-| 11 | `doctor.reviewed` | `ReviewService._do_confirm` / `_do_modify` / `_do_reject` | `action`, `review_id`, `to_stage`, `state_version` | 兼容 | |
-| 12 | `heartbeat` | `EventService.iter_sse`（空闲时本地生成） | `timestamp` | 完全兼容 | 本地生成的事件，不写入 Redis Stream。间隔由 `sse_heartbeat_interval_seconds` 控制（默认 30s）。 |
-| 13 | `resync` | `EventService.iter_sse`（`last_event_id` 不可用时本地生成） | `session_id`, `reason`, `timestamp` | 完全兼容 | 要求前端全量同步。 |
+| 6 | `agent.progress` | `langgraph_reasoning._emit_reasoning_progress`（开方推理子图各阶段开始：辨证/主方/加减化裁） | `stage`, `label`, `agent_name`, `session_id`, `timestamp` | 兼容（新增事件类型） | 瞬态过程提示，直接写 Redis Stream（不经 outbox）；Redis 不可用静默降级，不影响业务。 |
+| 7 | `review.required` | `Supervisor._advance_locked`（SAFETY 通过后进入 REVIEW） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `modified_formula`, `safety_review` | 兼容。`modified_formula` 在 LangGraph 路径中替换为 `formula_draft` 结构（向后兼容字段保留） | 必须包含 `modified_formula`，禁止包含 `base_formula`（P3-3 契约）。 |
+| 8 | `safety.blocked` | `Supervisor._advance_locked`（SAFETY 未通过且非 review/blocked 路径） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `safety_review`, `rollback_counts` | 兼容 | 仅 rollback 路径（回退到 PRESCRIPTION/MODIFICATION）时发射。 |
+| 9 | `session.blocked` | `Supervisor._enter_blocked` | `from_stage`, `blocked_reason`, `state_version`, `trace_id` | 兼容 | blocked 是终态之一，需通过 `/recover` 恢复。 |
+| 10 | `session.done` | `Supervisor._advance_locked`（RECORD → DONE） | `from_stage`, `to_stage`, `state_version`, `trace_id`, `record_id` | 兼容 | 仅在成功生成 medical_records 后发射。 |
+| 11 | `session.terminated` | `RecoveryService._do_terminate` | `action: "terminate"`, `reason`, `previous_status`, `previous_stage`, `terminated_at`, `terminated_by` | 兼容 | |
+| 12 | `doctor.reviewed` | `ReviewService._do_confirm` / `_do_modify` / `_do_reject` | `action`, `review_id`, `to_stage`, `state_version` | 兼容 | |
+| 13 | `heartbeat` | `EventService.iter_sse`（空闲时本地生成） | `timestamp` | 完全兼容 | 本地生成的事件，不写入 Redis Stream。间隔由 `sse_heartbeat_interval_seconds` 控制（默认 30s）。 |
+| 14 | `resync` | `EventService.iter_sse`（`last_event_id` 不可用时本地生成） | `session_id`, `reason`, `timestamp` | 完全兼容 | 要求前端全量同步。 |
 
 ### SSE 安全约束（当前实现）
 

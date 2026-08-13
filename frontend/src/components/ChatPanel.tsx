@@ -144,8 +144,18 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
   // agent.finished(reasoning) 被忽略，界面只能靠命令对账轮询刷新；SSE 唤醒或
   // 对账预算任一断掉就需要手动刷新。这里对全部 agent 一视同仁（读模型 GET 便宜，
   // 多刷几次无害），保证 reasoning 完成事件真正触发 UI 刷新。
+  // agent.progress（开方推理阶段）：辨证/主方/加减化裁，实时展示，完成后清除。
+  const [reasoningProgress, setReasoningProgress] = useState<{ stage: string; label: string } | null>(null)
+  const handleReasoningProgress = useCallback((stage: string, label: string) => {
+    setReasoningProgress({ stage, label })
+  }, [])
+
   const handleAgentFinished = useCallback(
-    (_agentName: string) => {
+    (agentName: string) => {
+      // 推理子图完成后清除阶段进度提示。
+      if (agentName === 'reasoning_subgraph' || agentName === 'reasoning') {
+        setReasoningProgress(null)
+      }
       void refreshDetail()
       if (sessionId) void loadMessages(sessionId)
     },
@@ -309,6 +319,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
     onStageChanged: handleStageChanged,
     onMessageCreated: handleMessageCreated,
     onAgentFinished: handleAgentFinished,
+    onReasoningProgress: handleReasoningProgress,
     onResync: handleResync,
     onReviewRequired: handleReviewRequired,
     onSafetyBlocked: handleSafetyBlocked,
@@ -877,6 +888,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
               state={streamHook.connectionState}
               lastError={streamHook.lastError}
               runningAgent={runningAgent}
+              progress={reasoningProgress}
               onReconnect={streamHook.reconnect}
             />
             {error ? (

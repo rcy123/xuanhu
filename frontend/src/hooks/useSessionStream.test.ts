@@ -322,6 +322,29 @@ describe('useSessionStream', () => {
     })
   })
 
+  it('agent.progress 触发 onReasoningProgress 回调', async () => {
+    const { getCaptured } = setupConnectSpy()
+    const onReasoningProgress = vi.fn()
+    const { result } = renderHook(() =>
+      useSessionStream({
+        sessionId: 's1',
+        stateVersion: 1,
+        onReasoningProgress,
+      }),
+    )
+    await act(async () => {
+      getCaptured().onEvent(
+        makeEvent('agent.progress', {
+          stage: 'syndrome',
+          label: '正在辨证…',
+          agent_name: 'reasoning_subgraph',
+        }),
+      )
+    })
+    expect(onReasoningProgress).toHaveBeenCalledWith('syndrome', '正在辨证…')
+    expect(result.current.agentRuns).toEqual({})
+  })
+
   it('连续 3 次 onError 后进入 polling', async () => {
     const onPollingRefresh = vi.fn().mockResolvedValue(undefined)
     const { getCaptured } = setupConnectSpy()

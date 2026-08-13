@@ -134,6 +134,28 @@ async def test_append_session_event_overwrites_untrusted_schema_version() -> Non
 
 
 @pytest.mark.asyncio
+async def test_append_agent_progress_writes_reasoning_stage() -> None:
+    """agent.progress（开方阶段进度）可写入 Redis Stream，含 stage/label 字段。"""
+    redis = FakeRedis()
+    service = EventService(redis)  # type: ignore[arg-type]
+
+    result = await service.append_session_event(
+        "sid-progress",
+        "agent.progress",
+        {"stage": "syndrome", "label": "正在辨证…", "agent_name": "reasoning_subgraph"},
+    )
+
+    assert result.event_id == "1-0"
+    assert redis.last_xadd is not None
+    payload = json.loads(redis.last_xadd["fields"]["payload"])
+    assert payload["stage"] == "syndrome"
+    assert payload["label"] == "正在辨证…"
+    assert payload["agent_name"] == "reasoning_subgraph"
+    assert payload["session_id"] == "sid-progress"
+    assert payload["schema_version"] == SESSION_EVENT_SCHEMA_VERSION
+
+
+@pytest.mark.asyncio
 async def test_read_events_after_returns_only_newer_events() -> None:
     """last_event_id 之后的事件可补发。"""
     redis = FakeRedis()

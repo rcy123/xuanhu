@@ -41,4 +41,14 @@ describe('StreamStatus', () => {
     render(<StreamStatus state="connected" runningAgent="辨证" />)
     expect(screen.getByText('· 辨证 运行中')).toBeInTheDocument()
   })
+
+  it('progress 非空时显示开方阶段进度', () => {
+    render(
+      <StreamStatus
+        state="connected"
+        progress={{ stage: 'syndrome', label: '正在辨证…' }}
+      />,
+    )
+    expect(screen.getByTestId('reasoning-progress')).toHaveTextContent('正在辨证…')
+  })
 })

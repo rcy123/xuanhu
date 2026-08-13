@@ -32,6 +32,8 @@ export interface UseSessionStreamOptions {
   onStageChanged?: (toStage: string, stateVersion: number) => void
   onMessageCreated?: (messageId: string) => void
   onAgentFinished?: (agentName: string) => void
+  /** 开方推理阶段进度（agent.progress：辨证/主方/加减化裁）。 */
+  onReasoningProgress?: (stage: string, label: string) => void
   onResync?: (reason: string) => void
   onReviewRequired?: (modifiedFormula: Formula, safetyReview: Record<string, unknown>) => void
   onSafetyBlocked?: (issues: SafetyIssue[], rollbackTarget?: string | null) => void
@@ -142,6 +144,12 @@ export function useSessionStream(options: UseSessionStreamOptions): UseSessionSt
             [agentName]: { status: 'running', agentRunId },
           }))
         }
+        break
+      }
+      case 'agent.progress': {
+        const stage = payload?.stage as string | undefined
+        const label = payload?.label as string | undefined
+        if (stage && label) opts.onReasoningProgress?.(stage, label)
         break
       }
       case 'agent.finished': {

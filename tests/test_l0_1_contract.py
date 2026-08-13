@@ -66,6 +66,7 @@ SSE_EVENTS = [
     "agent.started",
     "agent.finished",
     "agent.failed",
+    "agent.progress",
     "review.required",
     "safety.blocked",
     "session.blocked",

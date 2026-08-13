@@ -15,6 +15,8 @@ interface StreamStatusProps {
   state: StreamConnectionState
   lastError?: string | null
   runningAgent?: string | null
+  /** 开方推理阶段进度（agent.progress），如 { stage: 'syndrome', label: '正在辨证…' }。 */
+  progress?: { stage: string; label: string } | null
   onReconnect?: () => void
 }
 
@@ -29,7 +31,7 @@ const STATE_META: Record<
   disconnected: { color: '#ff4d4f', label: '已断开', showReconnect: true },
 }
 
-export function StreamStatus({ state, runningAgent, onReconnect }: StreamStatusProps) {
+export function StreamStatus({ state, runningAgent, progress, onReconnect }: StreamStatusProps) {
   if (state === 'idle') return null
 
   const meta = STATE_META[state]
@@ -59,6 +61,11 @@ export function StreamStatus({ state, runningAgent, onReconnect }: StreamStatusP
         {runningAgent ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
             · {runningAgent} 运行中
+          </Text>
+        ) : null}
+        {progress?.label ? (
+          <Text type="secondary" data-testid="reasoning-progress" style={{ fontSize: 12 }}>
+            · {progress.label}
           </Text>
         ) : null}
       </Space>

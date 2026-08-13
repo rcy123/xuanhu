@@ -527,6 +527,26 @@ def _formula_unit_correction_hint() -> str:
 _REASONING_MAX_RETRIES = 2
 
 
+async def _emit_reasoning_progress(session_id: uuid.UUID, stage: str, label: str) -> None:
+    """推送推理阶段进度（``agent.progress`` 事件，best-effort）。
+
+    开方推理子图内有多个模型生成阶段（辨证 → 主方 → 加减化裁），每阶段
+    开始前推一条进度事件，前端 SSE 收到后展示阶段状态条，避免 40s 开方
+    全程无反馈。进度是瞬态过程提示，直接写 Redis Stream（SSE 实时送达），
+    不走 outbox（无需审计/去重）；Redis 不可用时静默降级，绝不失败业务。
+    """
+    try:
+        from app.services.events import EventService
+
+        await EventService().append_session_event(
+            str(session_id),
+            "agent.progress",
+            {"stage": stage, "label": label, "agent_name": "reasoning_subgraph"},
+        )
+    except Exception:  # noqa: BLE001 - 进度事件绝不能影响推理业务
+        _logger.warning("emit reasoning progress failed: stage=%s", stage)
+
+
 async def run_reasoning_precheck_node(state: XuanhuGraphState) -> dict[str, Any]:
     loaded = await _load_reasoning_claim(state)
     if isinstance(loaded, dict):
@@ -632,6 +652,8 @@ async def run_reasoning_draft_syndrome_node(state: XuanhuGraphState) -> dict[str
             idempotency_key=f"{claim.idempotency_key}:syndrome",
             trace_id=_node_trace_id(state),
         )
+        # 推送辨证进度（best-effort）。
+        await _emit_reasoning_progress(claim.session_id, "syndrome", "正在辨证…")
         result = await _execute_syndrome(
             runtime=AgentRuntime(),
             repository=repository,
@@ -1053,6 +1075,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
             _SYNDROME_RESULT_CACHE[claim.id] = syndrome_result
         else:
             # ---- 2.8 阶段 1：基础方草稿（仅选方，不做加减）----
+            # 推送主方进度（best-effort）。
+            await _emit_reasoning_progress(claim.session_id, "base_formula", "正在确定主方…")
             base_policy, base_prompt = _reasoning_policy("base_formula")
             # preflight 强制 input.policy_version == run_spec.policy_version：
             # 基础方阶段使用 base 专属 policy/prompt 配对。
@@ -1160,6 +1184,8 @@ async def run_reasoning_draft_formula_node(state: XuanhuGraphState) -> dict[str,
                 }
 
         # ---- 2.8 阶段 2：并行加减草稿（每套通过筛选的方案一个）----
+        # 推送加减化裁进度（best-effort）。
+        await _emit_reasoning_progress(claim.session_id, "modification", "正在加减化裁…")
         mod_policy, mod_prompt = _reasoning_policy("modification")
 
         async def _run_mod_for_alternative(
