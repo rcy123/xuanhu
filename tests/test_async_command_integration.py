@@ -471,6 +471,56 @@ async def test_worker_success_and_same_transaction_outbox() -> None:
         await _cleanup(session_id)
 
 
+async def test_two_workers_do_not_double_process_commands() -> None:
+    """阶段2：两个 worker 并发消费同一队列，每条命令恰被处理一次。
+
+    多进程横向扩展的安全基座是 FOR UPDATE SKIP LOCKED：两个 worker 同时 claim
+    时只会拿到不相交的命令集，不会重复执行。本用例用两个 worker 实例并发
+    run_once 验证端到端“不重复处理”。
+    """
+    processed: set[UUID] = set()
+    processed_lock = asyncio.Lock()
+
+    async def handler(ctx: AsyncCommandContext) -> CommandSuccess:
+        async with processed_lock:
+            processed.add(ctx.command_id)
+        await asyncio.sleep(0.01)  # 拉长处理时间，让两个 worker 有机会竞争 claim
+        return CommandSuccess(http_status=200, result_payload={})
+
+    # 每条命令独立 session，避免同会话串行影响 claim 竞争。
+    session_ids: list[UUID] = []
+    command_ids: list[UUID] = []
+    for i in range(8):
+        sid = await _seed_session()
+        session_ids.append(sid)
+        command_ids.append(await _enqueue(sid, key=f"mw-{i}", payload={}))
+
+    try:
+        repo_a = PostgresAsyncCommandRepository(get_session_factory())
+        repo_b = PostgresAsyncCommandRepository(get_session_factory())
+        worker_a = AsyncCommandWorker(
+            repo_a, handlers={OPERATION: handler}, worker_id="worker-a", max_concurrency=4
+        )
+        worker_b = AsyncCommandWorker(
+            repo_b, handlers={OPERATION: handler}, worker_id="worker-b", max_concurrency=4
+        )
+
+        result_a, result_b = await asyncio.gather(worker_a.run_once(), worker_b.run_once())
+
+        assert result_a.succeeded + result_b.succeeded == 8
+        assert len(processed) == 8, f"每条命令应恰被处理一次，实际 {len(processed)}"
+        assert set(processed) == set(command_ids)
+        # 所有命令都是 succeeded 且 attempt_count 仍为 1（未被第二个 worker 重复处理）。
+        for cid in command_ids:
+            row = await _command_row(cid)
+            assert row is not None
+            assert row.status == STATUS_SUCCEEDED
+            assert row.attempt_count == 1
+    finally:
+        for sid in session_ids:
+            await _cleanup(sid)
+
+
 async def test_worker_unknown_operation_rejects_terminal() -> None:
     session_id = await _seed_session()
     try:

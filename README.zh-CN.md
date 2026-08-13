@@ -285,8 +285,13 @@ uv run alembic upgrade head
 # 导入知识库数据（可选）
 uv run python scripts/seed_data.py
 
-# 启动 API 服务
+# 启动 API 服务（单进程）
 uv run xuanhu-api
+
+# 或横向扩展：设置 API_WORKERS>1 以启用多进程 worker
+# 命令 worker / outbox publisher 靠 FOR UPDATE SKIP LOCKED 多进程安全 claim，
+# 会话锁靠 PostgreSQL advisory lock（跨进程唯一权威）
+API_WORKERS=4 uv run xuanhu-api
 ```
 
 API 服务地址：`http://localhost:8000`，交互式文档：`/docs`。

@@ -95,6 +95,16 @@ class Settings(BaseSettings):
     app_version: str = Field(default="0.1.0", description="应用版本号")
     api_host: str = Field(default="0.0.0.0", description="API 监听地址")
     api_port: int = Field(default=8000, ge=1, le=65535, description="API 监听端口")
+    api_workers: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        validation_alias="API_WORKERS",
+        description=(
+            "阶段2 横向扩展：uvicorn worker 进程数；1=单进程，>1=多进程。"
+            "命令 worker/outbox publisher 靠 SKIP LOCKED 多进程安全 claim，会话锁靠 PG advisory lock。"
+        ),
+    )
 
     # ---- 数据库 ----
     database_url: str = Field(..., alias="DB_URL", description="PostgreSQL 连接串（必填）")

@@ -143,7 +143,11 @@ def test_supported_uvicorn_entry_uses_selector_loop_factory(
     def fake_run(app: str, **kwargs: Any) -> None:
         captured.update({"app": app, **kwargs})
 
-    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(api_host="127.0.0.1", api_port=8123))
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(api_host="127.0.0.1", api_port=8123, api_workers=1),
+    )
     monkeypatch.setattr(server.uvicorn, "run", fake_run)
     server.main()
     assert captured == {
@@ -151,6 +155,31 @@ def test_supported_uvicorn_entry_uses_selector_loop_factory(
         "host": "127.0.0.1",
         "port": 8123,
         "loop": server.UVICORN_LOOP_FACTORY,
+    }
+
+
+def test_api_launcher_passes_workers_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """阶段2：API_WORKERS>1 时 launcher 应把 workers 传给 uvicorn。"""
+    from app import server
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(app: str, **kwargs: Any) -> None:
+        captured.update({"app": app, **kwargs})
+
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(api_host="0.0.0.0", api_port=8000, api_workers=4),
+    )
+    monkeypatch.setattr(server.uvicorn, "run", fake_run)
+    server.main()
+    assert captured == {
+        "app": "app.main:app",
+        "host": "0.0.0.0",
+        "port": 8000,
+        "loop": server.UVICORN_LOOP_FACTORY,
+        "workers": 4,
     }
 
 
