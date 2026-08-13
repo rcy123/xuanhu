@@ -65,8 +65,11 @@ def get_engine() -> AsyncEngine:
         else:
             _engine = create_async_engine(
                 async_url,
-                pool_size=10,
-                max_overflow=20,
+                # 阶段2配套：连接池大小可配置，多 worker 部署时按
+                # api_workers × (pool_size + max_overflow) ≤ PG max_connections
+                # 调整（见 app/server.py 启动检查）。
+                pool_size=settings.db_pool_size,
+                max_overflow=settings.db_pool_max_overflow,
                 pool_timeout=30,
                 pool_recycle=3600,
                 pool_pre_ping=True,

@@ -105,6 +105,18 @@ class Settings(BaseSettings):
             "命令 worker/outbox publisher 靠 SKIP LOCKED 多进程安全 claim，会话锁靠 PG advisory lock。"
         ),
     )
+    db_pool_size: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="SQLAlchemy 连接池大小（每进程）；多 worker 时需保证 api_workers×(pool_size+max_overflow) ≤ PG max_connections",
+    )
+    db_pool_max_overflow: int = Field(
+        default=20,
+        ge=0,
+        le=200,
+        description="SQLAlchemy 连接池溢出上限（每进程）",
+    )
 
     # ---- 数据库 ----
     database_url: str = Field(..., alias="DB_URL", description="PostgreSQL 连接串（必填）")

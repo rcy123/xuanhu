@@ -148,6 +148,8 @@ def test_supported_uvicorn_entry_uses_selector_loop_factory(
         "get_settings",
         lambda: SimpleNamespace(api_host="127.0.0.1", api_port=8123, api_workers=1),
     )
+    # 连接池容量检查是 best-effort 的 DB I/O，与本用例无关，置为 no-op。
+    monkeypatch.setattr(server, "_warn_pool_capacity", lambda _settings: None)
     monkeypatch.setattr(server.uvicorn, "run", fake_run)
     server.main()
     assert captured == {
@@ -172,6 +174,7 @@ def test_api_launcher_passes_workers_when_configured(monkeypatch: pytest.MonkeyP
         "get_settings",
         lambda: SimpleNamespace(api_host="0.0.0.0", api_port=8000, api_workers=4),
     )
+    monkeypatch.setattr(server, "_warn_pool_capacity", lambda _settings: None)
     monkeypatch.setattr(server.uvicorn, "run", fake_run)
     server.main()
     assert captured == {
@@ -181,6 +184,32 @@ def test_api_launcher_passes_workers_when_configured(monkeypatch: pytest.MonkeyP
         "loop": server.UVICORN_LOOP_FACTORY,
         "workers": 4,
     }
+
+
+def test_pool_capacity_total_matches_workers_times_pool() -> None:
+    """阶段2配套：总连接数 = workers × (pool_size + max_overflow)。"""
+    from app import server
+
+    settings = SimpleNamespace(api_workers=4, db_pool_size=10, db_pool_max_overflow=20)
+    assert server._pool_capacity_total(settings) == 4 * 30
+
+
+def test_pool_capacity_warning_when_total_exceeds_pg_max() -> None:
+    """阶段2配套：4 worker × 30 = 120 > 100 时应返回告警消息。"""
+    from app import server
+
+    settings = SimpleNamespace(api_workers=4, db_pool_size=10, db_pool_max_overflow=20)
+    message = server._pool_capacity_warning(settings, max_connections=100)
+    assert message is not None
+    assert "120" in message and "100" in message
+
+
+def test_pool_capacity_no_warning_when_within_pg_max() -> None:
+    """阶段2配套：单 worker 30 连接 < 100 时不应告警。"""
+    from app import server
+
+    settings = SimpleNamespace(api_workers=1, db_pool_size=10, db_pool_max_overflow=20)
+    assert server._pool_capacity_warning(settings, max_connections=100) is None
 
 
 @pytest.mark.asyncio
