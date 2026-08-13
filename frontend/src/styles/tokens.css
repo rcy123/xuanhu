@@ -1,61 +1,173 @@
 /**
  * 悬壶 WebUI —— 设计令牌（CSS 变量）
  *
- * 与 UI 设计文档 §2 视觉系统对齐：传统中医暖色调，避免纯白纯黑。
+ * 与 UI 设计文档 §2 视觉系统对齐：水墨宣纸暖色调，避免纯白纯黑。
  * Ant Design 主题在 App.tsx 中通过 ConfigProvider.token 覆盖为同一套色板。
+ *
+ * 调色板来源：项目品牌资产 logo.png（葫芦水墨 + 叶片松针绿 + 朱砂方印）
+ * - 朱砂红（seal）：采样 #d55941 → 收敛为 #C8442C，足够深用于主按钮与重要标记
+ * - 松针绿（leaf）：采样 #99ab7c → 加深为 #6F8256，避开 LLM 默认的「明黄+米黄」AI 调色板
+ * - 墨黑（ink）：#1B1A17（warm black），避开 Section 9.A 禁令的纯 #000
+ * - 宣纸暖白：#F5EFE0 / #FAF6E9（rice paper），与现有 #FFFEFA 形成层级
  */
 
 :root {
-  /* 主色 */
-  --xh-primary: #8e3f38; /* 朱砂褐 —— 主按钮、重要标记 */
-  --xh-primary-hover: #75322d;
-  --xh-primary-soft: #f3e6e2;
-  --xh-secondary: #2f6652; /* 松柏绿 —— 辅助色、链接 */
-  --xh-secondary-soft: #e5efe9;
+  /* ---- 主色：朱砂 ---- */
+  --xh-primary: #C8442C;
+  --xh-primary-hover: #A9382B;
+  --xh-primary-active: #8F2E25;
+  --xh-primary-soft: #F4DCD3;
+  --xh-primary-soft-2: rgba(200, 68, 44, 0.08);
 
-  /* 中性色（暖调替代纯灰） */
-  --xh-bg-page: #f2f1ec; /* 温润浅灰 —— 页面背景 */
-  --xh-bg-card: #fffefa; /* 宣纸白 —— 卡片/面板背景 */
-  --xh-bg-muted: #f7f4ed;
-  --xh-bg-sidebar: #f8f5ee;
-  --xh-border: #ddd8cd; /* 茶灰 —— 边框、分割线 */
-  --xh-border-strong: #cbc3b5;
-  --xh-text: #262a26; /* 墨色 —— 主文字 */
-  --xh-text-secondary: #6f746e; /* 淡墨 —— 次要文字、提示 */
+  /* ---- 辅助色：松针绿 ---- */
+  --xh-secondary: #6F8256;
+  --xh-secondary-hover: #5C6E47;
+  --xh-secondary-soft: #E2E7D3;
+  --xh-secondary-soft-2: rgba(111, 130, 86, 0.10);
 
-  /* 语义色（克制） */
-  --xh-success: #40785c;
-  --xh-warning: #a97824;
-  --xh-error: #a6443d;
-  --xh-info: #557584;
+  /* ---- 中性色（暖调宣纸） ---- */
+  --xh-bg-page: #F2EDE0; /* 页面底色：旧宣纸 */
+  --xh-bg-card: #FFFEFA; /* 卡片底色：精制宣纸 */
+  --xh-bg-paper: #FAF6E9; /* 装饰纸色 */
+  --xh-bg-paper-deep: #ECE4D0; /* 深宣纸：用于品牌面板背景 */
+  --xh-bg-muted: #EFEADC;
+  --xh-bg-sidebar: #F5F0E2;
+  --xh-border: #DCD4BF;
+  --xh-border-strong: #C7BC9D;
+  --xh-divider: #E5DDC8;
 
-  /* 间距（8px 基准） */
+  /* ---- 文本：墨色 ---- */
+  --xh-text: #1B1A17;
+  --xh-text-secondary: #5A5751;
+  --xh-text-tertiary: #8A8679;
+  --xh-text-on-primary: #FFFEFA;
+  --xh-text-on-secondary: #FFFEFA;
+
+  /* ---- 语义色（克制） ---- */
+  --xh-success: #5C7F4F;
+  --xh-warning: #B58032;
+  --xh-error: #B04139;
+  --xh-info: #5F7488;
+
+  /* ---- 间距（8px 基准，向 art-gallery 拉伸） ---- */
   --xh-space-xs: 4px;
   --xh-space-s: 8px;
   --xh-space-m: 12px;
   --xh-space-l: 16px;
   --xh-space-xl: 24px;
   --xh-space-xxl: 32px;
+  --xh-space-3xl: 48px;
+  --xh-space-4xl: 72px;
 
-  /* 圆角 */
-  --xh-radius-card: 14px;
+  /* ---- 圆角（Section 4.4 Shape Consistency Lock：单一半径体系） ---- */
+  --xh-radius-card: 16px;
   --xh-radius-button: 10px;
   --xh-radius-input: 10px;
+  --xh-radius-pill: 999px;
 
-  /* 字体 */
-  --xh-font-serif: "Noto Serif SC", "Georgia", "Microsoft YaHei", serif;
-  --xh-font-sans: "Noto Sans SC", "Inter", system-ui, "Microsoft YaHei", sans-serif;
+  /* ---- 字体（保留品牌既有中文字族，不引入 Inter 等 AI 默认） ---- */
+  --xh-font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "Georgia", serif;
+  --xh-font-sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --xh-font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
 
-  /* 卡片阴影（极轻） */
-  --xh-shadow-card: 0 8px 24px rgba(42, 39, 34, 0.06);
-  --xh-shadow-elevated: 0 20px 55px rgba(37, 34, 29, 0.16);
+  /* ---- 阴影（暖色调阴影，避开纯黑投影；Section 9.A） ---- */
+  --xh-shadow-card: 0 1px 0 rgba(27, 26, 23, 0.04), 0 8px 24px rgba(45, 38, 28, 0.06);
+  --xh-shadow-elevated: 0 1px 0 rgba(27, 26, 23, 0.06), 0 24px 60px rgba(45, 38, 28, 0.14);
+  --xh-shadow-inset-paper: inset 0 1px 0 rgba(255, 254, 250, 0.6), inset 0 -1px 0 rgba(45, 38, 28, 0.04);
+  --xh-shadow-focus: 0 0 0 3px rgba(200, 68, 44, 0.18);
 
-  /* 侧边栏宽度 */
+  /* ---- 侧栏与布局 ---- */
   --xh-sider-width: 296px;
   --xh-sider-collapsed-width: 76px;
   --xh-context-width: 420px;
   --xh-header-height: 68px;
   --xh-disclaimer-height: 30px;
+
+  /* ---- 水墨晕染背景（inline SVG，零网络请求；高 DPI 自适应） ---- */
+  /* 数据 URL 来源：手工构造的 SVG turbulence，用于品牌面板的纸面晕染。 */
+  --xh-ink-wash-bg:
+    radial-gradient(ellipse 60% 50% at 30% 20%, rgba(111, 130, 86, 0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 80% 70%, rgba(200, 68, 44, 0.05) 0%, transparent 60%),
+    radial-gradient(ellipse 80% 60% at 50% 90%, rgba(27, 26, 23, 0.04) 0%, transparent 70%);
+
+  /* 纸纹噪点（SVG turbulence，约 600B） */
+  --xh-paper-grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220' viewBox='0 0 220 220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.10  0 0 0 0 0.10  0 0 0 0 0.09  0 0 0 0.06 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+
+  /* ---- 渐变（仅用于品牌面板背景；CTAs 全部实色，避开 AI 默认的紫罗兰渐变） ---- */
+  --xh-gradient-paper:
+    linear-gradient(160deg, #F7F1E3 0%, #EFE7D2 52%, #E3DAC4 100%);
+
+  /* ---- 动效 ---- */
+  --xh-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --xh-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* 朱砂笔触下划线（inline SVG 数据 URL，配合 em 强调字使用） */
+  --xh-brush-underline: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 20' preserveAspectRatio='none'><path d='M6 13 C 40 5, 70 16, 102 11 S 160 6, 190 12' fill='none' stroke='%23C8442C' stroke-width='5.5' stroke-linecap='round' opacity='0.55'/></svg>");
+
+  /* 禅圆残环（enso）：留一处缺口，像毛笔起收笔 */
+  --xh-enso-ring: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><path d='M100 10 a90 90 0 1 1 -0.001 0' fill='none' stroke='%231B1A17' stroke-opacity='0.15' stroke-width='1.8' stroke-linecap='round' stroke-dasharray='486 79.5' stroke-dashoffset='314'/></svg>");
+}
+
+/* ---- 入场与微动效关键帧（fill-mode: both；prefers-reduced-motion 全局降级） ---- */
+@keyframes xh-rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes xh-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes xh-line-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes xh-float {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-8px);
+  }
+}
+
+/* 盖章动效：旋转角由各印章通过 --xh-stamp-rot 覆盖 */
+@keyframes xh-stamp {
+  0% {
+    opacity: 0;
+    transform: rotate(var(--xh-stamp-rot, -10deg)) scale(1.7);
+  }
+  55% {
+    opacity: 1;
+    transform: rotate(var(--xh-stamp-rot, -10deg)) scale(0.92);
+  }
+  75% {
+    transform: rotate(var(--xh-stamp-rot, -10deg)) scale(1.06);
+  }
+  100% {
+    opacity: 1;
+    transform: rotate(var(--xh-stamp-rot, -10deg)) scale(1);
+  }
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 html,
@@ -74,6 +186,7 @@ body {
   line-height: 1.7;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 * {
@@ -87,12 +200,13 @@ textarea {
 }
 
 ::selection {
-  background: rgba(142, 63, 56, 0.18);
+  background: rgba(200, 68, 44, 0.22);
+  color: var(--xh-text);
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(111, 116, 110, 0.34) transparent;
+  scrollbar-color: rgba(90, 87, 81, 0.32) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -101,8 +215,19 @@ textarea {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(111, 116, 110, 0.28);
+  background: rgba(90, 87, 81, 0.28);
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: padding-box;
+}
+
+/* 偏好减少动效时禁用所有过渡与动画（Section 6.B Reduced Motion） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

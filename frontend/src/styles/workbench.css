@@ -36,22 +36,18 @@
   gap: 12px;
 }
 
-.xh-brand-mark,
-.xh-home-mark {
+.xh-brand-mark {
+  width: 40px;
+  height: 40px;
   display: grid;
   place-items: center;
-  color: #fffdf8;
-  font-family: var(--xh-font-serif);
-  font-weight: 700;
-  background: linear-gradient(145deg, #a9554c, var(--xh-primary));
-  box-shadow: 0 8px 20px rgba(142, 63, 56, 0.2);
 }
 
-.xh-brand-mark {
-  width: 38px;
-  height: 38px;
-  border-radius: 12px 12px 12px 4px;
-  font-size: 18px;
+.xh-brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 5px rgba(27, 26, 23, 0.12));
 }
 
 .xh-brand-copy {
@@ -2579,7 +2575,6 @@
   .xh-brand-mark {
     width: 34px;
     height: 34px;
-    font-size: 16px;
   }
 
   .xh-brand-copy > .ant-typography {

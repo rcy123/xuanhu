@@ -4,7 +4,12 @@
  */
 
 import '@testing-library/jest-dom/vitest'
-import { vi } from 'vitest'
+import { cleanup } from '@testing-library/react'
+import { afterEach, vi } from 'vitest'
+
+// vitest 使用 globals: false，RTL 不会自动注册 afterEach 清理；
+// 显式注册以避免同一文件内多个测试的 DOM 相互累积。
+afterEach(() => cleanup())
 
 // Ant Design queries pseudo-element styles; jsdom logs a noisy "not implemented"
 // diagnostic for the optional second argument even though tests only need the

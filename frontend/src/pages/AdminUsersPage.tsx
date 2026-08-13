@@ -251,7 +251,9 @@ export function AdminUsersPage() {
     <main className="xh-admin-page" data-testid="admin-users-page">
       <header className="xh-admin-header">
         <div className="xh-admin-brand">
-          <div className="xh-admin-mark" aria-hidden="true">悬</div>
+          <div className="xh-admin-mark" aria-hidden="true">
+            <img src="/xuanhu-mark.png" alt="" />
+          </div>
           <div>
             <Text className="xh-admin-eyebrow">XUANHU ADMIN</Text>
             <Title level={4}>账户管理</Title>

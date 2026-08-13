@@ -75,8 +75,22 @@ describe('App Shell', () => {
 
   it('首页渲染品牌标题与引导文案', () => {
     renderAppAt('/')
-    expect(screen.getByText('悬壶工作台')).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { level: 1, name: '悬壶工作台' }),
+    ).toBeInTheDocument()
     expect(screen.getByText(/请访问/)).toBeInTheDocument()
+  })
+
+  it('文档页渲染标题、目录与正文', () => {
+    renderAppAt('/docs')
+    expect(
+      screen.getByRole('heading', { level: 1, name: /使用与设计文档/ }),
+    ).toBeInTheDocument()
+    expect(screen.getAllByText('快速上手').length).toBeGreaterThan(0)
+    expect(
+      screen.getByRole('heading', { level: 2, name: '诊疗工作流' }),
+    ).toBeInTheDocument()
+    expect(screen.getAllByText(/辅助决策工具/).length).toBeGreaterThan(0)
   })
 
   it('工作台渲染品牌标题、免责声明与新建问诊按钮', () => {
@@ -84,6 +98,10 @@ describe('App Shell', () => {
     expect(screen.getAllByText('悬壶').length).toBeGreaterThan(0)
     expect(screen.getByText(/辅助决策工具，所有结论仅供参考/)).toBeInTheDocument()
     expect(screen.getByText('新建问诊')).toBeInTheDocument()
+    expect(document.querySelector('.xh-brand-mark img')).toHaveAttribute(
+      'src',
+      '/xuanhu-mark.png',
+    )
   })
 
   it('无选中会话时主区显示空态引导', () => {
@@ -128,6 +146,10 @@ describe('App Shell', () => {
     renderAppAt('/admin/users')
     expect(await screen.findByTestId('admin-users-page')).toBeInTheDocument()
     expect(screen.getByText('医师用户')).toBeInTheDocument()
+    expect(document.querySelector('.xh-admin-mark img')).toHaveAttribute(
+      'src',
+      '/xuanhu-mark.png',
+    )
   })
 
   it('工作台渲染步骤条节点', () => {
