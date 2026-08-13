@@ -19,6 +19,9 @@ export default defineConfig({
   server: {
     host: '127.0.0.1',
     port: 5173,
+    // 内网穿透（cpolar/cloudflared）场景：公网域名 Host 头默认会被 Vite
+    // 拒绝（403 Blocked request）。dev 阶段放开，允许任意 Host 访问。
+    allowedHosts: true,
     proxy: {
       // 会话、消息、SSE、恢复、review、健康检查全部走 /api 前缀。
       // SSE（/stream）必须显式关闭 ws 之外的特殊处理，并保留 keep-alive。

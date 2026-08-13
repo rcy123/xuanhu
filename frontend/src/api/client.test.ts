@@ -438,13 +438,13 @@ describe('管理员账户 API', () => {
     }))
 
     await createAdminDoctor(
-      { name: '张医生', password: 'long-password-12' },
+      { username: 'zhangsan', name: '张医生', password: 'long-password-12' },
       { idempotencyKey: 'must-not-be-sent' },
     )
     expect(fn.mock.calls[0][0]).toBe(`${BASE}/admin/doctors`)
     expect(fn.mock.calls[0][1].method).toBe('POST')
     expect(JSON.parse(fn.mock.calls[0][1].body as string)).toEqual({
-      name: '张医生', password: 'long-password-12',
+      username: 'zhangsan', name: '张医生', password: 'long-password-12',
     })
     expect((fn.mock.calls[0][1].headers as Record<string, string>)['X-Idempotency-Key']).toBeUndefined()
 

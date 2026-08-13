@@ -435,3 +435,41 @@ async def health_llm_root(request: Request) -> JSONResponse:
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# 前端静态资源托管（单进程部署 / 内网穿透演示）
+# ---------------------------------------------------------------------------
+# XUANHU_UI_DIST 指向 Vite 构建产物（如 frontend/dist）时启用：
+#   - /assets 静态文件直出（构建产物带内容 hash，可长缓存）
+#   - 其余非 API 路径回退 index.html（SPA 客户端路由 /workbench、/login 等）
+# 必须放在所有路由注册之后：/api、/health、/docs、/metrics 已先行匹配，
+# 只有未命中路径才会落到 SPA 回退。生产多进程场景仍推荐 Nginx 同源反代
+# （deploy/nginx/xuanhu.conf），此开关面向单进程本地/演示部署。
+if _settings.ui_dist_dir:
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    ui_dist = Path(_settings.ui_dist_dir)
+    if not ui_dist.is_dir():
+        logger.warning("XUANHU_UI_DIST 指向的目录不存在，跳过前端静态托管: %s", ui_dist)
+    else:
+        assets_dir = ui_dist / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="ui-assets")
+
+        ui_dist_root = ui_dist.resolve()
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def spa_fallback(full_path: str) -> FileResponse:
+            """SPA 回退：命中真实文件则直出，否则返回 index.html。
+
+            resolve() + parents 包含性检查防止路径穿越（../ 逃逸到 dist 之外）。
+            """
+            if full_path:
+                candidate = (ui_dist / full_path).resolve()
+                if candidate.is_file() and ui_dist_root in candidate.parents:
+                    return FileResponse(candidate)
+            return FileResponse(ui_dist / "index.html")
