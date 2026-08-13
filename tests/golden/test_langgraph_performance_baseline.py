@@ -31,7 +31,7 @@ from pydantic import BaseModel
 import app.services.langgraph_intake as langgraph_intake_module
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.gateway import ModelTokenUsage, StructuredChatResponse
-from app.db.session import reset_session_factory
+from app.db.session import get_session_factory, reset_session_factory
 from app.main import app
 from tests._database_safety import validate_test_database_url
 from tests.test_l3_5_intake_subgraph import _E2EFakeGateway
@@ -139,6 +139,7 @@ async def test_langgraph_message_round_performance_baseline(
         lambda: AgentRuntime(gateway),
     )
     durations_ms: list[float] = []
+    session_ids: list[UUID] = []
 
     # The integration safety sentinel selects NullPool because the full suite
     # intentionally spans several event loops.  This performance module uses
@@ -165,6 +166,7 @@ async def test_langgraph_message_round_performance_baseline(
                     )
                     assert created.status_code == 201
                     session_id = created.json()["data"]["session_id"]
+                    session_ids.append(UUID(session_id))
 
                     started = time.perf_counter()
                     response = await client.post(
@@ -196,7 +198,21 @@ async def test_langgraph_message_round_performance_baseline(
                     # reaches succeeded; measure end-to-end (POST through done).
                     await _await_command_succeeded(client, location)
                     durations_ms.append((time.perf_counter() - started) * 1000)
+
     finally:
+        # 清理 golden 测试自身创建的会话：测试环境默认关闭 outbox publisher
+        # （conftest 设 OUTBOX_PUBLISHER_ENABLED=false），20 个会话会产生上百条
+        # 未发布的 outbox 事件积压，会污染后续集成测试的单次 run_once 断言。
+        # consult_sessions 级联删除 outbox_events / async_commands（ondelete=CASCADE）。
+        if session_ids:
+            from sqlalchemy import delete
+
+            from app.models.consult import ConsultSession
+
+            async with get_session_factory()() as db, db.begin():
+                await db.execute(
+                    delete(ConsultSession).where(ConsultSession.id.in_(session_ids))
+                )
         await reset_session_factory()
 
     p50 = _percentile_nearest_rank(durations_ms, 0.50)

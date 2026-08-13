@@ -912,6 +912,39 @@ class TestIdempotency:
 
         self._session_factory = session_factory
 
+    @pytest.fixture(autouse=True)
+    async def _cleanup_knowledge(self):
+        """每个测试方法结束后清理导入的知识数据。
+
+        TestIdempotency 会真实写入 herbs/formulas/acupoints 等知识表并 commit；
+        这些数据若残留，会污染后续依赖干净知识库的集成测试（如 l4_4 推理子图
+        的 formula 阶段）。function 级 teardown 按 FK 顺序删除，保证隔离。
+        """
+        yield
+        from sqlalchemy import delete
+
+        from app.db.session import get_session_factory, reset_session_factory
+        from app.models import (
+            Acupoint,
+            DosageUnit,
+            Formula,
+            Herb,
+            KnowledgeChunk,
+            KnowledgeSource,
+            TheoryCase,
+        )
+
+        await reset_session_factory()
+        factory = get_session_factory()
+        async with factory() as session:
+            # 先删有 FK 到 knowledge_sources 的行，再删 knowledge_sources 本身
+            for model in (Formula, Herb, Acupoint, TheoryCase, KnowledgeChunk):
+                await session.execute(delete(model))
+            await session.execute(delete(DosageUnit))
+            await session.execute(delete(KnowledgeSource))
+            await session.commit()
+        await reset_session_factory()
+
     async def _count_table(self, model) -> int:
         from sqlalchemy import func, select
 
