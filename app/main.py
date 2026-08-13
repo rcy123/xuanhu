@@ -20,6 +20,7 @@ from app.agent_runtime.lifecycle import (
     safe_runtime_error_code,
     shared_langgraph_runtime,
 )
+from app.api.admin import router as admin_router
 from app.api.advance import advance_exception_handlers
 from app.api.advance import router as advance_router
 from app.api.auth import auth_exception_handlers
@@ -260,6 +261,7 @@ if _settings.cors_allowed_origins:
 
 app.include_router(health_router)
 app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(sessions_router)
 app.include_router(messages_router)
 app.include_router(message_rollback_router)

@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 from fastapi import Depends, Request
 from redis.asyncio import Redis
 
-from app.core.auth import DoctorPrincipal, get_current_doctor, get_current_doctor_from_query
+from app.core.auth import DoctorPrincipal, get_current_doctor, get_current_doctor_from_query, require_admin
 from app.core.config import get_settings
 from app.core.exceptions import RateLimitedError
 from app.core.redis import get_redis
@@ -113,6 +113,25 @@ async def require_write_rate_limit(
         max_calls=get_settings().write_rate_limit_per_minute,
         window_seconds=60,
         identity=doctor.doctor_id,
+    )
+
+
+async def require_admin_write_rate_limit(
+    request: Request,
+    admin: DoctorPrincipal = Depends(require_admin),
+) -> None:
+    """Apply the standard write budget to administration changes.
+
+    This deliberately depends on ``require_admin`` instead of the clinical
+    dependency: administrator tokens must never acquire clinical privileges in
+    order to be rate-limited.
+    """
+    del request
+    await _require_within_limit(
+        key_prefix="write",
+        max_calls=get_settings().write_rate_limit_per_minute,
+        window_seconds=60,
+        identity=admin.doctor_id,
     )
 
 

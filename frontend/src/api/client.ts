@@ -163,7 +163,12 @@ export async function request<T>(
     // 认证失效：清除本地 token 并跳转登录页（阶段 1 加固）。
     if (
       response.status === 401
-      && (env.code === 'UNAUTHENTICATED' || env.code === 'INVALID_TOKEN' || env.code === 'TOKEN_EXPIRED')
+      && (
+        env.code === 'UNAUTHENTICATED'
+        || env.code === 'INVALID_TOKEN'
+        || env.code === 'TOKEN_EXPIRED'
+        || env.code === 'TOKEN_REVOKED'
+      )
     ) {
       handleAuthExpired()
     }

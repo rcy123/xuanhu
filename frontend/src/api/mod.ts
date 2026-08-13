@@ -12,8 +12,12 @@ export type { SseConnection, SseHandlers } from './sse'
 export {
   getAuthToken,
   setAuthToken,
+  setAuthSession,
+  getAuthUser,
   clearAuthToken,
+  clearAuthSession,
   isAuthenticated,
+  isAdminAuthenticated,
   setAuthExpiredHandler,
   handleAuthExpired,
 } from './auth'
@@ -37,6 +41,9 @@ export {
   exportRecord,
   getHealth,
   login,
+  listAdminDoctors,
+  createAdminDoctor,
+  disableAdminDoctor,
   toQuery,
 } from './index'
 export type { LoginResult } from './index'
@@ -49,5 +56,10 @@ export type {
   MessageSubmitResult,
   AdvanceMutationResult,
   ReviewMutationResult,
+  AuthenticatedUser,
+  UserRole,
+  DoctorAdminItem,
+  AdminDoctorListParams,
+  CreateAdminDoctorRequest,
 } from '@/types/api'
 export { downloadFileResponse } from './download'

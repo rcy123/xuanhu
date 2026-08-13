@@ -28,10 +28,13 @@ import {
   updateRecord,
   exportRecord,
   getCommandStatus,
+  listAdminDoctors,
+  createAdminDoctor,
+  disableAdminDoctor,
   isAsyncCommandAccepted,
   TransportErrorCode,
 } from '@/api/mod'
-import { __setBaseUrlResolver } from '@/api/mod'
+import { __setBaseUrlResolver, setAuthExpiredHandler } from '@/api/mod'
 
 // ---------------------------------------------------------------------------
 // fetch mock 工具
@@ -137,6 +140,8 @@ describe('message retry command boundaries', () => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  setAuthExpiredHandler(null)
+  window.sessionStorage.clear()
 })
 
 // ---------------------------------------------------------------------------
@@ -322,6 +327,31 @@ describe('request - HTTP 与传输错误', () => {
   })
 })
 
+describe('request - 认证失效', () => {
+  it('TOKEN_REVOKED 清理当前会话并触发认证过期处理', async () => {
+    const onExpired = vi.fn()
+    setAuthExpiredHandler(onExpired)
+    window.sessionStorage.setItem('xuanhu.access_token', 'revoked-token')
+    window.sessionStorage.setItem('xuanhu.auth_user', JSON.stringify({
+      id: 'doctor-1', username: 'zhangsan', name: '张医生', role: 'doctor',
+    }))
+    mockFetch(() => mockResponse({
+      status: 401,
+      body: {
+        code: 'TOKEN_REVOKED',
+        message: '登录状态已失效，请重新登录',
+        retryable: false,
+        trace_id: 'trace-revoked',
+      },
+    }))
+
+    await expect(request('consult/sessions')).rejects.toMatchObject({ code: 'TOKEN_REVOKED' })
+    expect(onExpired).toHaveBeenCalledOnce()
+    expect(window.sessionStorage.getItem('xuanhu.access_token')).toBeNull()
+    expect(window.sessionStorage.getItem('xuanhu.auth_user')).toBeNull()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // 请求头注入
 // ---------------------------------------------------------------------------
@@ -376,6 +406,52 @@ describe('request - URL 拼接', () => {
     const fn = mockFetch(() => mockResponse({ body: { code: 'SUCCESS', data: {}, trace_id: 't' } }))
     await request('https://other.example/health', { method: 'GET' })
     expect(fn.mock.calls[0][0]).toBe('https://other.example/health')
+  })
+})
+
+describe('管理员账户 API', () => {
+  it('列表请求使用 q 搜索参数和统一 Bearer token', async () => {
+    window.sessionStorage.setItem('xuanhu.access_token', 'admin-token')
+    const fn = mockFetch(() => mockResponse({
+      body: {
+        code: 'SUCCESS',
+        data: { items: [], total: 0, page: 2, page_size: 20 },
+        trace_id: 'trace-admin-list',
+      },
+    }))
+
+    await listAdminDoctors({ page: 2, page_size: 20, query: '张 医生' })
+    expect(fn.mock.calls[0][0]).toBe(`${BASE}/admin/doctors?page=2&page_size=20&q=%E5%BC%A0+%E5%8C%BB%E7%94%9F`)
+    expect((fn.mock.calls[0][1].headers as Record<string, string>).Authorization).toBe('Bearer admin-token')
+  })
+
+  it('创建和停用请求使用对应方法和数据，且不发送幂等键', async () => {
+    const fn = mockFetch(() => mockResponse({
+      body: {
+        code: 'SUCCESS',
+        data: {
+          id: 'doctor/a', name: '张医生', role: 'doctor', enabled: true,
+          last_login_at: null, created_at: '2026-08-13T00:00:00Z',
+        },
+        trace_id: 'trace-admin-write',
+      },
+    }))
+
+    await createAdminDoctor(
+      { name: '张医生', password: 'long-password-12' },
+      { idempotencyKey: 'must-not-be-sent' },
+    )
+    expect(fn.mock.calls[0][0]).toBe(`${BASE}/admin/doctors`)
+    expect(fn.mock.calls[0][1].method).toBe('POST')
+    expect(JSON.parse(fn.mock.calls[0][1].body as string)).toEqual({
+      name: '张医生', password: 'long-password-12',
+    })
+    expect((fn.mock.calls[0][1].headers as Record<string, string>)['X-Idempotency-Key']).toBeUndefined()
+
+    await disableAdminDoctor('doctor/a', { idempotencyKey: 'must-not-be-sent' })
+    expect(fn.mock.calls[1][0]).toBe(`${BASE}/admin/doctors/doctor%2Fa`)
+    expect(fn.mock.calls[1][1].method).toBe('DELETE')
+    expect((fn.mock.calls[1][1].headers as Record<string, string>)['X-Idempotency-Key']).toBeUndefined()
   })
 })
 

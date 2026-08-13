@@ -412,6 +412,12 @@ class Settings(BaseSettings):
         description="启动后台 AsyncCommandWorker（R7 默认开启；设 false 为回滚/熔断回同步路径）",
     )
     async_command_batch_size: int = Field(default=10, ge=1, le=200)
+    async_command_max_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description="阶段1 并发消费：同一批命令中不同会话可并行处理的上限；同会话命令仍串行（见 async_command_worker.run_once）",
+    )
     async_command_lease_seconds: int = Field(default=60, ge=5, le=3600)
     async_command_heartbeat_seconds: float = Field(
         default=20,

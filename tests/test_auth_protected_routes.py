@@ -60,7 +60,7 @@ async def db() -> AsyncSession:
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def doctor(db: AsyncSession) -> Doctor:
-    record = Doctor(name="受保护路由测试医师", password_hash=hash_password("p"), enabled=True)
+    record = Doctor(username="protected-route-doctor", name="受保护路由测试医师", password_hash=hash_password("p"), enabled=True)
     db.add(record)
     await db.commit()
     await db.refresh(record)
@@ -76,7 +76,9 @@ def _token(doctor_id: str, *, key: str = "protected-routes-test-key-0123456789",
         {
             "sub": doctor_id,
             "name": "测试",
+            "role": "doctor",
             "roles": ["doctor"],
+            "auth_version": 1,
             "iat": int((now - timedelta(minutes=5)).timestamp()),
             "exp": int(exp.timestamp()),
             "jti": uuid.uuid4().hex,

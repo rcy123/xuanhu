@@ -8,31 +8,47 @@
 import { useState } from 'react'
 import { Alert, Button, Form, Input, Typography } from 'antd'
 import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { ApiRequestError } from '@/api/errors'
 import { login } from '@/api/index'
-import { setAuthToken } from '@/api/auth'
+import { setAuthSession } from '@/api/auth'
 import './styles/login.css'
 
 const { Title, Text } = Typography
 
 interface LoginFormValues {
-  doctorId: string
+  username: string
   password: string
 }
 
-export function LoginPage() {
+export interface LoginPageProps {
+  /** 管理员入口仅改变文案与登录后的目的地；服务端仍负责角色校验。 */
+  mode?: 'doctor' | 'admin'
+}
+
+interface LoginLocationState {
+  authError?: string
+}
+
+export function LoginPage({ mode = 'doctor' }: LoginPageProps) {
   const navigate = useNavigate()
+  const location = useLocation()
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  const isAdminLogin = mode === 'admin'
+  const authError = (location.state as LoginLocationState | null)?.authError
 
   const onFinish = async (values: LoginFormValues) => {
     setSubmitting(true)
     setError(null)
     try {
-      const result = await login(values.doctorId, values.password)
-      setAuthToken(result.access_token)
-      navigate('/', { replace: true })
+      const result = await login(values.username, values.password)
+      if (!result.user || (result.user.role !== 'doctor' && result.user.role !== 'admin')) {
+        throw new Error('登录响应缺少账户角色信息，请联系系统管理员。')
+      }
+      setAuthSession(result.access_token, result.user)
+      // 管理员无论从哪个登录入口认证，都进入账户管理；普通医师进入临床工作台。
+      navigate(result.user.role === 'admin' ? '/admin/users' : '/workbench', { replace: true })
     } catch (caught: unknown) {
       setError(caught)
     } finally {
@@ -48,13 +64,27 @@ export function LoginPage() {
         : '登录失败，请检查账号密码后重试'
 
   return (
-    <main className="xh-login" data-testid="login-page">
+    <main
+      className="xh-login"
+      data-testid={isAdminLogin ? 'admin-login-page' : 'login-page'}
+    >
       <section className="xh-login-card">
         <div className="xh-login-brand" aria-hidden="true">
           悬
         </div>
-        <Title level={3}>悬壶 · 医师登录</Title>
-        <Text type="secondary">中医 AI 辅助诊疗工作台</Text>
+        <Title level={3}>悬壶 · {isAdminLogin ? '管理员登录' : '医师登录'}</Title>
+        <Text type="secondary">
+          {isAdminLogin ? '账户与医师用户管理' : '中医 AI 辅助诊疗工作台'}
+        </Text>
+
+        {authError ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={authError}
+            data-testid="login-auth-notice"
+          />
+        ) : null}
 
         <Form<LoginFormValues>
           layout="vertical"
@@ -63,15 +93,15 @@ export function LoginPage() {
           requiredMark={false}
         >
           <Form.Item
-            name="doctorId"
-            label="医师标识"
-            rules={[{ required: true, message: '请输入医师标识' }]}
+            name="username"
+            label="登录名"
+            rules={[{ required: true, message: '请输入登录名' }]}
           >
             <Input
               prefix={<UserOutlined />}
-              placeholder="医师唯一标识（doctors.id）"
+              placeholder="登录名（拼音/工号）"
               autoComplete="username"
-              data-testid="login-doctor-id"
+              data-testid="login-username"
             />
           </Form.Item>
           <Form.Item
@@ -109,7 +139,7 @@ export function LoginPage() {
 
         <div className="xh-login-footnote">
           <SafetyCertificateOutlined aria-hidden="true" />
-          登录信息仅保存在本次会话中，工作台关闭后需重新登录。
+          登录信息仅保存在本次会话中，关闭浏览器后需重新登录。
         </div>
       </section>
     </main>

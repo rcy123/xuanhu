@@ -343,4 +343,4 @@ def test_orm_and_migration_are_two_quote_free_append_only_tables() -> None:
     migration = import_module(MIGRATION_MODULE)
     assert migration.revision == "20260811_0017"
     assert migration.down_revision == "20260729_0016"
-    assert ScriptDirectory.from_config(Config("alembic.ini")).get_current_head() == "20260813_0019"
+    assert ScriptDirectory.from_config(Config("alembic.ini")).get_current_head() == "20260813_0021"

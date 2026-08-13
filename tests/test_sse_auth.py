@@ -75,7 +75,12 @@ async def db() -> AsyncSession:
 async def session_and_doctor(db: AsyncSession) -> tuple[ConsultSession, Doctor]:
     from app.api.auth import hash_password
 
-    doctor = Doctor(name="SSE鉴权测试医师", password_hash=hash_password("p"), enabled=True)
+    doctor = Doctor(
+        username=f"sse-auth-{uuid.uuid4().hex[:8]}",
+        name="SSE鉴权测试医师",
+        password_hash=hash_password("p"),
+        enabled=True,
+    )
     db.add(doctor)
     await db.flush()
     session = ConsultSession(

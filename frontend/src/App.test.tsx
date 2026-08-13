@@ -12,7 +12,7 @@ import { ConfigProvider, App as AntdApp } from 'antd'
 import { Profiler } from 'react'
 import App from '@/App'
 import * as api from '@/api/index'
-import type { PageData, SessionListItem } from '@/types/api'
+import type { DoctorAdminItem, PageData, SessionListItem } from '@/types/api'
 import { emptySessionReadModel } from '@/utils/readModel'
 
 vi.mock('@/utils/id', () => ({ generateIdempotencyKey: () => 'idem-test' }))
@@ -45,6 +45,12 @@ vi.spyOn(api, 'listMessages').mockResolvedValue({
   has_more: false,
   next_cursor: null,
 })
+vi.spyOn(api, 'listAdminDoctors').mockResolvedValue({
+  items: [],
+  total: 0,
+  page: 1,
+  page_size: 20,
+} satisfies PageData<DoctorAdminItem>)
 
 function renderAppAt(path: string) {
   return render(
@@ -64,7 +70,7 @@ describe('App Shell', () => {
     window.sessionStorage.setItem('xuanhu.access_token', 'test-token')
   })
   afterEach(() => {
-    window.sessionStorage.removeItem('xuanhu.access_token')
+    window.sessionStorage.clear()
   })
 
   it('首页渲染品牌标题与引导文案', () => {
@@ -92,12 +98,36 @@ describe('App Shell', () => {
     expect(screen.getByTestId('login-page')).toBeInTheDocument()
   })
 
-  it('登录页渲染医师标识/密码输入与提交按钮', () => {
+  it('登录页渲染登录名/密码输入与提交按钮', () => {
     window.sessionStorage.removeItem('xuanhu.access_token')
     renderAppAt('/login')
-    expect(screen.getAllByTestId('login-doctor-id').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('login-username').length).toBeGreaterThan(0)
     expect(screen.getAllByTestId('login-password').length).toBeGreaterThan(0)
     expect(screen.getAllByTestId('login-submit').length).toBeGreaterThan(0)
+  })
+
+  it('未登录访问管理端重定向到管理员登录页', () => {
+    window.sessionStorage.clear()
+    renderAppAt('/admin/users')
+    expect(screen.getByTestId('admin-login-page')).toBeInTheDocument()
+  })
+
+  it('普通医师访问管理端会回到临床工作台', () => {
+    window.sessionStorage.setItem('xuanhu.auth_user', JSON.stringify({
+      id: 'doctor-1', username: 'zhangsan', name: '测试医师', role: 'doctor',
+    }))
+    renderAppAt('/admin/users')
+    expect(screen.getAllByText('新建问诊').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('admin-users-page')).toBeNull()
+  })
+
+  it('管理员访问管理端显示用户管理界面', async () => {
+    window.sessionStorage.setItem('xuanhu.auth_user', JSON.stringify({
+      id: 'admin-1', username: 'admin', name: '系统管理员', role: 'admin',
+    }))
+    renderAppAt('/admin/users')
+    expect(await screen.findByTestId('admin-users-page')).toBeInTheDocument()
+    expect(screen.getByText('医师用户')).toBeInTheDocument()
   })
 
   it('工作台渲染步骤条节点', () => {

@@ -169,7 +169,7 @@ async def test_consultation_flow_logs_contain_no_phi(
     from app.api.auth import hash_password
     from app.core.auth import create_access_token
 
-    doctor = Doctor(name="日志PHI测试医师", password_hash=hash_password("p"), enabled=True)
+    doctor = Doctor(username="no-phi-doctor", name="日志PHI测试医师", password_hash=hash_password("p"), enabled=True)
     db.add(doctor)
     await db.commit()
     await db.refresh(doctor)

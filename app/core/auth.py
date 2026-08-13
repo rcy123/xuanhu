@@ -19,16 +19,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import jwt as pyjwt
-from fastapi import Header, Query
+from fastapi import Depends, Header, Query
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import XuanhuError
+from app.db.session import get_db, get_session_factory
+from app.models.doctor import Doctor
 
 logger = logging.getLogger("xuanhu.auth")
 
@@ -51,6 +56,13 @@ AUTH_EXEMPT_PATHS: frozenset[str] = frozenset(
 )
 
 JWT_ALGORITHM = "HS256"
+ACCOUNT_ROLES: frozenset[str] = frozenset({"doctor", "admin"})
+# New account-creation channels use this floor.  Login keeps accepting older
+# hashes so a migration does not lock out pre-existing clinician accounts.
+PASSWORD_MIN_LENGTH = 12
+# 登录名：简短、唯一、好记的 ASCII 标识（拼音/工号），替代难记的 UUID。
+USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{2,63}$")
+DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +115,51 @@ class AccountDisabledError(XuanhuError):
     retryable = False
 
 
+class TokenRevokedError(XuanhuError):
+    """The token no longer matches the authoritative account record."""
+
+    code = "TOKEN_REVOKED"
+    message = "登录状态已失效，请重新登录"
+    status_code = 401
+    retryable = False
+
+
+class ClinicalRoleRequiredError(XuanhuError):
+    """An administrator token was presented to a clinical endpoint."""
+
+    code = "CLINICAL_ROLE_REQUIRED"
+    message = "该账号无医师问诊权限"
+    status_code = 403
+    retryable = False
+
+
+class AdminRequiredError(XuanhuError):
+    """A non-administrator attempted to access the administration API."""
+
+    code = "ADMIN_REQUIRED"
+    message = "需要管理员权限"
+    status_code = 403
+    retryable = False
+
+
+class AdminActionForbiddenError(XuanhuError):
+    """An otherwise authenticated administrator attempted a forbidden action."""
+
+    code = "ADMIN_ACTION_FORBIDDEN"
+    message = "不允许执行该管理员操作"
+    status_code = 409
+    retryable = False
+
+
+class AdminUserNotFoundError(XuanhuError):
+    """A requested account does not exist in the administration view."""
+
+    code = "ADMIN_USER_NOT_FOUND"
+    message = "用户不存在"
+    status_code = 404
+    retryable = False
+
+
 # ---------------------------------------------------------------------------
 # 主体模型
 # ---------------------------------------------------------------------------
@@ -118,7 +175,9 @@ class DoctorPrincipal:
 
     doctor_id: str | None
     name: str | None = None
+    role: str | None = None
     roles: tuple[str, ...] = ("doctor",)
+    auth_version: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,19 +189,31 @@ def create_access_token(
     doctor_id: str,
     *,
     name: str | None = None,
+    role: str = "doctor",
+    auth_version: int = 1,
     settings: Settings | None = None,
 ) -> tuple[str, int]:
     """签发 access token，返回 ``(token, expires_in_seconds)``。
 
     颁发永远只用新 key（双密钥灰度期亦然）。
     """
+    if role not in ACCOUNT_ROLES:
+        raise ValueError(f"unsupported account role: {role!r}")
+    if type(auth_version) is not int or auth_version < 1:
+        raise ValueError("auth_version must be a positive integer")
+
     effective = settings or get_settings()
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=effective.jwt_access_token_ttl_seconds)
     payload = {
         "sub": doctor_id,
         "name": name,
-        "roles": ["doctor"],
+        # ``role`` is the authoritative JWT claim.  ``roles`` is retained for
+        # older consumers that already render this claim, but authorization
+        # never trusts it independently of the database-bound single role.
+        "role": role,
+        "roles": [role],
+        "auth_version": auth_version,
         "iat": int(now.timestamp()),
         "exp": int(expires.timestamp()),
         "jti": uuid.uuid4().hex,
@@ -177,14 +248,74 @@ def _principal_from_payload(payload: dict[str, Any]) -> DoctorPrincipal:
     sub = payload.get("sub")
     if not isinstance(sub, str) or not sub:
         raise InvalidTokenError()
-    roles_raw = payload.get("roles")
-    roles = tuple(str(r) for r in roles_raw) if isinstance(roles_raw, list) else ("doctor",)
+    role = payload.get("role")
+    if not isinstance(role, str) or role not in ACCOUNT_ROLES:
+        raise InvalidTokenError()
+    auth_version = payload.get("auth_version")
+    # bool is a subclass of int, so a strict type check is required here.
+    if type(auth_version) is not int or auth_version < 1:
+        raise InvalidTokenError()
     name = payload.get("name")
     return DoctorPrincipal(
         doctor_id=sub,
         name=name if isinstance(name, str) else None,
-        roles=roles or ("doctor",),
+        role=role,
+        roles=(role,),
+        auth_version=auth_version,
     )
+
+
+def _compat_principal_from_payload(payload: dict[str, Any]) -> DoctorPrincipal:
+    """Read old clinical JWTs in the non-blocking rollout modes only.
+
+    Old tokens contain ``sub`` and may contain ``roles=["doctor"]`` but lack
+    the later ``role`` and ``auth_version`` claims.  They can never become
+    administrator credentials: the strict parser is mandatory for ``on`` and
+    for all admin routes.
+    """
+    try:
+        return _principal_from_payload(payload)
+    except InvalidTokenError:
+        pass
+
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise InvalidTokenError()
+    roles_raw = payload.get("roles")
+    if roles_raw is not None:
+        if not isinstance(roles_raw, list) or any(not isinstance(item, str) for item in roles_raw):
+            raise InvalidTokenError()
+        if any(item != "doctor" for item in roles_raw):
+            raise InvalidTokenError()
+    name = payload.get("name")
+    return DoctorPrincipal(
+        doctor_id=sub,
+        name=name if isinstance(name, str) else None,
+        role="doctor",
+        roles=("doctor",),
+        auth_version=None,
+    )
+
+
+def _nonblocking_clinical_principal_or_anonymous(
+    principal: DoctorPrincipal,
+    fallback_doctor_id: str | None,
+) -> DoctorPrincipal:
+    """Keep non-clinical JWTs out of the clinical compatibility path.
+
+    ``off`` and ``audit`` deliberately remain non-blocking during rollout, but
+    an administrator credential still must not become a clinical principal.
+    A valid doctor JWT can retain its legacy compatibility behaviour; every
+    other parsed role falls back to the same anonymous display-only principal
+    as an absent or invalid token.
+    """
+    if principal.role == "doctor":
+        return principal
+    logger.warning(
+        "auth.denied_simulated: non-clinical token role=%s cannot enter clinical path",
+        principal.role,
+    )
+    return _anonymous_principal(fallback_doctor_id)
 
 
 def _parse_bearer(authorization: str | None) -> str | None:
@@ -212,6 +343,70 @@ def auth_fail_key(doctor_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _bind_principal_to_account(
+    principal: DoctorPrincipal,
+    db: AsyncSession,
+) -> DoctorPrincipal:
+    """Bind a signed JWT to the current, authoritative account row.
+
+    Signature verification alone cannot revoke a credential early.  This
+    lookup enforces account disablement, role changes, and ``auth_version`` on
+    every bearer-token request.  Account absence deliberately uses the same
+    token-revoked response as a version mismatch, avoiding account discovery.
+    """
+    if principal.doctor_id is None or principal.role is None or principal.auth_version is None:
+        raise InvalidTokenError()
+    try:
+        doctor_id = uuid.UUID(principal.doctor_id)
+    except ValueError:
+        raise InvalidTokenError() from None
+
+    doctor = await db.scalar(select(Doctor).where(Doctor.id == doctor_id))
+    if doctor is None:
+        raise TokenRevokedError()
+    # A disabled account may not continue using an already-issued token.  Keep
+    # ``ACCOUNT_DISABLED`` for a *new login* attempt, but make bearer callers
+    # clear their session through the standard 401 credential-revoked path.
+    if not doctor.enabled:
+        raise TokenRevokedError()
+    if doctor.auth_version != principal.auth_version or doctor.role != principal.role:
+        raise TokenRevokedError()
+    return DoctorPrincipal(
+        doctor_id=str(doctor.id),
+        name=doctor.name,
+        role=doctor.role,
+        roles=(doctor.role,),
+        auth_version=doctor.auth_version,
+    )
+
+
+async def _strict_principal_from_authorization(
+    authorization: str | None,
+    db: AsyncSession,
+) -> DoctorPrincipal:
+    """Decode, validate, and database-bind a bearer token without fallbacks."""
+    token = _parse_bearer(authorization)
+    if token is None:
+        raise UnauthenticatedError()
+    payload = _decode_token_payload(token, get_settings())
+    return await _bind_principal_to_account(_principal_from_payload(payload), db)
+
+
+async def _strict_principal_from_authorization_lazily(
+    authorization: str | None,
+) -> DoctorPrincipal:
+    """Strictly bind a clinical bearer only when auth enforcement is enabled.
+
+    The clinical dependencies must stay DB-free in ``off`` and ``audit`` so
+    their documented rollout fallback still works in degraded environments.
+    ``require_admin`` intentionally does not use this helper: admin routes
+    always receive a mandatory database dependency and fail closed.
+    """
+    factory = get_session_factory()
+    async with factory() as db:
+        return await _strict_principal_from_authorization(authorization, db)
+
+
 async def get_current_doctor(
     authorization: str | None = Header(default=None, alias="Authorization"),
     x_doctor_id: str | None = Header(default=None, alias="X-Doctor-Id"),
@@ -228,8 +423,13 @@ async def get_current_doctor(
     token = _parse_bearer(authorization)
     if token:
         try:
-            payload = _decode_token_payload(token, settings)
-            return _principal_from_payload(payload)
+            if settings.xuanhu_auth_enabled == "on":
+                principal = await _strict_principal_from_authorization_lazily(authorization)
+                if principal.role != "doctor":
+                    raise ClinicalRoleRequiredError()
+                return principal
+            principal = _compat_principal_from_payload(_decode_token_payload(token, settings))
+            return _nonblocking_clinical_principal_or_anonymous(principal, x_doctor_id)
         except XuanhuError as exc:
             if settings.xuanhu_auth_enabled == "on":
                 raise
@@ -238,14 +438,15 @@ async def get_current_doctor(
                 exc.code,
                 settings.xuanhu_auth_enabled,
             )
-    else:
-        if settings.xuanhu_auth_enabled == "on":
-            raise UnauthenticatedError()
-        if settings.xuanhu_auth_enabled == "audit":
-            logger.warning(
-                "auth.denied_simulated: 未携带 token（%s 模式不阻断）",
-                settings.xuanhu_auth_enabled,
-            )
+            return _anonymous_principal(x_doctor_id)
+
+    if settings.xuanhu_auth_enabled == "on":
+        raise UnauthenticatedError()
+    if settings.xuanhu_auth_enabled == "audit":
+        logger.warning(
+            "auth.denied_simulated: 未携带 token（%s 模式不阻断）",
+            settings.xuanhu_auth_enabled,
+        )
     return _anonymous_principal(x_doctor_id)
 
 
@@ -261,8 +462,13 @@ async def get_current_doctor_from_query(
     settings = get_settings()
     if token:
         try:
-            payload = _decode_token_payload(token, settings)
-            return _principal_from_payload(payload)
+            if settings.xuanhu_auth_enabled == "on":
+                principal = await _strict_principal_from_authorization_lazily(f"Bearer {token}")
+                if principal.role != "doctor":
+                    raise ClinicalRoleRequiredError()
+                return principal
+            principal = _compat_principal_from_payload(_decode_token_payload(token, settings))
+            return _nonblocking_clinical_principal_or_anonymous(principal, None)
         except XuanhuError as exc:
             if settings.xuanhu_auth_enabled == "on":
                 raise
@@ -271,12 +477,30 @@ async def get_current_doctor_from_query(
                 exc.code,
                 settings.xuanhu_auth_enabled,
             )
-    else:
-        if settings.xuanhu_auth_enabled == "on":
-            raise UnauthenticatedError()
-        if settings.xuanhu_auth_enabled == "audit":
-            logger.warning(
-                "auth.denied_simulated: SSE 未携带 token（%s 模式不阻断）",
-                settings.xuanhu_auth_enabled,
-            )
+            return _anonymous_principal(None)
+
+    if settings.xuanhu_auth_enabled == "on":
+        raise UnauthenticatedError()
+    if settings.xuanhu_auth_enabled == "audit":
+        logger.warning(
+            "auth.denied_simulated: SSE 未携带 token（%s 模式不阻断）",
+            settings.xuanhu_auth_enabled,
+        )
     return _anonymous_principal(None)
+
+
+async def require_admin(
+    db: DatabaseSession,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> DoctorPrincipal:
+    """Require a current active administrator, regardless of auth rollout mode.
+
+    Administrative account management is never eligible for the clinical
+    ``XUANHU_AUTH_ENABLED=off/audit`` compatibility path.  It requires a
+    properly signed bearer token and an enabled, version-matching ``admin``
+    row on every request.
+    """
+    principal = await _strict_principal_from_authorization(authorization, db)
+    if principal.role != "admin":
+        raise AdminRequiredError()
+    return principal

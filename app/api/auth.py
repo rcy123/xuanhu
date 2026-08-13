@@ -23,6 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import (
     AccountDisabledError,
     AccountLockedError,
+    AdminActionForbiddenError,
+    AdminRequiredError,
+    AdminUserNotFoundError,
+    ClinicalRoleRequiredError,
+    InvalidTokenError,
+    TokenExpiredError,
+    TokenRevokedError,
     UnauthenticatedError,
     auth_fail_key,
     create_access_token,
@@ -44,9 +51,12 @@ _password_hasher = PasswordHasher()
 
 
 class LoginRequest(BaseModel):
-    """登录请求体。"""
+    """登录请求体。
 
-    doctor_id: str = Field(..., min_length=1, max_length=128, description="医师唯一标识（doctors.id UUID）")
+    用唯一且好记的 ``username``（拼音/工号）登录；UUID 主键仅作内部引用。
+    """
+
+    username: str = Field(..., min_length=1, max_length=64, description="登录名（拼音/工号）")
     password: str = Field(..., min_length=1, max_length=256, description="登录密码")
 
 
@@ -109,20 +119,15 @@ async def login(
     await _ip_rate_allowed(request)
 
     redis = await get_redis()
-    fail_key = auth_fail_key(body.doctor_id)
+    fail_key = auth_fail_key(body.username)
 
     # 锁定判定：失败计数达到阈值后，key 存续期内一律拒绝。
     locked_count = await redis.get(fail_key)
     if locked_count is not None and int(locked_count) >= settings.login_fail_lock_threshold:
         raise AccountLockedError()
 
-    # 统一错误：用户不存在 / 密码错误 / UUID 非法 都返回 UNAUTHENTICATED。
-    try:
-        doctor_uuid = uuid.UUID(body.doctor_id)
-    except ValueError:
-        raise UnauthenticatedError() from None
-
-    result = await db.execute(select(Doctor).where(Doctor.id == doctor_uuid))
+    # 统一错误：用户不存在 / 密码错误 都返回 UNAUTHENTICATED（不区分细节）。
+    result = await db.execute(select(Doctor).where(Doctor.username == body.username))
     doctor = result.scalar_one_or_none()
     if doctor is None or not verify_password(doctor.password_hash, body.password):
         await _register_login_failure(redis, fail_key, settings)
@@ -134,7 +139,13 @@ async def login(
     # 登录成功：清除失败计数，签发 token。
     await redis.delete(fail_key)
     doctor.last_login_at = datetime.now(UTC)
-    token, expires_in = create_access_token(str(doctor.id), name=doctor.name, settings=settings)
+    token, expires_in = create_access_token(
+        str(doctor.id),
+        name=doctor.name,
+        role=doctor.role,
+        auth_version=doctor.auth_version,
+        settings=settings,
+    )
     logger.info("auth.login.success doctor_id=%s", doctor.id)
     return JSONResponse(
         status_code=200,
@@ -143,6 +154,12 @@ async def login(
                 "access_token": token,
                 "token_type": "Bearer",
                 "expires_in": expires_in,
+                "user": {
+                    "id": str(doctor.id),
+                    "username": doctor.username,
+                    "name": doctor.name,
+                    "role": doctor.role,
+                },
             },
             trace_id=trace_id,
             message="ok",
@@ -175,7 +192,19 @@ async def _register_login_failure(redis: Redis, fail_key: str, settings: Setting
 async def auth_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """把认证异常转为标准 envelope，错误信息统一不区分细节。"""
     trace_id = request.headers.get("x-request-id") or request.headers.get("x-trace-id") or str(uuid.uuid4())
-    assert isinstance(exc, UnauthenticatedError | AccountLockedError | AccountDisabledError)
+    assert isinstance(
+        exc,
+        UnauthenticatedError
+        | InvalidTokenError
+        | TokenExpiredError
+        | AccountLockedError
+        | AccountDisabledError
+        | TokenRevokedError
+        | ClinicalRoleRequiredError
+        | AdminRequiredError
+        | AdminActionForbiddenError
+        | AdminUserNotFoundError,
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -191,6 +220,13 @@ async def auth_exception_handler(request: Request, exc: Exception) -> JSONRespon
 
 auth_exception_handlers: dict[type[Exception], object] = {
     UnauthenticatedError: auth_exception_handler,
+    InvalidTokenError: auth_exception_handler,
+    TokenExpiredError: auth_exception_handler,
     AccountLockedError: auth_exception_handler,
     AccountDisabledError: auth_exception_handler,
+    TokenRevokedError: auth_exception_handler,
+    ClinicalRoleRequiredError: auth_exception_handler,
+    AdminRequiredError: auth_exception_handler,
+    AdminActionForbiddenError: auth_exception_handler,
+    AdminUserNotFoundError: auth_exception_handler,
 }

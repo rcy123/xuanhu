@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -70,6 +69,7 @@ async def db() -> AsyncSession:
 async def doctor(db: AsyncSession) -> Doctor:
     """创建一个启用密码的测试医师。"""
     record = Doctor(
+        username="auth-login-doctor",
         name="认证测试医师",
         password_hash=hash_password("correct-password"),
         enabled=True,
@@ -85,7 +85,7 @@ async def doctor(db: AsyncSession) -> Doctor:
 async def test_login_success_issues_token(client: AsyncClient, doctor: Doctor) -> None:
     resp = await client.post(
         "/api/v1/auth/login",
-        json={"doctor_id": str(doctor.id), "password": "correct-password"},
+        json={"username": doctor.username, "password": "correct-password"},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -102,12 +102,21 @@ async def test_login_success_issues_token(client: AsyncClient, doctor: Doctor) -
 
     payload = _decode_token_payload(token, get_settings())
     assert payload["sub"] == str(doctor.id)
+    assert payload["role"] == "doctor"
+    assert payload["roles"] == ["doctor"]
+    assert payload["auth_version"] == 1
+    assert data["user"] == {
+        "id": str(doctor.id),
+        "username": doctor.username,
+        "name": doctor.name,
+        "role": "doctor",
+    }
 
 
 async def test_login_wrong_password_unauthenticated(client: AsyncClient, doctor: Doctor) -> None:
     resp = await client.post(
         "/api/v1/auth/login",
-        json={"doctor_id": str(doctor.id), "password": "wrong-password"},
+        json={"username": doctor.username, "password": "wrong-password"},
     )
     assert resp.status_code == 401
     body = resp.json()
@@ -120,7 +129,7 @@ async def test_login_wrong_password_unauthenticated(client: AsyncClient, doctor:
 async def test_login_unknown_doctor_same_error(client: AsyncClient) -> None:
     resp = await client.post(
         "/api/v1/auth/login",
-        json={"doctor_id": str(uuid.uuid4()), "password": "whatever"},
+        json={"username": "no-such-user", "password": "whatever"},
     )
     assert resp.status_code == 401
     assert resp.json()["code"] == "UNAUTHENTICATED"
@@ -129,20 +138,20 @@ async def test_login_unknown_doctor_same_error(client: AsyncClient) -> None:
 async def test_login_invalid_uuid_same_error(client: AsyncClient) -> None:
     resp = await client.post(
         "/api/v1/auth/login",
-        json={"doctor_id": "not-a-uuid", "password": "whatever"},
+        json={"username": "!!invalid!!", "password": "whatever"},
     )
     assert resp.status_code == 401
     assert resp.json()["code"] == "UNAUTHENTICATED"
 
 
 async def test_login_disabled_account_403(client: AsyncClient, db: AsyncSession) -> None:
-    disabled = Doctor(name="停用医师", password_hash=hash_password("p"), enabled=False)
+    disabled = Doctor(username="auth-login-disabled", name="停用医师", password_hash=hash_password("p"), enabled=False)
     db.add(disabled)
     await db.commit()
     try:
         resp = await client.post(
             "/api/v1/auth/login",
-            json={"doctor_id": str(disabled.id), "password": "p"},
+            json={"username": disabled.username, "password": "p"},
         )
         assert resp.status_code == 403
         assert resp.json()["code"] == "ACCOUNT_DISABLED"
@@ -151,24 +160,22 @@ async def test_login_disabled_account_403(client: AsyncClient, db: AsyncSession)
         await db.commit()
 
 
-async def test_five_failures_lock_account(
-    client: AsyncClient, db: AsyncSession, doctor: Doctor
-) -> None:
+async def test_five_failures_lock_account(client: AsyncClient, db: AsyncSession, doctor: Doctor) -> None:
     """连续失败 5 次后账号锁定：第 6 次返回 ACCOUNT_LOCKED。"""
     redis = await get_redis()
-    fail_key = f"auth:fail:{doctor.id}"
+    fail_key = f"auth:fail:{doctor.username}"
     await redis.delete(fail_key)
     try:
         for _ in range(5):
             resp = await client.post(
                 "/api/v1/auth/login",
-                json={"doctor_id": str(doctor.id), "password": "wrong"},
+                json={"username": doctor.username, "password": "wrong"},
             )
             assert resp.status_code == 401
 
         locked = await client.post(
             "/api/v1/auth/login",
-            json={"doctor_id": str(doctor.id), "password": "correct-password"},
+            json={"username": doctor.username, "password": "correct-password"},
         )
         assert locked.status_code == 401
         assert locked.json()["code"] == "ACCOUNT_LOCKED"
@@ -178,9 +185,7 @@ async def test_five_failures_lock_account(
         await redis.delete(fail_key)
 
 
-async def test_login_failure_lock_is_sliding_window(
-    client: AsyncClient, doctor: Doctor
-) -> None:
+async def test_login_failure_lock_is_sliding_window(client: AsyncClient, doctor: Doctor) -> None:
     """每次失败都刷新锁定窗口（滑动窗口），而非仅首次失败设 TTL。
 
     文档 01 §2.2「连续失败 5 次锁 15 分钟」要求滑动语义：若第 1 次失败后
@@ -190,13 +195,13 @@ async def test_login_failure_lock_is_sliding_window(
 
     settings = get_settings()
     redis = await get_redis()
-    fail_key = f"auth:fail:{doctor.id}"
+    fail_key = f"auth:fail:{doctor.username}"
     await redis.delete(fail_key)
     try:
         # 第一次失败：窗口起算
         await client.post(
             "/api/v1/auth/login",
-            json={"doctor_id": str(doctor.id), "password": "wrong"},
+            json={"username": doctor.username, "password": "wrong"},
         )
         first_ttl = await redis.ttl(fail_key)
         assert first_ttl > settings.login_fail_lock_seconds - 5
@@ -207,7 +212,7 @@ async def test_login_failure_lock_is_sliding_window(
         # 第二次失败：滑动窗口应重新拉满到 ~15 分钟，而非停留在 3 秒
         await client.post(
             "/api/v1/auth/login",
-            json={"doctor_id": str(doctor.id), "password": "wrong"},
+            json={"username": doctor.username, "password": "wrong"},
         )
         second_ttl = await redis.ttl(fail_key)
         assert second_ttl > settings.login_fail_lock_seconds - 5, (
@@ -240,7 +245,7 @@ async def test_login_ip_rate_limit(client: AsyncClient, doctor: Doctor) -> None:
             responses.append(
                 await client.post(
                     "/api/v1/auth/login",
-                    json={"doctor_id": str(doctor.id), "password": "wrong"},
+                    json={"username": doctor.username, "password": "wrong"},
                 )
             )
         assert responses[-1].status_code == 429

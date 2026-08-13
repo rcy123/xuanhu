@@ -58,6 +58,46 @@ export interface CursorData<T> {
 }
 
 // ---------------------------------------------------------------------------
+// 账户与管理员
+// ---------------------------------------------------------------------------
+
+/** 已认证账户的角色。服务端是权限判定的唯一权威来源。 */
+export type UserRole = 'doctor' | 'admin'
+
+/** 登录成功后返回的最小账户展示信息。 */
+export interface AuthenticatedUser {
+  id: string
+  username: string
+  name: string
+  role: UserRole
+}
+
+/** 管理员用户管理列表中的账户项。绝不包含密码或密码哈希。 */
+export interface DoctorAdminItem {
+  id: string
+  username: string
+  name: string
+  role: UserRole
+  enabled: boolean
+  last_login_at: string | null
+  created_at: string
+}
+
+/** GET /admin/doctors 的查询参数。 */
+export interface AdminDoctorListParams {
+  page?: number
+  page_size?: number
+  query?: string
+}
+
+/** POST /admin/doctors 的请求体。 */
+export interface CreateAdminDoctorRequest {
+  username: string
+  name: string
+  password: string
+}
+
+// ---------------------------------------------------------------------------
 // §6 错误码（与后端 app/core/exceptions.py 对齐）
 // ---------------------------------------------------------------------------
 
@@ -65,6 +105,14 @@ export interface CursorData<T> {
 export const ErrorCode = {
   SUCCESS: 'SUCCESS',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
+  UNAUTHENTICATED: 'UNAUTHENTICATED',
+  INVALID_TOKEN: 'INVALID_TOKEN',
+  TOKEN_EXPIRED: 'TOKEN_EXPIRED',
+  TOKEN_REVOKED: 'TOKEN_REVOKED',
+  ACCOUNT_DISABLED: 'ACCOUNT_DISABLED',
+  ADMIN_REQUIRED: 'ADMIN_REQUIRED',
+  ADMIN_ACTION_FORBIDDEN: 'ADMIN_ACTION_FORBIDDEN',
+  ADMIN_USER_NOT_FOUND: 'ADMIN_USER_NOT_FOUND',
   SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   SESSION_BUSY: 'SESSION_BUSY',
   INVALID_STAGE_TRANSITION: 'INVALID_STAGE_TRANSITION',

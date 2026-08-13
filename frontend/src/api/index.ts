@@ -11,8 +11,12 @@ import { generateIdempotencyKey } from '@/utils/id'
 import type {
   AdvanceMutationResult,
   AdvanceRequest,
+  AdminDoctorListParams,
   AsyncCommandStatus,
+  AuthenticatedUser,
+  CreateAdminDoctorRequest,
   CursorData,
+  DoctorAdminItem,
   MessageCreateRequest,
   MessageItem,
   MessageListParams,
@@ -43,10 +47,10 @@ import type {
 // ---------------------------------------------------------------------------
 
 /** POST /auth/login —— 医师登录，换取 JWT。 */
-export function login(doctorId: string, password: string): Promise<LoginResult> {
+export function login(username: string, password: string): Promise<LoginResult> {
   return request<LoginResult>('auth/login', {
     method: 'POST',
-    body: JSON.stringify({ doctor_id: doctorId, password }),
+    body: JSON.stringify({ username, password }),
   })
 }
 
@@ -55,6 +59,55 @@ export interface LoginResult {
   access_token: string
   token_type: 'Bearer'
   expires_in: number
+  user: AuthenticatedUser
+}
+
+// ---------------------------------------------------------------------------
+// 管理员账户管理
+// ---------------------------------------------------------------------------
+
+/** GET /admin/doctors — 查询医师账户（仅管理员）。 */
+export function listAdminDoctors(
+  params: AdminDoctorListParams = {},
+  ctx?: RequestContext,
+): Promise<PageData<DoctorAdminItem>> {
+  const query = toQuery({
+    page: params.page,
+    page_size: params.page_size,
+    q: params.query,
+  })
+  return request<PageData<DoctorAdminItem>>(`admin/doctors?${query}`, {
+    method: 'GET',
+    ctx,
+  })
+}
+
+/** POST /admin/doctors — 新建医师账户（仅管理员）。 */
+export function createAdminDoctor(
+  body: CreateAdminDoctorRequest,
+  ctx?: RequestContext,
+): Promise<DoctorAdminItem> {
+  return request<DoctorAdminItem>('admin/doctors', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    // Account creation accepts a password, so it deliberately does not use
+    // the durable request-digest protocol.  Do not imply replay semantics
+    // that the server cannot safely provide without retaining password data.
+    ctx: withoutIdempotencyKey(ctx),
+  })
+}
+
+/** DELETE /admin/doctors/{id} — 软停用账户（仅管理员）。 */
+export function disableAdminDoctor(
+  doctorId: string,
+  ctx?: RequestContext,
+): Promise<DoctorAdminItem> {
+  return request<DoctorAdminItem>(`admin/doctors/${encodeURIComponent(doctorId)}`, {
+    method: 'DELETE',
+    // DELETE is already state-idempotent on the server; it does not need a
+    // client-generated command key.
+    ctx: withoutIdempotencyKey(ctx),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +500,13 @@ function withIdempotencyKey(ctx?: RequestContext): RequestContext {
     ...ctx,
     idempotencyKey: ctx?.idempotencyKey ?? generateIdempotencyKey(),
   }
+}
+
+/** Remove a command key for management endpoints that do not implement it. */
+function withoutIdempotencyKey(ctx?: RequestContext): RequestContext | undefined {
+  if (!ctx) return undefined
+  const { idempotencyKey: _idempotencyKey, ...safeContext } = ctx
+  return safeContext
 }
 
 /**

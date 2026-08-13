@@ -192,17 +192,16 @@ class SessionService:
     ) -> SessionListResponse:
         """查询会话列表，支持状态过滤、patient_ref 模糊搜索与分页排序。
 
-        阶段 2 加固：``on`` 模式下列表强制按当前医师过滤（``doctor_id = :me
-        OR doctor_id IS NULL`` 遗留无主会话过渡期可见），不靠客户端自觉。
+        阶段 2 加固：``on`` 模式下列表强制按当前医师过滤（``doctor_id = :me``），
+        不靠客户端自觉。历史无主会话（doctor_id IS NULL）过渡期已结束，
+        不再对任何账号可见（fail-closed）。
         """
         stmt = select(ConsultSession)
 
         if doctor_id and get_settings().xuanhu_access_enabled == "on":
             owner = _coerce_doctor_uuid(doctor_id)
             if owner is not None:
-                stmt = stmt.where(
-                    (ConsultSession.doctor_id == owner) | (ConsultSession.doctor_id.is_(None))
-                )
+                stmt = stmt.where(ConsultSession.doctor_id == owner)
 
         if status is not None:
             stmt = stmt.where(ConsultSession.status == status)

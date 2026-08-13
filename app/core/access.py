@@ -8,8 +8,8 @@
   session_id；session_id 单独成列）。
 - 三态开关 ``XUANHU_ACCESS_ENABLED``：off=不校验（灰度回退态）/ audit=
   校验并记审计但不阻断 / on=生效并阻断。
-- 遗留无主会话（``doctor_id IS NULL``，仅存量数据）过渡期允许任一登录
-  医师访问；``on`` 模式下新会话一律有真实 owner，NULL 只可能是历史遗留。
+- 历史无主会话（``doctor_id IS NULL``）过渡期已结束，``on`` 模式下一律
+  fail-closed：不匹配当前医师身份的会话（含无主）读写均拒绝。
 
 审计写入 **fail-open**：审计基础设施抖动时记一条 logger.error 但放行请求，
 避免连累临床业务（文档 02 §8 权衡）。
@@ -126,9 +126,11 @@ async def _enforce_session_access(
 
     owner = session.doctor_id
     actor = _actor_uuid(doctor.doctor_id)
-    if owner is None or (actor is not None and owner == actor):
-        # 遗留无主会话（过渡期任一登录医师可访问）或 owner 匹配。
+    if actor is not None and owner == actor:
+        # owner 匹配，放行。
         return
+    # owner 为 NULL（历史无主会话，过渡期已结束）或 actor 与 owner 不匹配
+    # → 越权，走下面的审计 + 403/404（fail-closed）。
 
     await _write_access_denied_audit(
         db,

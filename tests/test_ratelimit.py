@@ -16,18 +16,26 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ratelimit import RateLimiter, require_write_rate_limit
 from app.core.redis import get_redis, reset_redis
 from app.main import app
+from app.models.doctor import Doctor
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
-def _token(doctor_id: str) -> str:
+def _token(doctor: Doctor) -> str:
     from app.core.auth import create_access_token
 
-    token, _ = create_access_token(doctor_id)
+    token, _ = create_access_token(
+        str(doctor.id),
+        name=doctor.name,
+        role=doctor.role,
+        auth_version=doctor.auth_version,
+    )
     return token
 
 
@@ -68,6 +76,31 @@ async def client() -> AsyncClient:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def db() -> AsyncSession:
+    """A real account is required now that auth=on binds JWTs to the DB."""
+    from app.db.session import get_session_factory, reset_session_factory
+
+    await reset_session_factory()
+    factory = get_session_factory()
+    async with factory() as session:
+        yield session
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def rate_limit_doctors(db: AsyncSession) -> tuple[Doctor, Doctor]:
+    """Use distinct persisted accounts so the two route tests do not share a quota."""
+    limited = Doctor(username="ratelimit-limited", name="限流测试医师一", password_hash="unused", enabled=True)
+    unlimited = Doctor(username="ratelimit-unlimited", name="限流测试医师二", password_hash="unused", enabled=True)
+    db.add_all((limited, unlimited))
+    await db.commit()
+    await db.refresh(limited)
+    await db.refresh(unlimited)
+    yield limited, unlimited
+    await db.execute(delete(Doctor).where(Doctor.id.in_((limited.id, unlimited.id))))
+    await db.commit()
 
 
 async def _redis() -> object:
@@ -129,8 +162,11 @@ async def test_over_limit_removes_its_own_count() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_write_route_rate_limited_429(client: AsyncClient) -> None:
-    headers = {"Authorization": f"Bearer {_token('rl-doctor-1')}"}
+async def test_write_route_rate_limited_429(
+    client: AsyncClient,
+    rate_limit_doctors: tuple[Doctor, Doctor],
+) -> None:
+    headers = {"Authorization": f"Bearer {_token(rate_limit_doctors[0])}"}
     session_id = str(uuid.uuid4())
     payload = {"reason": "测试限流"}
 
@@ -155,14 +191,17 @@ async def test_write_route_rate_limited_429(client: AsyncClient) -> None:
     assert second.headers["Retry-After"] == "60"
 
 
-async def test_rate_limit_disabled_does_not_block(client: AsyncClient) -> None:
+async def test_rate_limit_disabled_does_not_block(
+    client: AsyncClient,
+    rate_limit_doctors: tuple[Doctor, Doctor],
+) -> None:
     """总开关关闭时（默认测试态）重复请求不触发 429（回归保护）。"""
     from app.core.config import get_settings
 
     os.environ["XUANHU_RATELIMIT_ENABLED"] = "false"
     get_settings.cache_clear()
     try:
-        headers = {"Authorization": f"Bearer {_token('rl-doctor-2')}"}
+        headers = {"Authorization": f"Bearer {_token(rate_limit_doctors[1])}"}
         session_id = str(uuid.uuid4())
         payload = {"reason": "测试限流"}
         for _ in range(3):

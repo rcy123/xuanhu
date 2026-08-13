@@ -1,0 +1,190 @@
+/* 悬壶 WebUI —— 管理员账户管理页 */
+
+.xh-admin-page {
+  min-height: 100dvh;
+  color: var(--xh-text);
+  background:
+    radial-gradient(circle at 92% 3%, rgba(142, 63, 56, 0.08), transparent 27%),
+    radial-gradient(circle at 8% 0%, rgba(47, 102, 82, 0.08), transparent 24%),
+    var(--xh-bg-page);
+}
+
+.xh-admin-header {
+  display: flex;
+  min-height: var(--xh-header-height);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--xh-space-l);
+  padding: 12px 32px;
+  border-bottom: 1px solid var(--xh-border);
+  background: rgba(255, 254, 250, 0.94);
+  backdrop-filter: blur(14px);
+}
+
+.xh-admin-brand,
+.xh-admin-account-actions,
+.xh-admin-page-heading,
+.xh-admin-toolbar {
+  display: flex;
+  align-items: center;
+}
+
+.xh-admin-brand {
+  gap: 12px;
+}
+
+.xh-admin-mark {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: 12px 12px 12px 4px;
+  color: #fffdf8;
+  font-family: var(--xh-font-serif);
+  font-size: 18px;
+  font-weight: 700;
+  background: linear-gradient(145deg, #a9554c, var(--xh-primary));
+  box-shadow: 0 8px 20px rgba(142, 63, 56, 0.2);
+}
+
+.xh-admin-eyebrow {
+  display: block;
+  color: var(--xh-text-secondary);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+}
+
+.xh-admin-brand h4 {
+  margin: 0;
+  color: var(--xh-primary);
+  font-family: var(--xh-font-serif);
+  letter-spacing: 0.08em;
+}
+
+.xh-admin-content {
+  width: min(1240px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 48px 0 32px;
+}
+
+.xh-admin-page-heading {
+  justify-content: space-between;
+  gap: var(--xh-space-l);
+  margin-bottom: 24px;
+}
+
+.xh-admin-page-heading h2 {
+  margin: 0 0 4px;
+  color: var(--xh-primary);
+  font-family: var(--xh-font-serif);
+}
+
+.xh-admin-action-error {
+  margin-bottom: 16px;
+}
+
+.xh-admin-users-card {
+  border: 1px solid var(--xh-border) !important;
+  border-radius: var(--xh-radius-card) !important;
+  box-shadow: var(--xh-shadow-card) !important;
+}
+
+.xh-admin-users-card .ant-card-body {
+  padding: 20px;
+}
+
+.xh-admin-toolbar {
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.xh-admin-toolbar .ant-input-search {
+  max-width: 430px;
+}
+
+.xh-admin-users-table .ant-table {
+  background: transparent;
+}
+
+.xh-admin-users-table .ant-table-thead > tr > th {
+  color: var(--xh-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--xh-bg-muted);
+}
+
+.xh-admin-users-table .ant-table-tbody > tr > td {
+  vertical-align: middle;
+}
+
+.xh-admin-account-id {
+  max-width: 250px;
+  color: var(--xh-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.xh-admin-user-avatar {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--xh-secondary);
+  background: var(--xh-secondary-soft);
+}
+
+.xh-admin-help {
+  margin: 16px 2px 0;
+  color: var(--xh-text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .xh-admin-header {
+    align-items: flex-start;
+    padding: 14px 18px;
+  }
+
+  .xh-admin-account-actions {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px !important;
+  }
+
+  .xh-admin-account-actions > .ant-typography {
+    max-width: 140px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .xh-admin-content {
+    width: min(100% - 28px, 1240px);
+    padding-top: 28px;
+  }
+
+  .xh-admin-page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .xh-admin-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .xh-admin-toolbar .ant-input-search {
+    max-width: none;
+  }
+
+  .xh-admin-toolbar > .ant-btn {
+    align-self: flex-end;
+  }
+
+  .xh-admin-users-card .ant-card-body {
+    padding: 14px;
+  }
+}

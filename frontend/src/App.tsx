@@ -14,8 +14,14 @@ import { Button, Typography } from 'antd'
 import { MenuOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
-import { isAuthenticated, setAuthExpiredHandler } from '@/api/auth'
+import {
+  clearAuthSession,
+  getAuthUser,
+  isAuthenticated,
+  setAuthExpiredHandler,
+} from '@/api/auth'
 import { LoginPage } from '@/pages/LoginPage'
+import { AdminUsersPage } from '@/pages/AdminUsersPage'
 import { useSessions } from '@/hooks/useSessions'
 import { useSessionDetail } from '@/hooks/useSessionDetail'
 import { useMessages } from '@/hooks/useMessages'
@@ -165,6 +171,38 @@ function RequireAuth({ children }: { children: ReactElement }) {
   if (!isAuthenticated()) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />
   }
+  // 管理员 token 不具有临床问诊权限；避免其在工作台中遇到服务端 403。
+  if (getAuthUser()?.role === 'admin') {
+    return <Navigate to="/admin/users" replace />
+  }
+  return children
+}
+
+/**
+ * 管理端的本地体验守卫。服务端 /admin/* 接口仍是权限的唯一权威来源。
+ * 已知为普通医师的会话保留其 token 并回到工作台；缺失或损坏身份信息的会话则
+ * 清空，避免旧版前端遗留的 token 被错误视为管理员会话。
+ */
+function RequireAdmin({ children }: { children: ReactElement }) {
+  const location = useLocation()
+  if (!isAuthenticated()) {
+    return <Navigate to="/admin/login" replace state={{ from: location.pathname }} />
+  }
+
+  const user = getAuthUser()
+  if (!user) {
+    clearAuthSession()
+    return (
+      <Navigate
+        to="/admin/login"
+        replace
+        state={{ authError: '登录会话信息不完整，请重新登录。' }}
+      />
+    )
+  }
+  if (user.role !== 'admin') {
+    return <Navigate to="/workbench" replace />
+  }
   return children
 }
 
@@ -172,8 +210,10 @@ export default function App() {
   useEffect(() => {
     // 认证失效（401）时跳转登录页。
     setAuthExpiredHandler(() => {
-      if (window.location.pathname !== '/login') {
-        window.location.assign('/login')
+      const isAdminPath = window.location.pathname.startsWith('/admin')
+      const loginPath = isAdminPath ? '/admin/login' : '/login'
+      if (window.location.pathname !== loginPath) {
+        window.location.assign(loginPath)
       }
     })
     return () => setAuthExpiredHandler(null)
@@ -182,7 +222,24 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/admin/login" element={<LoginPage mode="admin" />} />
       <Route path="/" element={<PlaceholderHome />} />
+      <Route
+        path="/admin"
+        element={(
+          <RequireAdmin>
+            <Navigate to="/admin/users" replace />
+          </RequireAdmin>
+        )}
+      />
+      <Route
+        path="/admin/users"
+        element={(
+          <RequireAdmin>
+            <AdminUsersPage />
+          </RequireAdmin>
+        )}
+      />
       <Route
         path="/workbench"
         element={(

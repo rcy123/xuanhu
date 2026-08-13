@@ -90,8 +90,8 @@ async def db() -> AsyncSession:
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def doctors(db: AsyncSession) -> tuple[Doctor, Doctor]:
-    doctor_a = Doctor(name="医师A", password_hash=hash_password("p"), enabled=True)
-    doctor_b = Doctor(name="医师B", password_hash=hash_password("p"), enabled=True)
+    doctor_a = Doctor(username="access-doctor-a", name="医师A", password_hash=hash_password("p"), enabled=True)
+    doctor_b = Doctor(username="access-doctor-b", name="医师B", password_hash=hash_password("p"), enabled=True)
     db.add_all([doctor_a, doctor_b])
     await db.commit()
     await db.refresh(doctor_a)
@@ -242,6 +242,54 @@ async def test_list_filters_by_owner(
     data = resp.json()["data"]
     ids = [item["session_id"] for item in data["items"]]
     assert str(owned_session.id) not in ids
+
+
+async def test_ownerless_session_is_fail_closed(
+    client: AsyncClient,
+    doctors: tuple[Doctor, Doctor],
+    db: AsyncSession,
+) -> None:
+    """历史无主会话（doctor_id=NULL）不再对任何账号可见（过渡期已结束）。
+
+    新建账号看到历史问诊数据是越权：无主会话必须在 on 模式下 fail-closed——
+    读 404、写 403、列表不可见，而非任何登录医师都能访问。
+    """
+    doctor_a, _ = doctors
+    ownerless = ConsultSession(
+        patient_ref=f"{_PATIENT_REF_PREFIX}ownerless",
+        patient_info={},
+        chief_complaint="历史数据",
+        current_stage="inquiry",
+        status="active",
+        created_by=None,
+        doctor_id=None,
+    )
+    db.add(ownerless)
+    await db.commit()
+    await db.refresh(ownerless)
+    try:
+        # 读接口 → 404（不暴露存在性）
+        resp = await client.get(
+            f"/api/v1/consult/sessions/{ownerless.id}",
+            headers=_headers(doctor_a),
+        )
+        assert resp.status_code == 404
+
+        # 写接口 → 403
+        resp2 = await client.post(
+            f"/api/v1/consult/sessions/{ownerless.id}/advance",
+            headers=_headers(doctor_a),
+            json={"force": False},
+        )
+        assert resp2.status_code == 403
+
+        # 列表不可见
+        resp3 = await client.get("/api/v1/consult/sessions", headers=_headers(doctor_a))
+        ids = [item["session_id"] for item in resp3.json()["data"]["items"]]
+        assert str(ownerless.id) not in ids
+    finally:
+        await db.execute(delete(ConsultSession).where(ConsultSession.id == ownerless.id))
+        await db.commit()
 
 
 async def test_audit_mode_does_not_block(

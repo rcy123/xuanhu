@@ -39,7 +39,7 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin):
 
     __table_args__ = (
         CheckConstraint(
-            "actor_type IN ('doctor','agent','system')",
+            "actor_type IN ('doctor','admin','agent','system')",
             name="chk_audit_events_actor_type",
         ),
         Index("idx_audit_events_session_created", "session_id", created_at.desc()),
