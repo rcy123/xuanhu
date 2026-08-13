@@ -177,7 +177,7 @@ async def safety_confirmation_error_handler(request: Request, exc: XuanhuError) 
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": get_trace_id(request),

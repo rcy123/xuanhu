@@ -197,6 +197,39 @@ async def test_cross_doctor_read_not_found(
     assert resp.json()["code"] == "SESSION_NOT_FOUND"
 
 
+async def test_error_response_never_leaks_detail(
+    client: AsyncClient,
+    doctors: tuple[Doctor, Doctor],
+    owned_session: ConsultSession,
+) -> None:
+    """阶段2 T2.7：错误响应 detail 恒为 None，不泄露内部结构化细节。
+
+    覆盖两类：越权读（SessionNotFoundError，detail 原本含 session_id）与
+    非法 session_id（ValidationError）。响应体不应出现 session_id / detail 内容。
+    """
+    _, doctor_b = doctors
+
+    # 越权读 → 404，detail 必须为 None，响应体不出现 session_id
+    resp = await client.get(
+        f"/api/v1/consult/sessions/{owned_session.id}",
+        headers=_headers(doctor_b),
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["code"] == "SESSION_NOT_FOUND"
+    assert body["detail"] is None
+    assert str(owned_session.id) not in resp.text
+
+    # 非法 session_id → 400/422，detail 必须为 None（不泄露输入细节）
+    resp2 = await client.get(
+        "/api/v1/consult/sessions/not-a-valid-uuid",
+        headers=_headers(doctor_b),
+    )
+    assert resp2.status_code in (400, 422)
+    body2 = resp2.json()
+    assert body2["detail"] is None
+
+
 async def test_list_filters_by_owner(
     client: AsyncClient,
     doctors: tuple[Doctor, Doctor],

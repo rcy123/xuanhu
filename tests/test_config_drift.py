@@ -26,7 +26,7 @@ from app.services.config_drift import (
     record_startup_config_snapshot,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
+pytestmark = [pytest.mark.integration]
 
 
 def _settings(**overrides):
@@ -92,6 +92,7 @@ async def _count_events(db, event_type: str) -> int:
     )
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_first_startup_writes_snapshot_no_drift(db) -> None:
     drifted, snapshot = await record_startup_config_snapshot(
         db,
@@ -104,6 +105,7 @@ async def test_first_startup_writes_snapshot_no_drift(db) -> None:
     assert await _count_events(db, CONFIG_DRIFT_EVENT) == 0
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_critical_key_change_emits_drift(db) -> None:
     await record_startup_config_snapshot(db, _settings(), trace_id="cfg-a")
     drifted, snapshot = await record_startup_config_snapshot(
@@ -116,6 +118,7 @@ async def test_critical_key_change_emits_drift(db) -> None:
     assert await _count_events(db, CONFIG_DRIFT_EVENT) == 1
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_non_critical_change_does_not_drift(db) -> None:
     """版本号 / CORS 等正常变更不触发偏离（防告警风暴）。"""
     await record_startup_config_snapshot(db, _settings(), trace_id="cfg-c")
@@ -127,6 +130,7 @@ async def test_non_critical_change_does_not_drift(db) -> None:
     assert drifted == []
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_metrics_observer_bounded(db) -> None:
     """observe_config_drift 对允许列表之外的 type 收敛到 unknown（无副作用）。"""
     observe_config_drift("langgraph_product_ready")

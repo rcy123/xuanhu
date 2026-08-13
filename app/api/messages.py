@@ -218,7 +218,7 @@ async def session_busy_handler(request: Request, exc: SessionBusyError) -> JSONR
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -234,7 +234,7 @@ async def invalid_state_version_handler(request: Request, exc: InvalidStateVersi
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -250,7 +250,7 @@ async def session_terminated_handler(request: Request, exc: SessionTerminatedErr
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -266,7 +266,7 @@ async def message_not_found_handler(request: Request, exc: SessionNotFoundError)
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -282,7 +282,7 @@ async def message_invalid_stage_handler(request: Request, exc: InvalidStageTrans
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -299,7 +299,7 @@ async def agent_trigger_failed_handler(request: Request, exc: AgentTriggerFailed
     payload: dict[str, Any] = {
         "code": exc.code,
         "message": exc.message,
-        "detail": exc.detail,
+        "detail": None,
         "retryable": exc.retryable,
         "stage": None,
         "trace_id": trace_id,
@@ -320,7 +320,7 @@ async def model_gateway_unavailable_handler(request: Request, exc: ModelGatewayU
         content={
             "code": "MODEL_GATEWAY_UNAVAILABLE",
             "message": "模型网关不可用，Agent 回复暂不可用",
-            "detail": str(exc),
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -336,7 +336,7 @@ async def idempotency_conflict_handler(request: Request, exc: IdempotencyConflic
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": _get_trace_id(request),

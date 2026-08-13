@@ -17,7 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from app.core.redis import reset_redis
 from app.main import app, resolve_docs_url
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
+pytestmark = [pytest.mark.integration]
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
@@ -40,12 +40,14 @@ def test_docs_disabled_in_production() -> None:
     assert resolve_docs_url("local") == "/docs"
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_docs_available_in_test_env(client: AsyncClient) -> None:
     """当前装配环境（local/staging）保留 /docs。"""
     response = await client.get("/docs")
     assert response.status_code in (200, 405)
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_catch_all_unhandled_exception_500_envelope() -> None:
     """未注册异常 → 500 INTERNAL_ERROR + trace_id，不含内部细节。
 

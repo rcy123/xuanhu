@@ -129,7 +129,7 @@ async def rollback_validation_handler(request: Request, exc: XuanhuValidationErr
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": _get_trace_id(request),

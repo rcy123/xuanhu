@@ -63,11 +63,28 @@ def verify_password(password_hash: str, password: str) -> bool:
         return False
 
 
+def _client_ip(request: Request) -> str:
+    """提取客户端真实 IP（阶段 3 反向代理部署）。
+
+    优先取 X-Forwarded-For 最左侧（nginx 注入的原始客户端地址）；仅在
+    ``TRUST_PROXY_HEADERS=true``（默认）时信任该头，否则回退直连地址——
+    避免内网攻击者伪造 X-Forwarded-For 绕过登录限流。
+    """
+    settings = get_settings()
+    if settings.trust_proxy_headers:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+    return request.client.host if request.client else "unknown"
+
+
 async def _ip_rate_allowed(request: Request) -> None:
     """按客户端 IP 对登录接口限流（10 次/分钟，超限 429）。"""
     settings = get_settings()
     redis = await get_redis()
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     key = f"{LOGIN_RATE_LIMIT_PREFIX}{client_ip}"
     current = await redis.incr(key)
     if current == 1:
@@ -134,10 +151,14 @@ async def login(
 
 
 async def _register_login_failure(redis: Redis, fail_key: str, settings: Settings) -> None:
-    """记录一次登录失败；达到阈值后 key 存续期=锁定窗口。"""
+    """记录一次登录失败；每次失败刷新锁定窗口（滑动窗口）。
+
+    文档 01 §2.2 要求「连续失败 5 次锁定 15 分钟」——语义为滑动窗口：
+    每次失败后 15 分钟窗口重新起算，而非固定窗口（否则攻击者可把尝试
+    均摊在窗口边缘稀释锁定时长）。
+    """
     count = await redis.incr(fail_key)
-    if count == 1:
-        await redis.expire(fail_key, settings.login_fail_lock_seconds)
+    await redis.expire(fail_key, settings.login_fail_lock_seconds)
     logger.warning(
         "auth.login.failed doctor_id=%s attempts=%d/%d",
         fail_key.rsplit(":", 1)[-1],

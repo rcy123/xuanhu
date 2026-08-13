@@ -221,7 +221,7 @@ async def review_invalid_action_handler(request: Request, exc: InvalidReviewActi
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -237,7 +237,7 @@ async def review_formula_override_required_handler(request: Request, exc: Formul
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -256,7 +256,7 @@ async def review_safety_blocked_handler(request: Request, exc: SafetyReviewBlock
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -273,7 +273,7 @@ async def review_safety_accept_risk_handler(request: Request, exc: SafetyAcceptR
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -289,7 +289,7 @@ async def review_session_not_found_handler(request: Request, exc: SessionNotFoun
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -305,7 +305,7 @@ async def review_idempotency_conflict_handler(request: Request, exc: Idempotency
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -321,7 +321,7 @@ async def review_invalid_stage_handler(request: Request, exc: InvalidStageTransi
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -337,7 +337,7 @@ async def review_invalid_state_version_handler(request: Request, exc: InvalidSta
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -353,7 +353,7 @@ async def review_session_terminated_handler(request: Request, exc: SessionTermin
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -369,7 +369,7 @@ async def review_session_busy_handler(request: Request, exc: SessionBusyError) -
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -385,7 +385,7 @@ async def review_validation_error_handler(request: Request, exc: XuanhuValidatio
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,

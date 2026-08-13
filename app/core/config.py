@@ -538,6 +538,14 @@ class Settings(BaseSettings):
         le=100,
         description="SSE 按医师并发连接上限",
     )
+    trust_proxy_headers: bool = Field(
+        default=True,
+        validation_alias="TRUST_PROXY_HEADERS",
+        description=(
+            "登录限流是否信任反向代理的 X-Forwarded-For 头（阶段3 nginx 注入）；"
+            "关闭后回退直连 IP，避免攻击者伪造头绕过限流"
+        ),
+    )
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"],
         validation_alias="CORS_ALLOWED_ORIGINS",
@@ -660,6 +668,12 @@ def validate_production_secrets(settings: Settings) -> list[str]:
         value = getattr(settings, field_name) or ""
         if _looks_like_placeholder(str(value)):
             violations.append(field_name.upper())
+    # HS256 签名密钥最小强度：RFC 7518 建议 ≥32 字节；文档 01 §2.1 要求
+    # openssl rand -base64 48（48 字节）。短密钥虽非占位符，但可被暴力
+    # 枚举，生产环境视为不合规。
+    jwt_key = str(getattr(settings, "jwt_signing_key", "") or "")
+    if jwt_key and len(jwt_key.encode("utf-8")) < 32:
+        violations.append("JWT_SIGNING_KEY_TOO_SHORT")
     for env_name in _ENV_SECRET_FIELDS:
         value = os.environ.get(env_name, "")
         if _looks_like_placeholder(value):
@@ -688,7 +702,7 @@ def ensure_production_secrets_ready(settings: Settings | None = None) -> None:
     violations = validate_production_secrets(effective)
     if violations:
         observe_production_secrets_validity(False)
-        raise RuntimeError("生产环境密钥守卫失败：以下密钥缺失/为占位符/为默认值，禁止启动 —— " + ", ".join(violations))
+        raise RuntimeError("生产环境密钥守卫失败：以下密钥缺失/为占位符/为默认值/强度不足，禁止启动 —— " + ", ".join(violations))
     observe_production_secrets_validity(True)
 
 

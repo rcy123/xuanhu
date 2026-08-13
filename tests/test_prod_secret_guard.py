@@ -48,6 +48,19 @@ def test_empty_jwt_key_detected() -> None:
     assert "JWT_SIGNING_KEY" in validate_production_secrets(s)
 
 
+def test_short_jwt_key_detected() -> None:
+    """HS256 密钥强度不足（<32 字节）视为不合规，防止弱密钥放行。"""
+    s = _prod_settings(jwt_signing_key="too-short-key")
+    violations = validate_production_secrets(s)
+    assert "JWT_SIGNING_KEY_TOO_SHORT" in violations
+
+
+def test_strong_jwt_key_not_flagged_for_length() -> None:
+    """≥32 字节的强随机 key 不触发长度违规。"""
+    s = _prod_settings()  # 默认 64 字符强 key
+    assert "JWT_SIGNING_KEY_TOO_SHORT" not in validate_production_secrets(s)
+
+
 def test_default_middleware_credentials_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POSTGRES_PASSWORD", "xuanhu_dev")
     monkeypatch.setenv("REDIS_PASSWORD", "xuanhu_dev")

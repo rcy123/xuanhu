@@ -26,7 +26,7 @@ from app.models.consult import ConsultMessage, ConsultSession
 from app.models.doctor import Doctor
 from app.models.domain import Observation
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
+pytestmark = [pytest.mark.integration]
 
 _PATIENT_REF_PREFIX = "NO-PHI-"
 _PATIENT_NAME = "测试患者张三丰"
@@ -159,6 +159,7 @@ async def client() -> AsyncClient:
         yield c
 
 
+@pytest.mark.asyncio(loop_scope="module")
 async def test_consultation_flow_logs_contain_no_phi(
     client: AsyncClient,
     db: AsyncSession,

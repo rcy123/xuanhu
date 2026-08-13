@@ -137,7 +137,7 @@ async def recovery_session_not_found_handler(request: Request, exc: SessionNotFo
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -153,7 +153,7 @@ async def recovery_not_needed_handler(request: Request, exc: RecoveryNotNeededEr
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -169,7 +169,7 @@ async def state_recovery_required_handler(request: Request, exc: StateRecoveryRe
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -187,7 +187,7 @@ async def langgraph_recovery_not_implemented_handler(
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -203,7 +203,7 @@ async def recovery_validation_error_handler(request: Request, exc: ValidationErr
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -222,7 +222,7 @@ async def recovery_session_busy_handler(request: Request, exc: SessionBusyError)
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -238,7 +238,7 @@ async def recovery_model_gateway_handler(request: Request, exc: ModelGatewayUnav
         content={
             "code": "MODEL_GATEWAY_UNAVAILABLE",
             "message": "LangGraph 运行时不可用，暂不能恢复会话",
-            "detail": str(exc),
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": _get_trace_id(request),

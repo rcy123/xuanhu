@@ -351,7 +351,7 @@ async def test_payload_digest_conflict_has_stable_409_envelope(
     assert response.json() == {
         "code": "IDEMPOTENCY_KEY_REUSED",
         "message": "相同幂等键不能用于不同请求",
-        "detail": "payload_digest_mismatch",
+        "detail": None,  # 阶段2 T2.7：detail 不回传客户端
         "retryable": False,
         "stage": None,
         "trace_id": "retry-trace",

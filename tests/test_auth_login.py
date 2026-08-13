@@ -178,6 +178,45 @@ async def test_five_failures_lock_account(
         await redis.delete(fail_key)
 
 
+async def test_login_failure_lock_is_sliding_window(
+    client: AsyncClient, doctor: Doctor
+) -> None:
+    """每次失败都刷新锁定窗口（滑动窗口），而非仅首次失败设 TTL。
+
+    文档 01 §2.2「连续失败 5 次锁 15 分钟」要求滑动语义：若第 1 次失败后
+    过了 14 分钟又失败，锁定应从这次失败重新起算 15 分钟，而非只剩 1 分钟。
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    redis = await get_redis()
+    fail_key = f"auth:fail:{doctor.id}"
+    await redis.delete(fail_key)
+    try:
+        # 第一次失败：窗口起算
+        await client.post(
+            "/api/v1/auth/login",
+            json={"doctor_id": str(doctor.id), "password": "wrong"},
+        )
+        first_ttl = await redis.ttl(fail_key)
+        assert first_ttl > settings.login_fail_lock_seconds - 5
+
+        # 模拟窗口即将到期：手动把 TTL 压到 3 秒
+        await redis.expire(fail_key, 3)
+
+        # 第二次失败：滑动窗口应重新拉满到 ~15 分钟，而非停留在 3 秒
+        await client.post(
+            "/api/v1/auth/login",
+            json={"doctor_id": str(doctor.id), "password": "wrong"},
+        )
+        second_ttl = await redis.ttl(fail_key)
+        assert second_ttl > settings.login_fail_lock_seconds - 5, (
+            f"滑动窗口未刷新：预期 ~{settings.login_fail_lock_seconds}s，实际 {second_ttl}s"
+        )
+    finally:
+        await redis.delete(fail_key)
+
+
 async def test_login_ip_rate_limit(client: AsyncClient, doctor: Doctor) -> None:
     """同 IP 1 分钟内超过 10 次登录 → 429。"""
     import os

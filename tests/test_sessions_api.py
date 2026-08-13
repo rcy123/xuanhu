@@ -439,10 +439,7 @@ async def test_create_langgraph_session_fails_closed_when_public_rollout_is_disa
     assert response.json() == {
         "code": "LANGGRAPH_PUBLIC_DISABLED",
         "message": "LangGraph 公共会话创建尚未开放",
-        "detail": (
-            "agent_runtime=langgraph 的公共会话创建未启用；"
-            "请使用 legacy 或由运维启用 XUANHU_LANGGRAPH_PUBLIC_ENABLED"
-        ),
+        "detail": None,  # 阶段2 T2.7：detail 不回传客户端
         "retryable": False,
         "stage": None,
         "trace_id": "trace-langgraph-public-disabled",

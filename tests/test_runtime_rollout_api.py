@@ -45,7 +45,7 @@ async def test_full_phase_rejects_new_legacy_before_database(
     assert response.json() == {
         "code": "LEGACY_RUNTIME_CREATION_DISABLED",
         "message": "全量切流后不再允许新建 Legacy 会话",
-        "detail": "phase=full 仅允许新建 agent_runtime=langgraph 的会话",
+        "detail": None,  # 阶段2 T2.7：detail 不回传客户端
         "retryable": False,
         "stage": None,
         "trace_id": "rollout-full-test",

@@ -147,7 +147,7 @@ async def command_not_found_handler(request: Request, exc: CommandNotFoundError)
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": _request_trace_id(request),

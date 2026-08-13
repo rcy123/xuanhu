@@ -228,7 +228,7 @@ async def record_not_found_handler(request: Request, exc: RecordNotFoundError) -
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -244,7 +244,7 @@ async def export_format_unsupported_handler(request: Request, exc: ExportFormatU
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -260,7 +260,7 @@ async def record_session_not_found_handler(request: Request, exc: SessionNotFoun
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -276,7 +276,7 @@ async def record_invalid_stage_handler(request: Request, exc: InvalidStageTransi
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -292,7 +292,7 @@ async def record_invalid_state_version_handler(request: Request, exc: InvalidSta
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -308,7 +308,7 @@ async def record_session_busy_handler(request: Request, exc: SessionBusyError) -
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -324,7 +324,7 @@ async def record_session_terminated_handler(request: Request, exc: SessionTermin
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -340,7 +340,7 @@ async def record_validation_error_handler(request: Request, exc: XuanhuValidatio
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,

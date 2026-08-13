@@ -1147,7 +1147,7 @@ async def advance_session_not_found_handler(request: Request, exc: SessionNotFou
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1162,7 +1162,7 @@ async def advance_busy_handler(request: Request, exc: SessionBusyError) -> JSONR
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1177,7 +1177,7 @@ async def advance_invalid_state_version_handler(request: Request, exc: InvalidSt
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1192,7 +1192,7 @@ async def advance_invalid_stage_handler(request: Request, exc: InvalidStageTrans
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1207,7 +1207,7 @@ async def insufficient_inquiry_handler(request: Request, exc: InsufficientInquir
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1222,7 +1222,7 @@ async def pending_doctor_review_handler(request: Request, exc: PendingDoctorRevi
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1237,7 +1237,7 @@ async def advance_model_gateway_handler(request: Request, exc: ModelGatewayUnava
         content={
             "code": "MODEL_GATEWAY_UNAVAILABLE",
             "message": "模型网关不可用，阶段推进暂不可用",
-            "detail": str(exc),
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -1251,7 +1251,7 @@ async def advance_idempotency_conflict_handler(request: Request, exc: Idempotenc
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": _get_trace_id(request),

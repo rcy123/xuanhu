@@ -214,7 +214,7 @@ async def session_not_found_handler(request: Request, exc: SessionNotFoundError)
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -230,7 +230,7 @@ async def invalid_stage_transition_handler(request: Request, exc: InvalidStageTr
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -246,7 +246,7 @@ async def validation_error_handler(request: Request, exc: XuanhuValidationError)
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -262,7 +262,7 @@ async def langgraph_public_disabled_handler(request: Request, exc: LangGraphPubl
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -279,7 +279,7 @@ async def runtime_switch_audit_mismatch_handler(request: Request, exc: RuntimeSw
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -296,7 +296,7 @@ async def runtime_rollout_not_ready_handler(request: Request, exc: RuntimeRollou
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
@@ -315,7 +315,7 @@ async def legacy_runtime_creation_disabled_handler(
         content={
             "code": exc.code,
             "message": exc.message,
-            "detail": exc.detail,
+            "detail": None,
             "retryable": exc.retryable,
             "stage": None,
             "trace_id": trace_id,
