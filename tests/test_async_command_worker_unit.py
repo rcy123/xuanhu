@@ -24,10 +24,15 @@ from app.agent_runtime.async_command_worker import (
 )
 
 
-def _claimed(*, attempt_count: int = 1, operation: str = "session.advance") -> ClaimedCommand:
+def _claimed(
+    *,
+    attempt_count: int = 1,
+    operation: str = "session.advance",
+    session_id: uuid.UUID | None = None,
+) -> ClaimedCommand:
     return ClaimedCommand(
         command_id=uuid.uuid4(),
-        session_id=uuid.uuid4(),
+        session_id=session_id or uuid.uuid4(),
         operation=operation,
         attempt_count=attempt_count,
         lease_token=uuid.uuid4(),
@@ -251,6 +256,84 @@ async def test_run_once_counts_a_mixed_batch() -> None:
     assert result.succeeded == 1
     assert result.retried == 1
     assert result.rejected == 1
+
+
+async def test_same_session_commands_are_serialized() -> None:
+    """阶段1：同一会话的命令必须串行处理（会话状态机依赖顺序推进）。"""
+    active = 0
+    max_active = 0
+
+    async def handler(ctx: AsyncCommandContext) -> CommandSuccess:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+        return CommandSuccess(http_status=200, result_payload={})
+
+    shared_session = uuid.uuid4()
+    repo = _FakeRepository(
+        claim_results=[
+            _claimed(session_id=shared_session),
+            _claimed(session_id=shared_session),
+            _claimed(session_id=shared_session),
+        ]
+    )
+    worker = AsyncCommandWorker(repo, handlers={"session.advance": handler}, worker_id="w", max_concurrency=8)
+    result = await worker.run_once()
+
+    assert max_active == 1, f"同会话命令不应并发，实际最大并发 {max_active}"
+    assert result.succeeded == 3
+
+
+async def test_different_session_commands_run_concurrently() -> None:
+    """阶段1：不同会话的命令应真正并行，不再被串行 for 循环阻塞。"""
+    active = 0
+    max_active = 0
+
+    async def handler(ctx: AsyncCommandContext) -> CommandSuccess:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+        return CommandSuccess(http_status=200, result_payload={})
+
+    repo = _FakeRepository(claim_results=[_claimed() for _ in range(3)])
+    worker = AsyncCommandWorker(repo, handlers={"session.advance": handler}, worker_id="w", max_concurrency=8)
+    result = await worker.run_once()
+
+    assert max_active >= 2, f"不同会话命令应并行，实际最大并发 {max_active}"
+    assert result.succeeded == 3
+
+
+async def test_max_concurrency_bounds_total_concurrency() -> None:
+    """阶段1：全局信号量约束总并发，避免把模型网关/DB 打爆。"""
+    active = 0
+    max_active = 0
+
+    async def handler(ctx: AsyncCommandContext) -> CommandSuccess:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+        return CommandSuccess(http_status=200, result_payload={})
+
+    repo = _FakeRepository(claim_results=[_claimed() for _ in range(8)])
+    worker = AsyncCommandWorker(repo, handlers={"session.advance": handler}, worker_id="w", max_concurrency=2)
+    result = await worker.run_once()
+
+    assert max_active <= 2, f"并发不应超过 max_concurrency=2，实际最大并发 {max_active}"
+    assert result.succeeded == 8
+
+
+def test_max_concurrency_validation() -> None:
+    """阶段1：max_concurrency 必须在 [1, 32] 区间。"""
+    with pytest.raises(ValueError):
+        AsyncCommandWorker(_FakeRepository(), handlers={}, worker_id="w", max_concurrency=0)
+    with pytest.raises(ValueError):
+        AsyncCommandWorker(_FakeRepository(), handlers={}, worker_id="w", max_concurrency=33)
 
 
 async def test_worker_registry_rejects_unplanned_operations() -> None:

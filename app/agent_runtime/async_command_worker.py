@@ -92,6 +92,7 @@ class AsyncCommandWorker:
         *,
         worker_id: str,
         batch_size: int = 10,
+        max_concurrency: int = 8,
         lease_seconds: int = 60,
         heartbeat_interval_seconds: float = 20,
         max_attempts: int = 8,
@@ -103,6 +104,8 @@ class AsyncCommandWorker:
             raise ValueError("worker_id must contain 1..128 characters")
         if batch_size < 1 or lease_seconds < 1 or max_attempts < 1:
             raise ValueError("batch_size, lease_seconds and max_attempts must be positive")
+        if not 1 <= max_concurrency <= 32:
+            raise ValueError("max_concurrency must be in [1, 32]")
         if not 0 < heartbeat_interval_seconds < lease_seconds:
             raise ValueError("heartbeat_interval_seconds must be in (0, lease_seconds)")
         if retry_base_seconds < 0 or retry_max_seconds < retry_base_seconds:
@@ -118,6 +121,7 @@ class AsyncCommandWorker:
         self._handlers = dict(handlers or {})
         self._worker_id = worker_id
         self._batch_size = batch_size
+        self._max_concurrency = max_concurrency
         self._lease_seconds = lease_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._max_attempts = max_attempts
@@ -140,10 +144,34 @@ class AsyncCommandWorker:
             lease_seconds=self._lease_seconds,
             max_attempts=self._max_attempts,
         )
-        counts: dict[str, int] = {}
+
+        # 阶段1 并发消费：同一会话的命令必须串行（会话状态机依赖顺序推进），
+        # 不同会话的命令并发处理，受全局信号量约束，避免把模型网关/DB 打爆。
+        # 同会话串行由「按 session 分组 + 组内 for 串行」保证；会话内 PG advisory
+        # 锁仍是业务层的最终兜底。
+        by_session: dict[uuid.UUID, list[ClaimedCommand]] = {}
         for command in claimed_commands:
-            outcome = await self._process(command)
-            counts[outcome] = counts.get(outcome, 0) + 1
+            by_session.setdefault(command.session_id, []).append(command)
+
+        semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        async def process_session_group(commands: list[ClaimedCommand]) -> dict[str, int]:
+            local: dict[str, int] = {}
+            for command in commands:
+                async with semaphore:
+                    outcome = await self._process(command)
+                local[outcome] = local.get(outcome, 0) + 1
+            return local
+
+        results = await asyncio.gather(
+            *(process_session_group(cmds) for cmds in by_session.values())
+        )
+
+        counts: dict[str, int] = {}
+        for local in results:
+            for outcome, count in local.items():
+                counts[outcome] = counts.get(outcome, 0) + count
+
         return WorkerRunResult(
             claimed=len(claimed_commands),
             succeeded=counts.get("succeeded", 0),

@@ -235,6 +235,7 @@ def _settings(async_command_enabled: bool) -> SimpleNamespace:
         async_command_enabled=async_command_enabled,
         async_command_shutdown_grace_seconds=5.0,
         async_command_batch_size=10,
+        async_command_max_concurrency=8,
         async_command_lease_seconds=60,
         async_command_heartbeat_seconds=20,
         async_command_max_attempts=8,

@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                     handlers=handlers,
                     worker_id=f"async-{uuid.uuid4().hex}",
                     batch_size=settings.async_command_batch_size,
+                    max_concurrency=settings.async_command_max_concurrency,
                     lease_seconds=settings.async_command_lease_seconds,
                     heartbeat_interval_seconds=settings.async_command_heartbeat_seconds,
                     max_attempts=settings.async_command_max_attempts,
