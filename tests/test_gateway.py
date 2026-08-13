@@ -1142,3 +1142,134 @@ async def test_chat_structured_empty_content_skips_json_fallback(mock_settings: 
     for payload in call_payloads:
         assert "tools" in payload
         assert "response_format" not in payload
+
+
+# ---------------------------------------------------------------------------
+# 阶段4 熔断器（模型网关熔断）测试
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_opens_and_fast_fails(
+    mock_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段4 熔断：连续可重试故障达到阈值后打开，后续请求快速失败不再打网关。"""
+    monkeypatch.setattr(mock_settings, "model_gateway_circuit_breaker_threshold", 2)
+    client = ModelGatewayClient(mock_settings, max_retries=0)
+
+    try:
+        with respx.mock:
+            route = respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+                return_value=Response(503, json={"error": "overloaded"})
+            )
+
+            for _ in range(2):
+                with pytest.raises(ModelGatewayUnavailableError):
+                    await client.chat(
+                        messages=[{"role": "user", "content": "hi"}],
+                        trace_id="cb-open",
+                    )
+
+            assert client._circuit.is_open is True
+            calls_before = route.call_count
+
+            with pytest.raises(ModelGatewayUnavailableError) as exc_info:
+                await client.chat(
+                    messages=[{"role": "user", "content": "hi"}],
+                    trace_id="cb-fastfail",
+                )
+
+            assert "熔断" in str(exc_info.value)
+            assert route.call_count == calls_before  # 打开后不再发出任何请求
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_ignores_non_retryable_4xx(
+    mock_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段4 熔断：客户端 4xx（非重试）是调用方问题，不应触发熔断。"""
+    monkeypatch.setattr(mock_settings, "model_gateway_circuit_breaker_threshold", 2)
+    client = ModelGatewayClient(mock_settings, max_retries=0)
+
+    try:
+        with respx.mock:
+            respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+                return_value=Response(400, json={"error": "bad request"})
+            )
+
+            for _ in range(3):
+                with pytest.raises(ModelGatewayUnavailableError):
+                    await client.chat(
+                        messages=[{"role": "user", "content": "hi"}],
+                        trace_id="cb-4xx",
+                    )
+
+            assert client._circuit.is_open is False
+            assert client._circuit.consecutive_failures == 0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_success_resets_failure_count(
+    mock_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段4 熔断：一次失败后成功应清零计数，不误开熔断。"""
+    monkeypatch.setattr(mock_settings, "model_gateway_circuit_breaker_threshold", 2)
+    client = ModelGatewayClient(mock_settings, max_retries=0)
+
+    try:
+        with respx.mock:
+            route = respx.post("http://mock-gateway:8080/v1/chat/completions")
+            route.side_effect = [
+                Response(503, json={"error": "overloaded"}),
+                Response(200, json={"choices": [{"message": {"content": "ok"}}]}),
+            ]
+
+            with pytest.raises(ModelGatewayUnavailableError):
+                await client.chat(
+                    messages=[{"role": "user", "content": "hi"}],
+                    trace_id="cb-reset-fail",
+                )
+            assert client._circuit.consecutive_failures == 1
+
+            result = await client.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                trace_id="cb-reset-ok",
+            )
+            assert result == "ok"
+            assert client._circuit.consecutive_failures == 0
+            assert client._circuit.is_open is False
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_counts_once_per_logical_request(
+    mock_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段4 熔断：一次逻辑调用即使传输层重试 3 次失败，也只计 1 次熔断失败。"""
+    monkeypatch.setattr(mock_settings, "model_gateway_circuit_breaker_threshold", 2)
+    client = ModelGatewayClient(mock_settings)  # 默认 max_retries=2
+
+    try:
+        with respx.mock:
+            respx.post("http://mock-gateway:8080/v1/chat/completions").mock(
+                return_value=Response(503, json={"error": "overloaded"})
+            )
+
+            with pytest.raises(ModelGatewayUnavailableError):
+                await client.chat(
+                    messages=[{"role": "user", "content": "hi"}],
+                    trace_id="cb-count-once",
+                )
+
+            assert client._circuit.consecutive_failures == 1
+    finally:
+        await client.aclose()

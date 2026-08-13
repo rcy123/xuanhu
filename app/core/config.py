@@ -142,6 +142,18 @@ class Settings(BaseSettings):
     model_gateway_timeout_seconds: int = Field(default=60, ge=1, description="网关请求超时（秒）")
     gateway_health_check_timeout_seconds: int = Field(default=10, ge=1, description="网关健康检查超时（秒）")
     model_gateway_max_retries: int = Field(default=2, ge=0, description="网关请求最大重试次数")
+    model_gateway_circuit_breaker_threshold: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="阶段4 熔断：连续失败达到该阈值后打开熔断器，快速失败",
+    )
+    model_gateway_circuit_breaker_cooldown_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=3600.0,
+        description="阶段4 熔断：打开后的冷却时长（秒），冷却后进入半开探测",
+    )
     model_gateway_route_profile: str = Field(default="default", description="网关路由 profile")
     reasoning_retry_backoff_base_seconds: float = Field(
         default=10.0,

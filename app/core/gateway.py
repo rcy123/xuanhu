@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import get_settings
 from app.core.exceptions import (
     ChatOutputTruncatedError,
@@ -122,6 +123,12 @@ class ModelGatewayClient:
         # Explicit callers (the L2 runtime) can use a separate retry budget;
         # all legacy callers preserve the configured behavior by default.
         self._max_retries = settings.model_gateway_max_retries if max_retries is None else max_retries
+        # 阶段4 熔断：模型网关连续故障时快速失败，避免 60s×重试堆积。
+        # 用 getattr 兜底默认值，兼容仅提供部分字段的测试/内嵌 settings。
+        self._circuit = CircuitBreaker(
+            failure_threshold=getattr(settings, "model_gateway_circuit_breaker_threshold", 5),
+            cooldown_seconds=getattr(settings, "model_gateway_circuit_breaker_cooldown_seconds", 30.0),
+        )
         self._route_profile = settings.model_gateway_route_profile
         self._chat_model = settings.chat_model
         self._embedding_model = settings.embedding_model
@@ -231,6 +238,15 @@ class ModelGatewayClient:
         if self._model_whitelist and model not in self._model_whitelist:
             raise ModelNotAllowedError(model)
 
+    def _record_circuit_failure(self, exc: Exception) -> None:
+        """只把「网关侧瞬态故障」（可重试）计入熔断失败。
+
+        超时/连接失败/5xx/429 等可重试错误反映网关健康度，应计入熔断；
+        客户端 4xx（非重试）是调用方 payload 问题，不应触发熔断。
+        """
+        if getattr(exc, "retryable", False):
+            self._circuit.record_failure()
+
     def _build_headers(self) -> dict[str, str]:
         """构建请求头，包含认证和路由信息。"""
         return {
@@ -320,6 +336,12 @@ class ModelGatewayClient:
         configured_attempts = 1 + self._max_retries
         max_attempts = configured_attempts if max_requests is None else min(configured_attempts, max_requests)
 
+        # 阶段4 熔断：网关已被判定为故障时快速失败，不进入 60s×重试的慢路径。
+        # 冷却结束后 is_open 返回 False（半开），放行探测请求，由下方的
+        # record_success / record_failure 决定闭合或重新打开。
+        if self._circuit.is_open:
+            raise ModelGatewayUnavailableError("模型网关熔断中，快速失败", retryable=True)
+
         for attempt in range(max_attempts):
             try:
                 response = await self._client.request(
@@ -330,6 +352,7 @@ class ModelGatewayClient:
                 )
 
                 if response.status_code >= 200 and response.status_code < 300:
+                    self._circuit.record_success()
                     return response
 
                 # 非 2xx 响应
@@ -402,7 +425,9 @@ class ModelGatewayClient:
 
         # 所有重试耗尽
         if last_exception is not None:
+            self._record_circuit_failure(last_exception)
             raise last_exception
+        self._record_circuit_failure(ModelGatewayUnavailableError("模型网关请求失败（重试耗尽）"))
         raise ModelGatewayUnavailableError("模型网关请求失败（重试耗尽）")
 
     async def chat(
