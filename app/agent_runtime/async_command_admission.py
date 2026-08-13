@@ -221,6 +221,11 @@ async def try_rollout_async_admission(
         # An invalid session id is left to the synchronous path, which raises the
         # canonical SESSION_NOT_FOUND — error semantics are unchanged.
         return None
+    # 阶段4 背压：队列过深时拒绝新命令（503），不 fallback 到同步路径——
+    # 同步路径同样会堆积，拒绝才是保护 worker/DB 的正确行为。
+    overloaded = await _queue_overloaded_response(request)
+    if overloaded is not None:
+        return overloaded
     ref = await enqueue_command(
         app_state,
         session_id=parsed_session_id,
@@ -231,6 +236,43 @@ async def try_rollout_async_admission(
     if ref is None:
         return None
     return build_accepted_response(request, session_id, ref)
+
+
+async def _queue_overloaded_response(request: Request) -> JSONResponse | None:
+    """队列过深时返回 503；否则 None（best-effort，查询失败按不超载处理）。
+
+    背压阈值 ``ASYNC_COMMAND_MAX_QUEUE_DEPTH``=0 时禁用。count_active 查询失败
+    不阻断 admission（宁可放行也不因监控查询失败拒绝临床请求）。
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if settings.async_command_max_queue_depth <= 0:
+        return None
+    try:
+        repository = PostgresAsyncCommandRepository(get_session_factory())
+        active = await repository.count_active()
+    except Exception:
+        return None
+    if active < settings.async_command_max_queue_depth:
+        return None
+    trace_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-trace-id")
+        or str(uuid.uuid4())
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "QUEUE_OVERLOADED",
+            "message": "系统繁忙，请稍后重试",
+            "detail": None,
+            "retryable": True,
+            "stage": None,
+            "trace_id": trace_id,
+        },
+        headers={"Retry-After": str(ACCEPTED_RETRY_AFTER_SECONDS)},
+    )
 
 
 __all__ = [

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -27,6 +28,11 @@ from app.agent_runtime.async_command import (
     PostgresAsyncCommandRepository,
 )
 from app.agent_runtime.async_command import AsyncCommandRepository as AsyncCommandRepositoryProtocol
+from app.core.metrics import (
+    async_command_processing_seconds,
+    observe_async_command_outcome,
+    observe_async_command_queue_depth,
+)
 from app.services.lease_guard import LeaseGuard, LeaseOwnershipLostError
 
 logger = logging.getLogger("xuanhu.async_command_worker")
@@ -158,8 +164,12 @@ class AsyncCommandWorker:
         async def process_session_group(commands: list[ClaimedCommand]) -> dict[str, int]:
             local: dict[str, int] = {}
             for command in commands:
+                started = time.monotonic()
                 async with semaphore:
                     outcome = await self._process(command)
+                # 阶段4 可观测性：处理时长 + 终态计数（best-effort，绝不影响业务）。
+                async_command_processing_seconds.observe(time.monotonic() - started)
+                observe_async_command_outcome(outcome)
                 local[outcome] = local.get(outcome, 0) + 1
             return local
 
@@ -171,6 +181,14 @@ class AsyncCommandWorker:
         for local in results:
             for outcome, count in local.items():
                 counts[outcome] = counts.get(outcome, 0) + count
+
+        # 阶段4 背压/队列深度：处理完这批后写入剩余未终结命令数。
+        try:
+            depth = await self._repository.count_active()
+        except Exception as exc:  # pragma: no cover - best-effort metric
+            logger.warning("async-command queue depth observation failed: %s", type(exc).__name__)
+        else:
+            observe_async_command_queue_depth(depth)
 
         return WorkerRunResult(
             claimed=len(claimed_commands),

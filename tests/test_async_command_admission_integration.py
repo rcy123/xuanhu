@@ -219,6 +219,54 @@ async def test_202_accepts_fast_without_inline_work() -> None:
         await _cleanup(session_id)
 
 
+async def test_admission_rejects_when_queue_overloaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """阶段4 背压：未终结命令数达到阈值时 admission 返回 503，不再堆积。"""
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("ASYNC_COMMAND_MAX_QUEUE_DEPTH", "2")
+    get_settings.cache_clear()
+    try:
+        _set_admission_ready()
+        # 3 条 active 命令（不同 session 各 1 条），超过阈值 2。
+        backlog_sessions: list[UUID] = []
+        repo = PostgresAsyncCommandRepository(get_session_factory())
+        for i in range(3):
+            sid = await _seed_session()
+            backlog_sessions.append(sid)
+            await repo.enqueue(
+                session_id=sid,
+                operation="intake.message",
+                idempotency_key=f"backlog-{i}",
+                request_payload={},
+            )
+
+        target_session = await _seed_session()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    _post_url(target_session, "intake.message"),
+                    json=_body_for("intake.message"),
+                    headers={"Prefer": "respond-async", "X-Idempotency-Key": "k-overload"},
+                )
+                assert response.status_code == 503, response.text
+                body = response.json()
+                assert body["code"] == "QUEUE_OVERLOADED"
+                assert body["retryable"] is True
+                assert body["detail"] is None
+                assert response.headers["Retry-After"] == "1"
+        finally:
+            await _cleanup(target_session)
+        for sid in backlog_sessions:
+            await _cleanup(sid)
+    finally:
+        _clear_admission()
+        get_settings.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # R7 default: ready => 202 even without any Prefer header
 # ---------------------------------------------------------------------------

@@ -1,0 +1,28 @@
+# 阶段4 异步命令 worker 队列告警规则。
+#
+# 依赖：
+#   - xuanhu_async_command_queue_depth — worker 每次轮询后写入的未终结命令数
+#     （queued + running，见 app/agent_runtime/async_command_worker.py）
+#
+# 设计约束：
+#   - 队列深度持续过高说明 worker 消费速度跟不上 admission 入队速度，
+#     属于“雪崩前兆”；阈值默认与 ASYNC_COMMAND_MAX_QUEUE_DEPTH=200 对齐。
+groups:
+  - name: xuanhu-async-command
+    interval: 30s
+    rules:
+      - alert: XuanhuAsyncCommandQueueDepthHigh
+        expr: xuanhu_async_command_queue_depth > 200
+        for: 5m
+        labels:
+          severity: warning
+          service: xuanhu
+          component: async-command-worker
+        annotations:
+          summary: Xuanhu async command queue depth is sustained above 200
+          description: >
+            The durable async-command queue has more than 200 queued+running
+            commands for 5 minutes. The worker is consuming slower than admission
+            is enqueueing. Check the async command worker health, model gateway
+            latency, and DB connection pool; consider raising
+            ASYNC_COMMAND_MAX_CONCURRENCY or scaling API_WORKERS.

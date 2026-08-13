@@ -440,6 +440,15 @@ class Settings(BaseSettings):
         le=32,
         description="阶段1 并发消费：同一批命令中不同会话可并行处理的上限；同会话命令仍串行（见 async_command_worker.run_once）",
     )
+    async_command_max_queue_depth: int = Field(
+        default=200,
+        ge=0,
+        le=100_000,
+        description=(
+            "阶段4 背压：未终结命令数（queued+running）达到该阈值时 admission 拒绝新命令（503）；"
+            "0=禁用背压检查"
+        ),
+    )
     async_command_lease_seconds: int = Field(default=60, ge=5, le=3600)
     async_command_heartbeat_seconds: float = Field(
         default=20,

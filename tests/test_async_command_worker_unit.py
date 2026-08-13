@@ -87,6 +87,9 @@ class _FakeRepository:
         self.retried.append((command_id, retry_after_seconds))
         return self.retry_result
 
+    async def count_active(self) -> int:
+        return len(self.queue)
+
 
 async def test_success_dispatch_settles_completed() -> None:
     async def handler(ctx: AsyncCommandContext) -> CommandSuccess:

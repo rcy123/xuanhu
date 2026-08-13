@@ -225,6 +225,8 @@ class AsyncCommandRepository(Protocol):
         retry_after_seconds: int,
     ) -> bool: ...
 
+    async def count_active(self) -> int: ...
+
 
 def canonical_json_digest(value: object) -> str:
     """Return the canonical SHA-256 hex digest of a JSON value."""
@@ -714,6 +716,25 @@ class PostgresAsyncCommandRepository:
                 )
                 await session.flush()
                 return True
+        except SQLAlchemyError:
+            raise AsyncCommandRepositoryError(AsyncCommandErrorCode.TRANSACTION_FAILED) from None
+
+    async def count_active(self) -> int:
+        """返回当前未终结（queued + running）的持久命令数。
+
+        供阶段 4 背压/队列深度指标使用：队列过深时 admission 可拒绝新命令，
+        避免无界积压。best-effort 语义由调用方保证（此处失败即抛事务异常）。
+        """
+        try:
+            async with self._session_factory() as session:
+                return int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AsyncCommand)
+                        .where(AsyncCommand.status.in_(ACTIVE_STATUSES))
+                    )
+                    or 0
+                )
         except SQLAlchemyError:
             raise AsyncCommandRepositoryError(AsyncCommandErrorCode.TRANSACTION_FAILED) from None
 

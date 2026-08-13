@@ -353,6 +353,33 @@ production_secrets_invalid = _Gauge(
     "1 when production secret validation fails at startup, else 0",
 )
 
+# ---------------------------------------------------------------------------
+# 阶段4 可观测性：异步命令 worker 队列指标
+# ---------------------------------------------------------------------------
+
+#: worker 终态结果（有界低基数标签）。
+_ASYNC_COMMAND_OUTCOMES = frozenset({"succeeded", "failed", "retried", "rejected", "ownership_lost"})
+
+#: 当前未终结（queued + running）的持久命令数。由 worker 每次轮询后写入。
+async_command_queue_depth = _Gauge(
+    "xuanhu_async_command_queue_depth",
+    "Current number of active (queued + running) durable async commands",
+)
+
+#: worker 每条命令的终态结果计数。
+async_command_processed_total = _Counter(
+    "xuanhu_async_command_processed_total",
+    "Async command worker terminal outcomes by bounded outcome",
+    labelnames=("outcome",),
+    allowlists={"outcome": _ASYNC_COMMAND_OUTCOMES},
+)
+
+#: 单条命令 handler 处理时长（含模型调用）。
+async_command_processing_seconds = _Histogram(
+    "xuanhu_async_command_processing_seconds",
+    "Async command handler processing duration",
+)
+
 
 def observe_config_drift(drift_type: str) -> None:
     """Record one detected config drift of the given bounded key type."""
@@ -362,6 +389,16 @@ def observe_config_drift(drift_type: str) -> None:
 def observe_production_secrets_validity(valid: bool) -> None:
     """Record the current production secret validation outcome (M1 gauge)."""
     production_secrets_invalid.set(0.0 if valid else 1.0)
+
+
+def observe_async_command_outcome(outcome: str) -> None:
+    """Record one async-command worker terminal outcome（有界标签）。"""
+    async_command_processed_total.inc(labels={"outcome": outcome})
+
+
+def observe_async_command_queue_depth(depth: int) -> None:
+    """Record the current async-command queue depth（非负整数）。"""
+    async_command_queue_depth.set(float(max(0, depth)))
 
 
 def observe_gateway_request(operation: str, outcome: str) -> None:

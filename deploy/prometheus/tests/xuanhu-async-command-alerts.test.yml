@@ -1,0 +1,48 @@
+rule_files:
+  - ../rules/xuanhu-async-command-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- queue depth sustained above threshold ---------------------------------
+  - name: queue depth above threshold fires after five minutes
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_async_command_queue_depth'
+        values: '250x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: XuanhuAsyncCommandQueueDepthHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: xuanhu
+              component: async-command-worker
+            exp_annotations:
+              summary: Xuanhu async command queue depth is sustained above 200
+              description: >
+                The durable async-command queue has more than 200 queued+running
+                commands for 5 minutes. The worker is consuming slower than admission
+                is enqueueing. Check the async command worker health, model gateway
+                latency, and DB connection pool; consider raising
+                ASYNC_COMMAND_MAX_CONCURRENCY or scaling API_WORKERS.
+
+  - name: queue depth below threshold stays quiet
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_async_command_queue_depth'
+        values: '50x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: XuanhuAsyncCommandQueueDepthHigh
+        exp_alerts: []
+
+  - name: transient spike above threshold does not fire within five minutes
+    interval: 1m
+    input_series:
+      - series: 'xuanhu_async_command_queue_depth'
+        values: '250x2 50x8'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: XuanhuAsyncCommandQueueDepthHigh
+        exp_alerts: []
