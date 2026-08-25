@@ -317,6 +317,7 @@ export type EventType =
   | 'session.done'
   | 'session.terminated'
   | 'doctor.reviewed'
+  | 'agent.progress'
   | 'heartbeat'
   | 'resync'
   | 'command.queued'

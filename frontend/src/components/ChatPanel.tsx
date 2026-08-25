@@ -407,8 +407,9 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
       setBaseFormulaAlternatives(null)
       setSelectedAlternativeIndex(null)
       setAlternativeSubmitting(false)
-      await refreshDetail()
+      const refreshed = await refreshDetail()
       if (sessionId) await loadMessages(sessionId)
+      if (refreshed !== null) setAlternativeError(null)
     } else if (entry.operation === 'prescription.review') {
       setModifyModalOpen(false)
       setRejectModalOpen(false)
@@ -427,6 +428,10 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
       setAlternativeSubmitting(false)
       setSelectedAlternativeIndex(null)
       setAlternativeError(bounded ?? '推进失败，请稍后重试')
+      // Async admission deliberately defers business validation to the worker.
+      // Refresh once so a concurrent recovery or state transition cannot leave
+      // the UI presenting an error against an obsolete session snapshot.
+      void refreshDetail()
     } else if (entry.operation === 'prescription.review') {
       setModifyModalOpen(false)
       setRejectModalOpen(false)
@@ -439,7 +444,7 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
         retryable: false,
       }))
     }
-  }, [messagesHook])
+  }, [messagesHook, refreshDetail])
 
   // R7 attention：对账预算耗尽、状态暂不可得。释放 spinner/loading 语义并只暴露
   // 固定的 PHI 安全本地码（COMMAND_STATUS_UNAVAILABLE），绝不伪造命令失败，也不
@@ -1018,12 +1023,14 @@ export function ChatPanel({ sessionId, detailHook, messagesHook, commandReconcil
                   onRecordGenerationStart={handleRecordGenerationStart}
                   onRecordGenerationFailed={handleRecordGenerationFailed}
                   onAdvanced={async () => {
-                    await refreshDetail()
+                    const refreshed = await refreshDetail()
                     if (sessionId) await loadMessages(sessionId)
+                    if (refreshed !== null) setAlternativeError(null)
                   }}
                   onRecovered={async () => {
-                    await refreshDetail()
+                    const refreshed = await refreshDetail()
                     if (sessionId) await loadMessages(sessionId)
+                    if (refreshed !== null) setAlternativeError(null)
                   }}
                   // R7: 已接受（202）的推进命令登记对账，pending 期间禁用按钮。
                   onCommandAccepted={(accepted, idemKey) => {

@@ -625,6 +625,12 @@ class DomainRepository(Protocol):
 
     async def get_gate_results(self, session_id: UUID, state_version: int) -> tuple[GateResultSchema, ...]: ...
 
+    async def get_carry_forward_gate_results(
+        self,
+        session_id: UUID,
+        target_state_version: int,
+    ) -> tuple[GateResultSchema, ...] | None: ...
+
     async def get_reasoning_authority(self, session_id: UUID, state_version: int) -> ReasoningAuthoritySnapshot | None: ...
 
     async def get_artifact_payload(
@@ -708,6 +714,61 @@ class PostgresDomainRepository(DomainRepository, OutboxRepository):
                 if len({row.graph_run_id for row in rows}) > 1:
                     return ()
                 return tuple(self._gate_schema(row) for row in self._ordered_gate_rows(rows))
+        except RepositoryError:
+            raise
+        except SQLAlchemyError:
+            raise RepositoryError(RepositoryErrorCode.TRANSACTION_FAILED) from None
+
+    async def get_carry_forward_gate_results(
+        self,
+        session_id: UUID,
+        target_state_version: int,
+    ) -> tuple[GateResultSchema, ...] | None:
+        """Load the persisted intake authority anchored by ``snapshot.advance``.
+
+        Recovery may advance the domain version without changing clinical facts.
+        In that narrow control-only case, the original completed triage/completeness
+        pair is the only safe source for a new current-version gate pair.
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                session_row = await session.get(ConsultSession, session_id)
+                if session_row is None:
+                    raise RepositoryError(RepositoryErrorCode.SESSION_NOT_FOUND)
+                source = self._advance_source(session_row.state_snapshot, target_state_version)
+                if source is None:
+                    return None
+                source_gate_id, source_state_version = source
+                source_gate = await session.scalar(
+                    select(GateResult)
+                    .join(GraphRun, GateResult.graph_run_id == GraphRun.id)
+                    .where(
+                        GateResult.id == source_gate_id,
+                        GateResult.session_id == session_id,
+                        GateResult.gate_name == "completeness",
+                        GateResult.input_state_version == source_state_version,
+                        GraphRun.session_id == session_id,
+                        GraphRun.status == "completed",
+                    )
+                )
+                if source_gate is None or not self._completion_gate_is_ready(source_gate):
+                    return None
+                rows = await self._source_gate_rows(
+                    session,
+                    session_id=session_id,
+                    source_state_version=source_state_version,
+                    graph_run_id=source_gate.graph_run_id,
+                )
+                authority = self._authority_gate_rows(rows)
+                if authority is None:
+                    return None
+                triage, completeness, _ = authority
+                if completeness.id != source_gate_id or not self._triage_gate_is_continue(triage):
+                    return None
+                return tuple(
+                    self._gate_schema(row).model_copy(update={"input_state_version": target_state_version})
+                    for row in (triage, completeness)
+                )
         except RepositoryError:
             raise
         except SQLAlchemyError:

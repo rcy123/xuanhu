@@ -65,7 +65,7 @@ from app.models.domain import (
     GraphRun,
     IntakeCommandClaim,
 )
-from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus
+from app.schemas.domain import ArtifactRevisionSchema, ArtifactStatus, GateResultSchema
 from app.schemas.recovery import RecoveryRequest, RecoveryResponse
 from app.services.langgraph_review import (
     DOCTOR_REVIEW_ARTIFACT_TYPE,
@@ -1365,6 +1365,24 @@ async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
     trace_id_raw = payload.get("trace_id")
     trace_id = trace_id_raw if isinstance(trace_id_raw, str) else _node_trace_id(state)
     output_version = domain_state.state_version + 1
+    carried_gates: tuple[GateResultSchema, ...] = ()
+    if action == "retry_current_stage" and source == "syndrome" and target == "inquiry":
+        # This recovery is control-only: observations and safety facts did not
+        # change, so carry forward the anchored intake authority at the new
+        # session version instead of guessing a fresh triage result.
+        carried_gates = await repository.get_carry_forward_gate_results(
+            session_id,
+            output_version,
+        ) or ()
+        if len(carried_gates) != 2:
+            raise StateRecoveryRequiredError(
+                message="无法验证恢复所需的问诊完备性门禁",
+                detail=(
+                    f"session_id={session_id} recovery requires an anchored "
+                    "completed triage/completeness gate pair"
+                ),
+                retryable=False,
+            )
     event_type = "session.terminated" if action == "terminate" else "session.recovered"
     old_advance = (session.state_snapshot or {}).get("advance")
     preserve_advance = old_advance if isinstance(old_advance, dict) else None
@@ -1381,8 +1399,14 @@ async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
         graph_version=DEFAULT_GRAPH_VERSION,
         graph_steps=(
             GraphStepSpec(step_name="verify_checkpoint_refs", status="completed", metadata={}),
+            GraphStepSpec(
+                step_name="carry_forward_intake_gates",
+                status="completed" if carried_gates else "skipped",
+                metadata={"gate_count": len(carried_gates)},
+            ),
             GraphStepSpec(step_name="apply_recovery_control", status="completed", metadata={}),
         ),
+        gate_results=carried_gates,
         artifact_payloads=(payload_spec,),
         audit_events=(
             AuditEventSpec(
@@ -1444,7 +1468,14 @@ async def execute_recovery_command(state: XuanhuGraphState) -> dict[str, Any]:
                 "revision": artifact.revision,
             }
         ],
-        "gate_results": [],
+        "gate_results": [
+            {
+                "gate_name": gate.gate_name,
+                "decision": gate.decision.value,
+                "policy_version": gate.policy_version,
+            }
+            for gate in carried_gates
+        ],
         "pending_interrupt": None,
         "last_error": None,
     }

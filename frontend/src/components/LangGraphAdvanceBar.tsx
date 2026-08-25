@@ -58,11 +58,36 @@ export function LangGraphAdvanceBar({
   const pendingAdvance = useRef<PendingAdvanceRequest | null>(null)
   const pendingRecoveryKey = useRef<string | null>(null)
   const prevPendingRef = useRef<boolean>(pending)
+  const previousDetailRef = useRef({
+    sessionId: detail.session_id,
+    stateVersion: detail.state_version,
+    currentStage: detail.current_stage,
+    recoveryStatus: detail.recovery_status,
+  })
+
+  // A refresh after a command/recovery can replace the authoritative session
+  // state while this component remains mounted. Do not keep showing an error
+  // that belongs to the previous state version or stage.
+  useEffect(() => {
+    const previous = previousDetailRef.current
+    const changed = previous.sessionId !== detail.session_id
+      || previous.stateVersion !== detail.state_version
+      || previous.currentStage !== detail.current_stage
+      || previous.recoveryStatus !== detail.recovery_status
+    if (changed) setError(null)
+    previousDetailRef.current = {
+      sessionId: detail.session_id,
+      stateVersion: detail.state_version,
+      currentStage: detail.current_stage,
+      recoveryStatus: detail.recovery_status,
+    }
+  }, [detail.session_id, detail.state_version, detail.current_stage, detail.recovery_status])
 
   // 对账终态：pending 由 true → false 表示该命令已 settle，解除按钮锁定。
   useEffect(() => {
     if (prevPendingRef.current === true && pending === false) {
       setSettling(false)
+      setError(null)
     }
     prevPendingRef.current = pending
   }, [pending])
@@ -111,6 +136,7 @@ export function LangGraphAdvanceBar({
         return
       }
       await onAdvanced(result)
+      setError(null)
       setSettling(false)
     } catch (caught: unknown) {
       const commandError = caught instanceof ApiRequestError ? caught : new ApiRequestError({
@@ -125,7 +151,7 @@ export function LangGraphAdvanceBar({
         || commandError.code === 'HTTP_COMMAND_RECOVERY_REQUIRED'
         || commandError.code === 'BAD_RESPONSE'
       if (!outcomeUncertain) pendingAdvance.current = null
-      if (commandError.code === 'INVALID_STATE_VERSION') {
+      if (commandError.code === 'INVALID_STATE_VERSION' || commandError.code === 'INSUFFICIENT_INQUIRY') {
         try {
           await onRefresh?.()
         } catch {
@@ -153,6 +179,7 @@ export function LangGraphAdvanceBar({
       )
       pendingRecoveryKey.current = null
       await onRecovered?.(result)
+      setError(null)
     } catch (caught: unknown) {
       setError(caught instanceof ApiRequestError ? caught : new ApiRequestError({
         code: 'RECOVERY_FAILED',

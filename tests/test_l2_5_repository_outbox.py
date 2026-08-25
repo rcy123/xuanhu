@@ -237,6 +237,30 @@ async def _reasoning_ready_session(
     return session_id, result.graph_run_id, source_gate.id
 
 
+async def test_get_carry_forward_gate_results_rebinds_valid_source_pair(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, graph_run_id, source_gate_id = await _reasoning_ready_session(repository, factory)
+
+    gates = await repository.get_carry_forward_gate_results(session_id, target_state_version=3)
+
+    assert gates is not None
+    assert [gate.gate_name for gate in gates] == ["triage", "completeness"]
+    assert all(gate.input_state_version == 3 for gate in gates)
+    assert gates[1].details == {"disposition": "ready"}
+    assert source_gate_id != graph_run_id
+
+
+async def test_get_carry_forward_gate_results_fails_without_source_anchor(
+    store: tuple[PostgresDomainRepository, async_sessionmaker[AsyncSession]],
+) -> None:
+    repository, factory = store
+    session_id, _, _ = await _session_and_message(factory)
+
+    assert await repository.get_carry_forward_gate_results(session_id, target_state_version=2) is None
+
+
 def _context(
     state: DomainState,
     delta: DomainDelta,

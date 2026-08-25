@@ -146,6 +146,7 @@ const KNOWN_EVENT_TYPES: EventType[] = [
   'session.done',
   'session.terminated',
   'doctor.reviewed',
+  'agent.progress',
   'heartbeat',
   'resync',
   'command.queued',

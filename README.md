@@ -418,24 +418,6 @@ xuanhu/
 └── .env.example                  # 环境变量模板
 ```
 
-### 📚 文档
-
-文档集位于 `docs/`，按主题归档（每个子目录自包含、带编号总览）：
-
-| 目录 | 主题 |
-|---|---|
-| [01_agent部分优化](docs/01_agent部分优化/) | Agent 架构演进、LangGraph 大修、收敛性重写 |
-| [02_agent逻辑优化](docs/02_agent逻辑优化/) | 单一后端收敛、网关超时、柔性采集 |
-| [03_agent性能优化](docs/03_agent性能优化/) | OP1–OP4 性能画像与优化、Embedding 缓存预热 |
-| [04_生产环境加固](docs/04_生产环境加固/) | 认证授权、PHI 访问控制、网络边界、灰度上线 |
-| [05_RAG效果评测](docs/05_RAG效果评测/) | RAG 评测实验设计、指标合同、消融实验 |
-| [06_项目总结](docs/06_项目总结/) | 项目全貌：架构、Agent、RAG、性能、加固、测试 |
-| [07_面试宝典](docs/07_面试宝典/) | 面试视角的系统设计、RAG、Agent、性能叙事 |
-| [08_后续优化](docs/08_后续优化/) | R9 问题契约方案与实施记录 |
-| [async-command.md](docs/async-command.md) | 持久化异步命令（R6/R7）设计 |
-
----
-
 ## ⚡ 性能优化
 
 Agent 运行时经过了四个维度（OP1–OP4）的系统性画像与优化。以下数据均在本地 Docker（PG/Redis/Milvus）+ 云端模型网关环境实测。
@@ -522,15 +504,6 @@ npm run lint
 npm run typecheck
 ```
 
-### 提交规范
-
-本项目使用约定式提交（Conventional Commits）。提交前请确保：
-
-- 所有代码检查通过（`ruff`、`mypy`、`oxlint`）
-- 测试全部通过（`pytest`、`vitest`）
-- 无密钥泄露（`gitleaks`）
-
----
 
 ## 🔒 安全合规
 
@@ -548,29 +521,3 @@ npm run typecheck
 - **模型输入前身份掩码** — 手机号、证件号等身份序列在 LLM 可见前替换为等长 `█`；证据摘要始终覆盖原始文本，掩码引文仍可验证（R9）
 - 会话数据按医师隔离
 - MVP 范围明确不接入 HIS/EMR
-
----
-
-## 🤝 参与贡献
-
-本项目处于早期开发阶段。如果你想参与：
-
-1. Fork 本仓库
-2. 创建功能分支（`git checkout -b feature/amazing-feature`）
-3. 提交变更（`git commit -m 'feat: add amazing feature'`）
-4. 推送到分支（`git push origin feature/amazing-feature`）
-5. 发起 Pull Request
-
-请确保代码通过所有代码检查和测试后再提交。
-
----
-
-## 📄 许可证
-
-**UNLICENSED** — 本项目目前不开放公开使用或分发。
-
----
-
-<p align="center">
-  <sub>为中医社区而建 ❤️</sub>
-</p>

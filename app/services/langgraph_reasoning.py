@@ -1986,6 +1986,7 @@ async def _commit_manual_required(
     trace_id: str,
 ) -> int:
     state = await repository.get_state(claim.session_id)
+    preserve_advance = await _load_session_advance(claim.session_id)
     delta = DomainDelta(
         delta_id=uuid.uuid5(uuid.NAMESPACE_URL, f"xuanhu:delta:{_commit_run_id(claim, 'manual_required')}"),
         run_id=_commit_run_id(claim, "manual_required"),
@@ -2014,6 +2015,7 @@ async def _commit_manual_required(
             trace_id=trace_id,
             output_state_version=state.state_version + 1,
             route="manual_required",
+            preserve_advance=preserve_advance,
         ),
         outbox_event_type=REASONING_COMMAND_COMPLETED,
         outbox_payload={

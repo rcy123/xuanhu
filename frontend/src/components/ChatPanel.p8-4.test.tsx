@@ -424,6 +424,54 @@ describe('ChatPanel P8-4 集成', () => {
     expect(screen.getByTestId('error-retry')).toBeInTheDocument()
   })
 
+  it('clears a stale async advance error after the command later succeeds', async () => {
+    let onSucceeded: ((entry: import('@/hooks/useCommandReconciliation').CommandReconciliationEntry) => void) | undefined
+    const reconciler = makeCommandReconciler()
+    reconciler.setHandlers = vi.fn((succeeded) => {
+      onSucceeded = succeeded
+    })
+    const refreshDetail = vi.fn().mockResolvedValue(makeDetail({ agent_runtime: 'langgraph', state_version: 2 }))
+    const loadMessages = vi.fn().mockResolvedValue([])
+    render(
+      <ChatPanel
+        sessionId="s1"
+        detailHook={makeDetailHook({ detail: makeDetail({ agent_runtime: 'langgraph' }), refreshDetail })}
+        messagesHook={makeMessagesHook({ loadMessages })}
+        commandReconciler={reconciler}
+      />,
+    )
+
+    // The command failure handler is installed through setHandlers; invoke it
+    // directly to model the bounded async error delivered by reconciliation.
+    const [, onFailed] = (reconciler.setHandlers as ReturnType<typeof vi.fn>).mock.calls[0]
+    act(() => {
+      onFailed({
+        commandId: 'cmd-failed',
+        sessionId: 's1',
+        operation: 'session.advance',
+        idempotencyKey: 'key-failed',
+        state: 'failed',
+        errorCode: 'INSUFFICIENT_INQUIRY',
+      })
+    })
+    expect(screen.getByText('INSUFFICIENT_INQUIRY')).toBeInTheDocument()
+
+    await act(async () => {
+      onSucceeded?.({
+        commandId: 'cmd-succeeded',
+        sessionId: 's1',
+        operation: 'session.advance',
+        idempotencyKey: 'key-succeeded',
+        state: 'succeeded',
+      })
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('INSUFFICIENT_INQUIRY')).not.toBeInTheDocument()
+    })
+    expect(refreshDetail).toHaveBeenCalled()
+    expect(loadMessages).toHaveBeenCalledWith('s1')
+  })
+
   it('does not render actionable controls for detail from another session', () => {
     const staleDetail = makeDetail({ session_id: 's1' })
     const submit = vi.fn().mockResolvedValue(true)

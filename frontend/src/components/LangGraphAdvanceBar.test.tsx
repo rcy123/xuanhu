@@ -244,6 +244,41 @@ describe('LangGraphAdvanceBar', () => {
     )
   })
 
+  it('refreshes after insufficient inquiry and clears the stale error after a newer detail arrives', async () => {
+    const advance = vi.spyOn(api, 'advanceSession').mockRejectedValue(
+      new ApiRequestError({
+        code: 'INSUFFICIENT_INQUIRY',
+        userMessage: '问诊信息不充分，不能推进',
+        status: 400,
+        retryable: false,
+      }),
+    )
+    const onRefresh = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <LangGraphAdvanceBar
+        detail={detail()}
+        onAdvanced={() => {}}
+        onRefresh={onRefresh}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('langgraph-advance-button'))
+    await waitFor(() => expect(screen.getByText('问诊信息不充分，不能推进')).toBeInTheDocument())
+    expect(advance).toHaveBeenCalledOnce()
+    expect(onRefresh).toHaveBeenCalledOnce()
+
+    rerender(
+      <LangGraphAdvanceBar
+        detail={{ ...detail(), state_version: 3 }}
+        onAdvanced={() => {}}
+        onRefresh={onRefresh}
+      />,
+    )
+    await waitFor(() => {
+      expect(screen.queryByText('问诊信息不充分，不能推进')).not.toBeInTheDocument()
+    })
+  })
+
   it('reuses the same key when the clinician retries a failed request', async () => {
     const advance = vi.spyOn(api, 'advanceSession')
       .mockRejectedValueOnce(new ApiRequestError({

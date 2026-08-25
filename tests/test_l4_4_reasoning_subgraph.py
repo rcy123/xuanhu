@@ -1382,6 +1382,10 @@ async def test_syndrome_verifier_failure_routes_to_manual_required_without_artif
             select(func.count()).select_from(ArtifactRevision).where(ArtifactRevision.artifact_type == "syndrome_draft")
         )
         assert artifact_count == 0
+        session = await db.get(ConsultSession, session_id)
+        assert session is not None
+        assert isinstance(session.state_snapshot, dict)
+        assert session.state_snapshot.get("advance") is not None
 
 
 async def test_formula_needs_more_info_invalidates_current_artifacts_and_returns_one_question(
